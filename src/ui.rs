@@ -138,6 +138,7 @@ impl UI {
                 // has children that are all numbered subgroups; surface how many
                 // there are so the depth is visible without expanding the tree.
                 let layer_prefix = match layer_count(children) {
+                    Some(1) => "1 layer, ".to_string(),
                     Some(n) => format!("{n} layers, "),
                     None => String::new(),
                 };
