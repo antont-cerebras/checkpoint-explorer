@@ -15,17 +15,17 @@ use crate::explorer::Explorer;
 
 #[derive(Parser)]
 #[command(name = "checkpoint-explorer")]
-#[command(about = "Interactive explorer for SafeTensors and GGUF files")]
+#[command(about = "Interactive explorer for model checkpoints (.safetensors, .gguf, .hdf5)")]
 struct Args {
     #[arg(
-        help = "SafeTensors and GGUF files, directories, or glob patterns to explore (e.g., *.safetensors, model-*.gguf)"
+        help = "Checkpoint files, directories, or glob patterns to explore (e.g., *.safetensors, model-*.gguf, *.hdf5)"
     )]
     paths: Vec<PathBuf>,
 
     #[arg(
         short,
         long,
-        help = "Recursively search directories for SafeTensors and GGUF files"
+        help = "Recursively search directories for checkpoint files"
     )]
     recursive: bool,
 }
@@ -34,11 +34,9 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.paths.is_empty() {
+        eprintln!("Error: Please specify one or more checkpoint files or directories to explore.");
         eprintln!(
-            "Error: Please specify one or more SafeTensors or GGUF files or directories to explore."
-        );
-        eprintln!(
-            "Usage: checkpoint-explorer <file1.safetensors> [file2.gguf] [directory] [*.safetensors] ..."
+            "Usage: checkpoint-explorer <file1.safetensors> [file2.gguf] [model.hdf5] [directory] [*.safetensors] ..."
         );
         std::process::exit(1);
     }
@@ -46,7 +44,7 @@ fn main() -> Result<()> {
     let files = collect_safetensors_files(&args.paths, args.recursive)?;
 
     if files.is_empty() {
-        eprintln!("Error: No SafeTensors or GGUF files found in the specified paths.");
+        eprintln!("Error: No checkpoint files found in the specified paths.");
         std::process::exit(1);
     }
 
