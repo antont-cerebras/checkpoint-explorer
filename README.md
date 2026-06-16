@@ -120,20 +120,20 @@ SafeTensors Explorer - model.safetensors (1/1)
 Use ↑/↓ to navigate, Enter/Space to expand/collapse, q to quit
 ================================================================================
 
-▼ 📁 transformer (123 tensors, 1.2 GB)
-  ▼ 📁 h (120 tensors, 1.1 GB)
-    ▼ 📁 0 (5 tensors, 45.2 MB)
-      📄 attn.c_attn.weight [Float16, (4096, 3072), 25.2 MB]
-      📄 attn.c_proj.weight [Float16, (1024, 4096), 8.4 MB]
-      📄 ln_1.weight [Float16, (4096,), 8.2 KB]
-      📄 mlp.c_fc.weight [Float16, (4096, 11008), 90.1 MB]
-      📄 mlp.c_proj.weight [Float16, (11008, 4096), 90.1 MB]
-    ▶ 📁 1 (5 tensors, 45.2 MB)
-    ▶ 📁 2 (5 tensors, 45.2 MB)
+▼ 📁 transformer (123 tensors, 1.2 GiB)
+  ▼ 📁 h (32 layers, 120 tensors, 1.1 GiB)
+    ▼ 📁 0 (5 tensors, 45.2 MiB)
+      📄 attn.c_attn.weight [Float16, (4096, 3072), 25.2 MiB]
+      📄 attn.c_proj.weight [Float16, (1024, 4096), 8.4 MiB]
+      📄 ln_1.weight [Float16, (4096,), 8.2 KiB]
+      📄 mlp.c_fc.weight [Float16, (4096, 11008), 90.1 MiB]
+      📄 mlp.c_proj.weight [Float16, (11008, 4096), 90.1 MiB]
+    ▶ 📁 1 (5 tensors, 45.2 MiB)
+    ▶ 📁 2 (5 tensors, 45.2 MiB)
     ...
-    ▶ 📁 31 (5 tensors, 45.2 MB)
-  📄 ln_f.weight [Float16, (4096,), 8.2 KB]
-  📄 wte.weight [Float16, (151936, 4096), 1.2 GB]
+    ▶ 📁 31 (5 tensors, 45.2 MiB)
+  📄 ln_f.weight [Float16, (4096,), 8.2 KiB]
+  📄 wte.weight [Float16, (151936, 4096), 1.2 GiB]
 
 Selected: 1/342 | Scroll: 0
 ```
