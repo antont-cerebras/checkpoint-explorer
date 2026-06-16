@@ -134,16 +134,12 @@ impl UI {
                 total_size,
             } => {
                 let icon = if *expanded { "▼" } else { "▶" };
-                // For a transformer's `layers` stack, surface how many layers it
-                // holds (each layer is a numbered subgroup).
-                let layer_prefix = if name == "layers" {
-                    let layers = children
-                        .iter()
-                        .filter(|child| matches!(child, TreeNode::Group { .. }))
-                        .count();
-                    format!("{layers} layers, ")
-                } else {
-                    String::new()
+                // A repeated-block stack (e.g. a transformer's `layers` group)
+                // has children that are all numbered subgroups; surface how many
+                // there are so the depth is visible without expanding the tree.
+                let layer_prefix = match layer_count(children) {
+                    Some(n) => format!("{n} layers, "),
+                    None => String::new(),
                 };
                 writeln!(
                     stdout,
@@ -237,4 +233,23 @@ impl UI {
         stdout.flush()?;
         Ok(())
     }
+}
+
+/// Returns the number of layers when `children` form a stack of numbered
+/// subgroups (as in a transformer's `layers` group): there is at least one
+/// subgroup and every subgroup has a purely numeric name. A single layer
+/// counts too, so incomplete checkpoints still report their depth. Returns
+/// `None` when the children are not such a stack.
+fn layer_count(children: &[TreeNode]) -> Option<usize> {
+    let mut numbered = 0;
+    let mut groups = 0;
+    for child in children {
+        if let TreeNode::Group { name, .. } = child {
+            groups += 1;
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()) {
+                numbered += 1;
+            }
+        }
+    }
+    (groups > 0 && numbered == groups).then_some(numbered)
 }
