@@ -10,7 +10,8 @@ pub fn format_shape(shape: &[usize]) -> String {
 }
 
 pub fn format_size(bytes: usize) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
+    // Sizes are scaled by 1024, so use the binary (IEC) unit labels.
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB"];
     let mut size = bytes as f64;
     let mut unit_idx = 0;
 
