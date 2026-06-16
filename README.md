@@ -136,7 +136,7 @@ Press `Enter` or `Esc` to exit search mode and return to the full tree view.
 ## Example Output
 
 ```
-SafeTensors Explorer - model.safetensors (1/1)
+Checkpoint Explorer - model.safetensors (1/1)
 Use ↑/↓ to navigate, Enter/Space to expand/collapse, / to search, c to copy path, q to quit
 ================================================================================
 

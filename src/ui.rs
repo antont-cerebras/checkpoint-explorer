@@ -49,7 +49,7 @@ impl UI {
         queue!(out, terminal::Clear(ClearType::CurrentLine))?;
         write!(
             out,
-            "SafeTensors Explorer - {} ({}/{})\r\n",
+            "Checkpoint Explorer - {} ({}/{})\r\n",
             config.current_file,
             config.file_idx + 1,
             config.total_files

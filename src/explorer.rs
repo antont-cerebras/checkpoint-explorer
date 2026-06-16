@@ -342,7 +342,7 @@ impl Explorer {
             let title = if self.files.len() == 1 {
                 self.files[0].to_string_lossy().to_string()
             } else {
-                "SafeTensors Model".to_string()
+                "Multiple files".to_string()
             };
 
             let tree_to_display = if self.search_mode {
