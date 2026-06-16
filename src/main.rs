@@ -7,7 +7,7 @@ mod utils;
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::explorer::Explorer;
 
@@ -82,36 +82,39 @@ fn collect_safetensors_files(paths: &[PathBuf], recursive: bool) -> Result<Vec<P
             } else if expanded_path.is_dir() {
                 // Check for SafeTensors index file first
                 let index_path = expanded_path.join("model.safetensors.index.json");
+                let mut found_from_index = false;
                 if index_path.exists() {
                     let index_files = parse_safetensors_index(&index_path)?;
+                    let mut missing = Vec::new();
                     for file in index_files {
-                        let full_path = expanded_path.join(file);
+                        let full_path = expanded_path.join(&file);
                         if full_path.exists() {
                             files.push(full_path);
+                            found_from_index = true;
+                        } else {
+                            missing.push(file);
                         }
                     }
-                } else {
-                    // Fallback to directory scanning
-                    let patterns = if recursive {
-                        vec![
-                            format!("{}/**/*.safetensors", expanded_path.display()),
-                            format!("{}/**/*.gguf", expanded_path.display()),
-                        ]
-                    } else {
-                        vec![
-                            format!("{}/*.safetensors", expanded_path.display()),
-                            format!("{}/*.gguf", expanded_path.display()),
-                        ]
-                    };
+                    if !missing.is_empty() {
+                        eprintln!(
+                            "Warning: {} file(s) listed in {} were not found on disk (e.g. {}).",
+                            missing.len(),
+                            index_path.display(),
+                            missing[0],
+                        );
+                    }
+                    if !found_from_index {
+                        eprintln!(
+                            "Warning: index file references no existing files (it may be stale); scanning {} directly instead.",
+                            expanded_path.display()
+                        );
+                    }
+                }
 
-                    for pattern in patterns {
-                        for entry in glob::glob(&pattern).context("Failed to read glob pattern")? {
-                            match entry {
-                                Ok(file_path) => files.push(file_path),
-                                Err(e) => eprintln!("Warning: Error reading file: {e}"),
-                            }
-                        }
-                    }
+                // Scan the directory when there is no index, or when the index
+                // is stale and pointed at files that no longer exist.
+                if !found_from_index {
+                    scan_directory(&expanded_path, recursive, &mut files)?;
                 }
             }
         }
@@ -120,6 +123,31 @@ fn collect_safetensors_files(paths: &[PathBuf], recursive: bool) -> Result<Vec<P
     // Sort files for consistent ordering
     files.sort();
     Ok(files)
+}
+
+fn scan_directory(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>) -> Result<()> {
+    let patterns = if recursive {
+        vec![
+            format!("{}/**/*.safetensors", dir.display()),
+            format!("{}/**/*.gguf", dir.display()),
+        ]
+    } else {
+        vec![
+            format!("{}/*.safetensors", dir.display()),
+            format!("{}/*.gguf", dir.display()),
+        ]
+    };
+
+    for pattern in patterns {
+        for entry in glob::glob(&pattern).context("Failed to read glob pattern")? {
+            match entry {
+                Ok(file_path) => files.push(file_path),
+                Err(e) => eprintln!("Warning: Error reading file: {e}"),
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_safetensors_index(index_path: &PathBuf) -> Result<Vec<String>> {
