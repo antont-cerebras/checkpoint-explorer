@@ -6,6 +6,7 @@ use crossterm::{
 };
 use std::io::{self, BufWriter, Write};
 
+use crate::health::HealthReport;
 use crate::tree::{MetadataInfo, Storage, TensorInfo, TreeNode};
 use crate::utils::{format_parameters, format_shape, format_size};
 
@@ -22,6 +23,9 @@ pub struct DrawConfig<'a> {
     /// Bottom status line: source file(s) of the selected row, or a copy
     /// confirmation.
     pub status_bar: &'a str,
+    /// Whether a checkpoint health issue was detected (shows a header hint to
+    /// press `h` for the report).
+    pub health_warning: bool,
 }
 
 pub struct UI;
@@ -49,11 +53,17 @@ impl UI {
         queue!(out, terminal::Clear(ClearType::CurrentLine))?;
         write!(
             out,
-            "Checkpoint Explorer - {} ({}/{})\r\n",
+            "Checkpoint Explorer - {} ({}/{})",
             config.current_file,
             config.file_idx + 1,
             config.total_files
         )?;
+        if config.health_warning {
+            queue!(out, SetForegroundColor(Color::Red))?;
+            write!(out, "   ⚠ index/file mismatch — press 'h'")?;
+            queue!(out, ResetColor)?;
+        }
+        write!(out, "\r\n")?;
         queue!(out, terminal::Clear(ClearType::CurrentLine))?;
         if config.search_mode {
             write!(
@@ -279,6 +289,97 @@ impl UI {
         stdout.flush()?;
         Ok(())
     }
+
+    /// Draw a full-screen warning panel summarising checkpoint health issues,
+    /// shown once at startup. Each category is capped so the panel stays small.
+    pub fn draw_health_warning(reports: &[HealthReport]) -> Result<()> {
+        let mut stdout = io::stdout();
+        execute!(
+            stdout,
+            terminal::Clear(ClearType::All),
+            cursor::MoveTo(0, 0)
+        )?;
+
+        execute!(stdout, SetForegroundColor(Color::Yellow))?;
+        writeln!(stdout, "⚠  Checkpoint health check\r")?;
+        writeln!(stdout, "{}\r", "=".repeat(60))?;
+        execute!(stdout, ResetColor)?;
+
+        for report in reports {
+            writeln!(stdout, "\r")?;
+            execute!(stdout, SetForegroundColor(Color::Yellow))?;
+            writeln!(
+                stdout,
+                "{} does not match the .safetensors files on disk.\r",
+                report.index_path
+            )?;
+            execute!(stdout, ResetColor)?;
+            writeln!(stdout, "\r")?;
+            // "missing" issues are red (something is gone), "extra" issues are
+            // yellow (present but unexpected).
+            health_section(
+                &mut stdout,
+                "Referenced by the index but MISSING",
+                &report.missing_files,
+                Color::Red,
+            )?;
+            health_section(
+                &mut stdout,
+                "Present on disk but NOT in the index",
+                &report.extra_files,
+                Color::Yellow,
+            )?;
+            health_section(
+                &mut stdout,
+                "Expected by the index but absent from their file",
+                &report.missing_tensors,
+                Color::Red,
+            )?;
+            health_section(
+                &mut stdout,
+                "In files but not listed in the index",
+                &report.extra_tensors,
+                Color::Yellow,
+            )?;
+        }
+
+        execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+        writeln!(
+            stdout,
+            "The explorer scans the directory directly when the index is stale. Press any key to return.\r"
+        )?;
+        execute!(stdout, ResetColor)?;
+
+        stdout.flush()?;
+        Ok(())
+    }
+}
+
+/// Write one capped section of the health panel: a titled list (in `color`) of
+/// up to `CAP` items, then a dimmed "… and N more" when truncated.
+fn health_section(
+    stdout: &mut io::Stdout,
+    title: &str,
+    items: &[String],
+    color: Color,
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    const CAP: usize = 6;
+    execute!(stdout, SetForegroundColor(color))?;
+    writeln!(stdout, "{title} ({}):\r", items.len())?;
+    execute!(stdout, ResetColor)?;
+    for item in items.iter().take(CAP) {
+        writeln!(stdout, "  {item}\r")?;
+    }
+    if items.len() > CAP {
+        execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+        writeln!(stdout, "  … and {} more\r", items.len() - CAP)?;
+        execute!(stdout, ResetColor)?;
+    }
+    writeln!(stdout, "\r")?;
+    Ok(())
 }
 
 /// Returns the number of layers when `children` form a stack of numbered
