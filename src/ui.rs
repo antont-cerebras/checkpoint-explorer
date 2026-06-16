@@ -1,10 +1,10 @@
 use anyhow::Result;
 use crossterm::{
-    cursor, execute,
+    cursor, execute, queue,
     style::{Color, ResetColor, SetForegroundColor},
     terminal::{self, ClearType},
 };
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 
 use crate::tree::{MetadataInfo, TensorInfo, TreeNode};
 use crate::utils::{format_parameters, format_shape, format_size};
@@ -25,12 +25,14 @@ pub struct UI;
 
 impl UI {
     pub fn draw_screen(config: &DrawConfig) -> Result<usize> {
-        let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            terminal::Clear(ClearType::All),
-            cursor::MoveTo(0, 0)
-        )?;
+        // Render the whole frame into one buffered writer and flush it once.
+        // `io::Stdout` is line-buffered, so writing directly would flush on
+        // every newline and paint the frame progressively; a `BufWriter` makes
+        // the update atomic. Combined with overwriting in place (clearing each
+        // line rather than the whole screen up front), this removes the flicker
+        // that a per-frame `Clear(All)` produced.
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
 
         let (_, terminal_height) = terminal::size()?;
         let header_height = 3;
@@ -38,18 +40,22 @@ impl UI {
         let available_height =
             (terminal_height as usize).saturating_sub(header_height + footer_height);
 
+        queue!(out, cursor::MoveTo(0, 0))?;
+
         // Header
-        writeln!(
-            stdout,
-            "SafeTensors Explorer - {} ({}/{})\r",
+        queue!(out, terminal::Clear(ClearType::CurrentLine))?;
+        write!(
+            out,
+            "SafeTensors Explorer - {} ({}/{})\r\n",
             config.current_file,
             config.file_idx + 1,
             config.total_files
         )?;
+        queue!(out, terminal::Clear(ClearType::CurrentLine))?;
         if config.search_mode {
-            writeln!(
-                stdout,
-                "SEARCH MODE: {} | Type to search, Enter/Esc to exit search\r",
+            write!(
+                out,
+                "SEARCH MODE: {} | Type to search, Enter/Esc to exit search\r\n",
                 if config.search_query.is_empty() {
                     "_"
                 } else {
@@ -57,12 +63,13 @@ impl UI {
                 }
             )?;
         } else {
-            writeln!(
-                stdout,
-                "Use ↑/↓ to navigate, Enter/Space to expand/collapse, / to search, q to quit\r"
+            write!(
+                out,
+                "Use ↑/↓ to navigate, Enter/Space to expand/collapse, / to search, q to quit\r\n"
             )?;
         }
-        writeln!(stdout, "{}\r", "=".repeat(80))?;
+        queue!(out, terminal::Clear(ClearType::CurrentLine))?;
+        write!(out, "{}\r\n", "=".repeat(80))?;
 
         // Calculate scroll offset
         let new_scroll_offset = if config.selected_idx >= config.scroll_offset + available_height {
@@ -83,32 +90,35 @@ impl UI {
         {
             let is_selected = actual_index == config.selected_idx;
 
+            queue!(out, terminal::Clear(ClearType::CurrentLine))?;
             if is_selected {
-                execute!(
-                    stdout,
+                queue!(
+                    out,
                     SetForegroundColor(Color::Black),
                     crossterm::style::SetBackgroundColor(Color::White)
                 )?;
             }
 
-            Self::draw_node(node, *depth, &mut stdout)?;
+            Self::draw_node(node, *depth, &mut out)?;
 
             if is_selected {
-                execute!(stdout, ResetColor)?;
+                queue!(out, ResetColor)?;
             }
         }
 
-        // Footer
-        execute!(stdout, cursor::MoveTo(0, terminal_height - 1))?;
+        // Wipe any rows left over from a previous, taller frame, then pin the
+        // footer to the bottom line (no trailing newline, to avoid scrolling).
+        queue!(out, terminal::Clear(ClearType::FromCursorDown))?;
+        queue!(out, cursor::MoveTo(0, terminal_height - 1))?;
         if config.search_mode && config.tree.is_empty() {
-            writeln!(
-                stdout,
+            write!(
+                out,
                 "No results found for \"{}\" | Press Esc to exit search\r",
                 config.search_query
             )?;
         } else {
-            writeln!(
-                stdout,
+            write!(
+                out,
                 "Total Parameters: {} | Selected: {}/{} | Scroll: {} | Matches: {}\r",
                 format_parameters(config.total_parameters),
                 config.selected_idx + 1,
@@ -118,11 +128,11 @@ impl UI {
             )?;
         }
 
-        stdout.flush()?;
+        out.flush()?;
         Ok(new_scroll_offset)
     }
 
-    fn draw_node(node: &TreeNode, depth: usize, stdout: &mut io::Stdout) -> Result<()> {
+    fn draw_node(node: &TreeNode, depth: usize, out: &mut impl Write) -> Result<()> {
         let indent = "  ".repeat(depth);
 
         match node {
@@ -143,7 +153,7 @@ impl UI {
                     None => String::new(),
                 };
                 writeln!(
-                    stdout,
+                    out,
                     "{}{} 📁 {} ({}{} tensors, {})\r",
                     indent,
                     icon,
@@ -161,7 +171,7 @@ impl UI {
                     info.name.split('.').next_back().unwrap_or(&info.name)
                 };
                 writeln!(
-                    stdout,
+                    out,
                     "{}  📄 {} [{}, {}, {}]\r",
                     indent,
                     display_name,
@@ -177,7 +187,7 @@ impl UI {
                     info.value.clone()
                 };
                 writeln!(
-                    stdout,
+                    out,
                     "{}  🏷️  {} [{}]: {}\r",
                     indent, info.name, info.value_type, truncated_value
                 )?;
