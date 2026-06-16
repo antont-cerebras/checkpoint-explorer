@@ -19,6 +19,9 @@ pub struct DrawConfig<'a> {
     pub scroll_offset: usize,
     pub search_mode: bool,
     pub search_query: &'a str,
+    /// Bottom status line: source file(s) of the selected row, or a copy
+    /// confirmation.
+    pub status_bar: &'a str,
 }
 
 pub struct UI;
@@ -34,7 +37,7 @@ impl UI {
         let stdout = io::stdout();
         let mut out = BufWriter::new(stdout.lock());
 
-        let (_, terminal_height) = terminal::size()?;
+        let (terminal_width, terminal_height) = terminal::size()?;
         let header_height = 3;
         let footer_height = 2;
         let available_height =
@@ -65,7 +68,7 @@ impl UI {
         } else {
             write!(
                 out,
-                "Use ↑/↓ to navigate, Enter/Space to expand/collapse, / to search, q to quit\r\n"
+                "Use ↑/↓ to navigate, Enter/Space to expand/collapse, / to search, c to copy path, q to quit\r\n"
             )?;
         }
         queue!(out, terminal::Clear(ClearType::CurrentLine))?;
@@ -106,9 +109,19 @@ impl UI {
             }
         }
 
-        // Wipe any rows left over from a previous, taller frame, then pin the
-        // footer to the bottom line (no trailing newline, to avoid scrolling).
+        // Wipe any rows left over from a previous, taller frame.
         queue!(out, terminal::Clear(ClearType::FromCursorDown))?;
+
+        // Status bar (line above the footer): source file of the selected row.
+        // Truncate keeping the tail so the file name stays visible.
+        queue!(out, cursor::MoveTo(0, terminal_height.saturating_sub(2)))?;
+        write!(
+            out,
+            "{}",
+            truncate_keep_end(config.status_bar, terminal_width as usize)
+        )?;
+
+        // Footer pinned to the bottom line (no trailing newline, to avoid scrolling).
         queue!(out, cursor::MoveTo(0, terminal_height - 1))?;
         if config.search_mode && config.tree.is_empty() {
             write!(
@@ -285,4 +298,18 @@ fn layer_count(children: &[TreeNode]) -> Option<usize> {
         }
     }
     (groups > 0 && numbered == groups).then_some(numbered)
+}
+
+/// Truncate `s` to at most `width` characters, keeping the END (so a path's
+/// file name stays visible) and prefixing `…` when truncated.
+fn truncate_keep_end(s: &str, width: usize) -> String {
+    let count = s.chars().count();
+    if count <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let tail: String = s.chars().skip(count - (width - 1)).collect();
+    format!("…{tail}")
 }

@@ -113,9 +113,15 @@ checkpoint-explorer model.safetensors checkpoint-*.safetensors
 | `↑` / `↓` | Navigate up/down through the tree |
 | `Enter` / `Space` | Expand/collapse groups, view tensor details |
 | `/` | Enter search mode to filter tensors |
+| `c` | Copy the selected tensor's file path to the clipboard |
 | `Esc` | Exit search mode |
 | `q` | Quit the application (or exit search mode if active) |
 | `Ctrl+C` | Force quit |
+
+A status bar above the footer always shows the file the tensor under the
+cursor lives in (or, for a group, how many files its tensors span). Pressing
+`c` copies that path to the clipboard via the OSC 52 terminal escape, so it
+works over SSH/tmux when the terminal supports it.
 
 ### Search Feature
 
@@ -131,7 +137,7 @@ Press `Enter` or `Esc` to exit search mode and return to the full tree view.
 
 ```
 SafeTensors Explorer - model.safetensors (1/1)
-Use ↑/↓ to navigate, Enter/Space to expand/collapse, q to quit
+Use ↑/↓ to navigate, Enter/Space to expand/collapse, / to search, c to copy path, q to quit
 ================================================================================
 
 ▼ 📁 transformer (123 tensors, 1.2 GiB)
@@ -149,7 +155,8 @@ Use ↑/↓ to navigate, Enter/Space to expand/collapse, q to quit
   📄 ln_f.weight [Float16, (4096,), 8.2 KiB]
   📄 wte.weight [Float16, (151936, 4096), 1.2 GiB]
 
-Selected: 1/342 | Scroll: 0
+/path/to/model.safetensors
+Total Parameters: 1.5B | Selected: 1/342 | Scroll: 0 | Matches: 342
 ```
 
 ## How It Works

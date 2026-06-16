@@ -24,6 +24,8 @@ pub struct TensorInfo {
     pub num_elements: usize,
     /// On-disk storage / compression status.
     pub storage: Storage,
+    /// Absolute path of the file this tensor was loaded from.
+    pub source_path: String,
 }
 
 impl TensorInfo {
