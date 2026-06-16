@@ -128,18 +128,30 @@ impl UI {
         match node {
             TreeNode::Group {
                 name,
+                children,
                 expanded,
                 tensor_count,
                 total_size,
-                ..
             } => {
                 let icon = if *expanded { "▼" } else { "▶" };
+                // For a transformer's `layers` stack, surface how many layers it
+                // holds (each layer is a numbered subgroup).
+                let layer_prefix = if name == "layers" {
+                    let layers = children
+                        .iter()
+                        .filter(|child| matches!(child, TreeNode::Group { .. }))
+                        .count();
+                    format!("{layers} layers, ")
+                } else {
+                    String::new()
+                };
                 writeln!(
                     stdout,
-                    "{}{} 📁 {} ({} tensors, {})\r",
+                    "{}{} 📁 {} ({}{} tensors, {})\r",
                     indent,
                     icon,
                     name,
+                    layer_prefix,
                     tensor_count,
                     format_size(*total_size)
                 )?;
