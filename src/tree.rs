@@ -1,12 +1,29 @@
 use std::collections::HashMap;
 
+/// How a tensor is stored on disk, for formats (like HDF5) that may compress.
+// `Raw`/`Compressed` are only constructed by the HDF5 reader; without that
+// feature they are still matched in the UI but never built.
+#[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub enum Storage {
+    /// Compression is not tracked for this format (e.g. safetensors / GGUF).
+    Unknown,
+    /// Stored uncompressed on disk.
+    Raw,
+    /// Compressed on disk with `codec`; `stored_bytes` is the on-disk size.
+    Compressed { codec: String, stored_bytes: usize },
+}
+
 #[derive(Debug, Clone)]
 pub struct TensorInfo {
     pub name: String,
     pub dtype: String,
     pub shape: Vec<usize>,
+    /// Logical (uncompressed) size in bytes: `num_elements * dtype_size`.
     pub size_bytes: usize,
     pub num_elements: usize,
+    /// On-disk storage / compression status.
+    pub storage: Storage,
 }
 
 #[derive(Debug, Clone)]

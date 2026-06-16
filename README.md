@@ -17,6 +17,9 @@ An interactive terminal-based explorer for [`safetensors`](https://huggingface.c
 - 📏 **Human-readable sizes** (B, KB, MB, GB)
 - ⌨️ **Keyboard navigation** for smooth exploration
 - 🧠 **GGUF support** - view GGML format tensors with quantization types
+- 🧊 **HDF5 checkpoint support** (opt-in `--features hdf5`) - read Cerebras-style
+  `.h5`/`.hdf5` checkpoints, showing compression status and both the logical and
+  on-disk (compressed) sizes
 
 ## Installation
 
@@ -33,6 +36,17 @@ cargo install safetensors_explorer
 git clone https://github.com/EricLBuehler/safetensors_explorer
 cd safetensors_explorer
 cargo build --release
+```
+
+### HDF5 checkpoint support (optional)
+Reading Cerebras-style HDF5 checkpoints is behind the `hdf5` feature, which is
+off by default so the standard build stays pure-Rust with no system
+dependencies. Enabling it bundles and statically links libhdf5 (requires a C
+toolchain + `cmake`; the first build is slower):
+```bash
+cargo install --git <repo-url> --features hdf5
+# or from source:
+cargo build --release --features hdf5
 ```
 
 ## Usage
@@ -152,6 +166,9 @@ Selected: 1/342 | Scroll: 0
 ### Supported Formats
 - `safetensors` files (`.safetensors`)
 - GGUF files (`.gguf`) with GGML tensor types including quantized formats
+- HDF5 checkpoints (`.h5`/`.hdf5`) when built with `--features hdf5` — Cerebras
+  layout (URL-quoted tensor names as top-level datasets), with per-tensor
+  compression markers (e.g. `lz4`, `gzip`) and on-disk sizes
 - `safetensors` index files (`model.safetensors.index.json`)
 - Directory scanning with recursive search option
 - All tensor data types supported by the `safetensors` and GGML formats

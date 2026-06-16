@@ -1,5 +1,7 @@
 mod explorer;
 mod gguf;
+#[cfg(feature = "hdf5")]
+mod hdf5;
 mod tree;
 mod ui;
 mod utils;
@@ -71,7 +73,7 @@ fn collect_safetensors_files(paths: &[PathBuf], recursive: bool) -> Result<Vec<P
 
             if expanded_path.is_file() {
                 let ext = expanded_path.extension().and_then(|s| s.to_str());
-                if ext == Some("safetensors") || ext == Some("gguf") {
+                if matches!(ext, Some("safetensors" | "gguf" | "h5" | "hdf5")) {
                     files.push(expanded_path.clone());
                 } else {
                     eprintln!(
@@ -126,17 +128,18 @@ fn collect_safetensors_files(paths: &[PathBuf], recursive: bool) -> Result<Vec<P
 }
 
 fn scan_directory(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>) -> Result<()> {
-    let patterns = if recursive {
-        vec![
-            format!("{}/**/*.safetensors", dir.display()),
-            format!("{}/**/*.gguf", dir.display()),
-        ]
+    // HDF5 is only scanned for when compiled in, to avoid surfacing files the
+    // build cannot read.
+    let exts: &[&str] = if cfg!(feature = "hdf5") {
+        &["safetensors", "gguf", "h5", "hdf5"]
     } else {
-        vec![
-            format!("{}/*.safetensors", dir.display()),
-            format!("{}/*.gguf", dir.display()),
-        ]
+        &["safetensors", "gguf"]
     };
+    let glob_prefix = if recursive { "**/" } else { "" };
+    let patterns: Vec<String> = exts
+        .iter()
+        .map(|ext| format!("{}/{glob_prefix}*.{ext}", dir.display()))
+        .collect();
 
     for pattern in patterns {
         for entry in glob::glob(&pattern).context("Failed to read glob pattern")? {
