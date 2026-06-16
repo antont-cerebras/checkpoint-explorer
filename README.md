@@ -1,4 +1,4 @@
-# `safetensors` Explorer
+# Checkpoint Explorer
 
 An interactive terminal-based explorer for [`safetensors`](https://huggingface.co/docs/safetensors) and [GGUF](https://huggingface.co/docs/hub/gguf) files, designed to help you visualize and navigate the structure of machine learning models.
 
@@ -23,9 +23,9 @@ An interactive terminal-based explorer for [`safetensors`](https://huggingface.c
 
 ## Installation
 
-### From crates.io
+### Install
 ```bash
-cargo install safetensors_explorer
+cargo install --git https://github.com/antont-cerebras/checkpoint-explorer
 ```
 
 ### Prerequisites
@@ -33,8 +33,8 @@ cargo install safetensors_explorer
 
 ### Build from source
 ```bash
-git clone https://github.com/EricLBuehler/safetensors_explorer
-cd safetensors_explorer
+git clone https://github.com/antont-cerebras/checkpoint-explorer
+cd checkpoint-explorer
 cargo build --release
 ```
 
@@ -54,10 +54,10 @@ cargo build --release --features hdf5
 ### Basic usage
 ```bash
 # Explore a single safetensors file
-safetensors_explorer model.safetensors
+checkpoint-explorer model.safetensors
 
 # Explore a GGUF file
-safetensors_explorer model.gguf
+checkpoint-explorer model.gguf
 
 # Or if building from source
 cargo run -- model.safetensors
@@ -67,43 +67,43 @@ cargo run -- model.gguf
 ### Directory exploration
 ```bash
 # Explore all safetensors and GGUF files in a directory
-safetensors_explorer /path/to/model/directory
+checkpoint-explorer /path/to/model/directory
 
 # Recursively search subdirectories
-safetensors_explorer -r /path/to/models
+checkpoint-explorer -r /path/to/models
 
 # The tool automatically detects and uses model.safetensors.index.json if present
-safetensors_explorer /path/to/huggingface/model
+checkpoint-explorer /path/to/huggingface/model
 ```
 
 ### Multi-file exploration
 ```bash
 # Explore multiple files as a unified model
-safetensors_explorer model-00001-of-00003.safetensors model-00002-of-00003.safetensors model-00003-of-00003.safetensors
+checkpoint-explorer model-00001-of-00003.safetensors model-00002-of-00003.safetensors model-00003-of-00003.safetensors
 
 # Mix safetensors and GGUF files
-safetensors_explorer model.safetensors model.gguf
+checkpoint-explorer model.safetensors model.gguf
 
 # Mix files and directories
-safetensors_explorer model.safetensors /path/to/additional/models
+checkpoint-explorer model.safetensors /path/to/additional/models
 ```
 
 ### Glob pattern support
 ```bash
 # Use wildcards to select multiple files
-safetensors_explorer *.safetensors
+checkpoint-explorer *.safetensors
 
 # Match files with specific patterns
-safetensors_explorer model-*.gguf
+checkpoint-explorer model-*.gguf
 
 # Match numbered checkpoint files
-safetensors_explorer checkpoint-[0-9]*.safetensors
+checkpoint-explorer checkpoint-[0-9]*.safetensors
 
 # Combine multiple patterns
-safetensors_explorer *.safetensors *.gguf
+checkpoint-explorer *.safetensors *.gguf
 
 # Mix glob patterns with explicit paths
-safetensors_explorer model.safetensors checkpoint-*.safetensors
+checkpoint-explorer model.safetensors checkpoint-*.safetensors
 ```
 
 ### Keyboard Controls

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use crate::explorer::Explorer;
 
 #[derive(Parser)]
-#[command(name = "safetensors-explorer")]
+#[command(name = "checkpoint-explorer")]
 #[command(about = "Interactive explorer for SafeTensors and GGUF files")]
 struct Args {
     #[arg(
@@ -38,7 +38,7 @@ fn main() -> Result<()> {
             "Error: Please specify one or more SafeTensors or GGUF files or directories to explore."
         );
         eprintln!(
-            "Usage: safetensors-explorer <file1.safetensors> [file2.gguf] [directory] [*.safetensors] ..."
+            "Usage: checkpoint-explorer <file1.safetensors> [file2.gguf] [directory] [*.safetensors] ..."
         );
         std::process::exit(1);
     }
