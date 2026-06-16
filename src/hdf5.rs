@@ -23,6 +23,12 @@ pub fn read_tensors(path: &std::path::Path) -> Result<Vec<TensorInfo>> {
         .member_names()
         .with_context(|| format!("Failed to list members of: {}", path.display()))?;
 
+    // Every tensor in this file shares the same source path.
+    let source_path = std::path::absolute(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+
     let mut tensors = Vec::with_capacity(members.len());
     for key in members {
         // Each top-level member is a tensor dataset; skip anything that is not a
@@ -72,6 +78,7 @@ pub fn read_tensors(path: &std::path::Path) -> Result<Vec<TensorInfo>> {
             size_bytes,
             num_elements,
             storage,
+            source_path: source_path.clone(),
         });
     }
 

@@ -8,16 +8,17 @@ use crossterm::{
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     fs::File,
-    io::{self, Read},
-    path::PathBuf,
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
 };
 
 use crate::gguf::GGUFFile;
 
 use crate::tree::{MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key};
 use crate::ui::{DrawConfig, UI};
+use crate::utils::base64_encode;
 
 pub struct Explorer {
     files: Vec<PathBuf>,
@@ -31,6 +32,9 @@ pub struct Explorer {
     search_query: String,
     search_mode: bool,
     filtered_tree: Vec<(TreeNode, usize)>,
+    /// Transient "✓ Copied …" message shown after pressing `c`; cleared on the
+    /// next key press.
+    copied_flash: Option<String>,
 }
 
 impl Explorer {
@@ -47,6 +51,7 @@ impl Explorer {
             search_query: String::new(),
             search_mode: false,
             filtered_tree: Vec::new(),
+            copied_flash: None,
         }
     }
 
@@ -92,6 +97,7 @@ impl Explorer {
     }
 
     fn load_safetensors_file(&mut self, file_path: &PathBuf) -> Result<()> {
+        let source_path = absolute_path(file_path);
         let mut file = File::open(file_path)
             .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
 
@@ -181,6 +187,7 @@ impl Explorer {
                 size_bytes,
                 num_elements,
                 storage: Storage::Unknown,
+                source_path: source_path.clone(),
             });
         }
 
@@ -188,6 +195,7 @@ impl Explorer {
     }
 
     fn load_gguf_file(&mut self, file_path: &PathBuf) -> Result<()> {
+        let source_path = absolute_path(file_path);
         let mut file = File::open(file_path)
             .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
 
@@ -240,6 +248,7 @@ impl Explorer {
                 size_bytes,
                 num_elements,
                 storage: Storage::Unknown,
+                source_path: source_path.clone(),
             });
         }
 
@@ -342,6 +351,8 @@ impl Explorer {
                 &self.flattened_tree
             };
 
+            let status_bar = self.status_bar_text();
+
             let config = DrawConfig {
                 tree: tree_to_display,
                 current_file: &title,
@@ -352,10 +363,13 @@ impl Explorer {
                 scroll_offset: self.scroll_offset,
                 search_mode: self.search_mode,
                 search_query: &self.search_query,
+                status_bar: &status_bar,
             };
             self.scroll_offset = UI::draw_screen(&config)?;
 
             if let Event::Key(key_event) = event::read()? {
+                // The copy confirmation only lasts until the next key press.
+                self.copied_flash = None;
                 match key_event {
                     KeyEvent {
                         code: KeyCode::Char('q'),
@@ -372,6 +386,12 @@ impl Explorer {
                         modifiers: KeyModifiers::CONTROL,
                         ..
                     } => break,
+                    // `c` (no modifier) copies the selected tensor's source path.
+                    // In search mode it falls through to be typed into the query.
+                    KeyEvent {
+                        code: KeyCode::Char('c'),
+                        ..
+                    } if !self.search_mode => self.copy_selected_path(),
                     KeyEvent {
                         code: KeyCode::Char('/'),
                         ..
@@ -435,6 +455,50 @@ impl Explorer {
         }
 
         Ok(())
+    }
+
+    /// Text for the bottom status bar: the source file(s) of the row under the
+    /// cursor, or the transient copy confirmation.
+    fn status_bar_text(&self) -> String {
+        if let Some(flash) = &self.copied_flash {
+            return format!("✓ Copied to clipboard: {flash}");
+        }
+
+        let tree = if self.search_mode {
+            &self.filtered_tree
+        } else {
+            &self.flattened_tree
+        };
+        let Some((node, _)) = tree.get(self.selected_idx) else {
+            return String::new();
+        };
+
+        match node {
+            TreeNode::Tensor { info } => info.source_path.clone(),
+            TreeNode::Group { .. } => {
+                let mut files = BTreeSet::new();
+                collect_source_paths(node, &mut files);
+                match files.len() {
+                    0 => String::new(),
+                    1 => files.into_iter().next().unwrap(),
+                    n => {
+                        let first = file_name(files.iter().next().unwrap());
+                        let last = file_name(files.iter().next_back().unwrap());
+                        format!("stored across {n} files: {first} … {last}")
+                    }
+                }
+            }
+            TreeNode::Metadata { .. } => String::new(),
+        }
+    }
+
+    /// Copy the source path of the selected tensor to the clipboard (OSC 52).
+    fn copy_selected_path(&mut self) {
+        if let Some((TreeNode::Tensor { info }, _)) = self.flattened_tree.get(self.selected_idx) {
+            let path = info.source_path.clone();
+            copy_to_clipboard(&path);
+            self.copied_flash = Some(path);
+        }
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -517,4 +581,45 @@ impl Explorer {
             let _ = event::read();
         }
     }
+}
+
+/// Resolve a path to an absolute string without requiring it to exist or
+/// resolving symlinks; falls back to the original path on error.
+fn absolute_path(path: &Path) -> String {
+    std::path::absolute(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The final path component (file name) of a path string.
+fn file_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// Collect the distinct source files of every tensor under `node`.
+fn collect_source_paths(node: &TreeNode, out: &mut BTreeSet<String>) {
+    match node {
+        TreeNode::Tensor { info } => {
+            out.insert(info.source_path.clone());
+        }
+        TreeNode::Group { children, .. } => {
+            for child in children {
+                collect_source_paths(child, out);
+            }
+        }
+        TreeNode::Metadata { .. } => {}
+    }
+}
+
+/// Copy `text` to the terminal clipboard via the OSC 52 escape sequence. This
+/// reaches the *local* clipboard even over SSH/tmux (when the terminal supports
+/// OSC 52), unlike shelling out to xclip/pbcopy on the remote host.
+fn copy_to_clipboard(text: &str) {
+    let mut stdout = io::stdout();
+    let _ = write!(stdout, "\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let _ = stdout.flush();
 }
