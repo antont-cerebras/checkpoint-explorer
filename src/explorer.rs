@@ -35,10 +35,12 @@ pub struct Explorer {
     /// Transient "✓ Copied …" message shown after pressing `c`; cleared on the
     /// next key press.
     copied_flash: Option<String>,
+    /// Index/file mismatches detected at startup, shown as a warning panel.
+    health_reports: Vec<crate::health::HealthReport>,
 }
 
 impl Explorer {
-    pub fn new(files: Vec<PathBuf>) -> Self {
+    pub fn new(files: Vec<PathBuf>, health_reports: Vec<crate::health::HealthReport>) -> Self {
         Self {
             files,
             tensors: Vec::new(),
@@ -52,6 +54,7 @@ impl Explorer {
             search_mode: false,
             filtered_tree: Vec::new(),
             copied_flash: None,
+            health_reports,
         }
     }
 
@@ -364,6 +367,7 @@ impl Explorer {
                 search_mode: self.search_mode,
                 search_query: &self.search_query,
                 status_bar: &status_bar,
+                health_warning: !self.health_reports.is_empty(),
             };
             self.scroll_offset = UI::draw_screen(&config)?;
 
@@ -392,6 +396,11 @@ impl Explorer {
                         code: KeyCode::Char('c'),
                         ..
                     } if !self.search_mode => self.copy_selected_path(),
+                    // `h` shows the checkpoint health report (when there is one).
+                    KeyEvent {
+                        code: KeyCode::Char('h'),
+                        ..
+                    } if !self.search_mode => self.show_health_report(),
                     KeyEvent {
                         code: KeyCode::Char('/'),
                         ..
@@ -577,6 +586,14 @@ impl Explorer {
 
     fn show_metadata_detail(&self, metadata: &MetadataInfo) {
         if UI::draw_metadata_detail(metadata).is_ok() {
+            // Wait for any key press
+            let _ = event::read();
+        }
+    }
+
+    fn show_health_report(&self) {
+        if !self.health_reports.is_empty() && UI::draw_health_warning(&self.health_reports).is_ok()
+        {
             // Wait for any key press
             let _ = event::read();
         }

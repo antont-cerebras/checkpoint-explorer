@@ -2,6 +2,7 @@ mod explorer;
 mod gguf;
 #[cfg(feature = "hdf5")]
 mod hdf5;
+mod health;
 mod tree;
 mod ui;
 mod utils;
@@ -28,6 +29,12 @@ struct Args {
         help = "Recursively search directories for checkpoint files"
     )]
     recursive: bool,
+
+    #[arg(
+        long = "no-health-check",
+        help = "Skip the checkpoint health check (index vs. files on disk)"
+    )]
+    no_health_check: bool,
 }
 
 fn main() -> Result<()> {
@@ -41,19 +48,25 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let files = collect_safetensors_files(&args.paths, args.recursive)?;
+    let (files, health_reports) =
+        collect_safetensors_files(&args.paths, args.recursive, args.no_health_check)?;
 
     if files.is_empty() {
         eprintln!("Error: No checkpoint files found in the specified paths.");
         std::process::exit(1);
     }
 
-    let mut explorer = Explorer::new(files);
+    let mut explorer = Explorer::new(files, health_reports);
     explorer.run()
 }
 
-fn collect_safetensors_files(paths: &[PathBuf], recursive: bool) -> Result<Vec<PathBuf>> {
+fn collect_safetensors_files(
+    paths: &[PathBuf],
+    recursive: bool,
+    no_health_check: bool,
+) -> Result<(Vec<PathBuf>, Vec<health::HealthReport>)> {
     let mut files = Vec::new();
+    let mut health_reports = Vec::new();
 
     for path in paths {
         // Try to expand as glob pattern
@@ -109,6 +122,15 @@ fn collect_safetensors_files(paths: &[PathBuf], recursive: bool) -> Result<Vec<P
                             expanded_path.display()
                         );
                     }
+
+                    // Health check: compare the index against the files on disk
+                    // and record any mismatch to surface in the UI.
+                    if !no_health_check
+                        && let Ok(report) = health::check(&expanded_path, &index_path)
+                        && report.has_issues()
+                    {
+                        health_reports.push(report);
+                    }
                 }
 
                 // Scan the directory when there is no index, or when the index
@@ -122,7 +144,7 @@ fn collect_safetensors_files(paths: &[PathBuf], recursive: bool) -> Result<Vec<P
 
     // Sort files for consistent ordering
     files.sort();
-    Ok(files)
+    Ok((files, health_reports))
 }
 
 fn scan_directory(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>) -> Result<()> {
