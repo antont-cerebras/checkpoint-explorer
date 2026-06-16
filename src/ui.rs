@@ -78,7 +78,7 @@ impl UI {
         } else {
             write!(
                 out,
-                "Use ↑/↓ to navigate, Enter/Space to expand/collapse, / to search, c to copy path, q to quit\r\n"
+                "Use ↑/↓ to navigate, Enter/Space to expand/collapse, E/C all, / to search, c to copy path, q to quit\r\n"
             )?;
         }
         queue!(out, terminal::Clear(ClearType::CurrentLine))?;

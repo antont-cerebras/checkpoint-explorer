@@ -243,6 +243,21 @@ impl TreeBuilder {
         result
     }
 
+    /// Recursively set the `expanded` flag on every group in the tree.
+    pub fn set_all_expanded(nodes: &mut [TreeNode], expanded: bool) {
+        for node in nodes {
+            if let TreeNode::Group {
+                expanded: node_expanded,
+                children,
+                ..
+            } = node
+            {
+                *node_expanded = expanded;
+                Self::set_all_expanded(children, expanded);
+            }
+        }
+    }
+
     pub fn flatten_tree(tree: &[TreeNode]) -> Vec<(TreeNode, usize)> {
         let mut flattened = Vec::new();
         for node in tree {

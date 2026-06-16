@@ -112,8 +112,10 @@ checkpoint-explorer model.safetensors checkpoint-*.safetensors
 |-----|--------|
 | `↑` / `↓` | Navigate up/down through the tree |
 | `Enter` / `Space` | Expand/collapse groups, view tensor details |
+| `E` / `C` | Expand all / collapse all groups |
 | `/` | Enter search mode to filter tensors |
 | `c` | Copy the selected tensor's file path to the clipboard |
+| `h` | Show the checkpoint health report (when there is a mismatch) |
 | `Esc` | Exit search mode |
 | `q` | Quit the application (or exit search mode if active) |
 | `Ctrl+C` | Force quit |

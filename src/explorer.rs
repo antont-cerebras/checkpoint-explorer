@@ -279,6 +279,15 @@ impl Explorer {
         self.update_filtered_tree();
     }
 
+    /// Expand or collapse every group, then reset the cursor to the top since
+    /// the visible rows change wholesale.
+    fn set_all_expanded(&mut self, expanded: bool) {
+        TreeBuilder::set_all_expanded(&mut self.tree, expanded);
+        self.flatten_tree();
+        self.selected_idx = 0;
+        self.scroll_offset = 0;
+    }
+
     fn update_filtered_tree(&mut self) {
         if self.search_query.is_empty() {
             self.filtered_tree = self.flattened_tree.clone();
@@ -401,6 +410,15 @@ impl Explorer {
                         code: KeyCode::Char('h'),
                         ..
                     } if !self.search_mode => self.show_health_report(),
+                    // `E` / `C` expand / collapse every group at once.
+                    KeyEvent {
+                        code: KeyCode::Char('E'),
+                        ..
+                    } if !self.search_mode => self.set_all_expanded(true),
+                    KeyEvent {
+                        code: KeyCode::Char('C'),
+                        ..
+                    } if !self.search_mode => self.set_all_expanded(false),
                     KeyEvent {
                         code: KeyCode::Char('/'),
                         ..
