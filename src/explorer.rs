@@ -76,8 +76,7 @@ impl Explorer {
         self.tensors
             .retain(|tensor| seen_names.insert(tensor.name.clone()));
 
-        self.tensors
-            .sort_by(|a, b| natural_sort_key(&a.name).cmp(&natural_sort_key(&b.name)));
+        self.tensors.sort_by_key(|a| natural_sort_key(&a.name));
         self.total_parameters = self.tensors.iter().map(|t| t.num_elements).sum::<usize>();
         self.build_tree();
         Ok(())
@@ -282,7 +281,7 @@ impl Explorer {
             }
 
             // Sort by score (highest first)
-            scored_results.sort_by(|a, b| b.1.cmp(&a.1));
+            scored_results.sort_by_key(|b| std::cmp::Reverse(b.1));
 
             // Create a flat list with depth 0 for all results
             self.filtered_tree = scored_results
@@ -358,18 +357,15 @@ impl Explorer {
                     KeyEvent {
                         code: KeyCode::Char('/'),
                         ..
-                    } => {
-                        if !self.search_mode {
-                            self.enter_search_mode();
-                        }
-                    }
+                    } if !self.search_mode => self.enter_search_mode(),
+                    // While searching, '/' is ignored rather than typed into the query.
+                    KeyEvent {
+                        code: KeyCode::Char('/'),
+                        ..
+                    } => {}
                     KeyEvent {
                         code: KeyCode::Esc, ..
-                    } => {
-                        if self.search_mode {
-                            self.exit_search_mode();
-                        }
-                    }
+                    } if self.search_mode => self.exit_search_mode(),
                     KeyEvent {
                         code: KeyCode::Up, ..
                     } => self.move_selection(-1),
@@ -390,32 +386,29 @@ impl Explorer {
                     KeyEvent {
                         code: KeyCode::Char(' '),
                         ..
-                    } => {
-                        if !self.search_mode {
-                            self.handle_selection();
-                        }
-                    }
+                    } if !self.search_mode => self.handle_selection(),
+                    // While searching, space is ignored rather than typed into the query.
+                    KeyEvent {
+                        code: KeyCode::Char(' '),
+                        ..
+                    } => {}
                     KeyEvent {
                         code: KeyCode::Backspace,
                         ..
-                    } => {
-                        if self.search_mode {
-                            self.search_query.pop();
-                            self.update_filtered_tree();
-                            self.selected_idx = 0;
-                            self.scroll_offset = 0;
-                        }
+                    } if self.search_mode => {
+                        self.search_query.pop();
+                        self.update_filtered_tree();
+                        self.selected_idx = 0;
+                        self.scroll_offset = 0;
                     }
                     KeyEvent {
                         code: KeyCode::Char(c),
                         ..
-                    } => {
-                        if self.search_mode {
-                            self.search_query.push(c);
-                            self.update_filtered_tree();
-                            self.selected_idx = 0;
-                            self.scroll_offset = 0;
-                        }
+                    } if self.search_mode => {
+                        self.search_query.push(c);
+                        self.update_filtered_tree();
+                        self.selected_idx = 0;
+                        self.scroll_offset = 0;
                     }
                     // Remove left/right file navigation since we're showing all files merged
                     _ => {}

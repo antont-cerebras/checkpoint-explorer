@@ -141,7 +141,7 @@ impl TreeBuilder {
                     tree.push(TreeNode::Tensor { info: tensor });
                 }
             } else {
-                tensors.sort_by(|a, b| natural_sort_key(&a.name).cmp(&natural_sort_key(&b.name)));
+                tensors.sort_by_key(|a| natural_sort_key(&a.name));
                 let tensor_count = tensors.len();
                 let total_size = tensors.iter().map(|t| t.size_bytes).sum();
 
