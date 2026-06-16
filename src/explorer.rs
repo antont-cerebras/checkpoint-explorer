@@ -16,7 +16,7 @@ use std::{
 
 use crate::gguf::GGUFFile;
 
-use crate::tree::{MetadataInfo, TensorInfo, TreeBuilder, TreeNode, natural_sort_key};
+use crate::tree::{MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key};
 use crate::ui::{DrawConfig, UI};
 
 pub struct Explorer {
@@ -64,6 +64,15 @@ impl Explorer {
                 }
                 Some("gguf") => {
                     self.load_gguf_file(file_path)?;
+                }
+                Some("h5") | Some("hdf5") => {
+                    #[cfg(feature = "hdf5")]
+                    self.load_hdf5_file(file_path)?;
+                    #[cfg(not(feature = "hdf5"))]
+                    eprintln!(
+                        "Warning: HDF5 support is not compiled in; rebuild with `--features hdf5` to read {}",
+                        file_path.display()
+                    );
                 }
                 _ => {
                     eprintln!("Warning: Unsupported file format: {}", file_path.display());
@@ -171,6 +180,7 @@ impl Explorer {
                 shape,
                 size_bytes,
                 num_elements,
+                storage: Storage::Unknown,
             });
         }
 
@@ -229,9 +239,17 @@ impl Explorer {
                 shape,
                 size_bytes,
                 num_elements,
+                storage: Storage::Unknown,
             });
         }
 
+        Ok(())
+    }
+
+    #[cfg(feature = "hdf5")]
+    fn load_hdf5_file(&mut self, file_path: &std::path::Path) -> Result<()> {
+        let tensors = crate::hdf5::read_tensors(file_path)?;
+        self.tensors.extend(tensors);
         Ok(())
     }
 

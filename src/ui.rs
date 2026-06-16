@@ -6,7 +6,7 @@ use crossterm::{
 };
 use std::io::{self, BufWriter, Write};
 
-use crate::tree::{MetadataInfo, TensorInfo, TreeNode};
+use crate::tree::{MetadataInfo, Storage, TensorInfo, TreeNode};
 use crate::utils::{format_parameters, format_shape, format_size};
 
 pub struct DrawConfig<'a> {
@@ -170,6 +170,21 @@ impl UI {
                 } else {
                     info.name.split('.').next_back().unwrap_or(&info.name)
                 };
+                // Size field: for compressed tensors show both the logical size
+                // and the smaller on-disk size plus a codec marker; for formats
+                // that track it, mark raw; otherwise just the size.
+                let size_field = match &info.storage {
+                    Storage::Unknown => format_size(info.size_bytes),
+                    Storage::Raw => format!("{} (raw)", format_size(info.size_bytes)),
+                    Storage::Compressed {
+                        codec,
+                        stored_bytes,
+                    } => format!(
+                        "{} → {} ({codec})",
+                        format_size(info.size_bytes),
+                        format_size(*stored_bytes)
+                    ),
+                };
                 writeln!(
                     out,
                     "{}  📄 {} [{}, {}, {}]\r",
@@ -177,7 +192,7 @@ impl UI {
                     display_name,
                     info.dtype,
                     format_shape(&info.shape),
-                    format_size(info.size_bytes)
+                    size_field
                 )?;
             }
             TreeNode::Metadata { info } => {
