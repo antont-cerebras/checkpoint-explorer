@@ -22,7 +22,13 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      # Cache compiled dependencies to speed-up subsequent runs
+      # The `hdf5` feature statically builds a bundled libhdf5 from source,
+      # which needs a C toolchain, CMake and zlib development headers.
+      - name: Install HDF5 build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential zlib1g-dev
+
+      # Cache compiled dependencies (including the built libhdf5) to speed-up
+      # subsequent runs
       - name: Cache cargo build outputs
         uses: Swatinem/rust-cache@v2
 
@@ -30,14 +36,21 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      # Lint the code with Clippy and reject warnings
-      - name: Lint with clippy
+      # Lint the default (pure-Rust) configuration that `cargo install` produces,
+      # then again with all features enabled (which compiles the HDF5 support).
+      - name: Lint with clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Lint with clippy (all features)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # Build in release mode to catch any optimisation-only issues
-      - name: Build
+      # Build both configurations in release mode
+      - name: Build (default features)
+        run: cargo build --workspace --release --verbose
+
+      - name: Build (all features)
         run: cargo build --workspace --release --all-features --verbose
 
-      # Run tests (if any) to validate functionality
+      # Run tests (the HDF5 reader's tests require its feature)
       - name: Run tests
         run: cargo test --workspace --all-features --verbose
