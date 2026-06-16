@@ -142,6 +142,7 @@ impl UI {
                 expanded,
                 tensor_count,
                 total_size,
+                stored_size,
             } => {
                 let icon = if *expanded { "▼" } else { "▶" };
                 // A repeated-block stack (e.g. a transformer's `layers` group)
@@ -152,15 +153,21 @@ impl UI {
                     Some(n) => format!("{n} layers, "),
                     None => String::new(),
                 };
+                // When any descendant is compressed the on-disk total differs
+                // from the logical total; show both, mirroring tensor rows.
+                let size_field = if stored_size != total_size {
+                    format!(
+                        "{} → {}",
+                        format_size(*total_size),
+                        format_size(*stored_size)
+                    )
+                } else {
+                    format_size(*total_size)
+                };
                 writeln!(
                     out,
                     "{}{} 📁 {} ({}{} tensors, {})\r",
-                    indent,
-                    icon,
-                    name,
-                    layer_prefix,
-                    tensor_count,
-                    format_size(*total_size)
+                    indent, icon, name, layer_prefix, tensor_count, size_field
                 )?;
             }
             TreeNode::Tensor { info } => {
