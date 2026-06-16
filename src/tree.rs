@@ -26,6 +26,17 @@ pub struct TensorInfo {
     pub storage: Storage,
 }
 
+impl TensorInfo {
+    /// The size actually occupied on disk: the compressed size when stored
+    /// compressed, otherwise the logical size.
+    pub fn on_disk_size(&self) -> usize {
+        match &self.storage {
+            Storage::Compressed { stored_bytes, .. } => *stored_bytes,
+            _ => self.size_bytes,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MetadataInfo {
     pub name: String,
@@ -41,6 +52,9 @@ pub enum TreeNode {
         expanded: bool,
         tensor_count: usize,
         total_size: usize,
+        /// Sum of descendant tensors' on-disk sizes (compressed where
+        /// applicable). Equals `total_size` when nothing is compressed.
+        stored_size: usize,
     },
     Tensor {
         info: TensorInfo,
@@ -125,6 +139,7 @@ impl TreeBuilder {
                 expanded: false,
                 tensor_count: 0,
                 total_size: 0,
+                stored_size: 0,
             });
         }
 
@@ -161,6 +176,7 @@ impl TreeBuilder {
                 tensors.sort_by_key(|a| natural_sort_key(&a.name));
                 let tensor_count = tensors.len();
                 let total_size = tensors.iter().map(|t| t.size_bytes).sum();
+                let stored_size = tensors.iter().map(|t| t.on_disk_size()).sum();
 
                 let children = Self::build_subtree(&tensors, &prefix);
 
@@ -170,6 +186,7 @@ impl TreeBuilder {
                     expanded: true,
                     tensor_count,
                     total_size,
+                    stored_size,
                 });
             }
         }
@@ -206,6 +223,7 @@ impl TreeBuilder {
         for (group_name, group_tensors) in groups {
             let tensor_count = group_tensors.len();
             let total_size = group_tensors.iter().map(|t| t.size_bytes).sum();
+            let stored_size = group_tensors.iter().map(|t| t.on_disk_size()).sum();
             let full_prefix = format!("{prefix}.{group_name}");
             let children = Self::build_subtree(&group_tensors, &full_prefix);
 
@@ -215,6 +233,7 @@ impl TreeBuilder {
                 expanded: false,
                 tensor_count,
                 total_size,
+                stored_size,
             });
         }
 
