@@ -7,7 +7,6 @@ use crossterm::{
 };
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
-use safetensors::SafeTensors;
 use std::{
     collections::HashSet,
     fs::File,
@@ -88,38 +87,87 @@ impl Explorer {
         let mut file = File::open(file_path)
             .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
 
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)
-            .with_context(|| format!("Failed to read file: {}", file_path.display()))?;
+        // A safetensors file begins with an 8-byte little-endian header length N
+        // followed by N bytes of JSON describing every tensor (name, dtype, shape,
+        // byte offsets) and an optional `__metadata__` map. The tensor data follows.
+        // We only display that header, so read just it instead of the whole file
+        // (which can be many GB per shard).
+        let mut len_buf = [0u8; 8];
+        file.read_exact(&mut len_buf)
+            .with_context(|| format!("Failed to read header length: {}", file_path.display()))?;
+        let header_len = u64::from_le_bytes(len_buf) as usize;
 
-        // First, try to read metadata
-        if let Ok((_, metadata)) = SafeTensors::read_metadata(&buffer) {
-            // Check if there's a __metadata__ key in the header
-            if let Some(metadata_value) = metadata.metadata() {
-                // Parse the metadata as key-value pairs
-                for (key, value) in metadata_value {
-                    self.metadata.push(MetadataInfo {
-                        name: key.clone(),
-                        value: value.clone(),
-                        value_type: "string".to_string(),
-                    });
-                }
-            }
+        // Guard against a corrupt or non-safetensors file claiming a huge header.
+        const MAX_HEADER_SIZE: usize = 100_000_000;
+        if header_len > MAX_HEADER_SIZE {
+            anyhow::bail!(
+                "SafeTensors header too large ({header_len} bytes): {}",
+                file_path.display()
+            );
         }
 
-        let tensors = SafeTensors::deserialize(&buffer).with_context(|| {
-            format!("Failed to parse SafeTensors file: {}", file_path.display())
+        let mut header_buf = vec![0u8; header_len];
+        file.read_exact(&mut header_buf)
+            .with_context(|| format!("Failed to read header: {}", file_path.display()))?;
+
+        let header: serde_json::Value = serde_json::from_slice(&header_buf).with_context(|| {
+            format!(
+                "Failed to parse SafeTensors header: {}",
+                file_path.display()
+            )
         })?;
 
-        for name in tensors.names() {
-            let tensor = tensors.tensor(name)?;
-            let shape = tensor.shape().to_vec();
+        let obj = header.as_object().ok_or_else(|| {
+            anyhow::anyhow!("Invalid SafeTensors header: {}", file_path.display())
+        })?;
+
+        for (key, value) in obj {
+            // The `__metadata__` entry holds free-form string key/value pairs.
+            if key == "__metadata__" {
+                if let Some(meta_obj) = value.as_object() {
+                    for (meta_key, meta_value) in meta_obj {
+                        self.metadata.push(MetadataInfo {
+                            name: meta_key.clone(),
+                            value: match meta_value.as_str() {
+                                Some(s) => s.to_string(),
+                                None => meta_value.to_string(),
+                            },
+                            value_type: "string".to_string(),
+                        });
+                    }
+                }
+                continue;
+            }
+
+            // Every other entry describes a tensor.
+            let dtype = value
+                .get("dtype")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            let shape: Vec<usize> = value
+                .get("shape")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_u64().map(|n| n as usize))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let size_bytes = value
+                .get("data_offsets")
+                .and_then(|v| v.as_array())
+                .filter(|offsets| offsets.len() == 2)
+                .and_then(|offsets| {
+                    let start = offsets[0].as_u64()?;
+                    let end = offsets[1].as_u64()?;
+                    Some(end.saturating_sub(start) as usize)
+                })
+                .unwrap_or(0);
             let num_elements = shape.iter().product::<usize>();
-            let dtype = format!("{:?}", tensor.dtype());
-            let size_bytes = tensor.data().len();
 
             self.tensors.push(TensorInfo {
-                name: name.to_string(),
+                name: key.clone(),
                 dtype,
                 shape,
                 size_bytes,
