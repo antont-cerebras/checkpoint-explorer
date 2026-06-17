@@ -705,26 +705,233 @@ impl Explorer {
     }
 
     fn show_tensor_detail(&self, tensor: &TensorInfo) {
-        if UI::draw_tensor_detail(tensor).is_ok() {
-            // Wait for any key press
-            let _ = event::read();
+        // Detail screen with sub-views: `m` heatmap, `v` numeric values, any
+        // other key returns to the tree.
+        loop {
+            if UI::draw_tensor_detail(tensor).is_err() {
+                return;
+            }
+            match event::read() {
+                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Char('m'),
+                    ..
+                })) => self.show_tensor_data(tensor, true),
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Char('v'),
+                    ..
+                })) => self.show_tensor_data(tensor, false),
+                Ok(Event::Key(_)) => return,
+                Ok(_) => {} // resize etc.: just redraw the detail
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// Draw a heatmap (`heatmap = true`) or numeric grid for the tensor, sized
+    /// to the terminal. `m`/`v` switch representation in place (no trip back to
+    /// the detail screen). For 3D tensors this shows one 2D slice at a fixed
+    /// first index (the 0th by default); `[`/`]` and the ← → arrows step
+    /// through the slices, wrapping around at both ends. Any other key returns
+    /// to the detail screen.
+    fn show_tensor_data(&self, tensor: &TensorInfo, heatmap: bool) {
+        let mut heatmap = heatmap;
+        let mut slice = 0usize;
+        loop {
+            let (cols, rows) = terminal::size().unwrap_or((100, 40));
+            let max_rows = (rows as usize).saturating_sub(8).max(1);
+            let sampled = if heatmap {
+                let max_cols = (cols as usize).saturating_sub(1).max(1);
+                crate::sample::sample_tensor(tensor, max_rows, max_cols, slice)
+            } else {
+                // Numeric cells are ~11 wide plus a row-index column.
+                let max_cols = ((cols as usize).saturating_sub(7) / 11).max(1);
+                crate::sample::sample_tensor(tensor, max_rows, max_cols, slice)
+            };
+
+            // The number of slices to navigate between (1 unless this is 3D);
+            // also reflects clamping of `slice` done inside the sampler.
+            let slices = match &sampled {
+                Ok(s) => {
+                    slice = s.slice;
+                    s.slices
+                }
+                Err(_) => 1,
+            };
+
+            let result = sampled.and_then(|s| {
+                if heatmap {
+                    UI::draw_heatmap(tensor, &s).map_err(|e| e.to_string())
+                } else {
+                    UI::draw_values(tensor, &s).map_err(|e| e.to_string())
+                }
+            });
+            if let Err(msg) = result {
+                let _ = UI::draw_message("Data preview unavailable", &msg);
+                if let Ok(Event::Key(key)) = event::read()
+                    && is_ctrl_c(&key)
+                {
+                    quit_immediately();
+                }
+                return;
+            }
+
+            match event::read() {
+                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+                Ok(Event::Key(KeyEvent {
+                    code, modifiers, ..
+                })) => {
+                    let shift = modifiers.contains(KeyModifiers::SHIFT);
+                    match code {
+                        // Switch representation in place, keeping the current slice.
+                        KeyCode::Char('m') => heatmap = true,
+                        KeyCode::Char('v') => heatmap = false,
+                        // Jump straight to a slice by typing its index.
+                        KeyCode::Char('/') if slices > 1 => {
+                            if let Some(n) = self.prompt_slice(slices) {
+                                slice = n;
+                            }
+                        }
+                        // Shift + arrows jump ~5% of the slices at once (wrapping).
+                        KeyCode::Right if slices > 1 && shift => {
+                            slice = (slice + slice_step(slices)) % slices
+                        }
+                        KeyCode::Left if slices > 1 && shift => {
+                            slice = (slice + slices - slice_step(slices)) % slices
+                        }
+                        // Plain arrows / brackets step one slice (wrapping).
+                        KeyCode::Char(']') | KeyCode::Right if slices > 1 => {
+                            slice = (slice + 1) % slices
+                        }
+                        KeyCode::Char('[') | KeyCode::Left if slices > 1 => {
+                            slice = (slice + slices - 1) % slices
+                        }
+                        _ => return,
+                    }
+                }
+                Ok(_) => {} // resize etc.: re-sample and redraw the same slice
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// Prompt for a slice to jump to — either an absolute index (`123`) or a
+    /// percentage of the way through (`50%`, where 0% is the first slice and
+    /// 100% the last). Returns the chosen slice, or `None` if cancelled / left
+    /// empty. Out-of-range entries are reported in the prompt, not jumped to.
+    /// Ctrl-C quits the app outright.
+    fn prompt_slice(&self, slices: usize) -> Option<usize> {
+        let mut input = String::new();
+        let mut error: Option<String> = None;
+        loop {
+            if UI::draw_slice_prompt(slices, &input, error.as_deref()).is_err() {
+                return None;
+            }
+            match event::read() {
+                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+                Ok(Event::Key(KeyEvent { code, .. })) => match code {
+                    KeyCode::Enter => match parse_slice_input(&input, slices) {
+                        Ok(Some(n)) => return Some(n),
+                        Ok(None) => return None, // empty + Enter cancels
+                        Err(msg) => error = Some(msg),
+                    },
+                    KeyCode::Esc => return None,
+                    KeyCode::Backspace => {
+                        input.pop();
+                        error = None;
+                    }
+                    // Accept digits, a decimal point and a trailing `%`.
+                    KeyCode::Char(c) if c.is_ascii_digit() || c == '.' || c == '%' => {
+                        input.push(c);
+                        error = None;
+                    }
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(_) => return None,
+            }
         }
     }
 
     fn show_metadata_detail(&self, metadata: &MetadataInfo) {
         if UI::draw_metadata_detail(metadata).is_ok() {
-            // Wait for any key press
-            let _ = event::read();
+            // Wait for any key press (Ctrl-C quits the app).
+            if let Ok(Event::Key(key)) = event::read()
+                && is_ctrl_c(&key)
+            {
+                quit_immediately();
+            }
         }
     }
 
     fn show_health_report(&self) {
         if !self.health_reports.is_empty() && UI::draw_health_warning(&self.health_reports).is_ok()
         {
-            // Wait for any key press
-            let _ = event::read();
+            // Wait for any key press (Ctrl-C quits the app).
+            if let Ok(Event::Key(key)) = event::read()
+                && is_ctrl_c(&key)
+            {
+                quit_immediately();
+            }
         }
     }
+}
+
+/// How many slices one Shift+arrow jump moves: about 5% of the total, at
+/// least 1 so it always advances.
+fn slice_step(slices: usize) -> usize {
+    (slices / 20).max(1)
+}
+
+/// Parse the slice-jump prompt input into a target slice for a tensor with
+/// `slices` slices. Accepts either an absolute index (`"123"`) or a percentage
+/// (`"50%"`, where 0% is the first slice and 100% the last). Returns `Ok(None)`
+/// for empty input (cancel) and `Err(message)` for invalid / out-of-range input
+/// (so the prompt can report it instead of jumping).
+fn parse_slice_input(input: &str, slices: usize) -> Result<Option<usize>, String> {
+    let s = input.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    if let Some(pct_str) = s.strip_suffix('%') {
+        let pct: f64 = pct_str
+            .trim()
+            .parse()
+            .map_err(|_| "invalid percentage — try e.g. 50%".to_string())?;
+        if !(0.0..=100.0).contains(&pct) {
+            return Err(format!("{pct}% is out of range — use 0% to 100%"));
+        }
+        // 0% -> first slice, 100% -> last slice; round to the nearest.
+        let idx = ((pct / 100.0) * (slices - 1) as f64).round() as usize;
+        Ok(Some(idx.min(slices - 1)))
+    } else {
+        let n: usize = s
+            .parse()
+            .map_err(|_| "enter a slice number or a percentage (e.g. 12 or 50%)".to_string())?;
+        if n < slices {
+            Ok(Some(n))
+        } else {
+            Err(format!(
+                "index {n} is out of range — the last slice is {}",
+                slices - 1
+            ))
+        }
+    }
+}
+
+/// Whether a key event is Ctrl-C.
+fn is_ctrl_c(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Restore the terminal (leave raw mode, show the cursor, clear the screen) and
+/// exit the process immediately. Used for Ctrl-C from any of the detail/data
+/// sub-screens so it quits outright instead of stepping back one screen.
+fn quit_immediately() -> ! {
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, terminal::Clear(ClearType::All), cursor::Show);
+    let _ = terminal::disable_raw_mode();
+    std::process::exit(0);
 }
 
 /// Resolve a path to an absolute string without requiring it to exist or
@@ -771,6 +978,31 @@ fn copy_to_clipboard(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_slice_input_handles_indices_percentages_and_errors() {
+        // Empty input cancels.
+        assert_eq!(parse_slice_input("", 10), Ok(None));
+        assert_eq!(parse_slice_input("   ", 10), Ok(None));
+
+        // Absolute indices.
+        assert_eq!(parse_slice_input("0", 10), Ok(Some(0)));
+        assert_eq!(parse_slice_input("9", 10), Ok(Some(9)));
+        assert!(parse_slice_input("10", 10).is_err()); // out of range (max 9)
+
+        // Percentages: 0% -> first, 100% -> last, rounded to nearest in between.
+        assert_eq!(parse_slice_input("0%", 360), Ok(Some(0)));
+        assert_eq!(parse_slice_input("100%", 360), Ok(Some(359)));
+        assert_eq!(parse_slice_input("50%", 360), Ok(Some(180))); // 0.5 * 359 = 179.5 -> 180
+        assert_eq!(parse_slice_input("50%", 11), Ok(Some(5))); // 0.5 * 10 = 5
+        assert_eq!(parse_slice_input("33.3%", 100), Ok(Some(33)));
+
+        // Out-of-range / malformed percentages and numbers are reported.
+        assert!(parse_slice_input("101%", 360).is_err());
+        assert!(parse_slice_input("-5%", 360).is_err());
+        assert!(parse_slice_input("abc", 360).is_err());
+        assert!(parse_slice_input("%", 360).is_err());
+    }
 
     /// Build an explorer whose flattened tree has the given row depths (the
     /// node contents don't matter for coarse navigation, only the depths).

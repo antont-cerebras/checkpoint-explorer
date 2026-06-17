@@ -138,6 +138,29 @@ Press `/` to enter search mode and start typing to filter tensors by name. The s
 
 Press `Enter` to open the highlighted result's details (you stay in search), and `Esc` or `q` to exit search mode and return to the full tree view.
 
+### Tensor data preview
+
+From a tensor's detail screen (open it with `Enter`/`Space`), you can preview the
+actual data of 1D/2D/3D tensors:
+
+- `m` — an **ASCII heatmap**: each sampled element is a colored block on a
+  blue→green→red scale, with a min/max legend.
+- `v` — a **numeric grid** of sampled values with row/column indices, including
+  the edges.
+
+For **3D tensors** (e.g. stacked MoE experts, shape `[experts, rows, cols]`) the
+preview shows a 2D matrix at a fixed leading index — the 0th by default. The
+`←` / `→` arrows step through the slices one at a time and `Shift`+`←` / `→` jump
+~5% at a time (both wrap around at the ends); `/` prompts for a slice to jump to —
+either an exact index or a percentage like `50%` (0% = first, 100% = last).
+Out-of-range entries are rejected with a message rather than jumping.
+Within either view, `m` and `v` switch between the heatmap and numeric
+representations in place, and `Ctrl+C` quits the app from anywhere.
+
+Both views sample a grid that fits the screen (they never read the whole tensor).
+Reading is supported for `safetensors` (any size) and HDF5 (`--features hdf5`,
+currently for datasets up to a size cap); GGUF data preview is not yet supported.
+
 ## Example Output
 
 ```

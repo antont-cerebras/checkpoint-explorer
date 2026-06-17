@@ -3,6 +3,7 @@ mod gguf;
 #[cfg(feature = "hdf5")]
 mod hdf5;
 mod health;
+mod sample;
 mod tree;
 mod ui;
 mod utils;

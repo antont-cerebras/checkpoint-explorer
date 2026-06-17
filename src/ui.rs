@@ -1,14 +1,37 @@
 use anyhow::Result;
 use crossterm::{
     cursor, execute, queue,
-    style::{Color, ResetColor, SetForegroundColor},
-    terminal::{self, ClearType},
+    style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
+    terminal::{self, BeginSynchronizedUpdate, ClearType, EndSynchronizedUpdate},
 };
 use std::io::{self, BufWriter, Write};
 
 use crate::health::HealthReport;
+use crate::sample::Sample;
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo, TreeNode};
 use crate::utils::{format_parameters, format_shape, format_size};
+
+/// The app's colour palette — the single source of truth for how each kind of
+/// thing is styled, so the same role looks the same on every screen. Change a
+/// colour here and it updates everywhere it's used.
+mod palette {
+    use crossterm::style::Color;
+
+    /// Interactive keys in hint lines (rendered bold, via [`super::key_hint`]).
+    pub const KEY: Color = Color::Cyan;
+    /// Secondary / de-emphasised hint text (ranges, "to cancel", …).
+    pub const DIM: Color = Color::DarkGrey;
+    /// Selected tree row (foreground on background).
+    pub const SELECT_FG: Color = Color::Black;
+    pub const SELECT_BG: Color = Color::White;
+    /// The slice-jump input box (foreground on background).
+    pub const INPUT_FG: Color = Color::White;
+    pub const INPUT_BG: Color = Color::DarkBlue;
+    /// Something missing / wrong / out of range.
+    pub const ERROR: Color = Color::Red;
+    /// Something present but unexpected (a softer alert than [`ERROR`]).
+    pub const WARN: Color = Color::Yellow;
+}
 
 pub struct DrawConfig<'a> {
     pub tree: &'a [(TreeNode, usize)],
@@ -47,7 +70,7 @@ impl UI {
         let available_height =
             (terminal_height as usize).saturating_sub(header_height + footer_height);
 
-        queue!(out, cursor::MoveTo(0, 0))?;
+        queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
 
         // Header
         queue!(out, terminal::Clear(ClearType::CurrentLine))?;
@@ -59,27 +82,39 @@ impl UI {
             config.total_files
         )?;
         if config.health_warning {
-            queue!(out, SetForegroundColor(Color::Red))?;
-            write!(out, "   ⚠ index/file mismatch — press 'h'")?;
+            queue!(out, SetForegroundColor(palette::ERROR))?;
+            write!(out, "   ⚠ index/file mismatch — press ")?;
+            key_hint(&mut out, "h")?;
             queue!(out, ResetColor)?;
         }
         write!(out, "\r\n")?;
         queue!(out, terminal::Clear(ClearType::CurrentLine))?;
         if config.search_mode {
-            write!(
-                out,
-                "SEARCH MODE: {} | Type to search, Enter to view, Esc/q to exit\r\n",
-                if config.search_query.is_empty() {
-                    "_"
-                } else {
-                    config.search_query
-                }
-            )?;
+            let query = if config.search_query.is_empty() {
+                "_"
+            } else {
+                config.search_query
+            };
+            write!(out, "SEARCH MODE: {query} | Type to search, ")?;
+            key_hint(&mut out, "Enter")?;
+            write!(out, " to view, ")?;
+            key_hint(&mut out, "Esc/q")?;
+            write!(out, " to exit\r\n")?;
         } else {
-            write!(
-                out,
-                "↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · Enter/Space expand · E/C all · / search · c copy · q quit\r\n"
+            hint_line(
+                &mut out,
+                &[
+                    ("↑/↓", "navigate"),
+                    ("←/→", "parent/child"),
+                    ("Shift+↑/↓", "sibling"),
+                    ("Enter/Space", "expand"),
+                    ("E/C", "all"),
+                    ("/", "search"),
+                    ("c", "copy"),
+                    ("q", "quit"),
+                ],
             )?;
+            write!(out, "\r\n")?;
         }
         queue!(out, terminal::Clear(ClearType::CurrentLine))?;
         write!(out, "{}\r\n", "=".repeat(80))?;
@@ -107,8 +142,8 @@ impl UI {
             if is_selected {
                 queue!(
                     out,
-                    SetForegroundColor(Color::Black),
-                    crossterm::style::SetBackgroundColor(Color::White)
+                    SetForegroundColor(palette::SELECT_FG),
+                    SetBackgroundColor(palette::SELECT_BG)
                 )?;
             }
 
@@ -136,9 +171,11 @@ impl UI {
         if config.search_mode && config.tree.is_empty() {
             write!(
                 out,
-                "No results found for \"{}\" | Press Esc to exit search\r",
+                "No results found for \"{}\" | Press ",
                 config.search_query
             )?;
+            key_hint(&mut out, "Esc")?;
+            write!(out, " to exit search\r")?;
         } else {
             write!(
                 out,
@@ -151,6 +188,7 @@ impl UI {
             )?;
         }
 
+        queue!(out, EndSynchronizedUpdate)?;
         out.flush()?;
         Ok(new_scroll_offset)
     }
@@ -311,7 +349,12 @@ impl UI {
         }
         writeln!(stdout, "File: {}\r", tensor.source_path)?;
         writeln!(stdout, "\r")?;
-        writeln!(stdout, "Press any key to return...\r")?;
+        // Highlight the `m` / `v` keys so they stand out from the prose.
+        write!(stdout, "Press ")?;
+        key_hint(&mut stdout, "m")?;
+        write!(stdout, " for a heatmap, ")?;
+        key_hint(&mut stdout, "v")?;
+        writeln!(stdout, " for numeric values, any other key to return...\r")?;
 
         stdout.flush()?;
         Ok(())
@@ -345,6 +388,207 @@ impl UI {
         Ok(())
     }
 
+    /// Render a sampled tensor as an ASCII heatmap (one colored block per
+    /// sampled element, colored by relative value).
+    pub fn draw_heatmap(tensor: &TensorInfo, sample: &Sample) -> Result<()> {
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
+        // Present the whole frame atomically (the terminal buffers everything
+        // between Begin/End and paints it in one go, so a redraw never shows a
+        // half-updated screen — this is what eliminates the flicker). We also
+        // overwrite in place: write each line's new content first, then clear
+        // only the leftover tail (`line_end`), and never emit a trailing
+        // newline (which could scroll the screen and flash).
+        queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
+
+        write!(out, "Heatmap: {}", tensor.name)?;
+        line_end(&mut out)?;
+        write!(
+            out,
+            "{} {} → sampled {}×{}, value range [{:.4}, {:.4}]",
+            tensor.dtype,
+            format_shape(&tensor.shape),
+            sample.rows.len(),
+            sample.cols.len(),
+            sample.min,
+            sample.max
+        )?;
+        line_end(&mut out)?;
+        if sample.slices > 1 {
+            write_slice_header(&mut out, sample)?;
+            line_end(&mut out)?;
+        }
+        line_end(&mut out)?;
+
+        let range = sample.max - sample.min;
+        for row in &sample.values {
+            for &v in row {
+                let t = if range > 0.0 {
+                    (v - sample.min) / range
+                } else {
+                    0.5
+                };
+                queue!(out, SetForegroundColor(heat_color(t)))?;
+                write!(out, "█")?;
+            }
+            queue!(out, ResetColor)?;
+            line_end(&mut out)?;
+        }
+
+        line_end(&mut out)?;
+        write!(out, "{:.4} low ", sample.min)?;
+        for i in 0..24 {
+            queue!(out, SetForegroundColor(heat_color(i as f64 / 23.0)))?;
+            write!(out, "█")?;
+        }
+        queue!(out, ResetColor)?;
+        write!(out, " high {:.4}", sample.max)?;
+        line_end(&mut out)?;
+
+        line_end(&mut out)?;
+        write_view_footer(&mut out, sample, true)?;
+
+        // Clear the footer's tail and everything below (no trailing newline),
+        // then end the synchronized frame.
+        queue!(
+            out,
+            terminal::Clear(ClearType::FromCursorDown),
+            EndSynchronizedUpdate
+        )?;
+        out.flush()?;
+        Ok(())
+    }
+
+    /// Render a sampled tensor as a grid of numeric values with row/column
+    /// indices (edges included).
+    pub fn draw_values(tensor: &TensorInfo, sample: &Sample) -> Result<()> {
+        const W: usize = 11;
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
+        // Synchronized, in-place overwrite (see `draw_heatmap`) to avoid flicker.
+        queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
+
+        write!(out, "Values: {}", tensor.name)?;
+        line_end(&mut out)?;
+        write!(
+            out,
+            "{} {} → sampled {} of {} rows × {} of {} cols (indices shown)",
+            tensor.dtype,
+            format_shape(&tensor.shape),
+            sample.rows.len(),
+            sample.total_rows,
+            sample.cols.len(),
+            sample.total_cols
+        )?;
+        line_end(&mut out)?;
+        if sample.slices > 1 {
+            write_slice_header(&mut out, sample)?;
+            line_end(&mut out)?;
+        }
+        line_end(&mut out)?;
+
+        // Column-index header.
+        write!(out, "{:>6} ", "")?;
+        for &c in &sample.cols {
+            write!(out, "{c:>W$}")?;
+        }
+        line_end(&mut out)?;
+
+        for (i, row) in sample.values.iter().enumerate() {
+            write!(out, "{:>6} ", sample.rows[i])?;
+            for &v in row {
+                write!(out, "{v:>W$.3e}")?;
+            }
+            line_end(&mut out)?;
+        }
+
+        line_end(&mut out)?;
+        write_view_footer(&mut out, sample, false)?;
+
+        queue!(
+            out,
+            terminal::Clear(ClearType::FromCursorDown),
+            EndSynchronizedUpdate
+        )?;
+        out.flush()?;
+        Ok(())
+    }
+
+    /// A prompt pinned to the bottom of the screen for jumping to a slice by
+    /// typing its index (overlaid on the current data view). The label and a
+    /// fixed-width input box are colored; `error`, when set, is shown in red on
+    /// the line below (e.g. for an out-of-range index).
+    pub fn draw_slice_prompt(slices: usize, input: &str, error: Option<&str>) -> Result<()> {
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
+        let (_w, h) = terminal::size()?;
+
+        // Prompt line.
+        queue!(
+            out,
+            cursor::MoveTo(0, h.saturating_sub(2)),
+            terminal::Clear(ClearType::CurrentLine),
+            SetForegroundColor(palette::KEY)
+        )?;
+        write!(out, "Go to slice ")?;
+        queue!(out, SetForegroundColor(palette::DIM))?;
+        write!(out, "(0-{} or 0-100%)", slices.saturating_sub(1))?;
+        queue!(out, ResetColor)?;
+        write!(out, "  ")?;
+        // The input box: a fixed-width highlighted field with a block cursor.
+        queue!(
+            out,
+            SetBackgroundColor(palette::INPUT_BG),
+            SetForegroundColor(palette::INPUT_FG)
+        )?;
+        write!(out, " {input}█ ")?;
+        for _ in input.len()..5 {
+            write!(out, " ")?;
+        }
+        queue!(out, ResetColor)?;
+        write!(out, "  ")?;
+        key_hint(&mut out, "Enter")?;
+        queue!(out, SetForegroundColor(palette::DIM))?;
+        write!(out, " to jump · ")?;
+        queue!(out, ResetColor)?;
+        key_hint(&mut out, "Esc")?;
+        queue!(out, SetForegroundColor(palette::DIM))?;
+        write!(out, " to cancel")?;
+        queue!(out, ResetColor)?;
+
+        // Feedback line below (out-of-range / invalid input).
+        queue!(
+            out,
+            cursor::MoveTo(0, h.saturating_sub(1)),
+            terminal::Clear(ClearType::CurrentLine)
+        )?;
+        if let Some(msg) = error {
+            queue!(out, SetForegroundColor(palette::ERROR))?;
+            write!(out, "{msg}")?;
+            queue!(out, ResetColor)?;
+        }
+
+        out.flush()?;
+        Ok(())
+    }
+
+    /// A simple full-screen message (e.g. when a data preview is unavailable).
+    pub fn draw_message(title: &str, message: &str) -> Result<()> {
+        let mut stdout = io::stdout();
+        execute!(
+            stdout,
+            terminal::Clear(ClearType::All),
+            cursor::MoveTo(0, 0)
+        )?;
+        writeln!(stdout, "{title}\r")?;
+        writeln!(stdout, "{}\r", "=".repeat(title.len().max(10)))?;
+        writeln!(stdout, "{message}\r")?;
+        writeln!(stdout, "\r")?;
+        writeln!(stdout, "Press any key to return...\r")?;
+        stdout.flush()?;
+        Ok(())
+    }
+
     /// Draw a full-screen warning panel summarising checkpoint health issues,
     /// shown once at startup. Each category is capped so the panel stays small.
     pub fn draw_health_warning(reports: &[HealthReport]) -> Result<()> {
@@ -355,14 +599,14 @@ impl UI {
             cursor::MoveTo(0, 0)
         )?;
 
-        execute!(stdout, SetForegroundColor(Color::Yellow))?;
+        execute!(stdout, SetForegroundColor(palette::WARN))?;
         writeln!(stdout, "⚠  Checkpoint health check\r")?;
         writeln!(stdout, "{}\r", "=".repeat(60))?;
         execute!(stdout, ResetColor)?;
 
         for report in reports {
             writeln!(stdout, "\r")?;
-            execute!(stdout, SetForegroundColor(Color::Yellow))?;
+            execute!(stdout, SetForegroundColor(palette::WARN))?;
             writeln!(
                 stdout,
                 "{} does not match the .safetensors files on disk.\r",
@@ -376,29 +620,29 @@ impl UI {
                 &mut stdout,
                 "Referenced by the index but MISSING",
                 &report.missing_files,
-                Color::Red,
+                palette::ERROR,
             )?;
             health_section(
                 &mut stdout,
                 "Present on disk but NOT in the index",
                 &report.extra_files,
-                Color::Yellow,
+                palette::WARN,
             )?;
             health_section(
                 &mut stdout,
                 "Expected by the index but absent from their file",
                 &report.missing_tensors,
-                Color::Red,
+                palette::ERROR,
             )?;
             health_section(
                 &mut stdout,
                 "In files but not listed in the index",
                 &report.extra_tensors,
-                Color::Yellow,
+                palette::WARN,
             )?;
         }
 
-        execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+        execute!(stdout, SetForegroundColor(palette::DIM))?;
         writeln!(
             stdout,
             "The explorer scans the directory directly when the index is stale. Press any key to return.\r"
@@ -408,6 +652,87 @@ impl UI {
         stdout.flush()?;
         Ok(())
     }
+}
+
+/// Write a key name highlighted (bold bright-cyan) so it stands out from the
+/// surrounding prose in a hint line. Uses `queue!` so it composes inside a
+/// buffered frame; the caller is responsible for flushing.
+fn key_hint(out: &mut impl Write, key: &str) -> Result<()> {
+    queue!(
+        out,
+        SetAttribute(Attribute::Bold),
+        SetForegroundColor(palette::KEY)
+    )?;
+    write!(out, "{key}")?;
+    queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+    Ok(())
+}
+
+/// Render a hint line as `key label · key label · …`, highlighting each key.
+/// An item with an empty key is written as a plain segment (e.g. a trailing
+/// "any other key to return"); an empty label writes just the key.
+fn hint_line(out: &mut impl Write, items: &[(&str, &str)]) -> Result<()> {
+    for (i, (key, label)) in items.iter().enumerate() {
+        if i > 0 {
+            write!(out, " · ")?;
+        }
+        if key.is_empty() {
+            write!(out, "{label}")?;
+        } else {
+            key_hint(out, key)?;
+            if !label.is_empty() {
+                write!(out, " {label}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Finish the current line: clear any leftover tail (so a shorter new line
+/// doesn't leave stale characters), then move to the start of the next line.
+/// Writing content *before* this clear is what keeps redraws flicker-free.
+fn line_end(out: &mut impl Write) -> Result<()> {
+    queue!(out, terminal::Clear(ClearType::UntilNewLine))?;
+    write!(out, "\r\n")?;
+    Ok(())
+}
+
+/// For a multi-slice (3D) tensor, write the line announcing which 2D slice is
+/// shown and how to change it (keys highlighted, no trailing newline — the
+/// caller ends the line). Only called when `sample.slices > 1`.
+fn write_slice_header(out: &mut impl Write, sample: &Sample) -> Result<()> {
+    write!(
+        out,
+        "slice {} of {} (fixed leading index) — ",
+        sample.slice, sample.slices
+    )?;
+    hint_line(
+        out,
+        &[
+            ("← →", "step"),
+            ("Shift+← →", "jump 5% (both wrap)"),
+            ("/", "index or %"),
+        ],
+    )
+}
+
+/// Footer for the data views: offers the other representation (`m`/`v` switch
+/// in place, no trip back to the detail screen) and mentions slice navigation
+/// only when there is more than one slice to move between. Keys highlighted.
+fn write_view_footer(out: &mut impl Write, sample: &Sample, heatmap: bool) -> Result<()> {
+    let switch = if heatmap {
+        ("v", "numeric values")
+    } else {
+        ("m", "heatmap")
+    };
+    let mut items = vec![switch];
+    if sample.slices > 1 {
+        items.push(("← →", "step"));
+        items.push(("Shift+← →", "jump 5%"));
+        items.push(("/", "index or %"));
+    }
+    items.push(("", "any other key to return..."));
+    hint_line(out, &items)
 }
 
 /// Write one capped section of the health panel: a titled list (in `color`) of
@@ -429,7 +754,7 @@ fn health_section(
         writeln!(stdout, "  {item}\r")?;
     }
     if items.len() > CAP {
-        execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+        execute!(stdout, SetForegroundColor(palette::DIM))?;
         writeln!(stdout, "  … and {} more\r", items.len() - CAP)?;
         execute!(stdout, ResetColor)?;
     }
@@ -468,6 +793,16 @@ fn truncate_keep_end(s: &str, width: usize) -> String {
     }
     let tail: String = s.chars().skip(count - (width - 1)).collect();
     format!("…{tail}")
+}
+
+/// Map a normalized value in `[0, 1]` to a blue→green→red 256-color ramp
+/// (the 6×6×6 ANSI color cube, indices 16..=231).
+fn heat_color(t: f64) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    let r = (t * 5.0).round() as u8;
+    let b = ((1.0 - t) * 5.0).round() as u8;
+    let g = ((1.0 - (t - 0.5).abs() * 2.0) * 5.0).round() as u8;
+    Color::AnsiValue(16 + 36 * r + 6 * g + b)
 }
 
 /// Format an integer with thousands separators (e.g. 579133440 -> "579,133,440").
