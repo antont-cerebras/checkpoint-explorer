@@ -7,7 +7,7 @@ use crossterm::{
 use std::io::{self, BufWriter, Write};
 
 use crate::health::HealthReport;
-use crate::sample::Sample;
+use crate::sample::{Sample, ViewDtype};
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo, TreeNode};
 use crate::utils::{format_parameters, format_shape, format_size};
 
@@ -279,84 +279,119 @@ impl UI {
         Ok(())
     }
 
-    pub fn draw_tensor_detail(tensor: &TensorInfo) -> Result<()> {
-        let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            terminal::Clear(ClearType::All),
-            cursor::MoveTo(0, 0)
-        )?;
+    /// Draw the tensor detail screen. `view` is the active dtype reinterpretation
+    /// (which changes the shown dtype, shape and parameter count); `overridable`
+    /// gates the `d` hint. Rendered flicker-free so it can also serve as the
+    /// live preview while choosing a dtype in the menu.
+    pub fn draw_tensor_detail(
+        tensor: &TensorInfo,
+        view: ViewDtype,
+        overridable: bool,
+    ) -> Result<()> {
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
+        queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
 
-        writeln!(stdout, "Tensor Details\r")?;
-        writeln!(stdout, "==============\r")?;
-        writeln!(stdout, "Name: {}\r", tensor.name)?;
-        writeln!(stdout, "Data Type: {}\r", tensor.dtype)?;
-        writeln!(stdout, "Shape: {}\r", format_shape(&tensor.shape))?;
-        writeln!(
-            stdout,
-            "Parameters: {} ({})\r",
-            format_parameters(tensor.num_elements),
-            with_thousands(tensor.num_elements)
+        write!(out, "Tensor Details")?;
+        line_end(&mut out)?;
+        write!(out, "==============")?;
+        line_end(&mut out)?;
+        write!(out, "Name: {}", tensor.name)?;
+        line_end(&mut out)?;
+
+        // Data type, with the active reinterpretation highlighted.
+        write!(out, "Data Type: ")?;
+        write_view_dtype(&mut out, &tensor.dtype, view)?;
+        line_end(&mut out)?;
+
+        // Shape and parameter count reflect the override (a packed view unpacks
+        // several values per stored element, growing the last dimension).
+        let shape = view.logical_shape(&tensor.shape, &tensor.dtype);
+        let num_elements: usize = shape.iter().product();
+        write!(out, "Shape: {}", format_shape(&shape))?;
+        line_end(&mut out)?;
+        write!(
+            out,
+            "Parameters: {} ({})",
+            format_parameters(num_elements),
+            with_thousands(num_elements)
         )?;
-        writeln!(stdout, "Size: {}\r", format_size(tensor.size_bytes))?;
+        line_end(&mut out)?;
+
+        write!(out, "Size: {}", format_size(tensor.size_bytes))?;
+        line_end(&mut out)?;
         // On-disk size + codec, for formats that track compression (HDF5).
         match &tensor.storage {
             Storage::Compressed {
                 codec,
                 stored_bytes,
             } => {
-                writeln!(
-                    stdout,
-                    "On disk: {} ({codec})\r",
-                    format_size(*stored_bytes)
-                )?;
+                write!(out, "On disk: {} ({codec})", format_size(*stored_bytes))?;
+                line_end(&mut out)?;
             }
             Storage::Raw => {
-                writeln!(
-                    stdout,
-                    "On disk: {} (uncompressed)\r",
+                write!(
+                    out,
+                    "On disk: {} (uncompressed)",
                     format_size(tensor.size_bytes)
                 )?;
+                line_end(&mut out)?;
             }
             Storage::Unknown => {}
         }
         // Where the data lives within the file.
         match &tensor.layout {
             Layout::ByteRange { start, end } => {
-                writeln!(
-                    stdout,
-                    "Data offsets: {} – {}  (within file data)\r",
+                write!(
+                    out,
+                    "Data offsets: {} – {}  (within file data)",
                     with_thousands(*start as usize),
                     with_thousands(*end as usize)
                 )?;
+                line_end(&mut out)?;
             }
             Layout::Offset(offset) => {
-                writeln!(
-                    stdout,
-                    "Data offset: {}  (within tensor data)\r",
+                write!(
+                    out,
+                    "Data offset: {}  (within tensor data)",
                     with_thousands(*offset as usize)
                 )?;
+                line_end(&mut out)?;
             }
             Layout::Chunked { chunk, num_chunks } => {
-                writeln!(
-                    stdout,
-                    "Chunks: {} × {}\r",
+                write!(
+                    out,
+                    "Chunks: {} × {}",
                     format_shape(chunk),
                     with_thousands(*num_chunks)
                 )?;
+                line_end(&mut out)?;
             }
             Layout::None => {}
         }
-        writeln!(stdout, "File: {}\r", tensor.source_path)?;
-        writeln!(stdout, "\r")?;
-        // Highlight the `m` / `v` keys so they stand out from the prose.
-        write!(stdout, "Press ")?;
-        key_hint(&mut stdout, "m")?;
-        write!(stdout, " for a heatmap, ")?;
-        key_hint(&mut stdout, "v")?;
-        writeln!(stdout, " for numeric values, any other key to return...\r")?;
+        write!(out, "File: {}", tensor.source_path)?;
+        line_end(&mut out)?;
+        line_end(&mut out)?;
 
-        stdout.flush()?;
+        // Footer hints (keys highlighted).
+        write!(out, "Press ")?;
+        key_hint(&mut out, "m")?;
+        write!(out, " for a heatmap, ")?;
+        key_hint(&mut out, "v")?;
+        write!(out, " for numeric values, ")?;
+        if overridable {
+            key_hint(&mut out, "d")?;
+            write!(out, " to reinterpret the dtype, ")?;
+        }
+        write!(out, "any other key to return...")?;
+
+        // No trailing newline (avoids scrolling); clear anything below.
+        queue!(
+            out,
+            terminal::Clear(ClearType::FromCursorDown),
+            EndSynchronizedUpdate
+        )?;
+        out.flush()?;
         Ok(())
     }
 
@@ -405,15 +440,16 @@ impl UI {
 
         write!(out, "Heatmap: {}", tensor.name)?;
         line_end(&mut out)?;
+        let integer = sample.view.is_integer(&tensor.dtype);
+        let lo = fmt_value(sample.min, integer);
+        let hi = fmt_value(sample.max, integer);
+        write_view_dtype(&mut out, &tensor.dtype, sample.view)?;
         write!(
             out,
-            "{} {} → sampled {}×{}, value range [{:.4}, {:.4}]",
-            tensor.dtype,
+            " {} → sampled {}×{}, value range [{lo}, {hi}]",
             format_shape(&tensor.shape),
             sample.rows.len(),
             sample.cols.len(),
-            sample.min,
-            sample.max
         )?;
         line_end(&mut out)?;
         if sample.slices > 1 {
@@ -451,13 +487,13 @@ impl UI {
         }
 
         line_end(&mut out)?;
-        write!(out, "{:.4} low ", sample.min)?;
+        write!(out, "{lo} low ")?;
         for i in 0..24 {
             queue!(out, SetForegroundColor(heat_color(i as f64 / 23.0)))?;
             write!(out, "█")?;
         }
         queue!(out, ResetColor)?;
-        write!(out, " high {:.4}", sample.max)?;
+        write!(out, " high {hi}")?;
         line_end(&mut out)?;
 
         line_end(&mut out)?;
@@ -485,10 +521,10 @@ impl UI {
 
         write!(out, "Values: {}", tensor.name)?;
         line_end(&mut out)?;
+        write_view_dtype(&mut out, &tensor.dtype, sample.view)?;
         write!(
             out,
-            "{} {} → sampled {} of {} rows × {} of {} cols (indices shown)",
-            tensor.dtype,
+            " {} → sampled {} of {} rows × {} of {} cols (indices shown)",
             format_shape(&tensor.shape),
             sample.rows.len(),
             sample.total_rows,
@@ -509,10 +545,16 @@ impl UI {
         }
         line_end(&mut out)?;
 
+        // Integer dtypes print as plain integers; floats use scientific notation.
+        let integer = sample.view.is_integer(&tensor.dtype);
         for (i, row) in sample.values.iter().enumerate() {
             write!(out, "{:>6} ", sample.rows[i])?;
             for &v in row {
-                write!(out, "{v:>W$.3e}")?;
+                if integer {
+                    write!(out, "{:>W$}", v as i64)?;
+                } else {
+                    write!(out, "{v:>W$.3e}")?;
+                }
             }
             line_end(&mut out)?;
         }
@@ -525,6 +567,58 @@ impl UI {
             terminal::Clear(ClearType::FromCursorDown),
             EndSynchronizedUpdate
         )?;
+        out.flush()?;
+        Ok(())
+    }
+
+    /// Overlay a dtype-selection menu on the bottom two lines of a data view: a
+    /// strip of the available views with `current` highlighted, plus a hint
+    /// line. The data view behind it is a live preview of the highlighted view.
+    pub fn draw_dtype_menu(options: &[ViewDtype], current: usize) -> Result<()> {
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
+        let (_w, h) = terminal::size()?;
+
+        queue!(
+            out,
+            cursor::MoveTo(0, h.saturating_sub(2)),
+            terminal::Clear(ClearType::CurrentLine),
+            SetForegroundColor(palette::DIM)
+        )?;
+        write!(out, "view as:")?;
+        queue!(out, ResetColor)?;
+        for (i, opt) in options.iter().enumerate() {
+            if i == current {
+                // The selected entry is a highlighted "button".
+                queue!(
+                    out,
+                    SetAttribute(Attribute::Bold),
+                    SetForegroundColor(palette::SELECT_FG),
+                    SetBackgroundColor(palette::SELECT_BG)
+                )?;
+                write!(out, " {} ", opt.menu_label())?;
+                queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+            } else {
+                queue!(out, SetForegroundColor(palette::DIM))?;
+                write!(out, " {} ", opt.menu_label())?;
+                queue!(out, ResetColor)?;
+            }
+        }
+
+        queue!(
+            out,
+            cursor::MoveTo(0, h.saturating_sub(1)),
+            terminal::Clear(ClearType::CurrentLine)
+        )?;
+        hint_line(
+            &mut out,
+            &[
+                ("← → or d/D", "move"),
+                ("Enter", "apply"),
+                ("Esc", "cancel"),
+            ],
+        )?;
+
         out.flush()?;
         Ok(())
     }
@@ -746,8 +840,43 @@ fn write_view_footer(out: &mut impl Write, sample: &Sample, heatmap: bool) -> Re
         items.push(("Shift+← →", "jump 5%"));
         items.push(("/", "index or %"));
     }
+    if sample.overridable {
+        items.push(("d", "dtype"));
+    }
     items.push(("", "any other key to return..."));
     hint_line(out, &items)
+}
+
+/// Format a heatmap legend / range value: integers without a fractional part,
+/// floats with four decimals.
+fn fmt_value(v: f64, integer: bool) -> String {
+    if integer {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.4}")
+    }
+}
+
+/// Write the dtype shown in a data-view header. With no override this is just
+/// the stored dtype; when overridden it fades the original dtype and highlights
+/// the active reinterpretation, e.g. a dimmed `BF16 as` then a bold `u4 (packed)`.
+fn write_view_dtype(out: &mut impl Write, stored: &str, view: ViewDtype) -> Result<()> {
+    match view.label() {
+        Some(label) => {
+            queue!(out, SetForegroundColor(palette::DIM))?;
+            write!(out, "{stored} as ")?;
+            queue!(
+                out,
+                ResetColor,
+                SetAttribute(Attribute::Bold),
+                SetForegroundColor(palette::KEY)
+            )?;
+            write!(out, "{label}")?;
+            queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+        }
+        None => write!(out, "{stored}")?,
+    }
+    Ok(())
 }
 
 /// Write one capped section of the health panel: a titled list (in `color`) of

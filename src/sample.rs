@@ -10,6 +10,158 @@ use std::io::{Read, Seek, SeekFrom};
 
 use crate::tree::{Layout, TensorInfo};
 
+/// A user override for how a tensor's bytes are decoded, for visualization.
+///
+/// The stored dtype can misrepresent the data, so the user can reinterpret the
+/// raw bytes two ways:
+///
+/// * [`ViewDtype::As`] decodes each stored container as a *different same-width*
+///   dtype — e.g. show a `BF16`-tagged tensor as `F16` (both 16-bit). No shape
+///   change.
+/// * The 4-bit views handle quantized weights stored inside a wider container
+///   (e.g. gpt-oss MoE: 4-bit values in a `bf16`/`f16` slot). `*Lo`/`*Hi` take
+///   a single value from the low / high nibble of each container (formats
+///   differ on which nibble carries the data); `*Packed` unpacks every nibble
+///   densely (a 16-bit slot yields four values, expanding the last dimension).
+///
+/// Overrides only apply where we read raw bytes (safetensors); HDF5 always uses
+/// the stored dtype.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ViewDtype {
+    /// Decode using the tensor's real dtype.
+    #[default]
+    Stored,
+    /// Reinterpret each container as this (same byte width) dtype, e.g. `"F16"`.
+    As(&'static str),
+    /// Unsigned 4-bit, low nibble of each stored container.
+    U4Lo,
+    /// Unsigned 4-bit, high nibble of each stored container.
+    U4Hi,
+    /// Unsigned 4-bit, all nibbles packed densely (last dim ×(bytes·2)).
+    U4Packed,
+    /// Signed 4-bit (two's complement), low nibble of each stored container.
+    I4Lo,
+    /// Signed 4-bit, high nibble of each stored container.
+    I4Hi,
+    /// Signed 4-bit, all nibbles packed densely.
+    I4Packed,
+}
+
+impl ViewDtype {
+    /// Short label for the active override, or `None` when using the stored dtype.
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            ViewDtype::Stored => None,
+            ViewDtype::As(dt) => Some(dt),
+            ViewDtype::U4Lo => Some("u4 (low nibble)"),
+            ViewDtype::U4Hi => Some("u4 (high nibble)"),
+            ViewDtype::U4Packed => Some("u4 (packed)"),
+            ViewDtype::I4Lo => Some("i4 (low nibble)"),
+            ViewDtype::I4Hi => Some("i4 (high nibble)"),
+            ViewDtype::I4Packed => Some("i4 (packed)"),
+        }
+    }
+
+    /// A compact label for the selection menu (e.g. `stored`, `F16`, `u4·hi`).
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            ViewDtype::Stored => "stored",
+            ViewDtype::As(dt) => dt,
+            ViewDtype::U4Lo => "u4·lo",
+            ViewDtype::U4Hi => "u4·hi",
+            ViewDtype::U4Packed => "u4·packed",
+            ViewDtype::I4Lo => "i4·lo",
+            ViewDtype::I4Hi => "i4·hi",
+            ViewDtype::I4Packed => "i4·packed",
+        }
+    }
+
+    /// How many logical 4-bit values are unpacked from each stored container of
+    /// `item_bytes` bytes. `1` for everything except the packed 4-bit views,
+    /// which yield `item_bytes * 2` nibbles per container.
+    fn packing(self, item_bytes: usize) -> usize {
+        match self {
+            ViewDtype::U4Packed | ViewDtype::I4Packed => item_bytes * 2,
+            _ => 1,
+        }
+    }
+
+    fn is_signed(self) -> bool {
+        matches!(
+            self,
+            ViewDtype::I4Lo | ViewDtype::I4Hi | ViewDtype::I4Packed
+        )
+    }
+
+    /// Whether the decoded values are integers (so they should be shown without
+    /// a fractional part). True for the 4-bit views and for integer stored / `As`
+    /// dtypes; false for floats.
+    pub fn is_integer(self, stored: &str) -> bool {
+        match self {
+            ViewDtype::Stored => dtype_is_integer(stored),
+            ViewDtype::As(dt) => dtype_is_integer(dt),
+            _ => true, // all 4-bit views are integer-valued
+        }
+    }
+}
+
+impl ViewDtype {
+    /// The logical shape under this view: the stored `shape` with its last
+    /// dimension scaled by the packing factor. Unchanged unless this is a
+    /// packed 4-bit view (which unpacks several values per stored container).
+    pub fn logical_shape(self, shape: &[usize], stored_dtype: &str) -> Vec<usize> {
+        let packing = item_size(stored_dtype)
+            .map(|b| self.packing(b))
+            .unwrap_or(1);
+        let mut shape = shape.to_vec();
+        if packing > 1
+            && let Some(last) = shape.last_mut()
+        {
+            *last *= packing;
+        }
+        shape
+    }
+}
+
+/// Whether a dtype label denotes an integer (or boolean) type.
+fn dtype_is_integer(dtype: &str) -> bool {
+    matches!(
+        dtype,
+        "I8" | "U8" | "I16" | "U16" | "I32" | "U32" | "I64" | "U64" | "BOOL"
+    )
+}
+
+/// The ordered list of views to choose from for a tensor of the given stored
+/// dtype: the stored dtype, then the other same-width dtypes, then the 4-bit
+/// reinterpretations.
+pub fn view_options(stored: &str) -> Vec<ViewDtype> {
+    let mut opts = vec![ViewDtype::Stored];
+    // Same-width float/int reinterpretations (excluding the stored dtype).
+    let same_width: &[&str] = match item_size(stored) {
+        Some(1) => &["I8", "U8"],
+        Some(2) => &["F16", "BF16", "I16", "U16"],
+        Some(4) => &["F32", "I32", "U32"],
+        Some(8) => &["F64", "I64", "U64"],
+        _ => &[],
+    };
+    opts.extend(
+        same_width
+            .iter()
+            .copied()
+            .filter(|&dt| dt != stored)
+            .map(ViewDtype::As),
+    );
+    opts.extend([
+        ViewDtype::U4Lo,
+        ViewDtype::U4Hi,
+        ViewDtype::U4Packed,
+        ViewDtype::I4Lo,
+        ViewDtype::I4Hi,
+        ViewDtype::I4Packed,
+    ]);
+    opts
+}
+
 /// A downsampled grid of tensor values plus the original indices it came from.
 pub struct Sample {
     /// Original row indices that were sampled (logical rows).
@@ -28,18 +180,40 @@ pub struct Sample {
     pub slices: usize,
     /// The slice index this sample is from (0 for 1D/2D).
     pub slice: usize,
+    /// The dtype reinterpretation this sample was decoded with.
+    pub view: ViewDtype,
+    /// Whether a dtype override is available for this tensor (safetensors only).
+    pub overridable: bool,
 }
 
 /// Sample a 1D/2D/3D tensor into at most `max_rows` x `max_cols` values. For a
 /// 3D tensor `[d0, d1, d2]`, `slice` selects the leading index and the `d1 x d2`
-/// matrix at that index is sampled (clamped to a valid slice).
+/// matrix at that index is sampled (clamped to a valid slice). `view` overrides
+/// how bytes are decoded (e.g. as packed 4-bit), which for a packed view
+/// expands the last dimension; it only applies to safetensors.
 pub fn sample_tensor(
     t: &TensorInfo,
     max_rows: usize,
     max_cols: usize,
     slice: usize,
+    view: ViewDtype,
 ) -> Result<Sample, String> {
-    let (total_rows, total_cols, slices) = match t.shape.as_slice() {
+    let ext = std::path::Path::new(&t.source_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    // We can only reinterpret raw bytes for safetensors; elsewhere fall back to
+    // the stored dtype so the header never mislabels what's shown.
+    let overridable = ext == "safetensors";
+    let view = if overridable { view } else { ViewDtype::Stored };
+
+    // A packed override unpacks several 4-bit values from each stored element,
+    // expanding the innermost (last) dimension by that factor.
+    let packing = item_size(&t.dtype)
+        .map(|bytes| view.packing(bytes))
+        .unwrap_or(1);
+
+    let (total_rows, stored_cols, slices) = match t.shape.as_slice() {
         [n] => (1usize, *n, 1usize),
         [r, c] => (*r, *c, 1usize),
         [d0, d1, d2] => (*d1, *d2, *d0),
@@ -50,22 +224,19 @@ pub fn sample_tensor(
             ));
         }
     };
+    let total_cols = stored_cols * packing;
     if total_rows == 0 || total_cols == 0 || slices == 0 {
         return Err("tensor has no elements".to_string());
     }
     let slice = slice.min(slices - 1);
-    // Elements to skip to reach the chosen slice (0 for 1D/2D).
+    // Logical elements to skip to reach the chosen slice (0 for 1D/2D).
     let base = slice * total_rows * total_cols;
 
     let rows = sample_indices(total_rows, max_rows.max(1));
     let cols = sample_indices(total_cols, max_cols.max(1));
 
-    let ext = std::path::Path::new(&t.source_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
     let values = match ext {
-        "safetensors" => read_safetensors(t, total_cols, base, &rows, &cols)?,
+        "safetensors" => read_safetensors(t, total_cols, base, &rows, &cols, view)?,
         "h5" | "hdf5" => read_hdf5(t, total_cols, base, &rows, &cols)?,
         _ => return Err("data preview is not supported for this format".to_string()),
     };
@@ -94,6 +265,8 @@ pub fn sample_tensor(
         total_cols,
         slices,
         slice,
+        view,
+        overridable,
     })
 }
 
@@ -141,6 +314,36 @@ fn decode(dtype: &str, b: &[u8]) -> f64 {
     }
 }
 
+/// Decode sub-element `sub` of a stored container `bytes` under `view`. For
+/// `Stored`/`As` this decodes the whole container; for the 4-bit views it
+/// extracts one nibble of the little-endian container, sign-extending for the
+/// signed views. The packed views read nibble `sub`; the low/high views always
+/// read the least/most significant nibble (so `sub` is ignored).
+fn decode_view(view: ViewDtype, dtype: &str, bytes: &[u8], sub: usize) -> f64 {
+    match view {
+        ViewDtype::Stored => return decode(dtype, bytes),
+        // Same-width reinterpretation: decode the container as the chosen dtype.
+        ViewDtype::As(dt) => return decode(dt, bytes),
+        _ => {}
+    }
+    // Little-endian integer value of the container (up to 8 bytes).
+    let mut container: u64 = 0;
+    for (i, &b) in bytes.iter().take(8).enumerate() {
+        container |= (b as u64) << (8 * i);
+    }
+    let nib_index = match view {
+        ViewDtype::U4Packed | ViewDtype::I4Packed => sub,
+        ViewDtype::U4Hi | ViewDtype::I4Hi => bytes.len() * 2 - 1,
+        _ => 0, // low-nibble views
+    };
+    let nibble = ((container >> (nib_index * 4)) & 0xF) as i64;
+    if view.is_signed() && nibble >= 8 {
+        (nibble - 16) as f64
+    } else {
+        nibble as f64
+    }
+}
+
 /// bf16 is just the high 16 bits of an f32.
 fn bf16_to_f64(bits: u16) -> f64 {
     f32::from_bits((bits as u32) << 16) as f64
@@ -163,17 +366,24 @@ fn f16_to_f64(bits: u16) -> f64 {
 }
 
 /// Read sampled values from a safetensors file by seeking to each sampled row.
+///
+/// Indices are logical: under a packed `view`, `total_cols` and `cols` count
+/// 4-bit values, while the file stores `item`-byte containers each holding
+/// `packing` of them. So a logical element `flat` lives in container `flat /
+/// packing` at nibble `flat % packing`.
 fn read_safetensors(
     t: &TensorInfo,
     total_cols: usize,
     base: usize,
     rows: &[usize],
     cols: &[usize],
+    view: ViewDtype,
 ) -> Result<Vec<Vec<f64>>, String> {
     let Layout::ByteRange { start, .. } = t.layout else {
         return Err("tensor data location is unknown".to_string());
     };
     let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
+    let packing = view.packing(item);
 
     let mut file = std::fs::File::open(&t.source_path).map_err(|e| e.to_string())?;
     // The data blob begins after the 8-byte header length and the JSON header.
@@ -181,46 +391,46 @@ fn read_safetensors(
     file.read_exact(&mut len_buf).map_err(|e| e.to_string())?;
     let data_start = 8 + u64::from_le_bytes(len_buf) + start;
 
-    let first = *cols.first().unwrap();
-    let last = *cols.last().unwrap();
-    let span = last - first + 1;
-    let span_bytes = span * item;
+    let decode_at = |buf: &[u8], local_container: usize, sub: usize| {
+        let off = local_container * item;
+        decode_view(view, &t.dtype, &buf[off..off + item], sub)
+    };
 
     let mut out = Vec::with_capacity(rows.len());
-    // Read each sampled row's column span in one go when it's reasonably sized;
-    // otherwise fall back to one read per sampled element.
+    // Read each sampled row's container span in one go when it's reasonably
+    // sized; otherwise fall back to one read per sampled element.
     const MAX_SPAN: usize = 64 * 1024 * 1024;
-    if span_bytes <= MAX_SPAN {
-        let mut buf = vec![0u8; span_bytes];
-        for &r in rows {
-            let off = data_start
-                + (base as u64 + (r as u64) * (total_cols as u64) + (first as u64)) * (item as u64);
+    for &r in rows {
+        let row_base = base + r * total_cols;
+        let first_container = (row_base + *cols.first().unwrap()) / packing;
+        let last_container = (row_base + *cols.last().unwrap()) / packing;
+        let span_bytes = (last_container - first_container + 1) * item;
+
+        let row: Vec<f64> = if span_bytes <= MAX_SPAN {
+            let mut buf = vec![0u8; span_bytes];
+            let off = data_start + (first_container as u64) * (item as u64);
             file.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
             file.read_exact(&mut buf).map_err(|e| e.to_string())?;
-            let row = cols
-                .iter()
+            cols.iter()
                 .map(|&c| {
-                    decode(
-                        &t.dtype,
-                        &buf[(c - first) * item..(c - first) * item + item],
-                    )
+                    let flat = row_base + c;
+                    decode_at(&buf, flat / packing - first_container, flat % packing)
                 })
-                .collect();
-            out.push(row);
-        }
-    } else {
-        let mut buf = vec![0u8; item];
-        for &r in rows {
+                .collect()
+        } else {
+            // Per-element reads for very wide rows.
+            let mut buf = vec![0u8; item];
             let mut row = Vec::with_capacity(cols.len());
             for &c in cols {
-                let off = data_start
-                    + (base as u64 + (r as u64) * (total_cols as u64) + (c as u64)) * (item as u64);
+                let flat = row_base + c;
+                let off = data_start + ((flat / packing) as u64) * (item as u64);
                 file.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
                 file.read_exact(&mut buf).map_err(|e| e.to_string())?;
-                row.push(decode(&t.dtype, &buf));
+                row.push(decode_view(view, &t.dtype, &buf, flat % packing));
             }
-            out.push(row);
-        }
+            row
+        };
+        out.push(row);
     }
     Ok(out)
 }
@@ -310,9 +520,19 @@ mod tests {
         shape: &[usize],
         offsets: (u64, u64),
     ) -> TensorInfo {
+        fixture_dtype(path, name, "F32", shape, offsets)
+    }
+
+    fn fixture_dtype(
+        path: &std::path::Path,
+        name: &str,
+        dtype: &str,
+        shape: &[usize],
+        offsets: (u64, u64),
+    ) -> TensorInfo {
         TensorInfo {
             name: name.to_string(),
-            dtype: "F32".to_string(),
+            dtype: dtype.to_string(),
             shape: shape.to_vec(),
             size_bytes: (offsets.1 - offsets.0) as usize,
             num_elements: shape.iter().product(),
@@ -342,9 +562,10 @@ mod tests {
         drop(f);
 
         let t = fixture(&path, "w", &[4, 5], (0, 80));
-        let s = sample_tensor(&t, 10, 10, 0).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored).unwrap();
         assert_eq!((s.total_rows, s.total_cols), (4, 5));
         assert_eq!((s.slices, s.slice), (1, 0));
+        assert!(s.overridable && s.view == ViewDtype::Stored);
         assert_eq!(s.min, 0.0);
         assert_eq!(s.max, 19.0);
         for (i, &r) in s.rows.iter().enumerate() {
@@ -373,7 +594,7 @@ mod tests {
 
         let t = fixture(&path, "w", &[2, 3, 4], (0, 96));
         // Slice 1 is the matrix [[12..16],[16..20],[20..24]].
-        let s = sample_tensor(&t, 10, 10, 1).unwrap();
+        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored).unwrap();
         assert_eq!((s.total_rows, s.total_cols), (3, 4));
         assert_eq!((s.slices, s.slice), (2, 1));
         for (i, &r) in s.rows.iter().enumerate() {
@@ -382,7 +603,52 @@ mod tests {
             }
         }
         // An out-of-range slice clamps to the last one.
-        assert_eq!(sample_tensor(&t, 10, 10, 99).unwrap().slice, 1);
+        assert_eq!(
+            sample_tensor(&t, 10, 10, 99, ViewDtype::Stored)
+                .unwrap()
+                .slice,
+            1
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reinterprets_packed_4bit_views() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_explorer_sample_u4");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // Shape [2] of F16 (2-byte containers): u16 values 0x1234 and 0x00AB.
+        let header = br#"{"w":{"dtype":"F16","shape":[2],"data_offsets":[0,4]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        f.write_all(&0x1234u16.to_le_bytes()).unwrap();
+        f.write_all(&0x00ABu16.to_le_bytes()).unwrap();
+        drop(f);
+
+        let t = fixture_dtype(&path, "w", "F16", &[2], (0, 4));
+
+        // Low nibble of each container -> [0x4, 0xB]. Shape unchanged.
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Lo).unwrap();
+        assert_eq!(s.total_cols, 2);
+        assert_eq!(s.values[0], vec![4.0, 11.0]);
+
+        // High nibble (bits 12-15) of each container -> 0x1234->0x1, 0x00AB->0x0.
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Hi).unwrap();
+        assert_eq!(s.total_cols, 2);
+        assert_eq!(s.values[0], vec![1.0, 0.0]);
+
+        // Packed: four nibbles per 16-bit container, last dim ×4 -> 8 values.
+        // 0x1234 -> [4,3,2,1]; 0x00AB -> [11,10,0,0].
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Packed).unwrap();
+        assert_eq!(s.total_cols, 8);
+        assert_eq!(s.values[0], vec![4.0, 3.0, 2.0, 1.0, 11.0, 10.0, 0.0, 0.0]);
+
+        // Signed packed: nibbles >= 8 are negative (0xB->-5, 0xA->-6).
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::I4Packed).unwrap();
+        assert_eq!(s.values[0], vec![4.0, 3.0, 2.0, 1.0, -5.0, -6.0, 0.0, 0.0]);
+
         let _ = std::fs::remove_file(&path);
     }
 }
@@ -416,8 +682,10 @@ mod hdf5_tests {
             layout: Layout::None,
         };
         // libhdf5 converts the stored f32 to f64 on read.
-        let s = sample_tensor(&t, 10, 10, 0).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored).unwrap();
         assert_eq!((s.total_rows, s.total_cols), (4, 5));
+        // HDF5 cannot be byte-reinterpreted, so it is not overridable.
+        assert!(!s.overridable);
         for (i, &r) in s.rows.iter().enumerate() {
             for (j, &c) in s.cols.iter().enumerate() {
                 assert_eq!(s.values[i][j], (r * 5 + c) as f64);
