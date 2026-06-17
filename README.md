@@ -162,6 +162,25 @@ Both views sample a grid that fits the screen (they never read the whole tensor)
 Reading is supported for `safetensors` (any size) and HDF5 (`--features hdf5`,
 currently for datasets up to a size cap); GGUF data preview is not yet supported.
 
+#### Dtype override
+
+When the stored dtype misrepresents the data — common for quantized checkpoints
+where 4-bit weights are packed into a `bf16`/`f16` slot — press `d` (safetensors
+only) to open a menu of alternative interpretations, just for visualization.
+This works from both the tensor **detail** screen and the heatmap/numeric views;
+the detail screen updates its dtype, shape and parameter count to match. The menu
+previews each option live as you move through it (`←`/`→` or `d`/`D` to move,
+`Enter` to apply, `Esc` to cancel); the choice is remembered per tensor until you
+quit. Options for a 16-bit tensor:
+
+- another **same-width** dtype, e.g. view a `BF16` tensor as `F16` / `I16` / `U16`;
+- **`u4`/`i4` (low nibble)** or **(high nibble)** — one 4-bit value from the
+  low / high nibble of each slot (formats differ on which nibble holds the data);
+- **`u4`/`i4` (packed)** — every nibble unpacked densely, so each 16-bit slot
+  yields four values and the last dimension grows ×4.
+
+The header shows the active reinterpretation (e.g. `BF16 as u4 (packed)`).
+
 ## Example Output
 
 ```

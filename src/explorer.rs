@@ -8,13 +8,15 @@ use crossterm::{
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use std::{
-    collections::{BTreeSet, HashSet},
+    cell::RefCell,
+    collections::{BTreeSet, HashMap, HashSet},
     fs::File,
     io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 
 use crate::gguf::GGUFFile;
+use crate::sample::ViewDtype;
 
 use crate::tree::{
     Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key,
@@ -39,6 +41,9 @@ pub struct Explorer {
     copied_flash: Option<String>,
     /// Index/file mismatches detected at startup, shown as a warning panel.
     health_reports: Vec<crate::health::HealthReport>,
+    /// Per-tensor dtype reinterpretation chosen in the data views, keyed by
+    /// tensor name. Session-scoped: remembered until the app exits.
+    dtype_overrides: RefCell<HashMap<String, ViewDtype>>,
 }
 
 impl Explorer {
@@ -57,6 +62,7 @@ impl Explorer {
             filtered_tree: Vec::new(),
             copied_flash: None,
             health_reports,
+            dtype_overrides: RefCell::new(HashMap::new()),
         }
     }
 
@@ -705,10 +711,17 @@ impl Explorer {
     }
 
     fn show_tensor_detail(&self, tensor: &TensorInfo) {
-        // Detail screen with sub-views: `m` heatmap, `v` numeric values, any
-        // other key returns to the tree.
+        // Detail screen with sub-views: `m` heatmap, `v` numeric values, `d`
+        // reinterpret dtype, any other key returns to the tree.
+        let overridable = dtype_overridable(tensor);
         loop {
-            if UI::draw_tensor_detail(tensor).is_err() {
+            let view = self
+                .dtype_overrides
+                .borrow()
+                .get(&tensor.name)
+                .copied()
+                .unwrap_or(ViewDtype::Stored);
+            if UI::draw_tensor_detail(tensor, view, overridable).is_err() {
                 return;
             }
             match event::read() {
@@ -721,6 +734,20 @@ impl Explorer {
                     code: KeyCode::Char('v'),
                     ..
                 })) => self.show_tensor_data(tensor, false),
+                // Reinterpret the dtype from the detail screen too (safetensors).
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Char('d') | KeyCode::Char('D'),
+                    ..
+                })) if overridable => {
+                    if let Some(chosen) = self.prompt_dtype(tensor, DtypePreview::Detail) {
+                        let mut overrides = self.dtype_overrides.borrow_mut();
+                        if chosen == ViewDtype::Stored {
+                            overrides.remove(&tensor.name);
+                        } else {
+                            overrides.insert(tensor.name.clone(), chosen);
+                        }
+                    }
+                }
                 Ok(Event::Key(_)) => return,
                 Ok(_) => {} // resize etc.: just redraw the detail
                 Err(_) => return,
@@ -738,45 +765,30 @@ impl Explorer {
         let mut heatmap = heatmap;
         let mut slice = 0usize;
         loop {
-            let (cols, rows) = terminal::size().unwrap_or((100, 40));
-            let text_rows = (rows as usize).saturating_sub(8).max(1);
-            let sampled = if heatmap {
-                let max_cols = (cols as usize).saturating_sub(1).max(1);
-                // The heatmap packs two data rows per text line (half blocks),
-                // so it can sample twice as many rows as there are lines.
-                crate::sample::sample_tensor(tensor, text_rows * 2, max_cols, slice)
-            } else {
-                // Numeric cells are ~11 wide plus a row-index column.
-                let max_cols = ((cols as usize).saturating_sub(7) / 11).max(1);
-                crate::sample::sample_tensor(tensor, text_rows, max_cols, slice)
-            };
+            // The dtype reinterpretation remembered for this tensor, if any.
+            let view = self
+                .dtype_overrides
+                .borrow()
+                .get(&tensor.name)
+                .copied()
+                .unwrap_or(ViewDtype::Stored);
 
-            // The number of slices to navigate between (1 unless this is 3D);
-            // also reflects clamping of `slice` done inside the sampler.
-            let slices = match &sampled {
-                Ok(s) => {
-                    slice = s.slice;
-                    s.slices
+            // (slices, overridable, clamped slice) on success.
+            let (slices, overridable) = match self.draw_data_view(tensor, heatmap, slice, view) {
+                Ok((slices, overridable, clamped)) => {
+                    slice = clamped;
+                    (slices, overridable)
                 }
-                Err(_) => 1,
+                Err(msg) => {
+                    let _ = UI::draw_message("Data preview unavailable", &msg);
+                    if let Ok(Event::Key(key)) = event::read()
+                        && is_ctrl_c(&key)
+                    {
+                        quit_immediately();
+                    }
+                    return;
+                }
             };
-
-            let result = sampled.and_then(|s| {
-                if heatmap {
-                    UI::draw_heatmap(tensor, &s).map_err(|e| e.to_string())
-                } else {
-                    UI::draw_values(tensor, &s).map_err(|e| e.to_string())
-                }
-            });
-            if let Err(msg) = result {
-                let _ = UI::draw_message("Data preview unavailable", &msg);
-                if let Ok(Event::Key(key)) = event::read()
-                    && is_ctrl_c(&key)
-                {
-                    quit_immediately();
-                }
-                return;
-            }
 
             match event::read() {
                 Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
@@ -788,6 +800,19 @@ impl Explorer {
                         // Switch representation in place, keeping the current slice.
                         KeyCode::Char('m') => heatmap = true,
                         KeyCode::Char('v') => heatmap = false,
+                        // Open the dtype menu (safetensors only); `d` or `D`.
+                        KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
+                            if let Some(chosen) =
+                                self.prompt_dtype(tensor, DtypePreview::Data { heatmap, slice })
+                            {
+                                let mut overrides = self.dtype_overrides.borrow_mut();
+                                if chosen == ViewDtype::Stored {
+                                    overrides.remove(&tensor.name);
+                                } else {
+                                    overrides.insert(tensor.name.clone(), chosen);
+                                }
+                            }
+                        }
                         // Jump straight to a slice by typing its index.
                         KeyCode::Char('/') if slices > 1 => {
                             if let Some(n) = self.prompt_slice(slices) {
@@ -813,6 +838,83 @@ impl Explorer {
                 }
                 Ok(_) => {} // resize etc.: re-sample and redraw the same slice
                 Err(_) => return,
+            }
+        }
+    }
+
+    /// Sample and draw the heatmap (`heatmap = true`) or numeric grid for
+    /// `(slice, view)`, sized to the terminal. Returns `(slices, overridable,
+    /// clamped_slice)` on success, or an error message for the caller to show.
+    /// Shared by the data-view loop and the dtype menu's live preview.
+    fn draw_data_view(
+        &self,
+        tensor: &TensorInfo,
+        heatmap: bool,
+        slice: usize,
+        view: ViewDtype,
+    ) -> Result<(usize, bool, usize), String> {
+        let (cols, rows) = terminal::size().unwrap_or((100, 40));
+        let text_rows = (rows as usize).saturating_sub(8).max(1);
+        let sample = if heatmap {
+            let max_cols = (cols as usize).saturating_sub(1).max(1);
+            // The heatmap packs two data rows per text line (half blocks),
+            // so it can sample twice as many rows as there are lines.
+            crate::sample::sample_tensor(tensor, text_rows * 2, max_cols, slice, view)?
+        } else {
+            // Numeric cells are ~11 wide plus a row-index column.
+            let max_cols = ((cols as usize).saturating_sub(7) / 11).max(1);
+            crate::sample::sample_tensor(tensor, text_rows, max_cols, slice, view)?
+        };
+        let info = (sample.slices, sample.overridable, sample.slice);
+        if heatmap {
+            UI::draw_heatmap(tensor, &sample).map_err(|e| e.to_string())?;
+        } else {
+            UI::draw_values(tensor, &sample).map_err(|e| e.to_string())?;
+        }
+        Ok(info)
+    }
+
+    /// Open the dtype-selection menu with a live preview, returning the chosen
+    /// view or `None` if cancelled. `d`/→ move forward, `D`/← back (the menu is
+    /// horizontal); Enter applies, Esc cancels. Ctrl-C quits the app. The
+    /// preview re-renders whichever screen the menu was opened from.
+    fn prompt_dtype(&self, tensor: &TensorInfo, preview: DtypePreview) -> Option<ViewDtype> {
+        let options = crate::sample::view_options(&tensor.dtype);
+        if options.is_empty() {
+            return None;
+        }
+        let current = self
+            .dtype_overrides
+            .borrow()
+            .get(&tensor.name)
+            .copied()
+            .unwrap_or(ViewDtype::Stored);
+        let mut idx = options.iter().position(|v| *v == current).unwrap_or(0);
+        loop {
+            // Live preview of the highlighted view, then the menu overlay.
+            let preview_ok = match preview {
+                DtypePreview::Detail => UI::draw_tensor_detail(tensor, options[idx], true).is_ok(),
+                DtypePreview::Data { heatmap, slice } => self
+                    .draw_data_view(tensor, heatmap, slice, options[idx])
+                    .is_ok(),
+            };
+            if !preview_ok {
+                return None;
+            }
+            let _ = UI::draw_dtype_menu(&options, idx);
+            match event::read() {
+                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+                Ok(Event::Key(KeyEvent { code, .. })) => match code {
+                    KeyCode::Right | KeyCode::Char('d') => idx = (idx + 1) % options.len(),
+                    KeyCode::Left | KeyCode::Char('D') => {
+                        idx = (idx + options.len() - 1) % options.len()
+                    }
+                    KeyCode::Enter => return Some(options[idx]),
+                    KeyCode::Esc => return None,
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(_) => return None,
             }
         }
     }
@@ -877,6 +979,22 @@ impl Explorer {
             }
         }
     }
+}
+
+/// Which screen the dtype menu re-renders as its live preview.
+#[derive(Clone, Copy)]
+enum DtypePreview {
+    Detail,
+    Data { heatmap: bool, slice: usize },
+}
+
+/// Whether a tensor's dtype can be reinterpreted — only safetensors, where we
+/// read the raw bytes ourselves (HDF5 values come pre-decoded via `read_raw`).
+fn dtype_overridable(tensor: &TensorInfo) -> bool {
+    std::path::Path::new(&tensor.source_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        == Some("safetensors")
 }
 
 /// How many slices one Shift+arrow jump moves: about 5% of the total, at
