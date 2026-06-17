@@ -117,16 +117,17 @@ checkpoint-explorer model.safetensors checkpoint-*.safetensors
 | `Enter` / `Space` | Expand/collapse groups, view tensor details |
 | `E` / `C` | Expand all / collapse all groups |
 | `/` | Enter search mode to filter tensors |
-| `c` | Copy the selected tensor's file path to the clipboard |
+| `c` | Copy the selected row's path (tensor file, or a group/root's file or directory) |
 | `h` | Show the checkpoint health report (when there is a mismatch) |
 | `Esc` | Exit search mode |
 | `q` | Quit the application (or exit search mode if active) |
 | `Ctrl+C` | Force quit |
 
-A status bar above the footer always shows the file the tensor under the
-cursor lives in (or, for a group, how many files its tensors span). Pressing
-`c` copies that path to the clipboard via the OSC 52 terminal escape, so it
-works over SSH/tmux when the terminal supports it.
+A status bar pinned to the bottom shows the file the selected tensor lives in
+(or, for a group/root, the single file or the shared directory of its tensors).
+Pressing `c` copies that path to the clipboard via the OSC 52 terminal escape —
+so copying the root yields the file or the checkpoint directory — and it works
+over SSH/tmux when the terminal supports it.
 
 ### Search Feature
 
