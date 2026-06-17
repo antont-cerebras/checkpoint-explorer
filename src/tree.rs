@@ -14,6 +14,24 @@ pub enum Storage {
     Compressed { codec: String, stored_bytes: usize },
 }
 
+/// Where a tensor's data sits within its file, by format.
+// `Chunked` is only constructed by the HDF5 reader.
+#[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub enum Layout {
+    /// Layout not tracked.
+    None,
+    /// safetensors: `[start, end)` byte range within the file's data blob.
+    ByteRange { start: u64, end: u64 },
+    /// GGUF: byte offset of the tensor's data within the tensor-data region.
+    Offset(u64),
+    /// HDF5: chunked storage with the given chunk shape and chunk count.
+    Chunked {
+        chunk: Vec<usize>,
+        num_chunks: usize,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct TensorInfo {
     pub name: String,
@@ -26,6 +44,8 @@ pub struct TensorInfo {
     pub storage: Storage,
     /// Absolute path of the file this tensor was loaded from.
     pub source_path: String,
+    /// Where the tensor's data lives within its file.
+    pub layout: Layout,
 }
 
 impl TensorInfo {

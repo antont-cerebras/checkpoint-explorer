@@ -7,7 +7,7 @@ use crossterm::{
 use std::io::{self, BufWriter, Write};
 
 use crate::health::HealthReport;
-use crate::tree::{MetadataInfo, Storage, TensorInfo, TreeNode};
+use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo, TreeNode};
 use crate::utils::{format_parameters, format_shape, format_size};
 
 pub struct DrawConfig<'a> {
@@ -254,7 +254,62 @@ impl UI {
         writeln!(stdout, "Name: {}\r", tensor.name)?;
         writeln!(stdout, "Data Type: {}\r", tensor.dtype)?;
         writeln!(stdout, "Shape: {}\r", format_shape(&tensor.shape))?;
+        writeln!(
+            stdout,
+            "Parameters: {} ({})\r",
+            format_parameters(tensor.num_elements),
+            with_thousands(tensor.num_elements)
+        )?;
         writeln!(stdout, "Size: {}\r", format_size(tensor.size_bytes))?;
+        // On-disk size + codec, for formats that track compression (HDF5).
+        match &tensor.storage {
+            Storage::Compressed {
+                codec,
+                stored_bytes,
+            } => {
+                writeln!(
+                    stdout,
+                    "On disk: {} ({codec})\r",
+                    format_size(*stored_bytes)
+                )?;
+            }
+            Storage::Raw => {
+                writeln!(
+                    stdout,
+                    "On disk: {} (uncompressed)\r",
+                    format_size(tensor.size_bytes)
+                )?;
+            }
+            Storage::Unknown => {}
+        }
+        // Where the data lives within the file.
+        match &tensor.layout {
+            Layout::ByteRange { start, end } => {
+                writeln!(
+                    stdout,
+                    "Data offsets: {} – {}  (within file data)\r",
+                    with_thousands(*start as usize),
+                    with_thousands(*end as usize)
+                )?;
+            }
+            Layout::Offset(offset) => {
+                writeln!(
+                    stdout,
+                    "Data offset: {}  (within tensor data)\r",
+                    with_thousands(*offset as usize)
+                )?;
+            }
+            Layout::Chunked { chunk, num_chunks } => {
+                writeln!(
+                    stdout,
+                    "Chunks: {} × {}\r",
+                    format_shape(chunk),
+                    with_thousands(*num_chunks)
+                )?;
+            }
+            Layout::None => {}
+        }
+        writeln!(stdout, "File: {}\r", tensor.source_path)?;
         writeln!(stdout, "\r")?;
         writeln!(stdout, "Press any key to return...\r")?;
 
@@ -413,4 +468,18 @@ fn truncate_keep_end(s: &str, width: usize) -> String {
     }
     let tail: String = s.chars().skip(count - (width - 1)).collect();
     format!("…{tail}")
+}
+
+/// Format an integer with thousands separators (e.g. 579133440 -> "579,133,440").
+fn with_thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let len = digits.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
