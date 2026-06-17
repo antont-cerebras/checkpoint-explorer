@@ -90,16 +90,13 @@ impl UI {
         write!(out, "\r\n")?;
         queue!(out, terminal::Clear(ClearType::CurrentLine))?;
         if config.search_mode {
-            let query = if config.search_query.is_empty() {
-                "_"
-            } else {
-                config.search_query
-            };
-            write!(out, "SEARCH MODE: {query} | Type to search, ")?;
-            key_hint(&mut out, "Enter")?;
-            write!(out, " to view, ")?;
-            key_hint(&mut out, "Esc/q")?;
-            write!(out, " to exit\r\n")?;
+            queue!(out, SetForegroundColor(palette::DIM))?;
+            write!(out, "Search ")?;
+            queue!(out, ResetColor)?;
+            input_box(&mut out, config.search_query, 16)?;
+            write!(out, "  ")?;
+            hint_line(&mut out, &[("Enter", "view"), ("Esc/q", "exit")])?;
+            write!(out, "\r\n")?;
         } else {
             hint_line(
                 &mut out,
@@ -644,17 +641,7 @@ impl UI {
         write!(out, "(0-{} or 0-100%)", slices.saturating_sub(1))?;
         queue!(out, ResetColor)?;
         write!(out, "  ")?;
-        // The input box: a fixed-width highlighted field with a block cursor.
-        queue!(
-            out,
-            SetBackgroundColor(palette::INPUT_BG),
-            SetForegroundColor(palette::INPUT_FG)
-        )?;
-        write!(out, " {input}█ ")?;
-        for _ in input.len()..5 {
-            write!(out, " ")?;
-        }
-        queue!(out, ResetColor)?;
+        input_box(&mut out, input, 5)?;
         write!(out, "  ")?;
         key_hint(&mut out, "Enter")?;
         queue!(out, SetForegroundColor(palette::DIM))?;
@@ -845,6 +832,24 @@ fn write_view_footer(out: &mut impl Write, sample: &Sample, heatmap: bool) -> Re
     }
     items.push(("", "any other key to return..."));
     hint_line(out, &items)
+}
+
+/// Render a text-input field: the typed `text` plus a block cursor, on the
+/// input palette colours, padded to at least `min_chars` characters wide. Used
+/// by the search bar and the slice-jump prompt so every input box matches.
+fn input_box(out: &mut impl Write, text: &str, min_chars: usize) -> Result<()> {
+    queue!(
+        out,
+        SetBackgroundColor(palette::INPUT_BG),
+        SetForegroundColor(palette::INPUT_FG)
+    )?;
+    write!(out, " {text}█")?;
+    for _ in text.chars().count()..min_chars {
+        write!(out, " ")?;
+    }
+    write!(out, " ")?;
+    queue!(out, ResetColor)?;
+    Ok(())
 }
 
 /// Format a heatmap legend / range value: integers without a fractional part,
