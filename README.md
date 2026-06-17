@@ -136,7 +136,7 @@ Press `/` to enter search mode and start typing to filter tensors by name. The s
 - Shows results in a **flat list** with full tensor names
 - Sorts by **relevance** - best matches appear first
 
-Press `Enter` or `Esc` to exit search mode and return to the full tree view.
+Press `Enter` to open the highlighted result's details (you stay in search), and `Esc` or `q` to exit search mode and return to the full tree view.
 
 ## Example Output
 
