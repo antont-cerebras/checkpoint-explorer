@@ -431,6 +431,19 @@ impl Explorer {
                     KeyEvent {
                         code: KeyCode::Esc, ..
                     } if self.search_mode => self.exit_search_mode(),
+                    // Shift+↑/↓ jump to the previous/next sibling (same depth,
+                    // same parent). These must precede the plain arrow arms,
+                    // which match any modifiers.
+                    KeyEvent {
+                        code: KeyCode::Up,
+                        modifiers: KeyModifiers::SHIFT,
+                        ..
+                    } => self.move_to_sibling(false),
+                    KeyEvent {
+                        code: KeyCode::Down,
+                        modifiers: KeyModifiers::SHIFT,
+                        ..
+                    } => self.move_to_sibling(true),
                     KeyEvent {
                         code: KeyCode::Up, ..
                     } => self.move_selection(-1),
@@ -438,6 +451,16 @@ impl Explorer {
                         code: KeyCode::Down,
                         ..
                     } => self.move_selection(1),
+                    // ← jumps to the parent group; → enters the group (its
+                    // first child), expanding it first if collapsed.
+                    KeyEvent {
+                        code: KeyCode::Left,
+                        ..
+                    } => self.move_to_parent(),
+                    KeyEvent {
+                        code: KeyCode::Right,
+                        ..
+                    } => self.move_to_first_child(),
                     KeyEvent {
                         code: KeyCode::Enter,
                         ..
@@ -546,6 +569,88 @@ impl Explorer {
         };
 
         self.selected_idx = new_idx;
+    }
+
+    /// Move the cursor to the parent group of the selected row (the nearest
+    /// preceding row at a shallower depth). No-op at the top level.
+    fn move_to_parent(&mut self) {
+        let tree = if self.search_mode {
+            &self.filtered_tree
+        } else {
+            &self.flattened_tree
+        };
+        let Some(&(_, depth)) = tree.get(self.selected_idx) else {
+            return;
+        };
+        if depth == 0 {
+            return;
+        }
+        if let Some(parent) = (0..self.selected_idx).rev().find(|&i| tree[i].1 < depth) {
+            self.selected_idx = parent;
+        }
+    }
+
+    /// Move the cursor to the next/previous sibling: the nearest row at the
+    /// same depth before a shallower row (i.e. without leaving the parent).
+    fn move_to_sibling(&mut self, forward: bool) {
+        let tree = if self.search_mode {
+            &self.filtered_tree
+        } else {
+            &self.flattened_tree
+        };
+        let Some(&(_, depth)) = tree.get(self.selected_idx) else {
+            return;
+        };
+
+        let indices: Vec<usize> = if forward {
+            (self.selected_idx + 1..tree.len()).collect()
+        } else {
+            (0..self.selected_idx).rev().collect()
+        };
+        for i in indices {
+            let d = tree[i].1;
+            if d < depth {
+                break; // left the parent: no sibling in this direction
+            }
+            if d == depth {
+                self.selected_idx = i;
+                break;
+            }
+            // d > depth: a descendant, keep scanning
+        }
+    }
+
+    /// Enter the selected group: expand it if collapsed, then move the cursor
+    /// to its first child. No-op for leaf rows or empty groups (and in search
+    /// mode, where the list is flat).
+    fn move_to_first_child(&mut self) {
+        if self.search_mode {
+            return;
+        }
+        let (expanded, has_children, depth) = match self.flattened_tree.get(self.selected_idx) {
+            Some((
+                TreeNode::Group {
+                    expanded, children, ..
+                },
+                depth,
+            )) => (*expanded, !children.is_empty(), *depth),
+            _ => return,
+        };
+        if !has_children {
+            return;
+        }
+        if !expanded {
+            let mut tree_clone = self.tree.clone();
+            let _ = TreeBuilder::toggle_node_by_index(self.selected_idx, &mut tree_clone);
+            self.tree = tree_clone;
+            self.flatten_tree();
+        }
+        // The first child is the next row, one level deeper.
+        if let Some((_, child_depth)) = self.flattened_tree.get(self.selected_idx + 1)
+            && *child_depth == depth + 1
+        {
+            self.selected_idx += 1;
+        }
     }
 
     fn enter_search_mode(&mut self) {
@@ -657,4 +762,118 @@ fn copy_to_clipboard(text: &str) {
     let mut stdout = io::stdout();
     let _ = write!(stdout, "\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an explorer whose flattened tree has the given row depths (the
+    /// node contents don't matter for coarse navigation, only the depths).
+    fn explorer_with_depths(depths: &[usize]) -> Explorer {
+        let mut e = Explorer::new(Vec::new(), Vec::new());
+        e.flattened_tree = depths
+            .iter()
+            .map(|&d| {
+                (
+                    TreeNode::Group {
+                        name: String::new(),
+                        children: Vec::new(),
+                        expanded: false,
+                        tensor_count: 0,
+                        total_size: 0,
+                        stored_size: 0,
+                    },
+                    d,
+                )
+            })
+            .collect();
+        e
+    }
+
+    // Depths:  0:0  1:1  2:1  3:2  4:1  5:0
+    #[test]
+    fn move_to_parent_jumps_to_the_nearest_shallower_row() {
+        let mut e = explorer_with_depths(&[0, 1, 1, 2, 1, 0]);
+
+        e.selected_idx = 3;
+        e.move_to_parent();
+        assert_eq!(e.selected_idx, 2);
+
+        e.selected_idx = 1;
+        e.move_to_parent();
+        assert_eq!(e.selected_idx, 0);
+
+        // Top-level row has no parent.
+        e.selected_idx = 0;
+        e.move_to_parent();
+        assert_eq!(e.selected_idx, 0);
+    }
+
+    #[test]
+    fn move_to_sibling_skips_descendants_and_stops_at_the_parent_boundary() {
+        let mut e = explorer_with_depths(&[0, 1, 1, 2, 1, 0]);
+
+        // Forward from idx2 (depth 1) skips the descendant idx3 (depth 2).
+        e.selected_idx = 2;
+        e.move_to_sibling(true);
+        assert_eq!(e.selected_idx, 4);
+
+        // Forward from idx4: the next row (idx5) is shallower, so no sibling.
+        e.selected_idx = 4;
+        e.move_to_sibling(true);
+        assert_eq!(e.selected_idx, 4);
+
+        // Backward from idx4 lands on idx2, skipping idx3.
+        e.selected_idx = 4;
+        e.move_to_sibling(false);
+        assert_eq!(e.selected_idx, 2);
+    }
+
+    fn group(depth: usize, expanded: bool, child: bool) -> (TreeNode, usize) {
+        let children = if child {
+            vec![TreeNode::Group {
+                name: String::new(),
+                children: Vec::new(),
+                expanded: false,
+                tensor_count: 0,
+                total_size: 0,
+                stored_size: 0,
+            }]
+        } else {
+            Vec::new()
+        };
+        (
+            TreeNode::Group {
+                name: String::new(),
+                children,
+                expanded,
+                tensor_count: 0,
+                total_size: 0,
+                stored_size: 0,
+            },
+            depth,
+        )
+    }
+
+    #[test]
+    fn move_to_first_child_enters_an_expanded_group() {
+        let mut e = Explorer::new(Vec::new(), Vec::new());
+        // idx0: expanded group with a child; idx1: that child (depth 1);
+        // idx2: a childless group at depth 0.
+        e.flattened_tree = vec![
+            group(0, true, true),
+            group(1, false, false),
+            group(0, false, false),
+        ];
+
+        e.selected_idx = 0;
+        e.move_to_first_child();
+        assert_eq!(e.selected_idx, 1);
+
+        // A group with no children does not move.
+        e.selected_idx = 2;
+        e.move_to_first_child();
+        assert_eq!(e.selected_idx, 2);
+    }
 }

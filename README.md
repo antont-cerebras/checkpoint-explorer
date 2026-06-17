@@ -111,6 +111,9 @@ checkpoint-explorer model.safetensors checkpoint-*.safetensors
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` | Navigate up/down through the tree |
+| `←` | Jump to the parent group |
+| `→` | Enter the group (expand if needed) and select its first child |
+| `Shift`+`↑` / `Shift`+`↓` | Jump to the previous / next sibling |
 | `Enter` / `Space` | Expand/collapse groups, view tensor details |
 | `E` / `C` | Expand all / collapse all groups |
 | `/` | Enter search mode to filter tensors |
