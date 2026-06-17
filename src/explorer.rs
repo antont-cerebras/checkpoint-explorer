@@ -16,7 +16,9 @@ use std::{
 
 use crate::gguf::GGUFFile;
 
-use crate::tree::{MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key};
+use crate::tree::{
+    Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key,
+};
 use crate::ui::{DrawConfig, UI};
 use crate::utils::base64_encode;
 
@@ -171,16 +173,18 @@ impl Explorer {
                         .collect()
                 })
                 .unwrap_or_default();
-            let size_bytes = value
+            let data_offsets = value
                 .get("data_offsets")
                 .and_then(|v| v.as_array())
                 .filter(|offsets| offsets.len() == 2)
-                .and_then(|offsets| {
-                    let start = offsets[0].as_u64()?;
-                    let end = offsets[1].as_u64()?;
-                    Some(end.saturating_sub(start) as usize)
-                })
+                .and_then(|offsets| Some((offsets[0].as_u64()?, offsets[1].as_u64()?)));
+            let size_bytes = data_offsets
+                .map(|(start, end)| end.saturating_sub(start) as usize)
                 .unwrap_or(0);
+            let layout = match data_offsets {
+                Some((start, end)) => Layout::ByteRange { start, end },
+                None => Layout::None,
+            };
             let num_elements = shape.iter().product::<usize>();
 
             self.tensors.push(TensorInfo {
@@ -191,6 +195,7 @@ impl Explorer {
                 num_elements,
                 storage: Storage::Unknown,
                 source_path: source_path.clone(),
+                layout,
             });
         }
 
@@ -252,6 +257,7 @@ impl Explorer {
                 num_elements,
                 storage: Storage::Unknown,
                 source_path: source_path.clone(),
+                layout: Layout::Offset(tensor.offset),
             });
         }
 

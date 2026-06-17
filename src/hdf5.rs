@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use hdf5_metno::filters::Filter;
 use hdf5_metno::types::TypeDescriptor;
 
-use crate::tree::{Storage, TensorInfo};
+use crate::tree::{Layout, Storage, TensorInfo};
 
 /// Read tensor metadata (name, dtype, shape, logical + on-disk size) from an
 /// HDF5 checkpoint.
@@ -71,6 +71,13 @@ pub fn read_tensors(path: &std::path::Path) -> Result<Vec<TensorInfo>> {
             None => Storage::Raw,
         };
 
+        // HDF5 data is chunked rather than a flat slice; report the chunk shape
+        // and count when present.
+        let layout = match (dataset.chunk(), dataset.num_chunks()) {
+            (Some(chunk), Some(num_chunks)) => Layout::Chunked { chunk, num_chunks },
+            _ => Layout::None,
+        };
+
         tensors.push(TensorInfo {
             name: percent_decode(&key),
             dtype,
@@ -79,6 +86,7 @@ pub fn read_tensors(path: &std::path::Path) -> Result<Vec<TensorInfo>> {
             num_elements,
             storage,
             source_path: source_path.clone(),
+            layout,
         });
     }
 
@@ -272,6 +280,8 @@ mod tests {
             }
             other => panic!("expected compressed storage, got {other:?}"),
         }
+        // The compressed dataset is chunked, so its layout is reported.
+        assert!(matches!(comp.layout, crate::tree::Layout::Chunked { .. }));
 
         let _ = std::fs::remove_file(&path);
     }
