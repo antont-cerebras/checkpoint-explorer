@@ -38,7 +38,6 @@ pub struct DrawConfig<'a> {
     pub current_file: &'a str,
     pub file_idx: usize,
     pub total_files: usize,
-    pub total_parameters: usize,
     pub selected_idx: usize,
     pub scroll_offset: usize,
     pub search_mode: bool,
@@ -66,7 +65,9 @@ impl UI {
 
         let (terminal_width, terminal_height) = terminal::size()?;
         let header_height = 3;
-        let footer_height = 2;
+        // One bottom line for the status bar (the per-checkpoint totals now live
+        // in the tree root instead of a footer).
+        let footer_height = 1;
         let available_height =
             (terminal_height as usize).saturating_sub(header_height + footer_height);
 
@@ -154,17 +155,10 @@ impl UI {
         // Wipe any rows left over from a previous, taller frame.
         queue!(out, terminal::Clear(ClearType::FromCursorDown))?;
 
-        // Status bar (line above the footer): source file of the selected row.
-        // Truncate keeping the tail so the file name stays visible.
-        queue!(out, cursor::MoveTo(0, terminal_height.saturating_sub(2)))?;
-        write!(
-            out,
-            "{}",
-            truncate_keep_end(config.status_bar, terminal_width as usize)
-        )?;
-
-        // Footer pinned to the bottom line (no trailing newline, to avoid scrolling).
-        queue!(out, cursor::MoveTo(0, terminal_height - 1))?;
+        // Status bar pinned to the bottom line (no trailing newline, to avoid
+        // scrolling): the source file(s)/directory of the selected row, or the
+        // empty-search message. Truncate keeping the tail so names stay visible.
+        queue!(out, cursor::MoveTo(0, terminal_height.saturating_sub(1)))?;
         if config.search_mode && config.tree.is_empty() {
             write!(
                 out,
@@ -176,12 +170,8 @@ impl UI {
         } else {
             write!(
                 out,
-                "Total Parameters: {} | Selected: {}/{} | Scroll: {} | Matches: {}\r",
-                format_parameters(config.total_parameters),
-                config.selected_idx + 1,
-                config.tree.len(),
-                new_scroll_offset,
-                config.tree.len()
+                "{}",
+                truncate_keep_end(config.status_bar, terminal_width as usize)
             )?;
         }
 
@@ -199,6 +189,7 @@ impl UI {
                 children,
                 expanded,
                 tensor_count,
+                params,
                 total_size,
                 stored_size,
             } => {
@@ -222,11 +213,21 @@ impl UI {
                 } else {
                     format_size(*total_size)
                 };
-                writeln!(
-                    out,
-                    "{}{} 📁 {} ({}{} tensors, {})\r",
-                    indent, icon, name, layer_prefix, tensor_count, size_field
-                )?;
+                if depth == 0 {
+                    // The checkpoint root: summarise the whole model, including
+                    // the total parameter count (which used to live in a footer).
+                    writeln!(
+                        out,
+                        "{icon} 📦 {name} ({tensor_count} tensors, {} params, {size_field})\r",
+                        format_parameters(*params)
+                    )?;
+                } else {
+                    writeln!(
+                        out,
+                        "{}{} 📁 {} ({}{} tensors, {})\r",
+                        indent, icon, name, layer_prefix, tensor_count, size_field
+                    )?;
+                }
             }
             TreeNode::Tensor { info } => {
                 // In search mode (depth 0), show full name; otherwise show short name

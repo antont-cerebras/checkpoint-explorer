@@ -188,24 +188,28 @@ Checkpoint Explorer - model.safetensors (1/1)
 Use ↑/↓ to navigate, Enter/Space to expand/collapse, / to search, c to copy path, q to quit
 ================================================================================
 
-▼ 📁 transformer (123 tensors, 1.2 GiB)
-  ▼ 📁 h (32 layers, 120 tensors, 1.1 GiB)
-    ▼ 📁 0 (5 tensors, 45.2 MiB)
-      📄 attn.c_attn.weight [Float16, (4096, 3072), 25.2 MiB]
-      📄 attn.c_proj.weight [Float16, (1024, 4096), 8.4 MiB]
-      📄 ln_1.weight [Float16, (4096,), 8.2 KiB]
-      📄 mlp.c_fc.weight [Float16, (4096, 11008), 90.1 MiB]
-      📄 mlp.c_proj.weight [Float16, (11008, 4096), 90.1 MiB]
-    ▶ 📁 1 (5 tensors, 45.2 MiB)
-    ▶ 📁 2 (5 tensors, 45.2 MiB)
-    ...
-    ▶ 📁 31 (5 tensors, 45.2 MiB)
-  📄 ln_f.weight [Float16, (4096,), 8.2 KiB]
-  📄 wte.weight [Float16, (151936, 4096), 1.2 GiB]
+▼ 📦 model.safetensors (342 tensors, 1.5B params, 1.2 GiB)
+  ▼ 📁 transformer (123 tensors, 1.2 GiB)
+    ▼ 📁 h (32 layers, 120 tensors, 1.1 GiB)
+      ▼ 📁 0 (5 tensors, 45.2 MiB)
+        📄 attn.c_attn.weight [Float16, (4096, 3072), 25.2 MiB]
+        📄 attn.c_proj.weight [Float16, (1024, 4096), 8.4 MiB]
+        📄 ln_1.weight [Float16, (4096,), 8.2 KiB]
+        📄 mlp.c_fc.weight [Float16, (4096, 11008), 90.1 MiB]
+        📄 mlp.c_proj.weight [Float16, (11008, 4096), 90.1 MiB]
+      ▶ 📁 1 (5 tensors, 45.2 MiB)
+      ▶ 📁 2 (5 tensors, 45.2 MiB)
+      ...
+      ▶ 📁 31 (5 tensors, 45.2 MiB)
+    📄 ln_f.weight [Float16, (4096,), 8.2 KiB]
+    📄 wte.weight [Float16, (151936, 4096), 1.2 GiB]
 
 /path/to/model.safetensors
-Total Parameters: 1.5B | Selected: 1/342 | Scroll: 0 | Matches: 342
 ```
+
+The **root** node summarises the whole checkpoint (tensor count, parameters and
+size). The bottom **status bar** shows the source file of the selected row — or,
+for a directory of shards, `N files in <dir>`.
 
 ## How It Works
 
