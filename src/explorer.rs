@@ -739,14 +739,16 @@ impl Explorer {
         let mut slice = 0usize;
         loop {
             let (cols, rows) = terminal::size().unwrap_or((100, 40));
-            let max_rows = (rows as usize).saturating_sub(8).max(1);
+            let text_rows = (rows as usize).saturating_sub(8).max(1);
             let sampled = if heatmap {
                 let max_cols = (cols as usize).saturating_sub(1).max(1);
-                crate::sample::sample_tensor(tensor, max_rows, max_cols, slice)
+                // The heatmap packs two data rows per text line (half blocks),
+                // so it can sample twice as many rows as there are lines.
+                crate::sample::sample_tensor(tensor, text_rows * 2, max_cols, slice)
             } else {
                 // Numeric cells are ~11 wide plus a row-index column.
                 let max_cols = ((cols as usize).saturating_sub(7) / 11).max(1);
-                crate::sample::sample_tensor(tensor, max_rows, max_cols, slice)
+                crate::sample::sample_tensor(tensor, text_rows, max_cols, slice)
             };
 
             // The number of slices to navigate between (1 unless this is 3D);

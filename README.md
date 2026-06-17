@@ -144,7 +144,8 @@ From a tensor's detail screen (open it with `Enter`/`Space`), you can preview th
 actual data of 1D/2D/3D tensors:
 
 - `m` — an **ASCII heatmap**: each sampled element is a colored block on a
-  blue→green→red scale, with a min/max legend.
+  blue→green→red scale, with a min/max legend. Each character row packs two
+  data rows (upper/lower half-block) for higher vertical resolution.
 - `v` — a **numeric grid** of sampled values with row/column indices, including
   the edges.
 

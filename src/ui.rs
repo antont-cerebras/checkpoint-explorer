@@ -388,8 +388,10 @@ impl UI {
         Ok(())
     }
 
-    /// Render a sampled tensor as an ASCII heatmap (one colored block per
-    /// sampled element, colored by relative value).
+    /// Render a sampled tensor as a colored heatmap. Each character cell is an
+    /// upper-half block `▀` whose foreground is the value above and background
+    /// the value below, so one text row shows two data rows — doubling the
+    /// vertical resolution (a terminal cell is ~twice as tall as it is wide).
     pub fn draw_heatmap(tensor: &TensorInfo, sample: &Sample) -> Result<()> {
         let stdout = io::stdout();
         let mut out = BufWriter::new(stdout.lock());
@@ -421,18 +423,31 @@ impl UI {
         line_end(&mut out)?;
 
         let range = sample.max - sample.min;
-        for row in &sample.values {
-            for &v in row {
-                let t = if range > 0.0 {
-                    (v - sample.min) / range
-                } else {
-                    0.5
-                };
-                queue!(out, SetForegroundColor(heat_color(t)))?;
-                write!(out, "█")?;
+        let norm = |v: f64| {
+            if range > 0.0 {
+                (v - sample.min) / range
+            } else {
+                0.5
+            }
+        };
+        // Two data rows per text line: foreground = the upper row's value,
+        // background = the lower row's. A trailing odd row keeps the default
+        // (dark) background for its empty lower half.
+        let mut r = 0;
+        while r < sample.values.len() {
+            let top = &sample.values[r];
+            let bottom = sample.values.get(r + 1);
+            for (c, &tv) in top.iter().enumerate() {
+                queue!(out, SetForegroundColor(heat_color(norm(tv))))?;
+                match bottom {
+                    Some(below) => queue!(out, SetBackgroundColor(heat_color(norm(below[c]))))?,
+                    None => queue!(out, SetBackgroundColor(Color::Reset))?,
+                }
+                write!(out, "▀")?;
             }
             queue!(out, ResetColor)?;
             line_end(&mut out)?;
+            r += 2;
         }
 
         line_end(&mut out)?;
