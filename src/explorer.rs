@@ -278,12 +278,50 @@ impl Explorer {
     }
 
     fn build_tree(&mut self) {
-        if self.metadata.is_empty() {
-            self.tree = TreeBuilder::build_tree(&self.tensors);
+        let children = if self.metadata.is_empty() {
+            TreeBuilder::build_tree(&self.tensors)
         } else {
-            self.tree = TreeBuilder::build_tree_mixed(&self.tensors, &self.metadata);
-        }
+            TreeBuilder::build_tree_mixed(&self.tensors, &self.metadata)
+        };
+        // Everything hangs off a single root node summarising the whole
+        // checkpoint (tensor count, parameters and size), so the tree reads
+        // top-down from one place instead of from a separate footer.
+        let total_size = self.tensors.iter().map(|t| t.size_bytes).sum();
+        let stored_size = self.tensors.iter().map(|t| t.on_disk_size()).sum();
+        let root = TreeNode::Group {
+            name: self.root_label(),
+            children,
+            expanded: true,
+            tensor_count: self.tensors.len(),
+            params: self.total_parameters,
+            total_size,
+            stored_size,
+        };
+        self.tree = vec![root];
         self.flatten_tree();
+    }
+
+    /// A concise name for the checkpoint root: the file name for a single file,
+    /// otherwise the shared parent directory's name (or "checkpoint").
+    fn root_label(&self) -> String {
+        let basename = |p: &Path| {
+            p.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "checkpoint".to_string())
+        };
+        match self.files.split_first() {
+            None => "checkpoint".to_string(),
+            Some((first, [])) => basename(first),
+            Some((first, _)) => {
+                let dir = first.parent();
+                if dir.is_some() && self.files.iter().all(|f| f.parent() == dir) {
+                    dir.map(basename)
+                        .unwrap_or_else(|| "checkpoint".to_string())
+                } else {
+                    "checkpoint".to_string()
+                }
+            }
+        }
     }
 
     fn flatten_tree(&mut self) {
@@ -382,7 +420,6 @@ impl Explorer {
                 current_file: &title,
                 file_idx: 0,
                 total_files: 1,
-                total_parameters: self.total_parameters,
                 selected_idx: self.selected_idx,
                 scroll_offset: self.scroll_offset,
                 search_mode: self.search_mode,
@@ -541,11 +578,16 @@ impl Explorer {
                 match files.len() {
                     0 => String::new(),
                     1 => files.into_iter().next().unwrap(),
-                    n => {
-                        let first = file_name(files.iter().next().unwrap());
-                        let last = file_name(files.iter().next_back().unwrap());
-                        format!("stored across {n} files: {first} … {last}")
-                    }
+                    n => match common_dir(&files) {
+                        // When the files share a directory, show that instead of
+                        // a long list — most checkpoints live in one folder.
+                        Some(dir) => format!("{n} files in {dir}"),
+                        None => {
+                            let first = file_name(files.iter().next().unwrap());
+                            let last = file_name(files.iter().next_back().unwrap());
+                            format!("stored across {n} files: {first} … {last}")
+                        }
+                    },
                 }
             }
             TreeNode::Metadata { .. } => String::new(),
@@ -988,6 +1030,21 @@ enum DtypePreview {
     Data { heatmap: bool, slice: usize },
 }
 
+/// The directory shared by all `paths`, or `None` if they don't all share one.
+fn common_dir(paths: &BTreeSet<String>) -> Option<String> {
+    let mut dirs = paths.iter().map(|p| {
+        Path::new(p)
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+    });
+    let first = dirs.next().flatten()?;
+    if dirs.all(|d| d.as_deref() == Some(first.as_str())) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
 /// Whether a tensor's dtype can be reinterpreted — only safetensors, where we
 /// read the raw bytes ourselves (HDF5 values come pre-decoded via `read_raw`).
 fn dtype_overridable(tensor: &TensorInfo) -> bool {
@@ -1137,6 +1194,7 @@ mod tests {
                         children: Vec::new(),
                         expanded: false,
                         tensor_count: 0,
+                        params: 0,
                         total_size: 0,
                         stored_size: 0,
                     },
@@ -1193,6 +1251,7 @@ mod tests {
                 children: Vec::new(),
                 expanded: false,
                 tensor_count: 0,
+                params: 0,
                 total_size: 0,
                 stored_size: 0,
             }]
@@ -1205,6 +1264,7 @@ mod tests {
                 children,
                 expanded,
                 tensor_count: 0,
+                params: 0,
                 total_size: 0,
                 stored_size: 0,
             },
