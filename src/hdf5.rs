@@ -151,7 +151,7 @@ fn dtype_name(desc: &TypeDescriptor) -> String {
 
 /// Decode `%XX` percent-escapes (the inverse of Python's `urllib.parse.quote`,
 /// which Cerebras uses to make a tensor name a valid flat HDF5 link).
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
