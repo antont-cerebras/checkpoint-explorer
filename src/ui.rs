@@ -68,7 +68,7 @@ impl UI {
         if config.search_mode {
             write!(
                 out,
-                "SEARCH MODE: {} | Type to search, Enter/Esc to exit search\r\n",
+                "SEARCH MODE: {} | Type to search, Enter to view, Esc/q to exit\r\n",
                 if config.search_query.is_empty() {
                     "_"
                 } else {

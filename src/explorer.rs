@@ -467,16 +467,14 @@ impl Explorer {
                         code: KeyCode::Right,
                         ..
                     } => self.move_to_first_child(),
+                    // Enter acts on the highlighted row in both modes: expand a
+                    // group or open a tensor/metadata detail. In search mode it
+                    // opens the result's detail (and stays in search); use Esc
+                    // or `q` to leave search.
                     KeyEvent {
                         code: KeyCode::Enter,
                         ..
-                    } => {
-                        if self.search_mode {
-                            self.exit_search_mode();
-                        } else {
-                            self.handle_selection();
-                        }
-                    }
+                    } => self.handle_selection(),
                     KeyEvent {
                         code: KeyCode::Char(' '),
                         ..
