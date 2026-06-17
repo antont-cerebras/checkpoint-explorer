@@ -31,6 +31,13 @@ mod palette {
     pub const ERROR: Color = Color::Red;
     /// Something present but unexpected (a softer alert than [`ERROR`]).
     pub const WARN: Color = Color::Yellow;
+    /// The bottom status bar (foreground on background).
+    pub const STATUS_FG: Color = Color::White;
+    pub const STATUS_BG: Color = Color::DarkGrey;
+    /// A success accent (e.g. the "copied" status bar): dark text on green, as
+    /// a light foreground is hard to read on the bright green.
+    pub const OK_BG: Color = Color::Green;
+    pub const OK_FG: Color = Color::Black;
 }
 
 pub struct DrawConfig<'a> {
@@ -42,8 +49,12 @@ pub struct DrawConfig<'a> {
     pub scroll_offset: usize,
     pub search_mode: bool,
     pub search_query: &'a str,
-    /// Bottom status line: source file(s) of the selected row, or a copy
-    /// confirmation.
+    /// Leading glyph for the status bar (e.g. `📄`, `📁`, `✓`), and whether it
+    /// is a success message (the copy confirmation) for accent colouring.
+    pub status_icon: &'a str,
+    pub status_ok: bool,
+    /// Bottom status line: source file(s)/directory of the selected row, or a
+    /// copy confirmation.
     pub status_bar: &'a str,
     /// Whether a checkpoint health issue was detected (shows a header hint to
     /// press `h` for the report).
@@ -167,12 +178,22 @@ impl UI {
             )?;
             key_hint(&mut out, "Esc")?;
             write!(out, " to exit search\r")?;
-        } else {
-            write!(
-                out,
-                "{}",
-                truncate_keep_end(config.status_bar, terminal_width as usize)
-            )?;
+        } else if !config.status_bar.is_empty() {
+            // A colored chip: leading glyph + the path/text, truncated tail-first
+            // so the file name stays visible. Dark-on-green for a copy success,
+            // light-on-grey otherwise.
+            let (bg, fg) = if config.status_ok {
+                (palette::OK_BG, palette::OK_FG)
+            } else {
+                (palette::STATUS_BG, palette::STATUS_FG)
+            };
+            let text = truncate_keep_end(
+                config.status_bar,
+                (terminal_width as usize).saturating_sub(6),
+            );
+            queue!(out, SetBackgroundColor(bg), SetForegroundColor(fg))?;
+            write!(out, " {} {text} ", config.status_icon)?;
+            queue!(out, ResetColor)?;
         }
 
         queue!(out, EndSynchronizedUpdate)?;

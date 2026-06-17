@@ -413,7 +413,7 @@ impl Explorer {
                 &self.flattened_tree
             };
 
-            let status_bar = self.status_bar_text();
+            let (status_icon, status_ok, status_bar) = self.status_bar();
 
             let config = DrawConfig {
                 tree: tree_to_display,
@@ -424,6 +424,8 @@ impl Explorer {
                 scroll_offset: self.scroll_offset,
                 search_mode: self.search_mode,
                 search_query: &self.search_query,
+                status_icon,
+                status_ok,
                 status_bar: &status_bar,
                 health_warning: !self.health_reports.is_empty(),
             };
@@ -554,11 +556,12 @@ impl Explorer {
         Ok(())
     }
 
-    /// Text for the bottom status bar: the source file(s) of the row under the
-    /// cursor, or the transient copy confirmation.
-    fn status_bar_text(&self) -> String {
+    /// Status bar contents for the row under the cursor: a leading glyph, an
+    /// "is this a success message" flag (the copy confirmation), and the text —
+    /// the source file(s)/directory, or the transient copy confirmation.
+    fn status_bar(&self) -> (&'static str, bool, String) {
         if let Some(flash) = &self.copied_flash {
-            return format!("✓ Copied to clipboard: {flash}");
+            return ("✓", true, format!("Copied: {flash}"));
         }
 
         let tree = if self.search_mode {
@@ -567,37 +570,58 @@ impl Explorer {
             &self.flattened_tree
         };
         let Some((node, _)) = tree.get(self.selected_idx) else {
-            return String::new();
+            return ("", false, String::new());
         };
 
         match node {
-            TreeNode::Tensor { info } => info.source_path.clone(),
+            TreeNode::Tensor { info } => ("📄", false, info.source_path.clone()),
             TreeNode::Group { .. } => {
                 let mut files = BTreeSet::new();
                 collect_source_paths(node, &mut files);
                 match files.len() {
-                    0 => String::new(),
-                    1 => files.into_iter().next().unwrap(),
+                    0 => ("", false, String::new()),
+                    1 => ("📄", false, files.into_iter().next().unwrap()),
                     n => match common_dir(&files) {
                         // When the files share a directory, show that instead of
                         // a long list — most checkpoints live in one folder.
-                        Some(dir) => format!("{n} files in {dir}"),
+                        Some(dir) => ("📁", false, format!("{n} files in {dir}")),
                         None => {
                             let first = file_name(files.iter().next().unwrap());
                             let last = file_name(files.iter().next_back().unwrap());
-                            format!("stored across {n} files: {first} … {last}")
+                            (
+                                "📁",
+                                false,
+                                format!("stored across {n} files: {first} … {last}"),
+                            )
                         }
                     },
                 }
             }
-            TreeNode::Metadata { .. } => String::new(),
+            TreeNode::Metadata { .. } => ("", false, String::new()),
         }
     }
 
-    /// Copy the source path of the selected tensor to the clipboard (OSC 52).
+    /// Copy the selected row's path to the clipboard (OSC 52): a tensor's file,
+    /// or for a group/root the single file it lives in, else the directory its
+    /// files share (so copying the root yields the file or the checkpoint dir).
     fn copy_selected_path(&mut self) {
-        if let Some((TreeNode::Tensor { info }, _)) = self.flattened_tree.get(self.selected_idx) {
-            let path = info.source_path.clone();
+        let Some((node, _)) = self.flattened_tree.get(self.selected_idx) else {
+            return;
+        };
+        let path = match node {
+            TreeNode::Tensor { info } => Some(info.source_path.clone()),
+            TreeNode::Group { .. } => {
+                let mut files = BTreeSet::new();
+                collect_source_paths(node, &mut files);
+                match files.len() {
+                    0 => None,
+                    1 => files.into_iter().next(),
+                    _ => common_dir(&files).or_else(|| files.into_iter().next()),
+                }
+            }
+            TreeNode::Metadata { .. } => None,
+        };
+        if let Some(path) = path {
             copy_to_clipboard(&path);
             self.copied_flash = Some(path);
         }
