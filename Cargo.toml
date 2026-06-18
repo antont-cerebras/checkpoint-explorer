@@ -15,6 +15,9 @@ crossterm = "0.28"
 serde_json = "1.0"
 glob = "0.3"
 fuzzy-matcher = "0.3"
+# Zero-copy reads (mmap) + parallel scans for whole-tensor statistics.
+memmap2 = "0.9"
+rayon = "1"
 # Optional: read Cerebras-style HDF5 checkpoints. Off by default so the
 # default build stays pure-Rust with no system dependencies; the `static`
 # feature builds a bundled libhdf5 from source (needs a C toolchain + cmake).

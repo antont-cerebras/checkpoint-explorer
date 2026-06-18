@@ -159,8 +159,21 @@ Out-of-range entries are rejected with a message rather than jumping.
 Within either view, `m` and `v` switch between the heatmap and numeric
 representations in place, and `Ctrl+C` quits the app from anywhere.
 
-Both views sample a grid that fits the screen (they never read the whole tensor).
-Reading is supported for `safetensors` (any size) and HDF5 (`--features hdf5`,
+#### Statistics
+
+The heatmap/numeric views show **exact whole-tensor statistics** — value range,
+mean, standard deviation, % zeros (sparsity) and a non-finite (NaN/Inf) count —
+computed by scanning every element once (memory-mapped, decoded in parallel with
+`rayon`). The heatmap's color scale uses the exact range, so colors mean the same
+thing across slices. The detail screen shows the same stats on demand: press `s`
+to compute them (so browsing the tree stays fast). Results are cached per tensor
+(and per dtype override) for the session, and the scan time is shown dimmed next
+to the stats. Scanning a multi-GB tensor takes a moment the first time (it's
+largely disk/NFS-bound); the scan runs on a worker thread with an animated
+spinner and a running timer, and `Ctrl+C` cancels.
+
+Both views also sample a grid that fits the screen (they never read the whole
+tensor for the *display*). Reading is supported for `safetensors` (any size) and HDF5 (`--features hdf5`,
 currently for datasets up to a size cap); GGUF data preview is not yet supported.
 
 #### Dtype override

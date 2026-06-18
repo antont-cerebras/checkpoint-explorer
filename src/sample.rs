@@ -8,6 +8,8 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
+use rayon::prelude::*;
+
 use crate::tree::{Layout, TensorInfo};
 
 /// A user override for how a tensor's bytes are decoded, for visualization.
@@ -26,7 +28,7 @@ use crate::tree::{Layout, TensorInfo};
 ///
 /// Overrides only apply where we read raw bytes (safetensors); HDF5 always uses
 /// the stored dtype.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum ViewDtype {
     /// Decode using the tensor's real dtype.
     #[default]
@@ -344,6 +346,247 @@ fn decode_view(view: ViewDtype, dtype: &str, bytes: &[u8], sub: usize) -> f64 {
     }
 }
 
+/// Exact whole-tensor statistics (under a given [`ViewDtype`]), computed by
+/// scanning every element once.
+#[derive(Clone, Copy, Debug)]
+pub struct Stats {
+    /// Total elements scanned.
+    pub count: u64,
+    pub min: f64,
+    pub max: f64,
+    pub mean: f64,
+    /// Population standard deviation.
+    pub std: f64,
+    /// Number of exactly-zero elements (sparsity).
+    pub zeros: u64,
+    /// Number of non-finite elements (NaN / ±Inf).
+    pub nonfinite: u64,
+    /// How long the scan took (set by [`tensor_stats`]).
+    pub elapsed: std::time::Duration,
+}
+
+impl Stats {
+    /// Fraction of elements that are exactly zero, in `0.0..=1.0`.
+    pub fn zero_fraction(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.zeros as f64 / self.count as f64
+        }
+    }
+}
+
+/// Mergeable accumulator for a parallel single-pass scan. Mean and variance use
+/// Welford's algorithm (tracking the running `mean` and `m2`, the sum of squared
+/// deviations) — numerically stable and free of the catastrophic cancellation
+/// that `E[x²] − E[x]²` suffers when the mean dominates the spread. The merge
+/// rule (Chan et al.) combines two partials associatively, so rayon can reduce.
+#[derive(Clone, Copy)]
+struct Acc {
+    count: u64,
+    /// Finite elements (the `n` for mean/variance).
+    finite: u64,
+    zeros: u64,
+    nonfinite: u64,
+    min: f64,
+    max: f64,
+    mean: f64,
+    m2: f64,
+}
+
+impl Acc {
+    const ID: Acc = Acc {
+        count: 0,
+        finite: 0,
+        zeros: 0,
+        nonfinite: 0,
+        min: f64::INFINITY,
+        max: f64::NEG_INFINITY,
+        mean: 0.0,
+        m2: 0.0,
+    };
+
+    #[inline]
+    fn push(&mut self, v: f64) {
+        self.count += 1;
+        if !v.is_finite() {
+            self.nonfinite += 1;
+            return;
+        }
+        if v < self.min {
+            self.min = v;
+        }
+        if v > self.max {
+            self.max = v;
+        }
+        if v == 0.0 {
+            self.zeros += 1;
+        }
+        // Welford online update.
+        self.finite += 1;
+        let delta = v - self.mean;
+        self.mean += delta / self.finite as f64;
+        self.m2 += delta * (v - self.mean);
+    }
+
+    fn merge(a: Acc, b: Acc) -> Acc {
+        let finite = a.finite + b.finite;
+        let (mean, m2) = if finite == 0 {
+            (0.0, 0.0)
+        } else {
+            // Parallel-variance combine; the `nb/n` and `na*nb/n` factors make
+            // an empty side contribute nothing (so this also handles ID).
+            let (na, nb) = (a.finite as f64, b.finite as f64);
+            let n = na + nb;
+            let delta = b.mean - a.mean;
+            (
+                a.mean + delta * nb / n,
+                a.m2 + b.m2 + delta * delta * na * nb / n,
+            )
+        };
+        Acc {
+            count: a.count + b.count,
+            finite,
+            zeros: a.zeros + b.zeros,
+            nonfinite: a.nonfinite + b.nonfinite,
+            min: a.min.min(b.min),
+            max: a.max.max(b.max),
+            mean,
+            m2,
+        }
+    }
+
+    fn finish(self) -> Stats {
+        let (min, max, mean, std) = if self.finite > 0 {
+            // Population variance is M2 / n.
+            let std = (self.m2 / self.finite as f64).sqrt();
+            (self.min, self.max, self.mean, std)
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+        Stats {
+            count: self.count,
+            min,
+            max,
+            mean,
+            std,
+            zeros: self.zeros,
+            nonfinite: self.nonfinite,
+            elapsed: std::time::Duration::ZERO,
+        }
+    }
+}
+
+/// Containers processed per parallel task (keeps per-task overhead low).
+const STATS_CHUNK: usize = 1 << 16;
+
+/// Compute exact statistics over the whole tensor under `view`. Reads every
+/// element once — memory-mapped and decoded in parallel for safetensors; for
+/// HDF5 it reads the (decompressed) dataset, capped in size. Only safetensors
+/// honours a non-`Stored` view (HDF5 always uses the stored dtype).
+pub fn tensor_stats(t: &TensorInfo, view: ViewDtype) -> Result<Stats, String> {
+    let ext = std::path::Path::new(&t.source_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let started = std::time::Instant::now();
+    let mut stats = match ext {
+        "safetensors" => stats_safetensors(t, view),
+        "h5" | "hdf5" => stats_hdf5(t),
+        _ => Err("statistics are not supported for this format".to_string()),
+    }?;
+    stats.elapsed = started.elapsed();
+    Ok(stats)
+}
+
+fn stats_safetensors(t: &TensorInfo, view: ViewDtype) -> Result<Stats, String> {
+    let Layout::ByteRange { start, end } = t.layout else {
+        return Err("tensor data location is unknown".to_string());
+    };
+    let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
+    let packing = view.packing(item);
+
+    let file = std::fs::File::open(&t.source_path).map_err(|e| e.to_string())?;
+    // SAFETY: read-only inspection; we accept that a concurrent external write
+    // could change the mapping (standard tradeoff for mmap-based readers).
+    let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+
+    let header_len =
+        u64::from_le_bytes(mmap.get(0..8).ok_or("file too small")?.try_into().unwrap());
+    let data_start = (8 + header_len + start) as usize;
+    let data_end = (8 + header_len + end) as usize;
+    let bytes = mmap
+        .get(data_start..data_end)
+        .ok_or("tensor data range is out of bounds")?;
+
+    let dtype = t.dtype.as_str();
+    let acc = bytes
+        .par_chunks(item * STATS_CHUNK)
+        .map(|chunk| {
+            let mut a = Acc::ID;
+            for container in chunk.chunks_exact(item) {
+                for sub in 0..packing {
+                    a.push(decode_view(view, dtype, container, sub));
+                }
+            }
+            a
+        })
+        .reduce(|| Acc::ID, Acc::merge);
+    Ok(acc.finish())
+}
+
+#[cfg(feature = "hdf5")]
+fn stats_hdf5(t: &TensorInfo) -> Result<Stats, String> {
+    // Reading is whole-dataset (libhdf5 decompresses everything), so cap it.
+    const MAX_ELEMS: usize = 200_000_000;
+    if t.num_elements > MAX_ELEMS {
+        return Err(format!(
+            "tensor too large for exact statistics ({} elements)",
+            t.num_elements
+        ));
+    }
+    let file = hdf5_metno::File::open(&t.source_path).map_err(|e| e.to_string())?;
+    let key = file
+        .member_names()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|k| crate::hdf5::percent_decode(k) == t.name)
+        .ok_or_else(|| "dataset not found in file".to_string())?;
+    let dataset = file.dataset(&key).map_err(|e| e.to_string())?;
+    // For ≤32-bit float sources, materialize the (decompressed) dataset as f32
+    // instead of f64 — the values are exact in f32, so it halves the buffer and
+    // the conversion work. Integer / f64 sources stay f64 to avoid precision
+    // loss. Either way the accumulators stay in double precision.
+    let acc = if matches!(t.dtype.as_str(), "F16" | "BF16" | "F32") {
+        let flat = dataset.read_raw::<f32>().map_err(|e| e.to_string())?;
+        reduce_to_acc(&flat, |v| v as f64)
+    } else {
+        let flat = dataset.read_raw::<f64>().map_err(|e| e.to_string())?;
+        reduce_to_acc(&flat, |v| v)
+    };
+    Ok(acc.finish())
+}
+
+/// Reduce a typed slice into an [`Acc`] in parallel, converting each element to
+/// `f64` for the (double-precision) accumulators.
+#[cfg(feature = "hdf5")]
+fn reduce_to_acc<T: Copy + Send + Sync>(data: &[T], to_f64: impl Fn(T) -> f64 + Sync) -> Acc {
+    data.par_chunks(STATS_CHUNK)
+        .map(|chunk| {
+            let mut a = Acc::ID;
+            for &v in chunk {
+                a.push(to_f64(v));
+            }
+            a
+        })
+        .reduce(|| Acc::ID, Acc::merge)
+}
+
+#[cfg(not(feature = "hdf5"))]
+fn stats_hdf5(_t: &TensorInfo) -> Result<Stats, String> {
+    Err("HDF5 support is not compiled in (rebuild with `--features hdf5`)".to_string())
+}
+
 /// bf16 is just the high 16 bits of an f32.
 fn bf16_to_f64(bits: u16) -> f64 {
     f32::from_bits((bits as u32) << 16) as f64
@@ -577,6 +820,34 @@ mod tests {
     }
 
     #[test]
+    fn computes_exact_whole_tensor_stats() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_explorer_stats");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // 4x5 f32, values 0..=19 (so one exact zero, mean 9.5).
+        let header = br#"{"w":{"dtype":"F32","shape":[4,5],"data_offsets":[0,80]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for i in 0..20u32 {
+            f.write_all(&(i as f32).to_le_bytes()).unwrap();
+        }
+        drop(f);
+
+        let t = fixture(&path, "w", &[4, 5], (0, 80));
+        let s = tensor_stats(&t, ViewDtype::Stored).unwrap();
+        assert_eq!(s.count, 20);
+        assert_eq!((s.min, s.max), (0.0, 19.0));
+        assert!((s.mean - 9.5).abs() < 1e-9);
+        // Population std of 0..=19 is sqrt(33.25) ≈ 5.76628.
+        assert!((s.std - 5.766_281_3).abs() < 1e-5);
+        assert_eq!(s.zeros, 1);
+        assert_eq!(s.nonfinite, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn samples_a_3d_safetensors_slice() {
         use std::io::Write;
         let dir = std::env::temp_dir().join("checkpoint_explorer_sample_3d");
@@ -691,6 +962,16 @@ mod hdf5_tests {
                 assert_eq!(s.values[i][j], (r * 5 + c) as f64);
             }
         }
+
+        // Exact stats over the whole dataset (exercises the f32 read path for a
+        // ≤32-bit float source). Values 0..=19, so mean 9.5 and one zero.
+        let st = tensor_stats(&t, ViewDtype::Stored).unwrap();
+        assert_eq!(st.count, 20);
+        assert_eq!((st.min, st.max), (0.0, 19.0));
+        assert!((st.mean - 9.5).abs() < 1e-9);
+        assert_eq!(st.zeros, 1);
+        assert_eq!(st.nonfinite, 0);
+
         let _ = std::fs::remove_file(&path);
     }
 }
