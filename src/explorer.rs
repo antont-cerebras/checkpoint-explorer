@@ -889,7 +889,7 @@ impl Explorer {
                         let _ = UI::draw_tensor_detail(tensor, view, overridable, sv);
                     });
                 }
-                // Reinterpret the dtype from the detail screen too (safetensors).
+                // Reinterpret the dtype from the detail screen too.
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('d') | KeyCode::Char('D'),
                     ..
@@ -966,7 +966,7 @@ impl Explorer {
                         // Switch representation in place, keeping the current slice.
                         KeyCode::Char('m') => heatmap = true,
                         KeyCode::Char('v') => heatmap = false,
-                        // Open the dtype menu (safetensors only); `d` or `D`.
+                        // Open the dtype menu; `d` or `D`.
                         KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
                             if let Some(chosen) =
                                 self.prompt_dtype(tensor, DtypePreview::Data { heatmap, slice })
@@ -1175,13 +1175,15 @@ fn common_dir(paths: &BTreeSet<String>) -> Option<String> {
     }
 }
 
-/// Whether a tensor's dtype can be reinterpreted — only safetensors, where we
-/// read the raw bytes ourselves (HDF5 values come pre-decoded via `read_raw`).
+/// Whether a tensor's dtype can be reinterpreted — formats whose raw stored
+/// bytes we read ourselves (safetensors and HDF5).
 fn dtype_overridable(tensor: &TensorInfo) -> bool {
-    std::path::Path::new(&tensor.source_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        == Some("safetensors")
+    matches!(
+        std::path::Path::new(&tensor.source_path)
+            .extension()
+            .and_then(|e| e.to_str()),
+        Some("safetensors") | Some("h5") | Some("hdf5")
+    )
 }
 
 /// How many slices one Shift+arrow jump moves: about 5% of the total, at

@@ -110,6 +110,7 @@ dependencies = [
  "crossterm",
  "fuzzy-matcher",
  "glob",
+ "half",
  "hdf5-metno",
  "hdf5-metno-sys",
  "lz4_flex",

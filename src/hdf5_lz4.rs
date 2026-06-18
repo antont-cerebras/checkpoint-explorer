@@ -221,7 +221,9 @@ mod tests {
     #[test]
     fn decodes_stored_uncompressed_blocks() {
         // Pseudo-random, incompressible data is stored verbatim (clen == block).
-        let data: Vec<u8> = (0..5000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let data: Vec<u8> = (0..5000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
         roundtrip(&data, 1024);
     }
 

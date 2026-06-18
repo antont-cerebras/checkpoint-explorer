@@ -184,8 +184,10 @@ preview is not yet supported.
 #### Dtype override
 
 When the stored dtype misrepresents the data — common for quantized checkpoints
-where 4-bit weights are packed into a `bf16`/`f16` slot — press `d` (safetensors
-only) to open a menu of alternative interpretations, just for visualization.
+where 4-bit weights are packed into a `bf16`/`f16`/`i16` slot — press `d`
+(safetensors or HDF5) to open a menu of alternative interpretations, just for
+visualization. It reinterprets the raw stored bytes, so for HDF5 it applies to
+both the statistics and (for previewable sizes) the data views.
 This works from both the tensor **detail** screen and the heatmap/numeric views;
 the detail screen updates its dtype, shape and parameter count to match. The menu
 previews each option live as you move through it (`←`/`→` or `d`/`D` to move,
