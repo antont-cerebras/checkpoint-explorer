@@ -1,12 +1,14 @@
 //! On-demand sampling of tensor data for the heatmap and numeric views.
 //!
-//! Tensors can be many GB, so we never read a whole one: we pick a small grid
-//! of element indices that fit the screen (including the edges) and read just
-//! those. safetensors are read by seeking to the sampled rows; HDF5 datasets
-//! are read via libhdf5 (which handles chunking and decompression) as their
-//! stored bytes, with a size cap on the preview.
+//! Tensors can be many GB, so we never read a whole one for the preview: we
+//! pick a small grid of element indices that fit the screen (including the
+//! edges) and read just those rows' column spans. Backing formats are reached
+//! through one [`TensorReader`] abstraction — memory-mapped safetensors and
+//! libhdf5 datasets today — so the preview and the statistics scan are written
+//! once and work the same regardless of format (and a new one, e.g. remote/S3
+//! shards, is just another implementation).
 
-use std::io::{Read, Seek, SeekFrom};
+use std::ops::Range;
 
 use rayon::prelude::*;
 
@@ -212,9 +214,8 @@ pub fn sample_tensor(
 
     // A packed override unpacks several 4-bit values from each stored element,
     // expanding the innermost (last) dimension by that factor.
-    let packing = item_size(&t.dtype)
-        .map(|bytes| view.packing(bytes))
-        .unwrap_or(1);
+    let item = item_size(&t.dtype);
+    let packing = item.map(|bytes| view.packing(bytes)).unwrap_or(1);
 
     let (total_rows, stored_cols, slices) = match t.shape.as_slice() {
         [n] => (1usize, *n, 1usize),
@@ -238,11 +239,8 @@ pub fn sample_tensor(
     let rows = sample_indices(total_rows, max_rows.max(1));
     let cols = sample_indices(total_cols, max_cols.max(1));
 
-    let values = match ext {
-        "safetensors" => read_safetensors(t, total_cols, base, &rows, &cols, view)?,
-        "h5" | "hdf5" => read_hdf5(t, total_cols, base, &rows, &cols, view)?,
-        _ => return Err("data preview is not supported for this format".to_string()),
-    };
+    let reader = open_reader(t)?;
+    let values = read_sampled(reader.as_ref(), t, total_cols, base, &rows, &cols, view)?;
 
     let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
     for row in &values {
@@ -577,98 +575,282 @@ fn reduce_view_bytes(bytes: &[u8], item: usize, view: ViewDtype, dtype: &str) ->
         .reduce(|| Acc::ID, Acc::merge)
 }
 
-/// Compute exact statistics over the whole tensor under `view`. Reads every
-/// element once and decodes in parallel — memory-mapped for safetensors, or
-/// streamed in bounded row-blocks for HDF5 (any size). Both honour a non-`Stored`
-/// view by reinterpreting the raw stored bytes.
-pub fn tensor_stats(t: &TensorInfo, view: ViewDtype) -> Result<Stats, String> {
+/// Largest block, in elements, read at once when scanning a tensor for stats —
+/// keeps peak memory bounded regardless of tensor size.
+const STATS_BLOCK_ELEMS: usize = 16 << 20; // ≈16M elements
+
+/// Format-agnostic access to one tensor's stored bytes. An implementation opens
+/// its backing store once (a memory-mapped safetensors file, an HDF5 dataset, …)
+/// and serves the raw stored containers — little-endian, row-major, exactly as
+/// [`decode`] / [`decode_view`] expect. The sampling preview and the statistics
+/// scan are written once against this trait, so supporting a new format (e.g.
+/// remote/S3 shards) is just another implementation.
+trait TensorReader {
+    /// The stored shape.
+    fn shape(&self) -> &[usize];
+
+    /// Read the axis-aligned region selected by `ranges` (one half-open range
+    /// per stored dimension, empty for a 0-D scalar) as a flat row-major
+    /// little-endian buffer of stored containers.
+    fn read_region(&self, ranges: &[Range<usize>]) -> Result<Vec<u8>, String>;
+
+    /// Read several regions, one buffer each. The default reads them
+    /// independently; a format may override to fetch one enclosing block when
+    /// that is cheaper (e.g. to avoid re-decompressing shared HDF5 chunks).
+    fn read_regions(&self, regions: &[Vec<Range<usize>>]) -> Result<Vec<Vec<u8>>, String> {
+        regions.iter().map(|r| self.read_region(r)).collect()
+    }
+
+    /// Scan the whole tensor, handing each bounded block of stored bytes to `f`
+    /// in order (used by the statistics pass). The default streams the dataset
+    /// in row-blocks via [`read_region`]; formats override for a zero-copy scan.
+    fn fold_blocks(&self, f: &mut dyn FnMut(&[u8])) -> Result<(), String> {
+        let shape = self.shape();
+        if shape.is_empty() {
+            let bytes = self.read_region(&[])?;
+            f(&bytes);
+            return Ok(());
+        }
+        let outer = shape[0];
+        let inner: usize = shape[1..].iter().product::<usize>().max(1);
+        let block = (STATS_BLOCK_ELEMS / inner).max(1);
+        let mut i = 0;
+        while i < outer {
+            let hi = (i + block).min(outer);
+            let mut ranges: Vec<Range<usize>> = Vec::with_capacity(shape.len());
+            ranges.push(i..hi);
+            ranges.extend(shape[1..].iter().map(|&d| 0..d));
+            let bytes = self.read_region(&ranges)?;
+            f(&bytes);
+            i = hi;
+        }
+        Ok(())
+    }
+}
+
+/// Open the right [`TensorReader`] for a tensor, dispatching by file extension.
+fn open_reader(t: &TensorInfo) -> Result<Box<dyn TensorReader>, String> {
     let ext = std::path::Path::new(&t.source_path)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
+    match ext {
+        "safetensors" => Ok(Box::new(SafetensorsReader::open(t)?)),
+        #[cfg(feature = "hdf5")]
+        "h5" | "hdf5" => Ok(Box::new(Hdf5Reader::open(t)?)),
+        _ => Err("reading tensor data is not supported for this format".to_string()),
+    }
+}
+
+/// Decompose a flat row-major container index into per-dimension indices.
+fn unravel(mut flat: usize, shape: &[usize]) -> Vec<usize> {
+    let mut idx = vec![0usize; shape.len()];
+    for d in (0..shape.len()).rev() {
+        idx[d] = flat % shape[d];
+        flat /= shape[d];
+    }
+    idx
+}
+
+/// The axis-aligned region covering containers `first..=last`, which must lie
+/// within a single innermost row (so every dimension but the last is a
+/// singleton). Empty `shape` (0-D) yields an empty selection.
+fn region_for_span(shape: &[usize], first: usize, last: usize) -> Vec<Range<usize>> {
+    if shape.is_empty() {
+        return Vec::new();
+    }
+    let lo = unravel(first, shape);
+    let hi = unravel(last, shape);
+    (0..shape.len())
+        .map(|d| {
+            if d + 1 == shape.len() {
+                lo[d]..hi[d] + 1
+            } else {
+                lo[d]..lo[d] + 1
+            }
+        })
+        .collect()
+}
+
+/// Copy the sub-region `want` out of `src`, a row-major buffer of `item`-byte
+/// containers laid out over `src_ranges` (same rank, `want` ⊆ `src_ranges`;
+/// both use absolute indices). Used to slice individual rows out of a larger
+/// block read.
+fn gather_region(
+    src: &[u8],
+    src_ranges: &[Range<usize>],
+    want: &[Range<usize>],
+    item: usize,
+) -> Vec<u8> {
+    let total: usize = want.iter().map(|r| r.len()).product();
+    let n = src_ranges.len();
+    if n == 0 {
+        return src[..total * item].to_vec();
+    }
+    // Row-major container strides of the source layout.
+    let mut stride = vec![1usize; n];
+    for d in (0..n - 1).rev() {
+        stride[d] = stride[d + 1] * src_ranges[d + 1].len();
+    }
+    let last = n - 1;
+    let span = want[last].len();
+    let mut out = Vec::with_capacity(total * item);
+    // Odometer over `want`'s leading dimensions; copy the contiguous last-dim
+    // span for each combination.
+    let mut idx: Vec<usize> = want[..last].iter().map(|r| r.start).collect();
+    loop {
+        let mut off = (want[last].start - src_ranges[last].start) * stride[last];
+        for d in 0..last {
+            off += (idx[d] - src_ranges[d].start) * stride[d];
+        }
+        let bo = off * item;
+        out.extend_from_slice(&src[bo..bo + span * item]);
+        if last == 0 {
+            break;
+        }
+        let mut d = last;
+        loop {
+            d -= 1;
+            idx[d] += 1;
+            if idx[d] < want[d].end {
+                break;
+            }
+            idx[d] = want[d].start;
+            if d == 0 {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Compute exact statistics over the whole tensor under `view`, scanning every
+/// element once and decoding in parallel. Works the same for any backing format
+/// via [`TensorReader`]; a non-`Stored` view reinterprets the raw stored bytes.
+pub fn tensor_stats(t: &TensorInfo, view: ViewDtype) -> Result<Stats, String> {
+    let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
     let started = std::time::Instant::now();
-    let mut stats = match ext {
-        "safetensors" => stats_safetensors(t, view),
-        "h5" | "hdf5" => stats_hdf5(t, view),
-        _ => Err("statistics are not supported for this format".to_string()),
-    }?;
+    let reader = open_reader(t)?;
+    let mut acc = Acc::ID;
+    reader.fold_blocks(&mut |bytes| {
+        acc = Acc::merge(acc, reduce_view_bytes(bytes, item, view, &t.dtype));
+    })?;
+    let mut stats = acc.finish();
     stats.elapsed = started.elapsed();
     Ok(stats)
 }
 
-fn stats_safetensors(t: &TensorInfo, view: ViewDtype) -> Result<Stats, String> {
-    let Layout::ByteRange { start, end } = t.layout else {
-        return Err("tensor data location is unknown".to_string());
-    };
-    let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
+/// Sample the grid of `rows × cols` logical values from `reader`, decoding under
+/// `view`. Indices are logical: under a packed view a logical element `flat`
+/// lives in container `flat / packing` at nibble `flat % packing`. Reads only
+/// each sampled row's column span (never the whole tensor), so it scales to any
+/// size and any format.
+fn read_sampled(
+    reader: &dyn TensorReader,
+    t: &TensorInfo,
+    total_cols: usize,
+    base: usize,
+    rows: &[usize],
+    cols: &[usize],
+    view: ViewDtype,
+) -> Result<Vec<Vec<f64>>, String> {
+    let dtype = t.dtype.as_str();
+    let item = item_size(dtype).ok_or_else(|| format!("unsupported dtype: {dtype}"))?;
+    let shape = reader.shape().to_vec();
+    let packing = view.packing(item);
+    let first_col = *cols.first().unwrap();
+    let last_col = *cols.last().unwrap();
+    let container_for = |row_base: usize, col: usize| (row_base + col) / packing;
 
-    let file = std::fs::File::open(&t.source_path).map_err(|e| e.to_string())?;
-    // SAFETY: read-only inspection; we accept that a concurrent external write
-    // could change the mapping (standard tradeoff for mmap-based readers).
-    let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+    // One region per sampled row, covering that row's sampled-column span.
+    let regions: Vec<Vec<Range<usize>>> = rows
+        .iter()
+        .map(|&r| {
+            let row_base = base + r * total_cols;
+            region_for_span(
+                &shape,
+                container_for(row_base, first_col),
+                container_for(row_base, last_col),
+            )
+        })
+        .collect();
+    let bufs = reader.read_regions(&regions)?;
 
-    let header_len =
-        u64::from_le_bytes(mmap.get(0..8).ok_or("file too small")?.try_into().unwrap());
-    let data_start = (8 + header_len + start) as usize;
-    let data_end = (8 + header_len + end) as usize;
-    let bytes = mmap
-        .get(data_start..data_end)
-        .ok_or("tensor data range is out of bounds")?;
-
-    Ok(reduce_view_bytes(bytes, item, view, &t.dtype).finish())
+    let out = rows
+        .iter()
+        .zip(bufs)
+        .map(|(&r, buf)| {
+            let row_base = base + r * total_cols;
+            let first_container = container_for(row_base, first_col);
+            cols.iter()
+                .map(|&c| {
+                    let flat = row_base + c;
+                    let off = (flat / packing - first_container) * item;
+                    buf.get(off..off + item)
+                        .map(|cont| decode_view(view, dtype, cont, flat % packing))
+                        .unwrap_or(f64::NAN)
+                })
+                .collect()
+        })
+        .collect();
+    Ok(out)
 }
 
-#[cfg(feature = "hdf5")]
-fn stats_hdf5(t: &TensorInfo, view: ViewDtype) -> Result<Stats, String> {
-    use hdf5_metno::{Hyperslab, SliceOrIndex};
+/// Memory-mapped reader for a safetensors tensor.
+struct SafetensorsReader {
+    mmap: memmap2::Mmap,
+    data_start: usize,
+    data_end: usize,
+    shape: Vec<usize>,
+    item: usize,
+}
 
-    let file = hdf5_metno::File::open(&t.source_path).map_err(|e| e.to_string())?;
-    // Ensure LZ4-compressed datasets are decodable (no-op after the first call).
-    crate::hdf5_lz4::register();
-    let key = file
-        .member_names()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .find(|k| crate::hdf5::percent_decode(k) == t.name)
-        .ok_or_else(|| "dataset not found in file".to_string())?;
-    let dataset = file.dataset(&key).map_err(|e| e.to_string())?;
-    let shape = dataset.shape();
-    let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
-
-    // Read the stored bytes (no lossy conversion) and decode them exactly like
-    // safetensors, so a dtype reinterpretation works identically here.
-    let reduce = |hyper: Hyperslab| -> Result<Acc, String> {
-        with_hdf5_block_bytes(&dataset, hyper, &t.dtype, |bytes| {
-            reduce_view_bytes(bytes, item, view, &t.dtype)
-        })
-    };
-
-    // 0-D (scalar): a single block over the whole (degenerate) shape.
-    if shape.is_empty() {
-        return reduce(Hyperslab::from(Vec::new())).map(Acc::finish);
-    }
-
-    // Stream along the outer axis in row-blocks so memory stays bounded
-    // regardless of tensor size (HDF5 decompresses the overlapping chunks).
-    let outer = shape[0];
-    let inner: usize = shape[1..].iter().product::<usize>().max(1);
-    const BLOCK_ELEMS: usize = 16 << 20; // ≈16M elements per read
-    let block = (BLOCK_ELEMS / inner).max(1);
-
-    let mut acc = Acc::ID;
-    let mut i = 0;
-    while i < outer {
-        let hi = (i + block).min(outer);
-        // Hyperslab: rows [i, hi) on axis 0, the full (bounded) extent elsewhere.
-        let mut dims: Vec<SliceOrIndex> = Vec::with_capacity(shape.len());
-        dims.push(SliceOrIndex::from(i..hi));
-        for &d in &shape[1..] {
-            dims.push(SliceOrIndex::from(0..d));
+impl SafetensorsReader {
+    fn open(t: &TensorInfo) -> Result<Self, String> {
+        let Layout::ByteRange { start, end } = t.layout else {
+            return Err("tensor data location is unknown".to_string());
+        };
+        let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
+        let file = std::fs::File::open(&t.source_path).map_err(|e| e.to_string())?;
+        // SAFETY: read-only inspection; we accept that a concurrent external
+        // write could change the mapping (standard tradeoff for mmap readers).
+        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+        let header_len =
+            u64::from_le_bytes(mmap.get(0..8).ok_or("file too small")?.try_into().unwrap());
+        let data_start = (8 + header_len + start) as usize;
+        let data_end = (8 + header_len + end) as usize;
+        if data_end > mmap.len() {
+            return Err("tensor data range is out of bounds".to_string());
         }
-        acc = Acc::merge(acc, reduce(Hyperslab::from(dims))?);
-        i = hi;
+        Ok(Self {
+            mmap,
+            data_start,
+            data_end,
+            shape: t.shape.clone(),
+            item,
+        })
     }
-    Ok(acc.finish())
+
+    fn blob(&self) -> &[u8] {
+        &self.mmap[self.data_start..self.data_end]
+    }
+}
+
+impl TensorReader for SafetensorsReader {
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn read_region(&self, ranges: &[Range<usize>]) -> Result<Vec<u8>, String> {
+        let full: Vec<Range<usize>> = self.shape.iter().map(|&d| 0..d).collect();
+        Ok(gather_region(self.blob(), &full, ranges, self.item))
+    }
+
+    /// Zero-copy full scan: the tensor's bytes are already mapped contiguously.
+    fn fold_blocks(&self, f: &mut dyn FnMut(&[u8])) -> Result<(), String> {
+        f(self.blob());
+        Ok(())
+    }
 }
 
 /// Read an HDF5 dataset selection and hand its bytes (little-endian, the order
@@ -729,6 +911,123 @@ fn with_hdf5_block_bytes<R>(
     })
 }
 
+/// Reader for an HDF5 dataset. Holds the open file/dataset so repeated region
+/// reads (one per sampled row) don't reopen it.
+#[cfg(feature = "hdf5")]
+struct Hdf5Reader {
+    // Kept only to hold the file open for the dataset's lifetime.
+    _file: hdf5_metno::File,
+    dataset: hdf5_metno::Dataset,
+    shape: Vec<usize>,
+    dtype: String,
+    item: usize,
+}
+
+#[cfg(feature = "hdf5")]
+impl Hdf5Reader {
+    fn open(t: &TensorInfo) -> Result<Self, String> {
+        let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
+        let file = hdf5_metno::File::open(&t.source_path).map_err(|e| e.to_string())?;
+        // Ensure LZ4-compressed datasets are decodable (no-op after first call).
+        crate::hdf5_lz4::register();
+        let key = file
+            .member_names()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|k| crate::hdf5::percent_decode(k) == t.name)
+            .ok_or_else(|| "dataset not found in file".to_string())?;
+        let dataset = file.dataset(&key).map_err(|e| e.to_string())?;
+        let shape = dataset.shape();
+        Ok(Self {
+            _file: file,
+            dataset,
+            shape,
+            dtype: t.dtype.clone(),
+            item,
+        })
+    }
+
+    fn hyperslab(ranges: &[Range<usize>]) -> hdf5_metno::Hyperslab {
+        use hdf5_metno::SliceOrIndex;
+        hdf5_metno::Hyperslab::from(
+            ranges
+                .iter()
+                .cloned()
+                .map(SliceOrIndex::from)
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+#[cfg(feature = "hdf5")]
+impl TensorReader for Hdf5Reader {
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    fn read_region(&self, ranges: &[Range<usize>]) -> Result<Vec<u8>, String> {
+        with_hdf5_block_bytes(
+            &self.dataset,
+            Self::hyperslab(ranges),
+            &self.dtype,
+            <[u8]>::to_vec,
+        )
+    }
+
+    /// Fetch one enclosing block when it fits a memory budget: reading the
+    /// bounding box of the sampled rows decompresses each overlapping chunk once
+    /// rather than once per row. When the box is too large the tensor is huge,
+    /// so the sampled rows are spread far apart and rarely share a chunk anyway,
+    /// and per-row reads are fine.
+    fn read_regions(&self, regions: &[Vec<Range<usize>>]) -> Result<Vec<Vec<u8>>, String> {
+        const BUDGET_BYTES: usize = 256 << 20;
+        if regions.len() < 2 {
+            return regions.iter().map(|r| self.read_region(r)).collect();
+        }
+        let ndim = regions[0].len();
+        let bbox: Vec<Range<usize>> = (0..ndim)
+            .map(|d| {
+                let lo = regions.iter().map(|r| r[d].start).min().unwrap_or(0);
+                let hi = regions.iter().map(|r| r[d].end).max().unwrap_or(0);
+                lo..hi
+            })
+            .collect();
+        let bbox_elems: usize = bbox.iter().map(|r| r.len()).product();
+        if bbox_elems.saturating_mul(self.item) > BUDGET_BYTES {
+            return regions.iter().map(|r| self.read_region(r)).collect();
+        }
+        let buf = self.read_region(&bbox)?;
+        Ok(regions
+            .iter()
+            .map(|r| gather_region(&buf, &bbox, r, self.item))
+            .collect())
+    }
+
+    fn fold_blocks(&self, f: &mut dyn FnMut(&[u8])) -> Result<(), String> {
+        let shape = &self.shape;
+        if shape.is_empty() {
+            return with_hdf5_block_bytes(&self.dataset, Self::hyperslab(&[]), &self.dtype, |b| {
+                f(b)
+            });
+        }
+        let outer = shape[0];
+        let inner: usize = shape[1..].iter().product::<usize>().max(1);
+        let block = (STATS_BLOCK_ELEMS / inner).max(1);
+        let mut i = 0;
+        while i < outer {
+            let hi = (i + block).min(outer);
+            let mut ranges: Vec<Range<usize>> = Vec::with_capacity(shape.len());
+            ranges.push(i..hi);
+            ranges.extend(shape[1..].iter().map(|&d| 0..d));
+            with_hdf5_block_bytes(&self.dataset, Self::hyperslab(&ranges), &self.dtype, |b| {
+                f(b)
+            })?;
+            i = hi;
+        }
+        Ok(())
+    }
+}
+
 /// Scan a safetensors tensor's bytes into an [`Acc`], either with the rayon
 /// `par_chunks` reduce (as production does) or a plain sequential `chunks` fold
 /// over the same chunking and decode. Used by the seq-vs-parallel benchmark to
@@ -772,11 +1071,6 @@ fn bench_scan(t: &TensorInfo, view: ViewDtype, parallel: bool) -> (Stats, std::t
     (acc.finish(), started.elapsed())
 }
 
-#[cfg(not(feature = "hdf5"))]
-fn stats_hdf5(_t: &TensorInfo, _view: ViewDtype) -> Result<Stats, String> {
-    Err("HDF5 support is not compiled in (rebuild with `--features hdf5`)".to_string())
-}
-
 /// bf16 is just the high 16 bits of an f32.
 fn bf16_to_f64(bits: u16) -> f64 {
     f32::from_bits((bits as u32) << 16) as f64
@@ -796,153 +1090,6 @@ fn f16_to_f64(bits: u16) -> f64 {
     };
     let signed = if sign == 1 { -val } else { val };
     signed as f64
-}
-
-/// Read sampled values from a safetensors file by seeking to each sampled row.
-///
-/// Indices are logical: under a packed `view`, `total_cols` and `cols` count
-/// 4-bit values, while the file stores `item`-byte containers each holding
-/// `packing` of them. So a logical element `flat` lives in container `flat /
-/// packing` at nibble `flat % packing`.
-fn read_safetensors(
-    t: &TensorInfo,
-    total_cols: usize,
-    base: usize,
-    rows: &[usize],
-    cols: &[usize],
-    view: ViewDtype,
-) -> Result<Vec<Vec<f64>>, String> {
-    let Layout::ByteRange { start, .. } = t.layout else {
-        return Err("tensor data location is unknown".to_string());
-    };
-    let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
-    let packing = view.packing(item);
-
-    let mut file = std::fs::File::open(&t.source_path).map_err(|e| e.to_string())?;
-    // The data blob begins after the 8-byte header length and the JSON header.
-    let mut len_buf = [0u8; 8];
-    file.read_exact(&mut len_buf).map_err(|e| e.to_string())?;
-    let data_start = 8 + u64::from_le_bytes(len_buf) + start;
-
-    let decode_at = |buf: &[u8], local_container: usize, sub: usize| {
-        let off = local_container * item;
-        decode_view(view, &t.dtype, &buf[off..off + item], sub)
-    };
-
-    let mut out = Vec::with_capacity(rows.len());
-    // Read each sampled row's container span in one go when it's reasonably
-    // sized; otherwise fall back to one read per sampled element.
-    const MAX_SPAN: usize = 64 * 1024 * 1024;
-    for &r in rows {
-        let row_base = base + r * total_cols;
-        let first_container = (row_base + *cols.first().unwrap()) / packing;
-        let last_container = (row_base + *cols.last().unwrap()) / packing;
-        let span_bytes = (last_container - first_container + 1) * item;
-
-        let row: Vec<f64> = if span_bytes <= MAX_SPAN {
-            let mut buf = vec![0u8; span_bytes];
-            let off = data_start + (first_container as u64) * (item as u64);
-            file.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
-            file.read_exact(&mut buf).map_err(|e| e.to_string())?;
-            cols.iter()
-                .map(|&c| {
-                    let flat = row_base + c;
-                    decode_at(&buf, flat / packing - first_container, flat % packing)
-                })
-                .collect()
-        } else {
-            // Per-element reads for very wide rows.
-            let mut buf = vec![0u8; item];
-            let mut row = Vec::with_capacity(cols.len());
-            for &c in cols {
-                let flat = row_base + c;
-                let off = data_start + ((flat / packing) as u64) * (item as u64);
-                file.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
-                file.read_exact(&mut buf).map_err(|e| e.to_string())?;
-                row.push(decode_view(view, &t.dtype, &buf, flat % packing));
-            }
-            row
-        };
-        out.push(row);
-    }
-    Ok(out)
-}
-
-#[cfg(feature = "hdf5")]
-fn read_hdf5(
-    t: &TensorInfo,
-    total_cols: usize,
-    base: usize,
-    rows: &[usize],
-    cols: &[usize],
-    view: ViewDtype,
-) -> Result<Vec<Vec<f64>>, String> {
-    use hdf5_metno::{Hyperslab, SliceOrIndex};
-
-    // Reading is whole-dataset (libhdf5 decompresses everything), so cap it.
-    const MAX_ELEMS: usize = 8_000_000;
-    if t.num_elements > MAX_ELEMS {
-        return Err(format!(
-            "tensor too large to preview ({} elements); sampling large HDF5 datasets is a planned follow-up",
-            t.num_elements
-        ));
-    }
-
-    let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
-    let packing = view.packing(item);
-
-    let file = hdf5_metno::File::open(&t.source_path).map_err(|e| e.to_string())?;
-    // Ensure LZ4-compressed datasets are decodable (no-op after the first call).
-    crate::hdf5_lz4::register();
-    // The decoded tensor name maps to a URL-quoted dataset key.
-    let key = file
-        .member_names()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .find(|k| crate::hdf5::percent_decode(k) == t.name)
-        .ok_or_else(|| "dataset not found in file".to_string())?;
-    let dataset = file.dataset(&key).map_err(|e| e.to_string())?;
-
-    // Read the whole (capped) dataset as raw stored bytes, then decode under the
-    // view — identical semantics to safetensors. Indices are logical: under a
-    // packed view, a logical element `flat` lives in container `flat / packing`
-    // at nibble `flat % packing`.
-    let shape = dataset.shape();
-    let hyper = Hyperslab::from(
-        shape
-            .iter()
-            .map(|&d| SliceOrIndex::from(0..d))
-            .collect::<Vec<_>>(),
-    );
-    with_hdf5_block_bytes(&dataset, hyper, &t.dtype, |bytes| {
-        rows.iter()
-            .map(|&r| {
-                let row_base = base + r * total_cols;
-                cols.iter()
-                    .map(|&c| {
-                        let flat = row_base + c;
-                        let off = (flat / packing) * item;
-                        bytes
-                            .get(off..off + item)
-                            .map(|container| decode_view(view, &t.dtype, container, flat % packing))
-                            .unwrap_or(f64::NAN)
-                    })
-                    .collect()
-            })
-            .collect()
-    })
-}
-
-#[cfg(not(feature = "hdf5"))]
-fn read_hdf5(
-    _t: &TensorInfo,
-    _total_cols: usize,
-    _base: usize,
-    _rows: &[usize],
-    _cols: &[usize],
-    _view: ViewDtype,
-) -> Result<Vec<Vec<f64>>, String> {
-    Err("HDF5 support is not compiled in (rebuild with `--features hdf5`)".to_string())
 }
 
 #[cfg(test)]
@@ -1041,6 +1188,7 @@ mod tests {
         let name = std::env::var("BENCH_TENSOR").expect("set BENCH_TENSOR");
 
         // Parse the safetensors header to build a TensorInfo for `name`.
+        use std::io::Read;
         let mut f = std::fs::File::open(&path).unwrap();
         let mut len = [0u8; 8];
         f.read_exact(&mut len).unwrap();
@@ -1309,6 +1457,52 @@ mod hdf5_tests {
         let st = tensor_stats(&t, ViewDtype::U4Packed).unwrap();
         assert_eq!(st.count, 8);
         assert_eq!((st.min, st.max), (0.0, 4.0));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn samples_a_3d_hdf5_slice() {
+        // A 3D dataset [d0=2, d1=3, d2=4] of values v = d0*100 + d1*10 + d2, so
+        // each element identifies its own (slice, row, col). Verifies the reader
+        // maps a sampled (slice, row, col) to the right dataset element.
+        let dir = std::env::temp_dir().join("checkpoint_explorer_3d_h5");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("v3.h5");
+        let _ = std::fs::remove_file(&path);
+        let data: Vec<f32> = (0..2)
+            .flat_map(|d0| {
+                (0..3).flat_map(move |d1| (0..4).map(move |d2| (d0 * 100 + d1 * 10 + d2) as f32))
+            })
+            .collect();
+        {
+            let file = hdf5_metno::File::create(&path).unwrap();
+            let ds = file
+                .new_dataset::<f32>()
+                .shape([2, 3, 4])
+                .create("w")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+        }
+        let t = TensorInfo {
+            name: "w".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![2, 3, 4],
+            size_bytes: 24 * 4,
+            num_elements: 24,
+            storage: Storage::Unknown,
+            source_path: path.to_string_lossy().into_owned(),
+            layout: Layout::None,
+        };
+
+        // Slice 1: every value should read as 100 + row*10 + col.
+        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored).unwrap();
+        assert_eq!((s.total_rows, s.total_cols, s.slices), (3, 4, 2));
+        for (i, &r) in s.rows.iter().enumerate() {
+            for (j, &c) in s.cols.iter().enumerate() {
+                assert_eq!(s.values[i][j], (100 + r * 10 + c) as f64);
+            }
+        }
 
         let _ = std::fs::remove_file(&path);
     }
