@@ -22,6 +22,7 @@ pub fn read_tensors(path: &std::path::Path) -> Result<Vec<TensorInfo>> {
     // libhdf5 is now initialised; teach it the LZ4 filter so compressed datasets
     // (stats/preview) are readable later in the session.
     crate::hdf5_lz4::register();
+    crate::hdf5_zstd::register();
 
     let members = file
         .member_names()

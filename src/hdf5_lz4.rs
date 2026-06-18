@@ -29,13 +29,15 @@ use hdf5_metno_sys::h5z::{
 };
 
 /// The HDF Group registered id for LZ4 (`H5Z_FILTER_LZ4`).
-const LZ4_FILTER_ID: H5Z_filter_t = 32004;
+pub const LZ4_FILTER_ID: H5Z_filter_t = 32004;
 /// Stored by reference inside libhdf5, so it must outlive the program: a string
 /// literal does.
 static FILTER_NAME: &[u8] = b"HDF5 lz4 filter (in-process)\0";
 
-/// Register the LZ4 decompression filter with libhdf5, exactly once per process.
-/// Cheap to call before every read; later calls are no-ops.
+/// Register the LZ4 filter with libhdf5, exactly once per process. Cheap to
+/// call before every read/write; later calls are no-ops. Both directions are
+/// provided: decode (reading the checkpoints, which ship LZ4-compressed) and
+/// encode (so the repack command can write LZ4 too).
 ///
 /// Call this only when libhdf5 has already been initialised (i.e. after a
 /// `File::open`) and no other thread is inside an HDF5 call — libhdf5 is not
@@ -46,7 +48,7 @@ pub fn register() {
         let class = H5Z_class2_t {
             version: H5Z_CLASS_T_VERS as c_int,
             id: LZ4_FILTER_ID,
-            encoder_present: 0, // we only ever decompress
+            encoder_present: 1,
             decoder_present: 1,
             name: FILTER_NAME.as_ptr() as *const c_char,
             can_apply: None,
@@ -61,9 +63,10 @@ pub fn register() {
     });
 }
 
-/// libhdf5 filter callback. We register a decoder only, so the forward
-/// (compression) direction is a hard error. A `0` return tells libhdf5 the
-/// filter failed, which surfaces as a normal read error upstream.
+/// libhdf5 filter callback: decompress (reverse) or compress (forward) the chunk
+/// in `*buf`. A `0` return tells libhdf5 the filter failed (surfaced as a normal
+/// read/write error). Untrusted file bytes must not unwind into C, so the body
+/// runs under `catch_unwind` (pointers passed as integers to stay UnwindSafe).
 unsafe extern "C" fn lz4_filter(
     flags: c_uint,
     _cd_nelmts: usize,
@@ -72,17 +75,18 @@ unsafe extern "C" fn lz4_filter(
     buf_size: *mut usize,
     buf: *mut *mut c_void,
 ) -> usize {
-    if flags & H5Z_FLAG_REVERSE == 0 {
-        return 0; // no encoder registered
-    }
-    // Decompression works off untrusted file bytes; a malformed chunk must not
-    // unwind into C. Pass pointers as integers so the closure stays UnwindSafe.
+    let reverse = flags & H5Z_FLAG_REVERSE != 0;
     let buf_addr = buf as usize;
     let bs_addr = buf_size as usize;
     std::panic::catch_unwind(|| unsafe {
-        decompress(nbytes, buf_addr as *mut *mut c_void, bs_addr as *mut usize)
+        let buf = buf_addr as *mut *mut c_void;
+        let buf_size = bs_addr as *mut usize;
+        if reverse {
+            decompress(nbytes, buf, buf_size).unwrap_or(0)
+        } else {
+            compress(nbytes, buf, buf_size)
+        }
     })
-    .unwrap_or(None)
     .unwrap_or(0)
 }
 
@@ -177,6 +181,54 @@ unsafe fn decompress(nbytes: usize, buf: *mut *mut c_void, buf_size: *mut usize)
     }
 }
 
+/// LZ4-compress the chunk in `*buf` with the `H5Zlz4` framing, replacing `*buf`
+/// with the framed bytes. Returns the framed length, or 0 on failure.
+unsafe fn compress(nbytes: usize, buf: *mut *mut c_void, buf_size: *mut usize) -> usize {
+    unsafe {
+        if buf.is_null() || (*buf).is_null() || nbytes == 0 {
+            return 0;
+        }
+        let input = std::slice::from_raw_parts(*buf as *const u8, nbytes);
+        let framed = frame_chunk(input);
+        install_output(buf, buf_size, &framed)
+    }
+}
+
+/// Build an `H5Zlz4` frame for one chunk as a single block (chunks are well
+/// under LZ4's block-size limit): `u64` total, `u32` block size, then `u32`
+/// compressed length + payload. A block that wouldn't shrink is stored verbatim
+/// (length == block size), which the decoder reads back as a raw copy.
+fn frame_chunk(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() / 2 + 16);
+    out.extend_from_slice(&(input.len() as u64).to_be_bytes());
+    out.extend_from_slice(&(input.len() as u32).to_be_bytes());
+    let comp = lz4_flex::block::compress(input);
+    let payload: &[u8] = if comp.len() < input.len() {
+        &comp
+    } else {
+        input
+    };
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Replace `*buf` with a fresh, HDF5-owned buffer holding `out`; returns its
+/// length (0 on allocation failure).
+unsafe fn install_output(buf: *mut *mut c_void, buf_size: *mut usize, out: &[u8]) -> usize {
+    unsafe {
+        let p = H5allocate_memory(out.len().max(1), 0) as *mut u8;
+        if p.is_null() {
+            return 0;
+        }
+        std::ptr::copy_nonoverlapping(out.as_ptr(), p, out.len());
+        H5free_memory(*buf);
+        *buf = p as *mut c_void;
+        *buf_size = out.len();
+        out.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +292,34 @@ mod tests {
         let mut frame = (16u64).to_be_bytes().to_vec();
         frame.extend_from_slice(&(16u32).to_be_bytes());
         assert!(!decode_into(&frame, &mut out));
+    }
+
+    #[test]
+    fn writes_and_reads_lz4_compressed_dataset() {
+        register();
+        let dir = std::env::temp_dir().join("checkpoint_explorer_lz4_write_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("l.h5");
+        let _ = std::fs::remove_file(&path);
+
+        let data: Vec<i16> = (0..64 * 64).map(|i| (i % 16) as i16).collect();
+        {
+            let f = hdf5_metno::File::create(&path).unwrap();
+            f.new_dataset::<i16>()
+                .shape([64, 64])
+                .chunk([16, 64])
+                .set_filters(&[hdf5_metno::filters::Filter::user(LZ4_FILTER_ID, &[])])
+                .create("w")
+                .unwrap()
+                .write_raw(&data)
+                .unwrap();
+        }
+        let f = hdf5_metno::File::open(&path).unwrap();
+        let ds = f.dataset("w").unwrap();
+        // Round-trips through our encode + decode filter, and actually shrank.
+        assert_eq!(ds.read_raw::<i16>().unwrap(), data);
+        assert!(ds.storage_size() < (64 * 64 * 2) as u64);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

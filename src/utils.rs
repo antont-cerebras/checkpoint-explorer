@@ -24,6 +24,22 @@ pub fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+/// Parse a human size like `1G`, `256M`, `64K` (binary, ×1024) or a bare byte
+/// count, returning the number of bytes.
+pub fn parse_size(s: &str) -> Result<usize, String> {
+    let s = s.trim();
+    let (num, mult) = match s.chars().last() {
+        Some('G' | 'g') => (&s[..s.len() - 1], 1usize << 30),
+        Some('M' | 'm') => (&s[..s.len() - 1], 1usize << 20),
+        Some('K' | 'k') => (&s[..s.len() - 1], 1usize << 10),
+        _ => (s, 1),
+    };
+    num.trim()
+        .parse::<usize>()
+        .map(|n| n * mult)
+        .map_err(|_| format!("invalid size '{s}' (use e.g. 64M, 256M, 1G)"))
+}
+
 pub fn format_shape(shape: &[usize]) -> String {
     format!(
         "({})",

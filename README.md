@@ -149,6 +149,7 @@ keep exploring.
 | `c` | Copy the current screen's text to the clipboard (works on every screen) |
 | `f` | Copy the selected row's File path (tensor file, or a group/root's file or directory) |
 | `h` | Show the checkpoint health report (when there is a mismatch) |
+| `R` | Repack the current HDF5 checkpoint into a new file (HDF5 only) |
 | `Backspace` / `\` | Step **back** / **forward** through the screens you've visited (browser-style history) — e.g. reopen a view you just left |
 | `Esc` | Exit search mode |
 | `q` | Quit the application (or exit search mode if active) |
@@ -265,6 +266,43 @@ quit. Options for a 16-bit tensor:
   yields four values and the last dimension grows ×4.
 
 The header shows the active reinterpretation (e.g. `BF16 as u4 (packed)`).
+
+### Repacking HDF5 checkpoints (`--features hdf5`)
+
+Cerebras-style HDF5 checkpoints compress their chunks with LZ4, which — being
+byte-oriented with no entropy coding — only reaches ~2× on quantized weights
+(e.g. 4-bit values packed into 16-bit words). **Repacking** rewrites the file
+with an entropy-coding codec, recovering that win, with the data preserved
+exactly (same dtype, shape and chunking).
+
+You choose the **codec** and the streaming **buffer size**:
+
+- `gzip` (DEFLATE) — built in; ~3.5× on 4-bit weights, but slower.
+- `zstd` — best ratio with fast decode (registered in-process; the output is
+  also readable by `h5py` + `hdf5plugin`).
+- `lz4` — the format these checkpoints ship with: fast, but only ~2×.
+- `none` — store uncompressed.
+
+From the main tree screen press `R`: it asks for the output filename (pre-filled
+with `<name>.repacked.hdf5`), then the codec, then the buffer size, and shows a
+progress bar while it streams each dataset across.
+
+The same is available non-interactively:
+
+```bash
+# Repack with zstd (default level), 256 MiB streaming buffer
+checkpoint-explorer convert --codec zstd model.hdf5 model.zst.hdf5
+
+# Pick a level (gzip 0–9, zstd 1–22), a 1 GiB buffer, and allow overwriting
+checkpoint-explorer convert -c gzip -l 9 -b 1G -f model.hdf5 model.gz.hdf5
+```
+
+Datasets are streamed in bounded row-blocks sized to the buffer, so memory stays
+low regardless of tensor size (a larger buffer just means fewer, bigger reads).
+On completion it reports how the on-disk size changed — e.g.
+`39 datasets · on disk 8.2 GiB (lz4) → 5.3 GiB (zstd): 35% smaller (1.56×)`. It
+refuses to write over its own input, and warns if the chosen codec is the one
+the source already uses (a re-encode, where a plain copy would do).
 
 ## Example Output
 
