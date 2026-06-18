@@ -766,6 +766,7 @@ impl Explorer {
             status_ok,
             status_bar: &status_bar,
             health_warning: !self.health_reports.is_empty(),
+            can_repack: self.repack_input().is_some(),
         };
         UI::draw_screen(out, &config)
     }
@@ -830,6 +831,11 @@ impl Explorer {
                         code: KeyCode::Char('C'),
                         ..
                     } if !self.search_mode => self.set_all_expanded(false),
+                    // `R` repacks the current HDF5 checkpoint into a new file.
+                    KeyEvent {
+                        code: KeyCode::Char('R'),
+                        ..
+                    } if !self.search_mode => self.repack_checkpoint(),
                     KeyEvent {
                         code: KeyCode::Char('/'),
                         ..
@@ -1801,6 +1807,237 @@ impl Explorer {
             }
         }
     }
+
+    /// The single HDF5 file backing this checkpoint, if repacking applies (one
+    /// `.h5`/`.hdf5` file). `None` for safetensors/GGUF or multi-file views.
+    fn repack_input(&self) -> Option<PathBuf> {
+        match self.files.as_slice() {
+            [f] if matches!(f.extension().and_then(|e| e.to_str()), Some("h5" | "hdf5")) => {
+                Some(f.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Repack the current HDF5 checkpoint into a new file: prompt for the output
+    /// name, then run the conversion with a progress screen.
+    fn repack_checkpoint(&self) {
+        let Some(input) = self.repack_input() else {
+            let _ = UI::draw_message(
+                "Repack unavailable",
+                "Repacking is available only for a single HDF5 checkpoint (.h5/.hdf5).",
+            );
+            let _ = event::read();
+            return;
+        };
+        let default = default_repacked_name(&input);
+        let Some(output) = self.prompt_output_path(&default) else {
+            return;
+        };
+        let Some(codec) = self.prompt_codec() else {
+            return;
+        };
+        if !self.confirm_same_codec(&input, codec) {
+            return;
+        }
+        let Some(buffer_bytes) = self.prompt_buffer() else {
+            return;
+        };
+        self.run_repack(&input, &output, codec, buffer_bytes);
+    }
+
+    /// If the source already uses `codec`, ask whether to re-encode anyway
+    /// (a plain copy would be equivalent). Returns `true` to proceed.
+    #[cfg(feature = "hdf5")]
+    fn confirm_same_codec(&self, input: &Path, codec: crate::codec::Codec) -> bool {
+        if crate::convert::source_codec(input) != Some(codec) {
+            return true;
+        }
+        let title = format!("Source is already {} — re-encode it anyway?", codec.label());
+        let mut idx = 0; // 0 = repack anyway, 1 = cancel
+        loop {
+            if UI::draw_choice_menu(&title, &["Repack anyway", "Cancel"], idx).is_err() {
+                return false;
+            }
+            match event::read() {
+                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+                Ok(Event::Key(KeyEvent { code, .. })) => match code {
+                    KeyCode::Left | KeyCode::Right => idx = 1 - idx,
+                    KeyCode::Enter => return idx == 0,
+                    KeyCode::Esc => return false,
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+    }
+
+    #[cfg(not(feature = "hdf5"))]
+    fn confirm_same_codec(&self, _input: &Path, _codec: crate::codec::Codec) -> bool {
+        true
+    }
+
+    /// Pick the output compression codec from a menu. Returns `None` if cancelled.
+    fn prompt_codec(&self) -> Option<crate::codec::Codec> {
+        use crate::codec::Codec;
+        let codecs = [Codec::Gzip, Codec::Zstd, Codec::Lz4, Codec::Uncompressed];
+        let labels: Vec<&str> = codecs.iter().map(|c| c.label()).collect();
+        let mut idx = 0;
+        loop {
+            if UI::draw_choice_menu("Repack — compression codec", &labels, idx).is_err() {
+                return None;
+            }
+            match event::read() {
+                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+                Ok(Event::Key(KeyEvent { code, .. })) => match code {
+                    KeyCode::Right => idx = (idx + 1) % codecs.len(),
+                    KeyCode::Left => idx = (idx + codecs.len() - 1) % codecs.len(),
+                    KeyCode::Enter => return Some(codecs[idx]),
+                    KeyCode::Esc => return None,
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Prompt for the streaming buffer size (e.g. `256M`, `1G`), pre-filled with
+    /// a default. Returns the size in bytes, or `None` if cancelled.
+    fn prompt_buffer(&self) -> Option<usize> {
+        let mut input = "256M".to_string();
+        let mut error: Option<String> = None;
+        loop {
+            if UI::draw_text_prompt(
+                "Streaming buffer size (e.g. 64M, 256M, 1G)",
+                &input,
+                error.as_deref(),
+            )
+            .is_err()
+            {
+                return None;
+            }
+            match event::read() {
+                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+                Ok(Event::Key(KeyEvent { code, .. })) => match code {
+                    KeyCode::Enter => match crate::utils::parse_size(input.trim()) {
+                        Ok(n) if n > 0 => return Some(n),
+                        Ok(_) => error = Some("Buffer must be greater than zero.".to_string()),
+                        Err(e) => error = Some(e),
+                    },
+                    KeyCode::Esc => return None,
+                    KeyCode::Backspace => {
+                        input.pop();
+                        error = None;
+                    }
+                    KeyCode::Char(c) => {
+                        input.push(c);
+                        error = None;
+                    }
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Prompt for the repack output path, pre-filled with `default`, rejecting an
+    /// empty name or an existing file. Returns `None` if cancelled.
+    fn prompt_output_path(&self, default: &Path) -> Option<PathBuf> {
+        let mut input = default.to_string_lossy().into_owned();
+        let mut error: Option<String> = None;
+        loop {
+            if UI::draw_text_prompt("Save repacked checkpoint as", &input, error.as_deref())
+                .is_err()
+            {
+                return None;
+            }
+            match event::read() {
+                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+                Ok(Event::Key(KeyEvent { code, .. })) => match code {
+                    KeyCode::Enter => {
+                        let trimmed = input.trim();
+                        if trimmed.is_empty() {
+                            error = Some("Enter a file name.".to_string());
+                        } else if Path::new(trimmed).exists() {
+                            error =
+                                Some("That file already exists — choose another name.".to_string());
+                        } else {
+                            return Some(PathBuf::from(trimmed));
+                        }
+                    }
+                    KeyCode::Esc => return None,
+                    KeyCode::Backspace => {
+                        input.pop();
+                        error = None;
+                    }
+                    KeyCode::Char(c) => {
+                        input.push(c);
+                        error = None;
+                    }
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
+    #[cfg(feature = "hdf5")]
+    fn run_repack(&self, input: &Path, output: &Path, codec: crate::codec::Codec, buffer: usize) {
+        let level = codec.clamp_level(codec.default_level());
+        let opts = crate::convert::Options {
+            codec,
+            level,
+            buffer_bytes: buffer,
+        };
+        let title = format!("Repacking → {} ({})", output.display(), codec.label());
+        let _ = UI::draw_progress(&title, 0, 1, "starting…");
+        let result = crate::convert::convert_hdf5(input, output, &opts, |done, total, name| {
+            let _ = UI::draw_progress(&title, done, total, name);
+        });
+        let level_note = if codec.uses_level() {
+            format!(", level {level}")
+        } else {
+            String::new()
+        };
+        let (heading, body) = match result {
+            Ok(rep) => (
+                "Repack complete",
+                format!("{} → {}{level_note}", rep.summary(codec), output.display()),
+            ),
+            Err(e) => ("Repack failed", format!("{e:#}")),
+        };
+        let _ = UI::draw_message(heading, &body);
+        let _ = event::read();
+    }
+
+    #[cfg(not(feature = "hdf5"))]
+    fn run_repack(
+        &self,
+        _input: &Path,
+        _output: &Path,
+        _codec: crate::codec::Codec,
+        _buffer: usize,
+    ) {
+        let _ = UI::draw_message(
+            "Repack unavailable",
+            "Rebuild with `--features hdf5` to enable repacking.",
+        );
+        let _ = event::read();
+    }
+}
+
+/// Default output name for a repack: `<stem>.repacked.<ext>` beside the input.
+fn default_repacked_name(input: &Path) -> PathBuf {
+    let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("h5");
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("checkpoint");
+    input.with_file_name(format!("{stem}.repacked.{ext}"))
 }
 
 /// Which screen the dtype menu re-renders as its live preview.

@@ -1,9 +1,14 @@
+mod codec;
+#[cfg(feature = "hdf5")]
+mod convert;
 mod explorer;
 mod gguf;
 #[cfg(feature = "hdf5")]
 mod hdf5;
 #[cfg(feature = "hdf5")]
 mod hdf5_lz4;
+#[cfg(feature = "hdf5")]
+mod hdf5_zstd;
 mod health;
 mod sample;
 mod tree;
@@ -11,7 +16,7 @@ mod ui;
 mod utils;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,7 +25,19 @@ use crate::explorer::{Explorer, OpenRequest, OpenView};
 #[derive(Parser)]
 #[command(name = "checkpoint-explorer")]
 #[command(about = "Interactive explorer for model checkpoints (.safetensors, .gguf, .hdf5)")]
-struct Args {
+#[command(args_conflicts_with_subcommands = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Files/directories/globs to explore (the default action when no
+    /// subcommand is given).
+    #[command(flatten)]
+    explore: ExploreArgs,
+}
+
+#[derive(ClapArgs)]
+struct ExploreArgs {
     #[arg(
         help = "Checkpoint files, directories, or glob patterns to explore (e.g., *.safetensors, model-*.gguf, *.hdf5)"
     )]
@@ -114,14 +131,55 @@ struct Args {
     exit: bool,
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+#[derive(Subcommand)]
+enum Command {
+    /// Repack an HDF5 checkpoint into a new file, re-compressing every dataset
+    /// with the chosen codec (e.g. gzip/zstd are ~2× smaller than the LZ4 these
+    /// checkpoints ship with).
+    Convert {
+        /// Source `.h5`/`.hdf5` checkpoint.
+        input: PathBuf,
+        /// Destination file to create.
+        output: PathBuf,
+        /// Compression codec for the output.
+        #[arg(short, long, value_enum, default_value_t = codec::Codec::default())]
+        codec: codec::Codec,
+        /// Compression level (gzip 0–9, zstd 1–22; ignored for lz4/none).
+        /// Defaults to a sensible level for the codec.
+        #[arg(short, long)]
+        level: Option<u8>,
+        /// Streaming buffer per dataset block, e.g. `256M`, `1G` (default 256M).
+        #[arg(short, long, default_value = "256M")]
+        buffer: String,
+        /// Overwrite the output file if it already exists.
+        #[arg(short, long)]
+        force: bool,
+    },
+}
 
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Command::Convert {
+            input,
+            output,
+            codec,
+            level,
+            buffer,
+            force,
+        }) => run_convert(&input, &output, codec, level, &buffer, force),
+        None => run_explore(cli.explore),
+    }
+}
+
+fn run_explore(args: ExploreArgs) -> Result<()> {
     if args.paths.is_empty() {
         eprintln!("Error: Please specify one or more checkpoint files or directories to explore.");
         eprintln!(
             "Usage: checkpoint-explorer <file1.safetensors> [file2.gguf] [model.hdf5] [directory] [*.safetensors] ..."
         );
+        eprintln!("       checkpoint-explorer convert <input.hdf5> <output.hdf5>");
         std::process::exit(1);
     }
 
@@ -160,6 +218,98 @@ fn main() -> Result<()> {
 
     let mut explorer = Explorer::new(files, health_reports, open);
     explorer.run()
+}
+
+#[cfg(feature = "hdf5")]
+fn run_convert(
+    input: &Path,
+    output: &Path,
+    codec: codec::Codec,
+    level: Option<u8>,
+    buffer: &str,
+    force: bool,
+) -> Result<()> {
+    use anyhow::bail;
+    use std::io::Write;
+
+    let ext = input.extension().and_then(|e| e.to_str());
+    if !matches!(ext, Some("h5" | "hdf5")) {
+        bail!(
+            "convert only supports HDF5 inputs (.h5/.hdf5), got: {}",
+            input.display()
+        );
+    }
+    // Refuse to read and write the same file (checked before --force removes the
+    // output, so we never delete the input).
+    if std::path::absolute(input).ok() == std::path::absolute(output).ok()
+        && std::path::absolute(input).is_ok()
+    {
+        bail!("input and output are the same file: {}", input.display());
+    }
+    // Warn when the target codec is what the source already uses (a re-encode;
+    // a plain file copy would be equivalent).
+    if convert::source_codec(input) == Some(codec) {
+        eprintln!(
+            "warning: source is already {}; repacking just re-encodes it — a plain copy would be equivalent",
+            codec.label()
+        );
+    }
+    if force && output.exists() {
+        fs::remove_file(output)
+            .with_context(|| format!("removing existing {}", output.display()))?;
+    }
+
+    let level = codec.clamp_level(level.unwrap_or_else(|| codec.default_level()));
+    let buffer_bytes = utils::parse_size(buffer).map_err(anyhow::Error::msg)?;
+    let opts = convert::Options {
+        codec,
+        level,
+        buffer_bytes,
+    };
+    let level_note = if codec.uses_level() {
+        format!(" level {level}")
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "Repacking {} → {} ({}{level_note}, {} buffer)",
+        input.display(),
+        output.display(),
+        codec.label(),
+        utils::format_size(buffer_bytes),
+    );
+
+    let mut stderr = std::io::stderr();
+    let report = convert::convert_hdf5(input, output, &opts, |done, total, name| {
+        let bar = progress_bar(done, total, 28);
+        let _ = write!(stderr, "\r{bar} [{done}/{total}] {name:.<48}\x1b[K");
+        let _ = stderr.flush();
+    })?;
+    eprintln!("\rDone: {}\x1b[K", report.summary(codec));
+    Ok(())
+}
+
+/// A `[####----]` progress bar of the given width.
+#[cfg(feature = "hdf5")]
+fn progress_bar(done: usize, total: usize, width: usize) -> String {
+    let filled = (done * width).checked_div(total).unwrap_or(0);
+    format!(
+        "[{}{}]",
+        "#".repeat(filled),
+        "-".repeat(width.saturating_sub(filled))
+    )
+}
+
+#[cfg(not(feature = "hdf5"))]
+fn run_convert(
+    _input: &Path,
+    _output: &Path,
+    _codec: codec::Codec,
+    _level: Option<u8>,
+    _buffer: &str,
+    _force: bool,
+) -> Result<()> {
+    anyhow::bail!("`convert` requires building with `--features hdf5`")
 }
 
 fn collect_safetensors_files(

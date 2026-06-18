@@ -70,6 +70,9 @@ pub struct DrawConfig<'a> {
     /// Whether a checkpoint health issue was detected (shows a header hint to
     /// press `h` for the report).
     pub health_warning: bool,
+    /// Whether the loaded checkpoint can be repacked (a single HDF5 file), which
+    /// gates the `R` hint.
+    pub can_repack: bool,
 }
 
 /// How a screen should render the statistics area: not computed yet, a scan in
@@ -170,21 +173,22 @@ impl UI {
             hint_line(&mut *out, &[("Enter", "view"), ("Esc/q", "exit")])?;
             write!(out, "\r\n")?;
         } else {
-            hint_line(
-                &mut *out,
-                &[
-                    ("↑/↓", "navigate"),
-                    ("←/→", "parent/child"),
-                    ("Shift+↑/↓", "sibling"),
-                    ("Enter/Space", "expand"),
-                    ("E/C", "all"),
-                    ("/", "search"),
-                    ("c", "copy screen"),
-                    ("f", "copy file"),
-                    ("⌫/\\", "back/fwd"),
-                    ("q", "quit"),
-                ],
-            )?;
+            let mut hints: Vec<(&str, &str)> = vec![
+                ("↑/↓", "navigate"),
+                ("←/→", "parent/child"),
+                ("Shift+↑/↓", "sibling"),
+                ("Enter/Space", "expand"),
+                ("E/C", "all"),
+                ("/", "search"),
+                ("c", "copy screen"),
+                ("f", "copy file"),
+                ("⌫/\\", "back/fwd"),
+            ];
+            if config.can_repack {
+                hints.push(("R", "repack"));
+            }
+            hints.push(("q", "quit"));
+            hint_line(&mut *out, &hints)?;
             write!(out, "\r\n")?;
         }
         queue!(
@@ -1002,6 +1006,129 @@ impl UI {
             queue!(out, ResetColor)?;
         }
 
+        out.flush()?;
+        Ok(())
+    }
+
+    /// A full-screen single-choice menu: a title and a strip of `options` with
+    /// `current` highlighted. Used to pick the repack codec.
+    pub fn draw_choice_menu(title: &str, options: &[&str], current: usize) -> Result<()> {
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
+        queue!(
+            out,
+            BeginSynchronizedUpdate,
+            terminal::Clear(ClearType::All),
+            cursor::MoveTo(0, 0)
+        )?;
+        write!(out, "{title}\r\n")?;
+        write!(out, "{}\r\n\r\n", "=".repeat(title.len().max(10)))?;
+        for (i, opt) in options.iter().enumerate() {
+            if i == current {
+                queue!(
+                    out,
+                    SetAttribute(Attribute::Bold),
+                    SetForegroundColor(palette::SELECT_FG),
+                    SetBackgroundColor(palette::SELECT_BG)
+                )?;
+                write!(out, " {opt} ")?;
+                queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+            } else {
+                queue!(out, SetForegroundColor(palette::DIM))?;
+                write!(out, " {opt} ")?;
+                queue!(out, ResetColor)?;
+            }
+            write!(out, " ")?;
+        }
+        write!(out, "\r\n\r\n")?;
+        hint_line(
+            &mut out,
+            &[("← →", "move"), ("Enter", "select"), ("Esc", "cancel")],
+        )?;
+        write!(out, "\r\n")?;
+        queue!(out, EndSynchronizedUpdate)?;
+        out.flush()?;
+        Ok(())
+    }
+
+    /// A free-text input prompt pinned to the bottom (label + editable box +
+    /// optional error line). Used to ask for the repack output filename.
+    pub fn draw_text_prompt(label: &str, input: &str, error: Option<&str>) -> Result<()> {
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
+        let (_w, h) = terminal::size()?;
+
+        queue!(
+            out,
+            cursor::MoveTo(0, h.saturating_sub(2)),
+            terminal::Clear(ClearType::CurrentLine),
+            SetForegroundColor(palette::KEY)
+        )?;
+        write!(out, "{label} ")?;
+        queue!(out, ResetColor)?;
+        input_box(&mut out, input, 24)?;
+        write!(out, "  ")?;
+        key_hint(&mut out, "Enter")?;
+        queue!(out, SetForegroundColor(palette::DIM))?;
+        write!(out, " to confirm · ")?;
+        queue!(out, ResetColor)?;
+        key_hint(&mut out, "Esc")?;
+        queue!(out, SetForegroundColor(palette::DIM))?;
+        write!(out, " to cancel")?;
+        queue!(out, ResetColor)?;
+
+        queue!(
+            out,
+            cursor::MoveTo(0, h.saturating_sub(1)),
+            terminal::Clear(ClearType::CurrentLine)
+        )?;
+        if let Some(msg) = error {
+            queue!(out, SetForegroundColor(palette::ERROR))?;
+            write!(out, "{msg}")?;
+            queue!(out, ResetColor)?;
+        }
+        out.flush()?;
+        Ok(())
+    }
+
+    /// A full-screen progress view with a bar, `done/total` count and a detail
+    /// line (e.g. the dataset currently being written). Drawn in place.
+    #[cfg(feature = "hdf5")]
+    pub fn draw_progress(title: &str, done: usize, total: usize, detail: &str) -> Result<()> {
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
+        queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
+        write!(out, "{title}")?;
+        line_end(&mut out)?;
+        write!(out, "{}", "=".repeat(title.len().max(10)))?;
+        line_end(&mut out)?;
+        line_end(&mut out)?;
+
+        const WIDTH: usize = 40;
+        let frac = if total > 0 {
+            done as f64 / total as f64
+        } else {
+            0.0
+        };
+        let filled = (frac * WIDTH as f64).round() as usize;
+        write!(out, "[")?;
+        queue!(out, SetForegroundColor(palette::KEY))?;
+        write!(out, "{}", "█".repeat(filled))?;
+        queue!(out, SetForegroundColor(palette::DIM))?;
+        write!(out, "{}", "░".repeat(WIDTH.saturating_sub(filled)))?;
+        queue!(out, ResetColor)?;
+        write!(out, "] {done}/{total}")?;
+        line_end(&mut out)?;
+        queue!(out, SetForegroundColor(palette::DIM))?;
+        write!(out, "{detail}")?;
+        queue!(out, ResetColor)?;
+        line_end(&mut out)?;
+
+        queue!(
+            out,
+            terminal::Clear(ClearType::FromCursorDown),
+            EndSynchronizedUpdate
+        )?;
         out.flush()?;
         Ok(())
     }

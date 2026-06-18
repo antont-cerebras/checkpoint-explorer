@@ -1082,6 +1082,7 @@ impl Hdf5Reader {
         let file = hdf5_metno::File::open(&t.source_path).map_err(|e| e.to_string())?;
         // Ensure LZ4-compressed datasets are decodable (no-op after first call).
         crate::hdf5_lz4::register();
+        crate::hdf5_zstd::register();
         let key = file
             .member_names()
             .map_err(|e| e.to_string())?
