@@ -36,6 +36,9 @@ half = { version = "2", optional = true }
 # Zstandard codec for the repack command (registered as an in-process HDF5
 # filter, id 32015); decode-compatible with h5py + hdf5plugin's zstd.
 zstd = { version = "0.13", optional = true }
+# zlib (DEFLATE) for the parallel repack pipeline's gzip path — produces the
+# same stream libhdf5's built-in deflate filter reads. Pure-Rust backend.
+flate2 = { version = "1", optional = true }
 
 [features]
-hdf5 = ["dep:hdf5-metno", "dep:ndarray", "dep:hdf5-metno-sys", "dep:lz4_flex", "dep:half", "dep:zstd"]
+hdf5 = ["dep:hdf5-metno", "dep:ndarray", "dep:hdf5-metno-sys", "dep:lz4_flex", "dep:half", "dep:zstd", "dep:flate2"]

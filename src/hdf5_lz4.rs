@@ -194,6 +194,20 @@ unsafe fn compress(nbytes: usize, buf: *mut *mut c_void, buf_size: *mut usize) -
     }
 }
 
+/// Compress raw bytes into an `H5Zlz4` frame (the repack writer's lz4 path,
+/// producing exactly what the filter's forward direction would).
+pub fn compress_block(raw: &[u8]) -> Vec<u8> {
+    frame_chunk(raw)
+}
+
+/// Decompress an `H5Zlz4` frame to its raw bytes (the repack reader's lz4 path),
+/// or `None` if malformed.
+pub fn decompress_block(framed: &[u8]) -> Option<Vec<u8>> {
+    let total = frame_total_size(framed)?;
+    let mut out = vec![0u8; total];
+    decode_into(framed, &mut out).then_some(out)
+}
+
 /// Build an `H5Zlz4` frame for one chunk as a single block (chunks are well
 /// under LZ4's block-size limit): `u64` total, `u32` block size, then `u32`
 /// compressed length + payload. A block that wouldn't shrink is stored verbatim

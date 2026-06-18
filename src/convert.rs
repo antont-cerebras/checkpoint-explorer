@@ -10,11 +10,15 @@
 //! outer axis in a configurable buffer so peak memory stays bounded regardless
 //! of tensor size.
 
+use std::os::raw::c_void;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use hdf5_metno::filters::Filter;
 use hdf5_metno::types::{FloatSize, IntSize, TypeDescriptor};
+use hdf5_metno_sys::h5d::{H5Dread_chunk, H5Dwrite_chunk};
+use hdf5_metno_sys::h5p::H5P_DEFAULT;
+use rayon::prelude::*;
 
 use crate::codec::Codec;
 
@@ -219,23 +223,28 @@ fn copy_dataset(
         Ok(d) => d,
         Err(_) => return Ok(None),
     };
-    let logical = (shape.iter().product::<usize>() * dtype.size()) as u64;
-
-    // Compression needs chunking, so stream only chunked, non-scalar datasets;
-    // tiny contiguous ones (e.g. 1-D norms stored unchunked) are copied verbatim
-    // (their size is negligible, so the codec wouldn't matter anyway).
-    let stream = !shape.is_empty() && chunk.is_some();
+    let item = dtype.size();
+    let logical = (shape.iter().product::<usize>() * item) as u64;
     let level = opts.codec.clamp_level(opts.level);
+    // Whether the source's filter pipeline is one we can invert ourselves
+    // off-thread (≤1 recognised compressor): `Some(source codec)` if so, `None`
+    // if it has other filters (e.g. shuffle) and must go through libhdf5.
+    let simple = source_filters_simple(ds);
+    let chunk_raw = chunk
+        .as_ref()
+        .map(|c| c.iter().product::<usize>() * item)
+        .unwrap_or(0);
 
     macro_rules! dispatch {
         ($T:ty) => {{
-            if stream {
-                let chunk = chunk.clone().unwrap();
+            if let Some(chunk) = chunk.clone() {
+                // Chunked: create the destination with the target codec, then
+                // copy chunks — in parallel (compress off the HDF5 thread) when
+                // the source filters are simple, else via libhdf5's pipeline.
                 let b = dst
                     .new_dataset::<$T>()
                     .shape(shape.as_slice())
                     .chunk(chunk.as_slice());
-                // Apply the chosen codec to the write pipeline.
                 let out = match opts.codec {
                     Codec::Uncompressed => b.create(name)?,
                     Codec::Gzip => b.deflate(level).create(name)?,
@@ -249,8 +258,20 @@ fn copy_dataset(
                         )])
                         .create(name)?,
                 };
-                stream_copy::<$T>(ds, &out, &shape, &chunk, opts.buffer_bytes)?;
+                match simple {
+                    Some(source) => copy_chunks_parallel(
+                        ds,
+                        &out,
+                        source,
+                        opts.codec,
+                        level,
+                        chunk_raw,
+                        opts.buffer_bytes,
+                    )?,
+                    None => stream_copy::<$T>(ds, &out, &shape, &chunk, opts.buffer_bytes)?,
+                }
             } else {
+                // Unchunked (tiny / scalar): copy verbatim.
                 let data = ds.read_raw::<$T>()?;
                 dst.new_dataset::<$T>()
                     .shape(shape.as_slice())
@@ -307,6 +328,146 @@ fn stream_copy<T: hdf5_metno::H5Type + Clone + Default>(
         i = hi;
     }
     Ok(())
+}
+
+/// The source's compression, if its filter pipeline is one we can invert
+/// ourselves (no filters, or exactly one recognised compressor):
+/// `Some(Some(codec))` compressed, `Some(None)` uncompressed, `None` if it has
+/// other filters (e.g. shuffle) and must be read through libhdf5's pipeline.
+fn source_filters_simple(ds: &hdf5_metno::Dataset) -> Option<Option<Codec>> {
+    match ds.filters().len() {
+        0 => Some(None),
+        1 => dataset_codec(ds).map(Some),
+        _ => None,
+    }
+}
+
+/// Copy a chunked dataset by transcoding each raw chunk: read the stored
+/// (filtered) chunk, decompress + recompress **in parallel** off the HDF5
+/// thread, and write the new chunk directly — so compression (the bottleneck)
+/// uses all cores while the serialised HDF5 I/O just shuffles bytes.
+///
+/// `source` is the source codec (`None` = uncompressed). Chunks are processed in
+/// batches sized to `buffer_bytes` to bound memory.
+fn copy_chunks_parallel(
+    src: &hdf5_metno::Dataset,
+    dst: &hdf5_metno::Dataset,
+    source: Option<Codec>,
+    target: Codec,
+    level: u8,
+    chunk_raw: usize,
+    buffer_bytes: usize,
+) -> Result<()> {
+    let n = src.num_chunks().unwrap_or(0);
+    let per_batch = (buffer_bytes / chunk_raw.max(1)).max(1);
+    let (src_id, dst_id) = (src.id(), dst.id());
+
+    let mut i = 0;
+    while i < n {
+        let hi = (i + per_batch).min(n);
+        // Serial (HDF5): read each chunk's stored bytes + filter mask.
+        let mut batch: Vec<(Vec<u64>, u32, Vec<u8>)> = Vec::with_capacity(hi - i);
+        for ci in i..hi {
+            let info = src
+                .chunk_info(ci)
+                .with_context(|| format!("missing chunk {ci}"))?;
+            let mut buf = vec![0u8; info.size as usize];
+            let mut mask: u32 = 0;
+            // libhdf5 2.0 takes an in/out buffer-size argument.
+            let mut buf_size: usize = buf.len();
+            // Hold the same lock hdf5-metno uses for all HDF5 calls: libhdf5
+            // isn't thread-safe and these raw calls would otherwise race other
+            // HDF5 access (e.g. concurrent tests).
+            let rc = hdf5_metno::sync::sync(|| unsafe {
+                H5Dread_chunk(
+                    src_id,
+                    H5P_DEFAULT,
+                    info.offset.as_ptr(),
+                    &mut mask,
+                    buf.as_mut_ptr() as *mut c_void,
+                    &mut buf_size,
+                )
+            });
+            if rc < 0 {
+                bail!("H5Dread_chunk failed for chunk {ci}");
+            }
+            batch.push((info.offset, mask, buf));
+        }
+        // Parallel (off HDF5): decompress the source codec, recompress the target.
+        let compressed: Vec<(Vec<u64>, Vec<u8>)> = batch
+            .into_par_iter()
+            .map(|(offset, mask, filtered)| {
+                let raw = decompress_chunk(source, mask, &filtered, chunk_raw)?;
+                Ok::<_, anyhow::Error>((offset, compress_chunk(target, level, &raw)?))
+            })
+            .collect::<Result<_>>()?;
+        // Serial (HDF5): write each transcoded chunk directly (mask 0 = fully
+        // filtered, so libhdf5 stores it as-is and reverses on read).
+        for (offset, bytes) in &compressed {
+            let rc = hdf5_metno::sync::sync(|| unsafe {
+                H5Dwrite_chunk(
+                    dst_id,
+                    H5P_DEFAULT,
+                    0,
+                    offset.as_ptr(),
+                    bytes.len(),
+                    bytes.as_ptr() as *const c_void,
+                )
+            });
+            if rc < 0 {
+                bail!("H5Dwrite_chunk failed");
+            }
+        }
+        i = hi;
+    }
+    Ok(())
+}
+
+/// Decompress one stored chunk to its raw bytes. A set low bit in `mask` means
+/// the source filter was skipped for this chunk (stored raw).
+fn decompress_chunk(
+    source: Option<Codec>,
+    mask: u32,
+    filtered: &[u8],
+    raw_size: usize,
+) -> Result<Vec<u8>> {
+    if mask & 1 != 0 || matches!(source, None | Some(Codec::Uncompressed)) {
+        return Ok(filtered.to_vec());
+    }
+    match source.unwrap() {
+        Codec::Lz4 => {
+            crate::hdf5_lz4::decompress_block(filtered).context("lz4 chunk decompress failed")
+        }
+        Codec::Zstd => zstd::decode_all(filtered).context("zstd chunk decompress failed"),
+        Codec::Gzip => {
+            use std::io::Read;
+            let mut out = Vec::with_capacity(raw_size);
+            flate2::read::ZlibDecoder::new(filtered)
+                .read_to_end(&mut out)
+                .context("zlib chunk decompress failed")?;
+            Ok(out)
+        }
+        Codec::Uncompressed => Ok(filtered.to_vec()),
+    }
+}
+
+/// Compress one raw chunk into the byte form the target codec's HDF5 filter
+/// produces (so a direct chunk write round-trips through libhdf5 on read).
+fn compress_chunk(target: Codec, level: u8, raw: &[u8]) -> Result<Vec<u8>> {
+    Ok(match target {
+        Codec::Uncompressed => raw.to_vec(),
+        Codec::Lz4 => crate::hdf5_lz4::compress_block(raw),
+        Codec::Zstd => zstd::encode_all(raw, level as i32).context("zstd chunk compress failed")?,
+        Codec::Gzip => {
+            use std::io::Write;
+            let mut enc = flate2::write::ZlibEncoder::new(
+                Vec::with_capacity(raw.len() / 2 + 16),
+                flate2::Compression::new(level as u32),
+            );
+            enc.write_all(raw).context("zlib chunk compress failed")?;
+            enc.finish().context("zlib chunk finish failed")?
+        }
+    })
 }
 
 #[cfg(test)]
