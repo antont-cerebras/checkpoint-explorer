@@ -537,15 +537,11 @@ fn stats_safetensors(t: &TensorInfo, view: ViewDtype) -> Result<Stats, String> {
 
 #[cfg(feature = "hdf5")]
 fn stats_hdf5(t: &TensorInfo) -> Result<Stats, String> {
-    // Reading is whole-dataset (libhdf5 decompresses everything), so cap it.
-    const MAX_ELEMS: usize = 200_000_000;
-    if t.num_elements > MAX_ELEMS {
-        return Err(format!(
-            "tensor too large for exact statistics ({} elements)",
-            t.num_elements
-        ));
-    }
+    use hdf5_metno::{Hyperslab, SliceOrIndex};
+
     let file = hdf5_metno::File::open(&t.source_path).map_err(|e| e.to_string())?;
+    // Ensure LZ4-compressed datasets are decodable (no-op after the first call).
+    crate::hdf5_lz4::register();
     let key = file
         .member_names()
         .map_err(|e| e.to_string())?
@@ -553,18 +549,74 @@ fn stats_hdf5(t: &TensorInfo) -> Result<Stats, String> {
         .find(|k| crate::hdf5::percent_decode(k) == t.name)
         .ok_or_else(|| "dataset not found in file".to_string())?;
     let dataset = file.dataset(&key).map_err(|e| e.to_string())?;
-    // For ≤32-bit float sources, materialize the (decompressed) dataset as f32
-    // instead of f64 — the values are exact in f32, so it halves the buffer and
-    // the conversion work. Integer / f64 sources stay f64 to avoid precision
-    // loss. Either way the accumulators stay in double precision.
-    let acc = if matches!(t.dtype.as_str(), "F16" | "BF16" | "F32") {
-        let flat = dataset.read_raw::<f32>().map_err(|e| e.to_string())?;
-        reduce_to_acc(&flat, |v| v as f64)
-    } else {
-        let flat = dataset.read_raw::<f64>().map_err(|e| e.to_string())?;
-        reduce_to_acc(&flat, |v| v)
+    let shape = dataset.shape();
+
+    // ≤32-bit-exact sources are read as f32 to halve the per-block buffer (the
+    // values round-trip exactly); wider/integer sources stay f64. Either way the
+    // accumulators are double precision. `read` reads a block and folds it.
+    let use_f32 = matches!(
+        t.dtype.as_str(),
+        "F16" | "BF16" | "F32" | "I8" | "U8" | "I16" | "U16"
+    );
+    let read = |hyper: Hyperslab| -> Result<Acc, String> {
+        if use_f32 {
+            let a = dataset
+                .read_slice::<f32, _, ndarray::IxDyn>(hyper)
+                .map_err(|e| e.to_string())?;
+            Ok(fold_block(a.as_slice(), a.iter(), |v| v as f64))
+        } else {
+            let a = dataset
+                .read_slice::<f64, _, ndarray::IxDyn>(hyper)
+                .map_err(|e| e.to_string())?;
+            Ok(fold_block(a.as_slice(), a.iter(), |v| v))
+        }
     };
+
+    // 0-D (scalar): a single block over the whole (degenerate) shape.
+    if shape.is_empty() {
+        return read(Hyperslab::from(Vec::new())).map(Acc::finish);
+    }
+
+    // Stream along the outer axis in row-blocks so memory stays bounded
+    // regardless of tensor size (HDF5 decompresses the overlapping chunks).
+    let outer = shape[0];
+    let inner: usize = shape[1..].iter().product::<usize>().max(1);
+    const BLOCK_ELEMS: usize = 16 << 20; // ≈16M elements (~64 MiB as f32) per read
+    let block = (BLOCK_ELEMS / inner).max(1);
+
+    let mut acc = Acc::ID;
+    let mut i = 0;
+    while i < outer {
+        let hi = (i + block).min(outer);
+        // Hyperslab: rows [i, hi) on axis 0, the full (bounded) extent elsewhere.
+        let mut dims: Vec<SliceOrIndex> = Vec::with_capacity(shape.len());
+        dims.push(SliceOrIndex::from(i..hi));
+        for &d in &shape[1..] {
+            dims.push(SliceOrIndex::from(0..d));
+        }
+        acc = Acc::merge(acc, read(Hyperslab::from(dims))?);
+        i = hi;
+    }
     Ok(acc.finish())
+}
+
+/// Fold one read block into an [`Acc`]: rayon-reduce the contiguous slice when
+/// available (a fresh read is standard-layout), else iterate.
+#[cfg(feature = "hdf5")]
+fn fold_block<'a, T: Copy + Send + Sync + 'a>(
+    contiguous: Option<&[T]>,
+    iter: impl Iterator<Item = &'a T>,
+    to_f64: impl Fn(T) -> f64 + Sync,
+) -> Acc {
+    if let Some(s) = contiguous {
+        reduce_to_acc(s, to_f64)
+    } else {
+        let mut a = Acc::ID;
+        for &v in iter {
+            a.push(to_f64(v));
+        }
+        a
+    }
 }
 
 /// Scan a safetensors tensor's bytes into an [`Acc`], either with the rayon
@@ -739,6 +791,8 @@ fn read_hdf5(
     }
 
     let file = hdf5_metno::File::open(&t.source_path).map_err(|e| e.to_string())?;
+    // Ensure LZ4-compressed datasets are decodable (no-op after the first call).
+    crate::hdf5_lz4::register();
     // The decoded tensor name maps to a URL-quoted dataset key.
     let key = file
         .member_names()
@@ -1033,6 +1087,23 @@ mod tests {
 mod hdf5_tests {
     use super::*;
     use crate::tree::{Layout, Storage};
+
+    /// Manual: `BENCH_FILE=<.hdf5> BENCH_TENSOR=<name> cargo test --release
+    /// --features hdf5 -- --ignored --nocapture hdf5_stats_timing`.
+    #[test]
+    #[ignore = "manual; set BENCH_FILE and BENCH_TENSOR"]
+    fn hdf5_stats_timing() {
+        let path = std::env::var("BENCH_FILE").expect("set BENCH_FILE");
+        let name = std::env::var("BENCH_TENSOR").expect("set BENCH_TENSOR");
+        let tensors = crate::hdf5::read_tensors(std::path::Path::new(&path)).unwrap();
+        let t = tensors.into_iter().find(|t| t.name == name).expect("tensor");
+        eprintln!("tensor {} dtype={} shape={:?}", t.name, t.dtype, t.shape);
+        let started = std::time::Instant::now();
+        match tensor_stats(&t, ViewDtype::Stored) {
+            Ok(s) => eprintln!("ok in {:?}: {s:?}", started.elapsed()),
+            Err(e) => eprintln!("ERR in {:?}: {e}", started.elapsed()),
+        }
+    }
 
     #[test]
     fn samples_an_hdf5_dataset_by_value() {

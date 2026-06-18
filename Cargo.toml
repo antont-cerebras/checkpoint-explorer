@@ -22,6 +22,14 @@ rayon = "1"
 # default build stays pure-Rust with no system dependencies; the `static`
 # feature builds a bundled libhdf5 from source (needs a C toolchain + cmake).
 hdf5-metno = { version = "0.12", optional = true, features = ["static", "zlib", "f16"] }
+# Used only by the HDF5 stats reader (hyperslab streaming); version pinned to
+# match hdf5-metno's so the `Array`/selection types line up.
+ndarray = { version = "0.17", optional = true }
+# FFI to the bundled libhdf5 (re-exports its `h5z`/`h5` symbols) so we can
+# register the LZ4 decompression filter it lacks; pinned to hdf5-metno's -sys.
+hdf5-metno-sys = { version = "0.11", optional = true }
+# Pure-Rust LZ4 block decompression backing that filter (decode only).
+lz4_flex = { version = "0.11", optional = true, default-features = false, features = ["safe-decode"] }
 
 [features]
-hdf5 = ["dep:hdf5-metno"]
+hdf5 = ["dep:hdf5-metno", "dep:ndarray", "dep:hdf5-metno-sys", "dep:lz4_flex"]

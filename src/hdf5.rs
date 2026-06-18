@@ -19,6 +19,10 @@ pub fn read_tensors(path: &std::path::Path) -> Result<Vec<TensorInfo>> {
     let file = hdf5_metno::File::open(path)
         .with_context(|| format!("Failed to open HDF5 file: {}", path.display()))?;
 
+    // libhdf5 is now initialised; teach it the LZ4 filter so compressed datasets
+    // (stats/preview) are readable later in the session.
+    crate::hdf5_lz4::register();
+
     let members = file
         .member_names()
         .with_context(|| format!("Failed to list members of: {}", path.display()))?;

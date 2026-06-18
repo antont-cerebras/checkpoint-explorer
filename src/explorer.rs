@@ -120,13 +120,25 @@ impl Explorer {
             }
         }
 
-        let stats = handle.join().ok().and_then(|r| r.ok());
-        if let Some(s) = stats {
-            self.stats_cache
-                .borrow_mut()
-                .insert((tensor.name.clone(), view), s);
+        match handle.join() {
+            Ok(Ok(s)) => {
+                self.stats_cache
+                    .borrow_mut()
+                    .insert((tensor.name.clone(), view), s);
+                Some(s)
+            }
+            // Surface a failure instead of silently doing nothing.
+            Ok(Err(msg)) => {
+                let _ = UI::draw_message("Statistics unavailable", &msg);
+                let _ = event::read();
+                None
+            }
+            Err(_) => {
+                let _ = UI::draw_message("Statistics unavailable", "the scan thread panicked");
+                let _ = event::read();
+                None
+            }
         }
-        stats
     }
 
     fn load_all_files(&mut self) -> Result<()> {
