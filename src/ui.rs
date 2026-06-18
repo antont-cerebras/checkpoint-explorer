@@ -8,7 +8,7 @@ use std::io::{self, BufWriter, Write};
 use std::time::Duration;
 
 use crate::health::HealthReport;
-use crate::sample::{Sample, Stats, ViewDtype};
+use crate::sample::{Sample, SampleMode, Stats, ViewDtype};
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo, TreeNode};
 use crate::utils::{format_parameters, format_shape, format_size};
 
@@ -528,9 +528,14 @@ impl UI {
         write!(out, " ")?;
         let logical = sample.view.logical_shape(&tensor.shape, &tensor.dtype);
         write_view_shape(&mut out, &tensor.shape, &logical)?;
+        let what = if sample.mode == SampleMode::Edges {
+            "first/last"
+        } else {
+            "sampled"
+        };
         write!(
             out,
-            " → sampled {}×{}, value range [{lo}, {hi}]{range_note}",
+            " → {what} {}×{}, value range [{lo}, {hi}]{range_note}",
             sample.rows.len(),
             sample.cols.len(),
         )?;
@@ -605,9 +610,13 @@ impl UI {
         write!(out, " ")?;
         let logical = sample.view.logical_shape(&tensor.shape, &tensor.dtype);
         write_view_shape(&mut out, &tensor.shape, &logical)?;
+        // In edges mode the grid is the first/last rows & columns (for padding);
+        // otherwise an evenly-spaced overview.
+        let edges = sample.mode == SampleMode::Edges;
+        let what = if edges { "first/last" } else { "sampled" };
         write!(
             out,
-            " → sampled {} of {} rows × {} of {} cols (indices shown)",
+            " → {what} {} of {} rows × {} of {} cols (indices shown)",
             sample.rows.len(),
             sample.total_rows,
             sample.cols.len(),
@@ -621,10 +630,24 @@ impl UI {
         }
         line_end(&mut out)?;
 
-        // Column-index header.
+        // In edges mode, the index after which rows/cols jump (the padding
+        // boundary), so we can draw a dotted separator there. `None` in grid
+        // mode, or when the matrix was small enough to show contiguously.
+        let gap = |idx: &[usize]| -> Option<usize> {
+            edges
+                .then(|| idx.windows(2).position(|w| w[1] != w[0] + 1))
+                .flatten()
+        };
+        let row_gap = gap(&sample.rows);
+        let col_gap = gap(&sample.cols);
+
+        // Column-index header (with a "⋯" separator column at the gap).
         write!(out, "{:>6} ", "")?;
-        for &c in &sample.cols {
+        for (j, &c) in sample.cols.iter().enumerate() {
             write!(out, "{c:>W$}")?;
+            if Some(j) == col_gap {
+                write!(out, "{:>W$}", "⋯")?;
+            }
         }
         line_end(&mut out)?;
 
@@ -632,14 +655,32 @@ impl UI {
         let integer = sample.view.is_integer(&tensor.dtype);
         for (i, row) in sample.values.iter().enumerate() {
             write!(out, "{:>6} ", sample.rows[i])?;
-            for &v in row {
+            for (j, &v) in row.iter().enumerate() {
                 if integer {
                     write!(out, "{:>W$}", v as i64)?;
                 } else {
                     write!(out, "{v:>W$.3e}")?;
                 }
+                if Some(j) == col_gap {
+                    queue!(out, SetForegroundColor(palette::DIM))?;
+                    write!(out, "{:>W$}", "⋯")?;
+                    queue!(out, ResetColor)?;
+                }
             }
             line_end(&mut out)?;
+            // Dotted row after the gap to mark the rows that were skipped.
+            if Some(i) == row_gap {
+                queue!(out, SetForegroundColor(palette::DIM))?;
+                write!(out, "{:>6} ", "⋮")?;
+                for j in 0..row.len() {
+                    write!(out, "{:>W$}", "⋮")?;
+                    if Some(j) == col_gap {
+                        write!(out, "{:>W$}", "⋱")?;
+                    }
+                }
+                queue!(out, ResetColor)?;
+                line_end(&mut out)?;
+            }
         }
 
         line_end(&mut out)?;
@@ -916,6 +957,12 @@ fn write_view_footer(out: &mut impl Write, sample: &Sample, heatmap: bool) -> Re
     if sample.overridable {
         items.push(("d", "dtype"));
     }
+    // Toggle between the overview grid and the first/last rows & cols (edges).
+    items.push(if sample.mode == SampleMode::Edges {
+        ("e", "grid")
+    } else {
+        ("e", "edges")
+    });
     items.push(("", "any other key to return..."));
     hint_line(out, &items)
 }
