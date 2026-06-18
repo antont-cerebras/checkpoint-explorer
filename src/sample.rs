@@ -3,8 +3,8 @@
 //! Tensors can be many GB, so we never read a whole one: we pick a small grid
 //! of element indices that fit the screen (including the edges) and read just
 //! those. safetensors are read by seeking to the sampled rows; HDF5 datasets
-//! are read via libhdf5 (which converts any numeric dtype to `f64` and handles
-//! decompression) with a size cap.
+//! are read via libhdf5 (which handles chunking and decompression) as their
+//! stored bytes, with a size cap on the preview.
 
 use std::io::{Read, Seek, SeekFrom};
 
@@ -26,8 +26,8 @@ use crate::tree::{Layout, TensorInfo};
 ///   differ on which nibble carries the data); `*Packed` unpacks every nibble
 ///   densely (a 16-bit slot yields four values, expanding the last dimension).
 ///
-/// Overrides only apply where we read raw bytes (safetensors); HDF5 always uses
-/// the stored dtype.
+/// Overrides apply wherever we read the raw stored bytes — both safetensors and
+/// HDF5.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum ViewDtype {
     /// Decode using the tensor's real dtype.
@@ -184,7 +184,7 @@ pub struct Sample {
     pub slice: usize,
     /// The dtype reinterpretation this sample was decoded with.
     pub view: ViewDtype,
-    /// Whether a dtype override is available for this tensor (safetensors only).
+    /// Whether a dtype override is available for this tensor (safetensors/HDF5).
     pub overridable: bool,
 }
 
@@ -192,7 +192,7 @@ pub struct Sample {
 /// 3D tensor `[d0, d1, d2]`, `slice` selects the leading index and the `d1 x d2`
 /// matrix at that index is sampled (clamped to a valid slice). `view` overrides
 /// how bytes are decoded (e.g. as packed 4-bit), which for a packed view
-/// expands the last dimension; it only applies to safetensors.
+/// expands the last dimension; it applies to safetensors and HDF5.
 pub fn sample_tensor(
     t: &TensorInfo,
     max_rows: usize,
@@ -204,9 +204,10 @@ pub fn sample_tensor(
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
-    // We can only reinterpret raw bytes for safetensors; elsewhere fall back to
-    // the stored dtype so the header never mislabels what's shown.
-    let overridable = ext == "safetensors";
+    // Dtype overrides reinterpret raw stored bytes; supported for safetensors
+    // and HDF5. For any other format fall back to the stored dtype so the
+    // header never mislabels what's shown.
+    let overridable = matches!(ext, "safetensors" | "h5" | "hdf5");
     let view = if overridable { view } else { ViewDtype::Stored };
 
     // A packed override unpacks several 4-bit values from each stored element,
@@ -239,7 +240,7 @@ pub fn sample_tensor(
 
     let values = match ext {
         "safetensors" => read_safetensors(t, total_cols, base, &rows, &cols, view)?,
-        "h5" | "hdf5" => read_hdf5(t, total_cols, base, &rows, &cols)?,
+        "h5" | "hdf5" => read_hdf5(t, total_cols, base, &rows, &cols, view)?,
         _ => return Err("data preview is not supported for this format".to_string()),
     };
 
@@ -297,23 +298,64 @@ fn item_size(dtype: &str) -> Option<usize> {
     })
 }
 
+/// A primitive numeric dtype, parsed once from its string label so the hot scan
+/// loop dispatches on a cheap enum instead of matching the `&str` per element.
+#[derive(Clone, Copy)]
+enum Prim {
+    F64,
+    F32,
+    F16,
+    BF16,
+    I64,
+    I32,
+    I16,
+    I8,
+    U64,
+    U32,
+    U16,
+    U8,
+}
+
+/// Parse a dtype label into a [`Prim`], or `None` for unknown labels.
+fn parse_prim(dtype: &str) -> Option<Prim> {
+    Some(match dtype {
+        "F64" => Prim::F64,
+        "F32" => Prim::F32,
+        "F16" => Prim::F16,
+        "BF16" => Prim::BF16,
+        "I64" => Prim::I64,
+        "I32" => Prim::I32,
+        "I16" => Prim::I16,
+        "I8" => Prim::I8,
+        "U64" => Prim::U64,
+        "U32" => Prim::U32,
+        "U16" => Prim::U16,
+        "U8" | "BOOL" => Prim::U8,
+        _ => return None,
+    })
+}
+
+/// Decode `item_size` little-endian bytes as `p` into an `f64`.
+fn decode_prim(p: Prim, b: &[u8]) -> f64 {
+    match p {
+        Prim::F64 => f64::from_le_bytes(b.try_into().unwrap()),
+        Prim::F32 => f32::from_le_bytes(b.try_into().unwrap()) as f64,
+        Prim::F16 => f16_to_f64(u16::from_le_bytes(b.try_into().unwrap())),
+        Prim::BF16 => bf16_to_f64(u16::from_le_bytes(b.try_into().unwrap())),
+        Prim::I64 => i64::from_le_bytes(b.try_into().unwrap()) as f64,
+        Prim::I32 => i32::from_le_bytes(b.try_into().unwrap()) as f64,
+        Prim::I16 => i16::from_le_bytes(b.try_into().unwrap()) as f64,
+        Prim::I8 => (b[0] as i8) as f64,
+        Prim::U64 => u64::from_le_bytes(b.try_into().unwrap()) as f64,
+        Prim::U32 => u32::from_le_bytes(b.try_into().unwrap()) as f64,
+        Prim::U16 => u16::from_le_bytes(b.try_into().unwrap()) as f64,
+        Prim::U8 => b[0] as f64,
+    }
+}
+
 /// Decode `item_size(dtype)` little-endian bytes into an `f64`.
 fn decode(dtype: &str, b: &[u8]) -> f64 {
-    match dtype {
-        "F64" => f64::from_le_bytes(b.try_into().unwrap()),
-        "F32" => f32::from_le_bytes(b.try_into().unwrap()) as f64,
-        "F16" => f16_to_f64(u16::from_le_bytes(b.try_into().unwrap())),
-        "BF16" => bf16_to_f64(u16::from_le_bytes(b.try_into().unwrap())),
-        "I64" => i64::from_le_bytes(b.try_into().unwrap()) as f64,
-        "I32" => i32::from_le_bytes(b.try_into().unwrap()) as f64,
-        "I16" => i16::from_le_bytes(b.try_into().unwrap()) as f64,
-        "I8" => (b[0] as i8) as f64,
-        "U64" => u64::from_le_bytes(b.try_into().unwrap()) as f64,
-        "U32" => u32::from_le_bytes(b.try_into().unwrap()) as f64,
-        "U16" => u16::from_le_bytes(b.try_into().unwrap()) as f64,
-        "U8" | "BOOL" => b[0] as f64,
-        _ => f64::NAN,
-    }
+    parse_prim(dtype).map_or(f64::NAN, |p| decode_prim(p, b))
 }
 
 /// Decode sub-element `sub` of a stored container `bytes` under `view`. For
@@ -480,10 +522,65 @@ impl Acc {
 /// Containers processed per parallel task (keeps per-task overhead low).
 const STATS_CHUNK: usize = 1 << 16;
 
+/// Build a per-container decoder for `(view, dtype)`, resolving the `&str` dtype
+/// dispatch once up front. The returned closure maps a container's bytes and a
+/// nibble index to an `f64`; it runs once per logical value in the hot scan
+/// loop (billions of times), so it must avoid string matching.
+fn view_decoder(view: ViewDtype, dtype: &str) -> impl Fn(&[u8], usize) -> f64 {
+    // For Stored / same-width `As`, decode the whole container as this primitive.
+    let prim = match view {
+        ViewDtype::As(dt) => parse_prim(dt),
+        _ => parse_prim(dtype),
+    };
+    let signed = view.is_signed();
+    move |bytes: &[u8], sub: usize| match view {
+        ViewDtype::Stored | ViewDtype::As(_) => prim.map_or(f64::NAN, |p| decode_prim(p, bytes)),
+        _ => {
+            // 4-bit nibble views: pull one nibble from the little-endian container.
+            let mut container: u64 = 0;
+            for (i, &b) in bytes.iter().take(8).enumerate() {
+                container |= (b as u64) << (8 * i);
+            }
+            let nib_index = match view {
+                ViewDtype::U4Packed | ViewDtype::I4Packed => sub,
+                ViewDtype::U4Hi | ViewDtype::I4Hi => bytes.len() * 2 - 1,
+                _ => 0, // low-nibble views
+            };
+            let nibble = ((container >> (nib_index * 4)) & 0xF) as i64;
+            if signed && nibble >= 8 {
+                (nibble - 16) as f64
+            } else {
+                nibble as f64
+            }
+        }
+    }
+}
+
+/// Reduce a flat little-endian byte buffer of `item`-byte containers into an
+/// [`Acc`] under `view`, decoding every logical value (a packed view yields
+/// several per container). Parallel over chunks; shared by the safetensors and
+/// HDF5 scanners so a dtype reinterpretation means the same thing in both.
+fn reduce_view_bytes(bytes: &[u8], item: usize, view: ViewDtype, dtype: &str) -> Acc {
+    let packing = view.packing(item);
+    let decode = view_decoder(view, dtype);
+    bytes
+        .par_chunks(item * STATS_CHUNK)
+        .map(|chunk| {
+            let mut a = Acc::ID;
+            for container in chunk.chunks_exact(item) {
+                for sub in 0..packing {
+                    a.push(decode(container, sub));
+                }
+            }
+            a
+        })
+        .reduce(|| Acc::ID, Acc::merge)
+}
+
 /// Compute exact statistics over the whole tensor under `view`. Reads every
-/// element once — memory-mapped and decoded in parallel for safetensors; for
-/// HDF5 it reads the (decompressed) dataset, capped in size. Only safetensors
-/// honours a non-`Stored` view (HDF5 always uses the stored dtype).
+/// element once and decodes in parallel — memory-mapped for safetensors, or
+/// streamed in bounded row-blocks for HDF5 (any size). Both honour a non-`Stored`
+/// view by reinterpreting the raw stored bytes.
 pub fn tensor_stats(t: &TensorInfo, view: ViewDtype) -> Result<Stats, String> {
     let ext = std::path::Path::new(&t.source_path)
         .extension()
@@ -492,7 +589,7 @@ pub fn tensor_stats(t: &TensorInfo, view: ViewDtype) -> Result<Stats, String> {
     let started = std::time::Instant::now();
     let mut stats = match ext {
         "safetensors" => stats_safetensors(t, view),
-        "h5" | "hdf5" => stats_hdf5(t),
+        "h5" | "hdf5" => stats_hdf5(t, view),
         _ => Err("statistics are not supported for this format".to_string()),
     }?;
     stats.elapsed = started.elapsed();
@@ -504,7 +601,6 @@ fn stats_safetensors(t: &TensorInfo, view: ViewDtype) -> Result<Stats, String> {
         return Err("tensor data location is unknown".to_string());
     };
     let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
-    let packing = view.packing(item);
 
     let file = std::fs::File::open(&t.source_path).map_err(|e| e.to_string())?;
     // SAFETY: read-only inspection; we accept that a concurrent external write
@@ -519,24 +615,11 @@ fn stats_safetensors(t: &TensorInfo, view: ViewDtype) -> Result<Stats, String> {
         .get(data_start..data_end)
         .ok_or("tensor data range is out of bounds")?;
 
-    let dtype = t.dtype.as_str();
-    let acc = bytes
-        .par_chunks(item * STATS_CHUNK)
-        .map(|chunk| {
-            let mut a = Acc::ID;
-            for container in chunk.chunks_exact(item) {
-                for sub in 0..packing {
-                    a.push(decode_view(view, dtype, container, sub));
-                }
-            }
-            a
-        })
-        .reduce(|| Acc::ID, Acc::merge);
-    Ok(acc.finish())
+    Ok(reduce_view_bytes(bytes, item, view, &t.dtype).finish())
 }
 
 #[cfg(feature = "hdf5")]
-fn stats_hdf5(t: &TensorInfo) -> Result<Stats, String> {
+fn stats_hdf5(t: &TensorInfo, view: ViewDtype) -> Result<Stats, String> {
     use hdf5_metno::{Hyperslab, SliceOrIndex};
 
     let file = hdf5_metno::File::open(&t.source_path).map_err(|e| e.to_string())?;
@@ -550,38 +633,26 @@ fn stats_hdf5(t: &TensorInfo) -> Result<Stats, String> {
         .ok_or_else(|| "dataset not found in file".to_string())?;
     let dataset = file.dataset(&key).map_err(|e| e.to_string())?;
     let shape = dataset.shape();
+    let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
 
-    // ≤32-bit-exact sources are read as f32 to halve the per-block buffer (the
-    // values round-trip exactly); wider/integer sources stay f64. Either way the
-    // accumulators are double precision. `read` reads a block and folds it.
-    let use_f32 = matches!(
-        t.dtype.as_str(),
-        "F16" | "BF16" | "F32" | "I8" | "U8" | "I16" | "U16"
-    );
-    let read = |hyper: Hyperslab| -> Result<Acc, String> {
-        if use_f32 {
-            let a = dataset
-                .read_slice::<f32, _, ndarray::IxDyn>(hyper)
-                .map_err(|e| e.to_string())?;
-            Ok(fold_block(a.as_slice(), a.iter(), |v| v as f64))
-        } else {
-            let a = dataset
-                .read_slice::<f64, _, ndarray::IxDyn>(hyper)
-                .map_err(|e| e.to_string())?;
-            Ok(fold_block(a.as_slice(), a.iter(), |v| v))
-        }
+    // Read the stored bytes (no lossy conversion) and decode them exactly like
+    // safetensors, so a dtype reinterpretation works identically here.
+    let reduce = |hyper: Hyperslab| -> Result<Acc, String> {
+        with_hdf5_block_bytes(&dataset, hyper, &t.dtype, |bytes| {
+            reduce_view_bytes(bytes, item, view, &t.dtype)
+        })
     };
 
     // 0-D (scalar): a single block over the whole (degenerate) shape.
     if shape.is_empty() {
-        return read(Hyperslab::from(Vec::new())).map(Acc::finish);
+        return reduce(Hyperslab::from(Vec::new())).map(Acc::finish);
     }
 
     // Stream along the outer axis in row-blocks so memory stays bounded
     // regardless of tensor size (HDF5 decompresses the overlapping chunks).
     let outer = shape[0];
     let inner: usize = shape[1..].iter().product::<usize>().max(1);
-    const BLOCK_ELEMS: usize = 16 << 20; // ≈16M elements (~64 MiB as f32) per read
+    const BLOCK_ELEMS: usize = 16 << 20; // ≈16M elements per read
     let block = (BLOCK_ELEMS / inner).max(1);
 
     let mut acc = Acc::ID;
@@ -594,29 +665,68 @@ fn stats_hdf5(t: &TensorInfo) -> Result<Stats, String> {
         for &d in &shape[1..] {
             dims.push(SliceOrIndex::from(0..d));
         }
-        acc = Acc::merge(acc, read(Hyperslab::from(dims))?);
+        acc = Acc::merge(acc, reduce(Hyperslab::from(dims))?);
         i = hi;
     }
     Ok(acc.finish())
 }
 
-/// Fold one read block into an [`Acc`]: rayon-reduce the contiguous slice when
-/// available (a fresh read is standard-layout), else iterate.
+/// Read an HDF5 dataset selection and hand its bytes (little-endian, the order
+/// `decode`/`decode_view` expect) to `f`. The memory type matches the stored
+/// dtype so libhdf5 copies the bits through without a lossy numeric conversion
+/// — this is what lets the dtype-override views (same-width reinterpretation,
+/// 4-bit nibbles) work on HDF5 too. When the read is contiguous on a
+/// little-endian host (the common case) the bytes are borrowed in place with no
+/// copy; otherwise each element is serialised in row-major logical order.
 #[cfg(feature = "hdf5")]
-fn fold_block<'a, T: Copy + Send + Sync + 'a>(
-    contiguous: Option<&[T]>,
-    iter: impl Iterator<Item = &'a T>,
-    to_f64: impl Fn(T) -> f64 + Sync,
-) -> Acc {
-    if let Some(s) = contiguous {
-        reduce_to_acc(s, to_f64)
-    } else {
-        let mut a = Acc::ID;
-        for &v in iter {
-            a.push(to_f64(v));
-        }
-        a
+fn with_hdf5_block_bytes<R>(
+    dataset: &hdf5_metno::Dataset,
+    hyper: hdf5_metno::Hyperslab,
+    dtype: &str,
+    f: impl FnOnce(&[u8]) -> R,
+) -> Result<R, String> {
+    macro_rules! run {
+        ($ty:ty) => {{
+            let a = dataset
+                .read_slice::<$ty, _, ndarray::IxDyn>(hyper)
+                .map_err(|e| e.to_string())?;
+            match a.as_slice() {
+                // Contiguous + little-endian: the native bytes already match the
+                // little-endian layout we decode, so reinterpret them in place.
+                Some(s) if cfg!(target_endian = "little") => {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            s.as_ptr() as *const u8,
+                            std::mem::size_of_val(s),
+                        )
+                    };
+                    f(bytes)
+                }
+                // Non-contiguous or big-endian: serialise to little-endian first.
+                _ => {
+                    let mut buf = Vec::with_capacity(a.len() * std::mem::size_of::<$ty>());
+                    for v in a.iter() {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
+                    f(&buf)
+                }
+            }
+        }};
     }
+    Ok(match dtype {
+        "F64" => run!(f64),
+        "F32" => run!(f32),
+        "F16" => run!(half::f16),
+        "I64" => run!(i64),
+        "I32" => run!(i32),
+        "I16" => run!(i16),
+        "I8" => run!(i8),
+        "U64" => run!(u64),
+        "U32" => run!(u32),
+        "U16" => run!(u16),
+        "U8" | "BOOL" => run!(u8),
+        other => return Err(format!("unsupported dtype: {other}")),
+    })
 }
 
 /// Scan a safetensors tensor's bytes into an [`Acc`], either with the rayon
@@ -662,23 +772,8 @@ fn bench_scan(t: &TensorInfo, view: ViewDtype, parallel: bool) -> (Stats, std::t
     (acc.finish(), started.elapsed())
 }
 
-/// Reduce a typed slice into an [`Acc`] in parallel, converting each element to
-/// `f64` for the (double-precision) accumulators.
-#[cfg(feature = "hdf5")]
-fn reduce_to_acc<T: Copy + Send + Sync>(data: &[T], to_f64: impl Fn(T) -> f64 + Sync) -> Acc {
-    data.par_chunks(STATS_CHUNK)
-        .map(|chunk| {
-            let mut a = Acc::ID;
-            for &v in chunk {
-                a.push(to_f64(v));
-            }
-            a
-        })
-        .reduce(|| Acc::ID, Acc::merge)
-}
-
 #[cfg(not(feature = "hdf5"))]
-fn stats_hdf5(_t: &TensorInfo) -> Result<Stats, String> {
+fn stats_hdf5(_t: &TensorInfo, _view: ViewDtype) -> Result<Stats, String> {
     Err("HDF5 support is not compiled in (rebuild with `--features hdf5`)".to_string())
 }
 
@@ -780,7 +875,10 @@ fn read_hdf5(
     base: usize,
     rows: &[usize],
     cols: &[usize],
+    view: ViewDtype,
 ) -> Result<Vec<Vec<f64>>, String> {
+    use hdf5_metno::{Hyperslab, SliceOrIndex};
+
     // Reading is whole-dataset (libhdf5 decompresses everything), so cap it.
     const MAX_ELEMS: usize = 8_000_000;
     if t.num_elements > MAX_ELEMS {
@@ -789,6 +887,9 @@ fn read_hdf5(
             t.num_elements
         ));
     }
+
+    let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
+    let packing = view.packing(item);
 
     let file = hdf5_metno::File::open(&t.source_path).map_err(|e| e.to_string())?;
     // Ensure LZ4-compressed datasets are decodable (no-op after the first call).
@@ -801,22 +902,35 @@ fn read_hdf5(
         .find(|k| crate::hdf5::percent_decode(k) == t.name)
         .ok_or_else(|| "dataset not found in file".to_string())?;
     let dataset = file.dataset(&key).map_err(|e| e.to_string())?;
-    // libhdf5 converts any numeric dtype to f64 on read.
-    let flat = dataset.read_raw::<f64>().map_err(|e| e.to_string())?;
 
-    let out = rows
-        .iter()
-        .map(|&r| {
-            cols.iter()
-                .map(|&c| {
-                    flat.get(base + r * total_cols + c)
-                        .copied()
-                        .unwrap_or(f64::NAN)
-                })
-                .collect()
-        })
-        .collect();
-    Ok(out)
+    // Read the whole (capped) dataset as raw stored bytes, then decode under the
+    // view — identical semantics to safetensors. Indices are logical: under a
+    // packed view, a logical element `flat` lives in container `flat / packing`
+    // at nibble `flat % packing`.
+    let shape = dataset.shape();
+    let hyper = Hyperslab::from(
+        shape
+            .iter()
+            .map(|&d| SliceOrIndex::from(0..d))
+            .collect::<Vec<_>>(),
+    );
+    with_hdf5_block_bytes(&dataset, hyper, &t.dtype, |bytes| {
+        rows.iter()
+            .map(|&r| {
+                let row_base = base + r * total_cols;
+                cols.iter()
+                    .map(|&c| {
+                        let flat = row_base + c;
+                        let off = (flat / packing) * item;
+                        bytes
+                            .get(off..off + item)
+                            .map(|container| decode_view(view, &t.dtype, container, flat % packing))
+                            .unwrap_or(f64::NAN)
+                    })
+                    .collect()
+            })
+            .collect()
+    })
 }
 
 #[cfg(not(feature = "hdf5"))]
@@ -826,6 +940,7 @@ fn read_hdf5(
     _base: usize,
     _rows: &[usize],
     _cols: &[usize],
+    _view: ViewDtype,
 ) -> Result<Vec<Vec<f64>>, String> {
     Err("HDF5 support is not compiled in (rebuild with `--features hdf5`)".to_string())
 }
@@ -1096,7 +1211,10 @@ mod hdf5_tests {
         let path = std::env::var("BENCH_FILE").expect("set BENCH_FILE");
         let name = std::env::var("BENCH_TENSOR").expect("set BENCH_TENSOR");
         let tensors = crate::hdf5::read_tensors(std::path::Path::new(&path)).unwrap();
-        let t = tensors.into_iter().find(|t| t.name == name).expect("tensor");
+        let t = tensors
+            .into_iter()
+            .find(|t| t.name == name)
+            .expect("tensor");
         eprintln!("tensor {} dtype={} shape={:?}", t.name, t.dtype, t.shape);
         let started = std::time::Instant::now();
         match tensor_stats(&t, ViewDtype::Stored) {
@@ -1128,25 +1246,69 @@ mod hdf5_tests {
             source_path: path.to_string_lossy().into_owned(),
             layout: Layout::None,
         };
-        // libhdf5 converts the stored f32 to f64 on read.
+        // Read the stored f32 bytes back, decoding under the stored view.
         let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored).unwrap();
         assert_eq!((s.total_rows, s.total_cols), (4, 5));
-        // HDF5 cannot be byte-reinterpreted, so it is not overridable.
-        assert!(!s.overridable);
+        // HDF5 reads raw stored bytes now, so dtype overrides are available.
+        assert!(s.overridable);
         for (i, &r) in s.rows.iter().enumerate() {
             for (j, &c) in s.cols.iter().enumerate() {
                 assert_eq!(s.values[i][j], (r * 5 + c) as f64);
             }
         }
 
-        // Exact stats over the whole dataset (exercises the f32 read path for a
-        // ≤32-bit float source). Values 0..=19, so mean 9.5 and one zero.
+        // Exact stats over the whole dataset (raw byte read + streaming scan).
+        // Values 0..=19, so mean 9.5 and one zero.
         let st = tensor_stats(&t, ViewDtype::Stored).unwrap();
         assert_eq!(st.count, 20);
         assert_eq!((st.min, st.max), (0.0, 19.0));
         assert!((st.mean - 9.5).abs() < 1e-9);
         assert_eq!(st.zeros, 1);
         assert_eq!(st.nonfinite, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reinterprets_hdf5_dtype_bytes() {
+        // A small I16 dataset whose values pack two 4-bit nibbles each, so the
+        // packed-u4 view should unpack them — proving HDF5 reads honour overrides
+        // by reinterpreting the stored bytes (not libhdf5's converted values).
+        let dir = std::env::temp_dir().join("checkpoint_explorer_reinterp_h5");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("q.h5");
+        let _ = std::fs::remove_file(&path);
+        // 0x21, 0x43 → low/high nibbles (1,2) and (3,4).
+        let data: Vec<i16> = vec![0x21, 0x43];
+        {
+            let file = hdf5_metno::File::create(&path).unwrap();
+            let ds = file.new_dataset::<i16>().shape([1, 2]).create("w").unwrap();
+            ds.write_raw(&data).unwrap();
+        }
+        let t = TensorInfo {
+            name: "w".to_string(),
+            dtype: "I16".to_string(),
+            shape: vec![1, 2],
+            size_bytes: 4,
+            num_elements: 2,
+            storage: Storage::Unknown,
+            source_path: path.to_string_lossy().into_owned(),
+            layout: Layout::None,
+        };
+
+        // Stored view: the raw signed 16-bit values.
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored).unwrap();
+        assert_eq!(s.values[0], vec![0x21 as f64, 0x43 as f64]);
+
+        // Packed u4: each 16-bit slot yields four nibbles, last dim ×4.
+        let p = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Packed).unwrap();
+        assert_eq!(p.total_cols, 8);
+        assert_eq!(p.values[0], vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0]);
+
+        // Stats under the packed view see all eight unpacked nibbles.
+        let st = tensor_stats(&t, ViewDtype::U4Packed).unwrap();
+        assert_eq!(st.count, 8);
+        assert_eq!((st.min, st.max), (0.0, 4.0));
 
         let _ = std::fs::remove_file(&path);
     }

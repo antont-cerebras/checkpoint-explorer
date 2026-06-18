@@ -30,6 +30,9 @@ ndarray = { version = "0.17", optional = true }
 hdf5-metno-sys = { version = "0.11", optional = true }
 # Pure-Rust LZ4 block decompression backing that filter (decode only).
 lz4_flex = { version = "0.11", optional = true, default-features = false, features = ["safe-decode"] }
+# `f16` reads use `half::f16` (the type hdf5-metno's `f16` feature implements
+# `H5Type` for); needed to read 16-bit-float datasets without lossy conversion.
+half = { version = "2", optional = true }
 
 [features]
-hdf5 = ["dep:hdf5-metno", "dep:ndarray", "dep:hdf5-metno-sys", "dep:lz4_flex"]
+hdf5 = ["dep:hdf5-metno", "dep:ndarray", "dep:hdf5-metno-sys", "dep:lz4_flex", "dep:half"]
