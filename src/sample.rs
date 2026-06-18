@@ -188,19 +188,37 @@ pub struct Sample {
     pub view: ViewDtype,
     /// Whether a dtype override is available for this tensor (safetensors/HDF5).
     pub overridable: bool,
+    /// Which sampling produced this grid (evenly-spaced vs. edges).
+    pub mode: SampleMode,
 }
+
+/// How [`sample_tensor`] chooses which rows/columns to show.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SampleMode {
+    /// Evenly-spaced indices across the whole matrix (the default overview).
+    #[default]
+    Grid,
+    /// The first and last few rows and columns, contiguously — to inspect edge
+    /// padding (e.g. is a tensor zero-padded, or padded with something else).
+    Edges,
+}
+
+/// Per-side row/column count for [`SampleMode::Edges`] (capped to fit the screen).
+const EDGE: usize = 10;
 
 /// Sample a 1D/2D/3D tensor into at most `max_rows` x `max_cols` values. For a
 /// 3D tensor `[d0, d1, d2]`, `slice` selects the leading index and the `d1 x d2`
 /// matrix at that index is sampled (clamped to a valid slice). `view` overrides
 /// how bytes are decoded (e.g. as packed 4-bit), which for a packed view
-/// expands the last dimension; it applies to safetensors and HDF5.
+/// expands the last dimension; it applies to safetensors and HDF5. `mode`
+/// selects an evenly-spaced grid or the first/last rows & columns (edges).
 pub fn sample_tensor(
     t: &TensorInfo,
     max_rows: usize,
     max_cols: usize,
     slice: usize,
     view: ViewDtype,
+    mode: SampleMode,
 ) -> Result<Sample, String> {
     let ext = std::path::Path::new(&t.source_path)
         .extension()
@@ -236,8 +254,16 @@ pub fn sample_tensor(
     // Logical elements to skip to reach the chosen slice (0 for 1D/2D).
     let base = slice * total_rows * total_cols;
 
-    let rows = sample_indices(total_rows, max_rows.max(1));
-    let cols = sample_indices(total_cols, max_cols.max(1));
+    let (rows, cols) = match mode {
+        SampleMode::Grid => (
+            sample_indices(total_rows, max_rows.max(1)),
+            sample_indices(total_cols, max_cols.max(1)),
+        ),
+        SampleMode::Edges => (
+            edge_indices(total_rows, max_rows.max(1), EDGE),
+            edge_indices(total_cols, max_cols.max(1), EDGE),
+        ),
+    };
 
     let reader = open_reader(t)?;
     let values = read_sampled(reader.as_ref(), t, total_cols, base, &rows, &cols, view)?;
@@ -268,6 +294,7 @@ pub fn sample_tensor(
         slice,
         view,
         overridable,
+        mode,
     })
 }
 
@@ -283,6 +310,19 @@ fn sample_indices(n: usize, k: usize) -> Vec<usize> {
         .map(|i| (i * (n - 1) + (k - 1) / 2) / (k - 1))
         .collect();
     idx.dedup();
+    idx
+}
+
+/// The first and last `edge` indices of `0..n` (so padding at either end is
+/// visible), capped so at most `max` are returned and they fit the screen.
+/// Returns all of `0..n` when that already fits without a gap.
+fn edge_indices(n: usize, max: usize, edge: usize) -> Vec<usize> {
+    let per_side = edge.min(max.max(2) / 2).max(1);
+    if n <= 2 * per_side {
+        return (0..n).collect();
+    }
+    let mut idx: Vec<usize> = (0..per_side).collect();
+    idx.extend((n - per_side)..n);
     idx
 }
 
@@ -1107,6 +1147,20 @@ mod tests {
     }
 
     #[test]
+    fn edge_indices_takes_first_and_last() {
+        // Small enough to show whole (n <= 2*per_side): no gap.
+        assert_eq!(edge_indices(5, 100, 10), vec![0, 1, 2, 3, 4]);
+        // First 10 and last 10 of 100, with a gap in between.
+        let e = edge_indices(100, 100, 10);
+        assert_eq!(e.len(), 20);
+        assert_eq!(&e[..10], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(&e[10..], &[90, 91, 92, 93, 94, 95, 96, 97, 98, 99]);
+        // Capped by `max` (per side = max/2) so it fits the screen.
+        let e2 = edge_indices(100, 8, 10);
+        assert_eq!(e2, vec![0, 1, 2, 3, 96, 97, 98, 99]);
+    }
+
+    #[test]
     fn decodes_float_dtypes() {
         assert_eq!(decode("F32", &1.5f32.to_le_bytes()), 1.5);
         assert_eq!(decode("F64", &(-2.25f64).to_le_bytes()), -2.25);
@@ -1164,7 +1218,7 @@ mod tests {
         drop(f);
 
         let t = fixture(&path, "w", &[4, 5], (0, 80));
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
         assert_eq!((s.total_rows, s.total_cols), (4, 5));
         assert_eq!((s.slices, s.slice), (1, 0));
         assert!(s.overridable && s.view == ViewDtype::Stored);
@@ -1287,7 +1341,7 @@ mod tests {
 
         let t = fixture(&path, "w", &[2, 3, 4], (0, 96));
         // Slice 1 is the matrix [[12..16],[16..20],[20..24]].
-        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored).unwrap();
+        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored, SampleMode::Grid).unwrap();
         assert_eq!((s.total_rows, s.total_cols), (3, 4));
         assert_eq!((s.slices, s.slice), (2, 1));
         for (i, &r) in s.rows.iter().enumerate() {
@@ -1297,7 +1351,7 @@ mod tests {
         }
         // An out-of-range slice clamps to the last one.
         assert_eq!(
-            sample_tensor(&t, 10, 10, 99, ViewDtype::Stored)
+            sample_tensor(&t, 10, 10, 99, ViewDtype::Stored, SampleMode::Grid)
                 .unwrap()
                 .slice,
             1
@@ -1323,23 +1377,23 @@ mod tests {
         let t = fixture_dtype(&path, "w", "F16", &[2], (0, 4));
 
         // Low nibble of each container -> [0x4, 0xB]. Shape unchanged.
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Lo).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Lo, SampleMode::Grid).unwrap();
         assert_eq!(s.total_cols, 2);
         assert_eq!(s.values[0], vec![4.0, 11.0]);
 
         // High nibble (bits 12-15) of each container -> 0x1234->0x1, 0x00AB->0x0.
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Hi).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Hi, SampleMode::Grid).unwrap();
         assert_eq!(s.total_cols, 2);
         assert_eq!(s.values[0], vec![1.0, 0.0]);
 
         // Packed: four nibbles per 16-bit container, last dim ×4 -> 8 values.
         // 0x1234 -> [4,3,2,1]; 0x00AB -> [11,10,0,0].
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Packed).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Packed, SampleMode::Grid).unwrap();
         assert_eq!(s.total_cols, 8);
         assert_eq!(s.values[0], vec![4.0, 3.0, 2.0, 1.0, 11.0, 10.0, 0.0, 0.0]);
 
         // Signed packed: nibbles >= 8 are negative (0xB->-5, 0xA->-6).
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::I4Packed).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::I4Packed, SampleMode::Grid).unwrap();
         assert_eq!(s.values[0], vec![4.0, 3.0, 2.0, 1.0, -5.0, -6.0, 0.0, 0.0]);
 
         let _ = std::fs::remove_file(&path);
@@ -1395,7 +1449,7 @@ mod hdf5_tests {
             layout: Layout::None,
         };
         // Read the stored f32 bytes back, decoding under the stored view.
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
         assert_eq!((s.total_rows, s.total_cols), (4, 5));
         // HDF5 reads raw stored bytes now, so dtype overrides are available.
         assert!(s.overridable);
@@ -1445,11 +1499,11 @@ mod hdf5_tests {
         };
 
         // Stored view: the raw signed 16-bit values.
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
         assert_eq!(s.values[0], vec![0x21 as f64, 0x43 as f64]);
 
         // Packed u4: each 16-bit slot yields four nibbles, last dim ×4.
-        let p = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Packed).unwrap();
+        let p = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Packed, SampleMode::Grid).unwrap();
         assert_eq!(p.total_cols, 8);
         assert_eq!(p.values[0], vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0]);
 
@@ -1496,7 +1550,7 @@ mod hdf5_tests {
         };
 
         // Slice 1: every value should read as 100 + row*10 + col.
-        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored).unwrap();
+        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored, SampleMode::Grid).unwrap();
         assert_eq!((s.total_rows, s.total_cols, s.slices), (3, 4, 2));
         for (i, &r) in s.rows.iter().enumerate() {
             for (j, &c) in s.cols.iter().enumerate() {

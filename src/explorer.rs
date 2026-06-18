@@ -8,7 +8,7 @@ use crossterm::{
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap, HashSet},
     fs::File,
     io::{self, Read, Write},
@@ -16,7 +16,7 @@ use std::{
 };
 
 use crate::gguf::GGUFFile;
-use crate::sample::{Stats, ViewDtype};
+use crate::sample::{SampleMode, Stats, ViewDtype};
 
 use crate::tree::{
     Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key,
@@ -47,6 +47,10 @@ pub struct Explorer {
     /// Exact whole-tensor statistics, cached per (tensor name, view) since the
     /// scan is expensive. Session-scoped.
     stats_cache: RefCell<HashMap<(String, ViewDtype), Stats>>,
+    /// Whether the data views show the edges (padding) sample rather than the
+    /// evenly-spaced grid. Session-scoped: remembered as you move between
+    /// tensors and in/out of the preview.
+    data_view_edges: Cell<bool>,
 }
 
 impl Explorer {
@@ -67,6 +71,7 @@ impl Explorer {
             health_reports,
             dtype_overrides: RefCell::new(HashMap::new()),
             stats_cache: RefCell::new(HashMap::new()),
+            data_view_edges: Cell::new(false),
         }
     }
 
@@ -920,6 +925,13 @@ impl Explorer {
         let mut heatmap = heatmap;
         let mut slice = 0usize;
         loop {
+            // Edges (padding) vs. grid is a session-remembered preference, so it
+            // sticks as you move between tensors and in/out of the preview.
+            let mode = if self.data_view_edges.get() {
+                SampleMode::Edges
+            } else {
+                SampleMode::Grid
+            };
             // The dtype reinterpretation remembered for this tensor, if any.
             let view = self
                 .dtype_overrides
@@ -933,14 +945,14 @@ impl Explorer {
             // heatmap/grid — the data view redraws each frame with the running
             // timer in its stats line.
             self.compute_stats_animated(tensor, view, |sv| {
-                let _ = self.draw_data_view(tensor, heatmap, slice, view, sv);
+                let _ = self.draw_data_view(tensor, heatmap, slice, view, mode, sv);
             });
             let stats = self.cached_stats(tensor, view);
             let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
 
             // (slices, overridable, clamped slice) on success.
             let (slices, overridable) =
-                match self.draw_data_view(tensor, heatmap, slice, view, stats_view) {
+                match self.draw_data_view(tensor, heatmap, slice, view, mode, stats_view) {
                     Ok((slices, overridable, clamped)) => {
                         slice = clamped;
                         (slices, overridable)
@@ -966,11 +978,21 @@ impl Explorer {
                         // Switch representation in place, keeping the current slice.
                         KeyCode::Char('m') => heatmap = true,
                         KeyCode::Char('v') => heatmap = false,
+                        // Toggle the edges (first/last rows & columns) view, for
+                        // inspecting padding; remembered for the session.
+                        KeyCode::Char('e') | KeyCode::Char('E') => {
+                            self.data_view_edges.set(!self.data_view_edges.get())
+                        }
                         // Open the dtype menu; `d` or `D`.
                         KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
-                            if let Some(chosen) =
-                                self.prompt_dtype(tensor, DtypePreview::Data { heatmap, slice })
-                            {
+                            if let Some(chosen) = self.prompt_dtype(
+                                tensor,
+                                DtypePreview::Data {
+                                    heatmap,
+                                    slice,
+                                    mode,
+                                },
+                            ) {
                                 let mut overrides = self.dtype_overrides.borrow_mut();
                                 if chosen == ViewDtype::Stored {
                                     overrides.remove(&tensor.name);
@@ -1018,6 +1040,7 @@ impl Explorer {
         heatmap: bool,
         slice: usize,
         view: ViewDtype,
+        mode: SampleMode,
         stats: StatsView,
     ) -> Result<(usize, bool, usize), String> {
         let (cols, rows) = terminal::size().unwrap_or((100, 40));
@@ -1026,11 +1049,11 @@ impl Explorer {
             let max_cols = (cols as usize).saturating_sub(1).max(1);
             // The heatmap packs two data rows per text line (half blocks),
             // so it can sample twice as many rows as there are lines.
-            crate::sample::sample_tensor(tensor, text_rows * 2, max_cols, slice, view)?
+            crate::sample::sample_tensor(tensor, text_rows * 2, max_cols, slice, view, mode)?
         } else {
             // Numeric cells are ~11 wide plus a row-index column.
             let max_cols = ((cols as usize).saturating_sub(7) / 11).max(1);
-            crate::sample::sample_tensor(tensor, text_rows, max_cols, slice, view)?
+            crate::sample::sample_tensor(tensor, text_rows, max_cols, slice, view, mode)?
         };
         let info = (sample.slices, sample.overridable, sample.slice);
         if heatmap {
@@ -1066,8 +1089,12 @@ impl Explorer {
                 DtypePreview::Detail => {
                     UI::draw_tensor_detail(tensor, options[idx], true, stats_view).is_ok()
                 }
-                DtypePreview::Data { heatmap, slice } => self
-                    .draw_data_view(tensor, heatmap, slice, options[idx], stats_view)
+                DtypePreview::Data {
+                    heatmap,
+                    slice,
+                    mode,
+                } => self
+                    .draw_data_view(tensor, heatmap, slice, options[idx], mode, stats_view)
                     .is_ok(),
             };
             if !preview_ok {
@@ -1157,7 +1184,11 @@ impl Explorer {
 #[derive(Clone, Copy)]
 enum DtypePreview {
     Detail,
-    Data { heatmap: bool, slice: usize },
+    Data {
+        heatmap: bool,
+        slice: usize,
+        mode: SampleMode,
+    },
 }
 
 /// The directory shared by all `paths`, or `None` if they don't all share one.

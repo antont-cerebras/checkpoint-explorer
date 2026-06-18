@@ -150,6 +150,13 @@ actual data of 1D/2D/3D tensors:
 - `v` — a **numeric grid** of sampled values with row/column indices, including
   the edges.
 
+Both views sample an evenly-spaced overview by default. Press `e` to toggle an
+**edges view** that instead shows the first and last ~10 rows *and* columns
+(with a dotted `⋯` / `⋮` separator marking the skipped middle) — handy for
+seeing how a tensor is padded at its edges (e.g. zero padding vs. something
+else). The choice is remembered for the session, so it sticks as you move
+between tensors.
+
 For **3D tensors** (e.g. stacked MoE experts, shape `[experts, rows, cols]`) the
 preview shows a 2D matrix at a fixed leading index — the 0th by default. The
 `←` / `→` arrows step through the slices one at a time and `Shift`+`←` / `→` jump
@@ -157,7 +164,8 @@ preview shows a 2D matrix at a fixed leading index — the 0th by default. The
 either an exact index or a percentage like `50%` (0% = first, 100% = last).
 Out-of-range entries are rejected with a message rather than jumping.
 Within either view, `m` and `v` switch between the heatmap and numeric
-representations in place, and `Ctrl+C` quits the app from anywhere.
+representations in place, `e` toggles the edges view, and `Ctrl+C` quits the app
+from anywhere.
 
 #### Statistics
 
