@@ -2,6 +2,8 @@ mod explorer;
 mod gguf;
 #[cfg(feature = "hdf5")]
 mod hdf5;
+#[cfg(feature = "hdf5")]
+mod hdf5_lz4;
 mod health;
 mod sample;
 mod tree;
