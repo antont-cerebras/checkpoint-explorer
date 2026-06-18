@@ -2,3 +2,6 @@
 
 # Editor swap files
 *.swp
+
+# Personal scratch notes
+/TODO.md
