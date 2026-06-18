@@ -335,10 +335,12 @@ impl UI {
         line_end(&mut out)?;
 
         // Shape and parameter count reflect the override (a packed view unpacks
-        // several values per stored element, growing the last dimension).
+        // several values per stored element, growing the last dimension); show
+        // `stored as reinterpreted` just like the dtype line above.
         let shape = view.logical_shape(&tensor.shape, &tensor.dtype);
         let num_elements: usize = shape.iter().product();
-        write!(out, "Shape: {}", format_shape(&shape))?;
+        write!(out, "Shape: ")?;
+        write_view_shape(&mut out, &tensor.shape, &shape)?;
         line_end(&mut out)?;
         write!(
             out,
@@ -516,10 +518,12 @@ impl UI {
             " (sampled)"
         };
         write_view_dtype(&mut out, &tensor.dtype, sample.view)?;
+        write!(out, " ")?;
+        let logical = sample.view.logical_shape(&tensor.shape, &tensor.dtype);
+        write_view_shape(&mut out, &tensor.shape, &logical)?;
         write!(
             out,
-            " {} → sampled {}×{}, value range [{lo}, {hi}]{range_note}",
-            format_shape(&tensor.shape),
+            " → sampled {}×{}, value range [{lo}, {hi}]{range_note}",
             sample.rows.len(),
             sample.cols.len(),
         )?;
@@ -591,10 +595,12 @@ impl UI {
         write!(out, "Values: {}", tensor.name)?;
         line_end(&mut out)?;
         write_view_dtype(&mut out, &tensor.dtype, sample.view)?;
+        write!(out, " ")?;
+        let logical = sample.view.logical_shape(&tensor.shape, &tensor.dtype);
+        write_view_shape(&mut out, &tensor.shape, &logical)?;
         write!(
             out,
-            " {} → sampled {} of {} rows × {} of {} cols (indices shown)",
-            format_shape(&tensor.shape),
+            " → sampled {} of {} rows × {} of {} cols (indices shown)",
             sample.rows.len(),
             sample.total_rows,
             sample.cols.len(),
@@ -1018,6 +1024,29 @@ fn write_view_dtype(out: &mut impl Write, stored: &str, view: ViewDtype) -> Resu
             queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
         }
         None => write!(out, "{stored}")?,
+    }
+    Ok(())
+}
+
+/// Write the shape shown in a detail / data-view header. When the active view
+/// changes the logical shape — only a packed 4-bit view does, growing the last
+/// dimension — fade the stored shape and highlight the reinterpreted one (e.g.
+/// `(128, 2880) as (128, 11520)`), mirroring how [`write_view_dtype`] shows the
+/// dtype. Otherwise just the (unchanged) shape.
+fn write_view_shape(out: &mut impl Write, stored: &[usize], logical: &[usize]) -> Result<()> {
+    if stored == logical {
+        write!(out, "{}", format_shape(logical))?;
+    } else {
+        queue!(out, SetForegroundColor(palette::DIM))?;
+        write!(out, "{} as ", format_shape(stored))?;
+        queue!(
+            out,
+            ResetColor,
+            SetAttribute(Attribute::Bold),
+            SetForegroundColor(palette::KEY)
+        )?;
+        write!(out, "{}", format_shape(logical))?;
+        queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
     }
     Ok(())
 }
