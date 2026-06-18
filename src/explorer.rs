@@ -16,12 +16,12 @@ use std::{
 };
 
 use crate::gguf::GGUFFile;
-use crate::sample::ViewDtype;
+use crate::sample::{Stats, ViewDtype};
 
 use crate::tree::{
     Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key,
 };
-use crate::ui::{DrawConfig, UI};
+use crate::ui::{DrawConfig, StatsView, UI};
 use crate::utils::base64_encode;
 
 pub struct Explorer {
@@ -44,6 +44,9 @@ pub struct Explorer {
     /// Per-tensor dtype reinterpretation chosen in the data views, keyed by
     /// tensor name. Session-scoped: remembered until the app exits.
     dtype_overrides: RefCell<HashMap<String, ViewDtype>>,
+    /// Exact whole-tensor statistics, cached per (tensor name, view) since the
+    /// scan is expensive. Session-scoped.
+    stats_cache: RefCell<HashMap<(String, ViewDtype), Stats>>,
 }
 
 impl Explorer {
@@ -63,7 +66,67 @@ impl Explorer {
             copied_flash: None,
             health_reports,
             dtype_overrides: RefCell::new(HashMap::new()),
+            stats_cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Cached exact statistics for `(tensor, view)`, or `None` if not yet
+    /// computed (cheap lookup — never scans).
+    fn cached_stats(&self, tensor: &TensorInfo, view: ViewDtype) -> Option<Stats> {
+        self.stats_cache
+            .borrow()
+            .get(&(tensor.name.clone(), view))
+            .copied()
+    }
+
+    /// Exact statistics for `(tensor, view)`, computing and caching them on a
+    /// miss. The scan runs on a worker thread; while it runs, `redraw` is called
+    /// each frame with a [`StatsView::Computing`] state so the caller can animate
+    /// a spinner *in place* on its own screen. Stays responsive to Ctrl-C (which
+    /// cancels); small tensors finish before the spinner ever appears. `None` if
+    /// statistics aren't available.
+    fn compute_stats_animated(
+        &self,
+        tensor: &TensorInfo,
+        view: ViewDtype,
+        mut redraw: impl FnMut(StatsView),
+    ) -> Option<Stats> {
+        if let Some(s) = self.cached_stats(tensor, view) {
+            return Some(s);
+        }
+
+        let owned = tensor.clone();
+        let handle = std::thread::spawn(move || crate::sample::tensor_stats(&owned, view));
+
+        const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let started = std::time::Instant::now();
+        let mut frame = 0usize;
+        while !handle.is_finished() {
+            // Only animate once it's clearly not instant, to avoid a flash for
+            // small tensors (which return before the first frame).
+            if started.elapsed() >= std::time::Duration::from_millis(120) {
+                redraw(StatsView::Computing {
+                    spinner: SPINNER[frame % SPINNER.len()],
+                    elapsed: started.elapsed(),
+                });
+                frame += 1;
+            }
+            // Frame delay that also stays responsive to Ctrl-C while we wait.
+            if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false)
+                && let Ok(Event::Key(key)) = event::read()
+                && is_ctrl_c(&key)
+            {
+                quit_immediately();
+            }
+        }
+
+        let stats = handle.join().ok().and_then(|r| r.ok());
+        if let Some(s) = stats {
+            self.stats_cache
+                .borrow_mut()
+                .insert((tensor.name.clone(), view), s);
+        }
+        stats
     }
 
     fn load_all_files(&mut self) -> Result<()> {
@@ -778,7 +841,7 @@ impl Explorer {
 
     fn show_tensor_detail(&self, tensor: &TensorInfo) {
         // Detail screen with sub-views: `m` heatmap, `v` numeric values, `d`
-        // reinterpret dtype, any other key returns to the tree.
+        // reinterpret dtype, `s` compute statistics, any other key returns.
         let overridable = dtype_overridable(tensor);
         loop {
             let view = self
@@ -787,7 +850,11 @@ impl Explorer {
                 .get(&tensor.name)
                 .copied()
                 .unwrap_or(ViewDtype::Stored);
-            if UI::draw_tensor_detail(tensor, view, overridable).is_err() {
+            // Show stats only if already computed (here or from a data view) —
+            // don't scan automatically so browsing the tree stays fast.
+            let stats = self.cached_stats(tensor, view);
+            let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
+            if UI::draw_tensor_detail(tensor, view, overridable, stats_view).is_err() {
                 return;
             }
             match event::read() {
@@ -800,6 +867,16 @@ impl Explorer {
                     code: KeyCode::Char('v'),
                     ..
                 })) => self.show_tensor_data(tensor, false),
+                // Compute exact whole-tensor statistics on demand, animating the
+                // spinner in the detail screen's Statistics line.
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Char('s') | KeyCode::Char('S'),
+                    ..
+                })) => {
+                    self.compute_stats_animated(tensor, view, |sv| {
+                        let _ = UI::draw_tensor_detail(tensor, view, overridable, sv);
+                    });
+                }
                 // Reinterpret the dtype from the detail screen too (safetensors).
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('d') | KeyCode::Char('D'),
@@ -839,22 +916,33 @@ impl Explorer {
                 .copied()
                 .unwrap_or(ViewDtype::Stored);
 
+            // Exact stats power the value range, heatmap scale and stats line.
+            // Compute them once (cached), animating the spinner on this very
+            // heatmap/grid — the data view redraws each frame with the running
+            // timer in its stats line.
+            self.compute_stats_animated(tensor, view, |sv| {
+                let _ = self.draw_data_view(tensor, heatmap, slice, view, sv);
+            });
+            let stats = self.cached_stats(tensor, view);
+            let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
+
             // (slices, overridable, clamped slice) on success.
-            let (slices, overridable) = match self.draw_data_view(tensor, heatmap, slice, view) {
-                Ok((slices, overridable, clamped)) => {
-                    slice = clamped;
-                    (slices, overridable)
-                }
-                Err(msg) => {
-                    let _ = UI::draw_message("Data preview unavailable", &msg);
-                    if let Ok(Event::Key(key)) = event::read()
-                        && is_ctrl_c(&key)
-                    {
-                        quit_immediately();
+            let (slices, overridable) =
+                match self.draw_data_view(tensor, heatmap, slice, view, stats_view) {
+                    Ok((slices, overridable, clamped)) => {
+                        slice = clamped;
+                        (slices, overridable)
                     }
-                    return;
-                }
-            };
+                    Err(msg) => {
+                        let _ = UI::draw_message("Data preview unavailable", &msg);
+                        if let Ok(Event::Key(key)) = event::read()
+                            && is_ctrl_c(&key)
+                        {
+                            quit_immediately();
+                        }
+                        return;
+                    }
+                };
 
             match event::read() {
                 Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
@@ -918,6 +1006,7 @@ impl Explorer {
         heatmap: bool,
         slice: usize,
         view: ViewDtype,
+        stats: StatsView,
     ) -> Result<(usize, bool, usize), String> {
         let (cols, rows) = terminal::size().unwrap_or((100, 40));
         let text_rows = (rows as usize).saturating_sub(8).max(1);
@@ -933,9 +1022,9 @@ impl Explorer {
         };
         let info = (sample.slices, sample.overridable, sample.slice);
         if heatmap {
-            UI::draw_heatmap(tensor, &sample).map_err(|e| e.to_string())?;
+            UI::draw_heatmap(tensor, &sample, stats).map_err(|e| e.to_string())?;
         } else {
-            UI::draw_values(tensor, &sample).map_err(|e| e.to_string())?;
+            UI::draw_values(tensor, &sample, stats).map_err(|e| e.to_string())?;
         }
         Ok(info)
     }
@@ -958,10 +1047,15 @@ impl Explorer {
         let mut idx = options.iter().position(|v| *v == current).unwrap_or(0);
         loop {
             // Live preview of the highlighted view, then the menu overlay.
+            // Only read cached stats — navigating the menu must never trigger a scan.
+            let stats = self.cached_stats(tensor, options[idx]);
+            let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
             let preview_ok = match preview {
-                DtypePreview::Detail => UI::draw_tensor_detail(tensor, options[idx], true).is_ok(),
+                DtypePreview::Detail => {
+                    UI::draw_tensor_detail(tensor, options[idx], true, stats_view).is_ok()
+                }
                 DtypePreview::Data { heatmap, slice } => self
-                    .draw_data_view(tensor, heatmap, slice, options[idx])
+                    .draw_data_view(tensor, heatmap, slice, options[idx], stats_view)
                     .is_ok(),
             };
             if !preview_ok {

@@ -5,9 +5,10 @@ use crossterm::{
     terminal::{self, BeginSynchronizedUpdate, ClearType, EndSynchronizedUpdate},
 };
 use std::io::{self, BufWriter, Write};
+use std::time::Duration;
 
 use crate::health::HealthReport;
-use crate::sample::{Sample, ViewDtype};
+use crate::sample::{Sample, Stats, ViewDtype};
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo, TreeNode};
 use crate::utils::{format_parameters, format_shape, format_size};
 
@@ -59,6 +60,15 @@ pub struct DrawConfig<'a> {
     /// Whether a checkpoint health issue was detected (shows a header hint to
     /// press `h` for the report).
     pub health_warning: bool,
+}
+
+/// How a screen should render the statistics area: not computed yet, a scan in
+/// progress (with a spinner + running timer), or the finished `Stats`.
+#[derive(Clone, Copy)]
+pub enum StatsView<'a> {
+    Pending,
+    Computing { spinner: char, elapsed: Duration },
+    Ready(&'a Stats),
 }
 
 pub struct UI;
@@ -306,6 +316,7 @@ impl UI {
         tensor: &TensorInfo,
         view: ViewDtype,
         overridable: bool,
+        stats: StatsView,
     ) -> Result<()> {
         let stdout = io::stdout();
         let mut out = BufWriter::new(stdout.lock());
@@ -392,6 +403,37 @@ impl UI {
         line_end(&mut out)?;
         line_end(&mut out)?;
 
+        // Exact whole-tensor statistics: shown once computed, else a hint.
+        match stats {
+            StatsView::Ready(s) => {
+                // min/max are exact integers for integer dtypes — show them as
+                // such (no `.0000`).
+                let integer = view.is_integer(&tensor.dtype);
+                write!(
+                    out,
+                    "Statistics: min {} · max {} · ",
+                    fmt_value(s.min, integer),
+                    fmt_value(s.max, integer)
+                )?;
+                write_stats_line(&mut out, s)?;
+            }
+            StatsView::Computing { spinner, elapsed } => {
+                write!(out, "Statistics: ")?;
+                write_computing(&mut out, spinner, elapsed)?;
+            }
+            StatsView::Pending => {
+                queue!(out, SetForegroundColor(palette::DIM))?;
+                write!(out, "Statistics: press ")?;
+                queue!(out, ResetColor)?;
+                key_hint(&mut out, "s")?;
+                queue!(out, SetForegroundColor(palette::DIM))?;
+                write!(out, " to scan the full tensor")?;
+                queue!(out, ResetColor)?;
+            }
+        }
+        line_end(&mut out)?;
+        line_end(&mut out)?;
+
         // Footer hints (keys highlighted).
         write!(out, "Press ")?;
         key_hint(&mut out, "m")?;
@@ -446,7 +488,7 @@ impl UI {
     /// upper-half block `▀` whose foreground is the value above and background
     /// the value below, so one text row shows two data rows — doubling the
     /// vertical resolution (a terminal cell is ~twice as tall as it is wide).
-    pub fn draw_heatmap(tensor: &TensorInfo, sample: &Sample) -> Result<()> {
+    pub fn draw_heatmap(tensor: &TensorInfo, sample: &Sample, stats: StatsView) -> Result<()> {
         let stdout = io::stdout();
         let mut out = BufWriter::new(stdout.lock());
         // Present the whole frame atomically (the terminal buffers everything
@@ -460,30 +502,38 @@ impl UI {
         write!(out, "Heatmap: {}", tensor.name)?;
         line_end(&mut out)?;
         let integer = sample.view.is_integer(&tensor.dtype);
-        let lo = fmt_value(sample.min, integer);
-        let hi = fmt_value(sample.max, integer);
+        // Use the exact whole-tensor range (and color scale) once stats are
+        // ready; otherwise fall back to the sampled range, flagged as such.
+        let (rmin, rmax) = match stats {
+            StatsView::Ready(s) => (s.min, s.max),
+            _ => (sample.min, sample.max),
+        };
+        let lo = fmt_value(rmin, integer);
+        let hi = fmt_value(rmax, integer);
+        let range_note = if matches!(stats, StatsView::Ready(_)) {
+            ""
+        } else {
+            " (sampled)"
+        };
         write_view_dtype(&mut out, &tensor.dtype, sample.view)?;
         write!(
             out,
-            " {} → sampled {}×{}, value range [{lo}, {hi}]",
+            " {} → sampled {}×{}, value range [{lo}, {hi}]{range_note}",
             format_shape(&tensor.shape),
             sample.rows.len(),
             sample.cols.len(),
         )?;
         line_end(&mut out)?;
+        write_stats_view(&mut out, stats)?;
         if sample.slices > 1 {
             write_slice_header(&mut out, sample)?;
             line_end(&mut out)?;
         }
         line_end(&mut out)?;
 
-        let range = sample.max - sample.min;
+        let range = rmax - rmin;
         let norm = |v: f64| {
-            if range > 0.0 {
-                (v - sample.min) / range
-            } else {
-                0.5
-            }
+            if range > 0.0 { (v - rmin) / range } else { 0.5 }
         };
         // Two data rows per text line: foreground = the upper row's value,
         // background = the lower row's. A trailing odd row keeps the default
@@ -531,7 +581,7 @@ impl UI {
 
     /// Render a sampled tensor as a grid of numeric values with row/column
     /// indices (edges included).
-    pub fn draw_values(tensor: &TensorInfo, sample: &Sample) -> Result<()> {
+    pub fn draw_values(tensor: &TensorInfo, sample: &Sample, stats: StatsView) -> Result<()> {
         const W: usize = 11;
         let stdout = io::stdout();
         let mut out = BufWriter::new(stdout.lock());
@@ -551,6 +601,7 @@ impl UI {
             sample.total_cols
         )?;
         line_end(&mut out)?;
+        write_stats_view(&mut out, stats)?;
         if sample.slices > 1 {
             write_slice_header(&mut out, sample)?;
             line_end(&mut out)?;
@@ -872,6 +923,71 @@ fn input_box(out: &mut impl Write, text: &str, min_chars: usize) -> Result<()> {
     write!(out, " ")?;
     queue!(out, ResetColor)?;
     Ok(())
+}
+
+/// Write a one-line statistics summary (mean, std, sparsity, non-finite count),
+/// with field labels dimmed; the non-finite count is highlighted when nonzero.
+fn write_stats_line(out: &mut impl Write, s: &Stats) -> Result<()> {
+    queue!(out, SetForegroundColor(palette::DIM))?;
+    write!(out, "mean ")?;
+    queue!(out, ResetColor)?;
+    write!(out, "{:.4}", s.mean)?;
+    queue!(out, SetForegroundColor(palette::DIM))?;
+    write!(out, " · std ")?;
+    queue!(out, ResetColor)?;
+    write!(out, "{:.4}", s.std)?;
+    queue!(out, SetForegroundColor(palette::DIM))?;
+    write!(out, " · zeros ")?;
+    queue!(out, ResetColor)?;
+    write!(out, "{:.1}%", s.zero_fraction() * 100.0)?;
+    if s.nonfinite > 0 {
+        queue!(out, SetForegroundColor(palette::WARN))?;
+        write!(out, " · {} non-finite", s.nonfinite)?;
+        queue!(out, ResetColor)?;
+    }
+    // How long the scan took, dimmed.
+    queue!(out, SetForegroundColor(palette::DIM))?;
+    write!(out, "  ({})", fmt_duration(s.elapsed))?;
+    queue!(out, ResetColor)?;
+    Ok(())
+}
+
+/// Render the stats line for a data view (heatmap/numeric): the stats once
+/// `Ready`, a spinner while `Computing`, nothing while `Pending`. Ends the line.
+fn write_stats_view(out: &mut impl Write, stats: StatsView) -> Result<()> {
+    match stats {
+        StatsView::Ready(s) => {
+            write_stats_line(out, s)?;
+            line_end(out)?;
+        }
+        StatsView::Computing { spinner, elapsed } => {
+            write_computing(out, spinner, elapsed)?;
+            line_end(out)?;
+        }
+        StatsView::Pending => {}
+    }
+    Ok(())
+}
+
+/// Write the "scan in progress" stats segment: a spinner (accent colour), a
+/// dimmed label and the running elapsed time. Drawn in place of the stats.
+fn write_computing(out: &mut impl Write, spinner: char, elapsed: Duration) -> Result<()> {
+    queue!(out, SetForegroundColor(palette::KEY))?;
+    write!(out, "{spinner} ")?;
+    queue!(out, SetForegroundColor(palette::DIM))?;
+    write!(out, "computing statistics… {}", fmt_duration(elapsed))?;
+    queue!(out, ResetColor)?;
+    Ok(())
+}
+
+/// Human-readable scan duration: milliseconds under a second, else seconds.
+fn fmt_duration(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms >= 1000 {
+        format!("{:.1}s", d.as_secs_f64())
+    } else {
+        format!("{ms}ms")
+    }
 }
 
 /// Format a heatmap legend / range value: integers without a fractional part,
