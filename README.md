@@ -172,6 +172,13 @@ to the stats. Scanning a multi-GB tensor takes a moment the first time (it's
 largely disk/NFS-bound); the scan runs on a worker thread with an animated
 spinner and a running timer, and `Ctrl+C` cancels.
 
+The same scan also detects **sub-byte / low-bit encodings** (safetensors only) by
+OR-ing every stored word: if some low or high bits are *always* zero, the data is
+encoded in fewer bits than the stored dtype. An `Encoding:` line reports it — e.g.
+the gpt-oss MoE weights stored as `bf16` show `low 6 bits always zero (10 of 16
+bits used)`, and a clean 4-bit field packed low into a 16-bit word shows up as
+`high 12 bits always zero — looks like u4`.
+
 Both views also sample a grid that fits the screen (they never read the whole
 tensor for the *display*). Reading is supported for `safetensors` (any size) and HDF5 (`--features hdf5`,
 currently for datasets up to a size cap); GGUF data preview is not yet supported.

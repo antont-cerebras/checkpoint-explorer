@@ -8,7 +8,7 @@ use std::io::{self, BufWriter, Write};
 use std::time::Duration;
 
 use crate::health::HealthReport;
-use crate::sample::{Sample, Stats, ViewDtype};
+use crate::sample::{BitUsage, Sample, Stats, ViewDtype};
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo, TreeNode};
 use crate::utils::{format_parameters, format_shape, format_size};
 
@@ -416,6 +416,13 @@ impl UI {
                     fmt_value(s.max, integer)
                 )?;
                 write_stats_line(&mut out, s)?;
+                // Detected sub-byte / low-bit encoding, on its own line.
+                if let Some(b) = &s.bits
+                    && b.is_sparse()
+                {
+                    line_end(&mut out)?;
+                    write_encoding(&mut out, b)?;
+                }
             }
             StatsView::Computing { spinner, elapsed } => {
                 write!(out, "Statistics: ")?;
@@ -952,13 +959,20 @@ fn write_stats_line(out: &mut impl Write, s: &Stats) -> Result<()> {
     Ok(())
 }
 
-/// Render the stats line for a data view (heatmap/numeric): the stats once
-/// `Ready`, a spinner while `Computing`, nothing while `Pending`. Ends the line.
+/// Render the stats line for a data view (heatmap/numeric): the stats (plus an
+/// encoding line when a sub-byte encoding is detected) once `Ready`, a spinner
+/// while `Computing`, nothing while `Pending`. Ends each line.
 fn write_stats_view(out: &mut impl Write, stats: StatsView) -> Result<()> {
     match stats {
         StatsView::Ready(s) => {
             write_stats_line(out, s)?;
             line_end(out)?;
+            if let Some(b) = &s.bits
+                && b.is_sparse()
+            {
+                write_encoding(out, b)?;
+                line_end(out)?;
+            }
         }
         StatsView::Computing { spinner, elapsed } => {
             write_computing(out, spinner, elapsed)?;
@@ -966,6 +980,33 @@ fn write_stats_view(out: &mut impl Write, stats: StatsView) -> Result<()> {
         }
         StatsView::Pending => {}
     }
+    Ok(())
+}
+
+/// Write an "Encoding:" line describing a detected sub-byte / low-bit encoding:
+/// which container bits are always zero, and the effective width (flagged as
+/// `uN` when a clean field sits at one end).
+fn write_encoding(out: &mut impl Write, b: &BitUsage) -> Result<()> {
+    let (lo, hi, used) = (b.low_zero(), b.high_zero(), b.used_bits());
+    queue!(out, SetForegroundColor(palette::DIM))?;
+    write!(out, "Encoding: ")?;
+    queue!(out, ResetColor)?;
+    if lo > 0 {
+        write!(out, "low {lo} bits always zero")?;
+    }
+    if hi > 0 {
+        if lo > 0 {
+            write!(out, ", ")?;
+        }
+        write!(out, "high {hi} bits always zero")?;
+    }
+    queue!(out, SetForegroundColor(palette::DIM))?;
+    if (lo == 0 || hi == 0) && matches!(used, 2 | 3 | 4 | 5 | 6 | 8) {
+        write!(out, " — looks like u{used}")?;
+    } else {
+        write!(out, " ({used} of {} bits used)", b.width)?;
+    }
+    queue!(out, ResetColor)?;
     Ok(())
 }
 

@@ -316,6 +316,16 @@ fn decode(dtype: &str, b: &[u8]) -> f64 {
     }
 }
 
+/// The little-endian integer value of up to 8 container bytes.
+#[inline]
+fn le_u64(bytes: &[u8]) -> u64 {
+    let mut v = 0u64;
+    for (i, &b) in bytes.iter().take(8).enumerate() {
+        v |= (b as u64) << (8 * i);
+    }
+    v
+}
+
 /// Decode sub-element `sub` of a stored container `bytes` under `view`. For
 /// `Stored`/`As` this decodes the whole container; for the 4-bit views it
 /// extracts one nibble of the little-endian container, sign-extending for the
@@ -328,11 +338,7 @@ fn decode_view(view: ViewDtype, dtype: &str, bytes: &[u8], sub: usize) -> f64 {
         ViewDtype::As(dt) => return decode(dt, bytes),
         _ => {}
     }
-    // Little-endian integer value of the container (up to 8 bytes).
-    let mut container: u64 = 0;
-    for (i, &b) in bytes.iter().take(8).enumerate() {
-        container |= (b as u64) << (8 * i);
-    }
+    let container = le_u64(bytes);
     let nib_index = match view {
         ViewDtype::U4Packed | ViewDtype::I4Packed => sub,
         ViewDtype::U4Hi | ViewDtype::I4Hi => bytes.len() * 2 - 1,
@@ -343,6 +349,49 @@ fn decode_view(view: ViewDtype, dtype: &str, bytes: &[u8], sub: usize) -> f64 {
         (nibble - 16) as f64
     } else {
         nibble as f64
+    }
+}
+
+/// Which bits of a fixed-width stored container are ever set across the whole
+/// tensor (`or_mask`), used to detect a sub-byte / low-bit encoding hiding in a
+/// wider dtype (e.g. quantized weights stored in `bf16` whose low mantissa bits
+/// are always zero). Only available for safetensors (we see the raw bytes).
+#[derive(Clone, Copy, Debug)]
+pub struct BitUsage {
+    /// Container width in bits (e.g. 16 for `bf16`/`f16`).
+    pub width: u32,
+    /// OR of every container's little-endian integer value.
+    pub or_mask: u64,
+}
+
+impl BitUsage {
+    /// Number of least-significant bits that are always zero.
+    pub fn low_zero(&self) -> u32 {
+        if self.or_mask == 0 {
+            self.width
+        } else {
+            self.or_mask.trailing_zeros()
+        }
+    }
+
+    /// Number of most-significant bits (within `width`) that are always zero.
+    pub fn high_zero(&self) -> u32 {
+        if self.or_mask == 0 {
+            self.width
+        } else {
+            self.width + self.or_mask.leading_zeros() - 64
+        }
+    }
+
+    /// Span from the lowest to the highest possibly-set bit.
+    pub fn used_bits(&self) -> u32 {
+        self.width - self.low_zero() - self.high_zero()
+    }
+
+    /// Whether some end of the container is always zero — i.e. the data is
+    /// encoded in fewer bits than the stored dtype's width.
+    pub fn is_sparse(&self) -> bool {
+        self.or_mask != 0 && (self.low_zero() > 0 || self.high_zero() > 0)
     }
 }
 
@@ -361,6 +410,9 @@ pub struct Stats {
     pub zeros: u64,
     /// Number of non-finite elements (NaN / ±Inf).
     pub nonfinite: u64,
+    /// Stored-bit usage (sub-byte encoding detection); `None` where the raw
+    /// bytes aren't available (HDF5).
+    pub bits: Option<BitUsage>,
     /// How long the scan took (set by [`tensor_stats`]).
     pub elapsed: std::time::Duration,
 }
@@ -392,6 +444,9 @@ struct Acc {
     max: f64,
     mean: f64,
     m2: f64,
+    /// OR of raw container bits (for sub-byte encoding detection; safetensors
+    /// only — left 0 elsewhere).
+    or_bits: u64,
 }
 
 impl Acc {
@@ -404,6 +459,7 @@ impl Acc {
         max: f64::NEG_INFINITY,
         mean: 0.0,
         m2: 0.0,
+        or_bits: 0,
     };
 
     #[inline]
@@ -453,6 +509,7 @@ impl Acc {
             max: a.max.max(b.max),
             mean,
             m2,
+            or_bits: a.or_bits | b.or_bits,
         }
     }
 
@@ -472,6 +529,7 @@ impl Acc {
             std,
             zeros: self.zeros,
             nonfinite: self.nonfinite,
+            bits: None,
             elapsed: std::time::Duration::ZERO,
         }
     }
@@ -525,6 +583,8 @@ fn stats_safetensors(t: &TensorInfo, view: ViewDtype) -> Result<Stats, String> {
         .map(|chunk| {
             let mut a = Acc::ID;
             for container in chunk.chunks_exact(item) {
+                // Track which stored bits are ever set (sub-byte detection).
+                a.or_bits |= le_u64(container);
                 for sub in 0..packing {
                     a.push(decode_view(view, dtype, container, sub));
                 }
@@ -532,7 +592,12 @@ fn stats_safetensors(t: &TensorInfo, view: ViewDtype) -> Result<Stats, String> {
             a
         })
         .reduce(|| Acc::ID, Acc::merge);
-    Ok(acc.finish())
+    let mut stats = acc.finish();
+    stats.bits = Some(BitUsage {
+        width: (item * 8) as u32,
+        or_mask: acc.or_bits,
+    });
+    Ok(stats)
 }
 
 #[cfg(feature = "hdf5")]
@@ -588,6 +653,7 @@ fn bench_scan(t: &TensorInfo, view: ViewDtype, parallel: bool) -> (Stats, std::t
     let chunk_acc = |chunk: &[u8]| {
         let mut a = Acc::ID;
         for container in chunk.chunks_exact(item) {
+            a.or_bits |= le_u64(container);
             for sub in 0..packing {
                 a.push(decode_view(view, dtype, container, sub));
             }
@@ -949,6 +1015,64 @@ mod tests {
         assert!((s.std - 5.766_281_3).abs() < 1e-5);
         assert_eq!(s.zeros, 1);
         assert_eq!(s.nonfinite, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn detects_sub_byte_encoding() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_explorer_bits");
+        let _ = std::fs::create_dir_all(&dir);
+
+        // BF16-style container where the low 6 bits are always zero (like the
+        // gpt-oss MoE weights) — values 0x_c0, 0x40c0, 0x80c0 → OR 0xc0c0.
+        let path = dir.join("sparse.safetensors");
+        let header = br#"{"w":{"dtype":"BF16","shape":[3],"data_offsets":[0,6]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for v in [0x00c0u16, 0x40c0, 0x80c0] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        drop(f);
+        let t = fixture_dtype(&path, "w", "BF16", &[3], (0, 6));
+        let b = tensor_stats(&t, ViewDtype::Stored).unwrap().bits.unwrap();
+        assert_eq!(b.width, 16);
+        assert_eq!(b.or_mask, 0xc0c0);
+        assert_eq!(b.low_zero(), 6); // bits 0..5 always zero
+        assert_eq!(b.high_zero(), 0); // bit 15 is set
+        assert!(b.is_sparse());
+        let _ = std::fs::remove_file(&path);
+
+        // A clean u4 packed low into a u16 (high 12 bits always zero).
+        let path = dir.join("u4.safetensors");
+        let header = br#"{"w":{"dtype":"U16","shape":[3],"data_offsets":[0,6]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for v in [1u16, 9, 15] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        drop(f);
+        let t = fixture_dtype(&path, "w", "U16", &[3], (0, 6));
+        let b = tensor_stats(&t, ViewDtype::Stored).unwrap().bits.unwrap();
+        assert_eq!((b.low_zero(), b.high_zero(), b.used_bits()), (0, 12, 4));
+        assert!(b.is_sparse());
+        let _ = std::fs::remove_file(&path);
+
+        // A dense u16 (top and bottom bits both used) is not sparse.
+        let path = dir.join("dense.safetensors");
+        let header = br#"{"w":{"dtype":"U16","shape":[2],"data_offsets":[0,4]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for v in [0x8001u16, 0x0001] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        drop(f);
+        let t = fixture_dtype(&path, "w", "U16", &[2], (0, 4));
+        let b = tensor_stats(&t, ViewDtype::Stored).unwrap().bits.unwrap();
+        assert!(!b.is_sparse());
         let _ = std::fs::remove_file(&path);
     }
 
