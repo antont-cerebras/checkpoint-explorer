@@ -567,6 +567,49 @@ fn stats_hdf5(t: &TensorInfo) -> Result<Stats, String> {
     Ok(acc.finish())
 }
 
+/// Scan a safetensors tensor's bytes into an [`Acc`], either with the rayon
+/// `par_chunks` reduce (as production does) or a plain sequential `chunks` fold
+/// over the same chunking and decode. Used by the seq-vs-parallel benchmark to
+/// compare timing and results fairly. Returns `(stats, scan_time)` (timing the
+/// reduce only, not the mmap/header parse).
+#[cfg(test)]
+fn bench_scan(t: &TensorInfo, view: ViewDtype, parallel: bool) -> (Stats, std::time::Duration) {
+    let Layout::ByteRange { start, end } = t.layout else {
+        panic!("benchmark expects a safetensors ByteRange tensor");
+    };
+    let item = item_size(&t.dtype).expect("known dtype");
+    let packing = view.packing(item);
+    let file = std::fs::File::open(&t.source_path).unwrap();
+    let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+    let header_len = u64::from_le_bytes(mmap[0..8].try_into().unwrap());
+    let bytes = &mmap[(8 + header_len + start) as usize..(8 + header_len + end) as usize];
+    let dtype = t.dtype.as_str();
+
+    let chunk_acc = |chunk: &[u8]| {
+        let mut a = Acc::ID;
+        for container in chunk.chunks_exact(item) {
+            for sub in 0..packing {
+                a.push(decode_view(view, dtype, container, sub));
+            }
+        }
+        a
+    };
+
+    let started = std::time::Instant::now();
+    let acc = if parallel {
+        bytes
+            .par_chunks(item * STATS_CHUNK)
+            .map(chunk_acc)
+            .reduce(|| Acc::ID, Acc::merge)
+    } else {
+        bytes
+            .chunks(item * STATS_CHUNK)
+            .map(chunk_acc)
+            .fold(Acc::ID, Acc::merge)
+    };
+    (acc.finish(), started.elapsed())
+}
+
 /// Reduce a typed slice into an [`Acc`] in parallel, converting each element to
 /// `f64` for the (double-precision) accumulators.
 #[cfg(feature = "hdf5")]
@@ -817,6 +860,68 @@ mod tests {
             }
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Manual benchmark: `BENCH_FILE=... BENCH_TENSOR=... cargo test --release
+    /// -- --ignored --nocapture seq_vs_parallel`. Compares the rayon reduce
+    /// against a sequential fold (same decode + accumulator) on a real tensor.
+    #[test]
+    #[ignore = "manual benchmark; set BENCH_FILE and BENCH_TENSOR"]
+    fn seq_vs_parallel_accumulation() {
+        let path = std::env::var("BENCH_FILE").expect("set BENCH_FILE");
+        let name = std::env::var("BENCH_TENSOR").expect("set BENCH_TENSOR");
+
+        // Parse the safetensors header to build a TensorInfo for `name`.
+        let mut f = std::fs::File::open(&path).unwrap();
+        let mut len = [0u8; 8];
+        f.read_exact(&mut len).unwrap();
+        let mut hb = vec![0u8; u64::from_le_bytes(len) as usize];
+        f.read_exact(&mut hb).unwrap();
+        let hdr: serde_json::Value = serde_json::from_slice(&hb).unwrap();
+        let info = &hdr[&name];
+        let dtype = info["dtype"].as_str().unwrap().to_string();
+        let shape: Vec<usize> = info["shape"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as usize)
+            .collect();
+        let off = info["data_offsets"].as_array().unwrap();
+        let (s, e) = (off[0].as_u64().unwrap(), off[1].as_u64().unwrap());
+        let t = TensorInfo {
+            name: name.clone(),
+            dtype,
+            shape: shape.clone(),
+            size_bytes: (e - s) as usize,
+            num_elements: shape.iter().product(),
+            storage: crate::tree::Storage::Unknown,
+            source_path: path.clone(),
+            layout: Layout::ByteRange { start: s, end: e },
+        };
+
+        let view = ViewDtype::Stored;
+        // First sequential run is cold (it faults in the whole tensor); the next
+        // two run from the warmed page cache, isolating accumulation cost.
+        let (_, t_cold) = bench_scan(&t, view, false);
+        let (seq, t_seq) = bench_scan(&t, view, false);
+        let (par, t_par) = bench_scan(&t, view, true);
+
+        eprintln!("tensor {name} — {} elements, {}", t.num_elements, t.dtype);
+        eprintln!("sequential (cold, incl I/O): {t_cold:?}");
+        eprintln!("sequential (warm):           {t_seq:?}");
+        eprintln!("parallel   (warm):           {t_par:?}");
+        eprintln!(
+            "speedup (seq/par, warm):     {:.2}x",
+            t_seq.as_secs_f64() / t_par.as_secs_f64()
+        );
+        eprintln!("seq stats: {seq:?}");
+        eprintln!("par stats: {par:?}");
+
+        // min/max are order-independent (exact); mean/std differ only by
+        // floating-point summation order, so allow a tiny relative slack.
+        assert_eq!((seq.min, seq.max), (par.min, par.max));
+        assert!((seq.mean - par.mean).abs() <= seq.mean.abs() * 1e-9 + 1e-12);
+        assert!((seq.std - par.std).abs() <= seq.std.abs() * 1e-9 + 1e-12);
     }
 
     #[test]
