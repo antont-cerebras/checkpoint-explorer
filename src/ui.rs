@@ -351,26 +351,33 @@ impl UI {
         line_end(&mut out)?;
 
         write!(out, "Size: {}", format_size(tensor.size_bytes))?;
-        line_end(&mut out)?;
-        // On-disk size + codec, for formats that track compression (HDF5).
+        // On-disk size + codec on the same line, for formats that track
+        // compression (HDF5); safetensors leaves it off entirely.
         match &tensor.storage {
             Storage::Compressed {
                 codec,
                 stored_bytes,
             } => {
-                write!(out, "On disk: {} ({codec})", format_size(*stored_bytes))?;
-                line_end(&mut out)?;
+                // Show the compression ratio so the on-disk vs logical gap is
+                // explicit (e.g. 4-bit weights in 16-bit words only reach ~2×
+                // under byte-oriented LZ4).
+                let ratio = tensor.size_bytes as f64 / (*stored_bytes).max(1) as f64;
+                write!(
+                    out,
+                    " · on disk: {} ({codec}, {ratio:.1}×)",
+                    format_size(*stored_bytes)
+                )?;
             }
             Storage::Raw => {
                 write!(
                     out,
-                    "On disk: {} (uncompressed)",
+                    " · on disk: {} (uncompressed)",
                     format_size(tensor.size_bytes)
                 )?;
-                line_end(&mut out)?;
             }
             Storage::Unknown => {}
         }
+        line_end(&mut out)?;
         // Where the data lives within the file.
         match &tensor.layout {
             Layout::ByteRange { start, end } => {
@@ -945,7 +952,17 @@ fn write_stats_line(out: &mut impl Write, s: &Stats) -> Result<()> {
     queue!(out, SetForegroundColor(palette::DIM))?;
     write!(out, " · zeros ")?;
     queue!(out, ResetColor)?;
-    write!(out, "{:.1}%", s.zero_fraction() * 100.0)?;
+    // Distinguish "no zeros at all" from "some, but a tiny fraction": the latter
+    // would otherwise round to a misleading `0.0%` (e.g. when min is exactly 0),
+    // so show the small fraction in scientific notation to keep its magnitude.
+    let pct = s.zero_fraction() * 100.0;
+    if s.zeros == 0 {
+        write!(out, "0%")?;
+    } else if pct < 0.1 {
+        write!(out, "{pct:.1e}%")?;
+    } else {
+        write!(out, "{pct:.1}%")?;
+    }
     if s.nonfinite > 0 {
         queue!(out, SetForegroundColor(palette::WARN))?;
         write!(out, " · {} non-finite", s.nonfinite)?;
