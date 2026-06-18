@@ -176,10 +176,10 @@ disk/NFS-bound); the scan runs on a worker thread with an animated spinner and a
 running timer, and `Ctrl+C` cancels.
 
 Both views also sample a grid that fits the screen (they never read the whole
-tensor for the *display*). Whole-tensor statistics work for `safetensors` and
-HDF5 (`--features hdf5`) of any size; the heatmap/numeric *data* preview is
-supported for `safetensors` (any size) and HDF5 up to a size cap; GGUF data
-preview is not yet supported.
+tensor for the *display* — only each sampled row's column span). Both the
+statistics and the data preview work for `safetensors` and HDF5
+(`--features hdf5`) of any size, reached through one format-agnostic reader; GGUF
+data preview is not yet supported.
 
 #### Dtype override
 
