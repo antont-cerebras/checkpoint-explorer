@@ -8,7 +8,8 @@
 //! once and work the same regardless of format (and a new one, e.g. remote/S3
 //! shards, is just another implementation).
 
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rayon::prelude::*;
 
@@ -743,11 +744,12 @@ trait TensorReader {
     /// Scan the whole tensor, handing each bounded block of stored bytes to `f`
     /// in order (used by the statistics pass). The default streams the dataset
     /// in row-blocks via [`read_region`]; formats override for a zero-copy scan.
-    fn fold_blocks(&self, f: &mut dyn FnMut(&[u8])) -> Result<(), String> {
+    /// `f` returns [`ControlFlow::Break`] to stop early (e.g. on cancellation).
+    fn fold_blocks(&self, f: &mut dyn FnMut(&[u8]) -> ControlFlow<()>) -> Result<(), String> {
         let shape = self.shape();
         if shape.is_empty() {
             let bytes = self.read_region(&[])?;
-            f(&bytes);
+            let _ = f(&bytes);
             return Ok(());
         }
         let outer = shape[0];
@@ -760,7 +762,9 @@ trait TensorReader {
             ranges.push(i..hi);
             ranges.extend(shape[1..].iter().map(|&d| 0..d));
             let bytes = self.read_region(&ranges)?;
-            f(&bytes);
+            if f(&bytes).is_break() {
+                break;
+            }
             i = hi;
         }
         Ok(())
@@ -866,14 +870,23 @@ fn gather_region(
 /// Compute exact statistics over the whole tensor under `view`, scanning every
 /// element once and decoding in parallel. Works the same for any backing format
 /// via [`TensorReader`]; a non-`Stored` view reinterprets the raw stored bytes.
-pub fn tensor_stats(t: &TensorInfo, view: ViewDtype) -> Result<Stats, String> {
+pub fn tensor_stats(t: &TensorInfo, view: ViewDtype, cancel: &AtomicBool) -> Result<Stats, String> {
     let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
     let started = std::time::Instant::now();
     let reader = open_reader(t)?;
     let mut acc = Acc::ID;
     reader.fold_blocks(&mut |bytes| {
         acc = Acc::merge(acc, reduce_view_bytes(bytes, item, view, &t.dtype));
+        // Stop between blocks when the caller cancels (e.g. a key press).
+        if cancel.load(Ordering::Relaxed) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
     })?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".to_string());
+    }
     let mut stats = acc.finish();
     stats.elapsed = started.elapsed();
     Ok(stats)
@@ -986,8 +999,8 @@ impl TensorReader for SafetensorsReader {
     }
 
     /// Zero-copy full scan: the tensor's bytes are already mapped contiguously.
-    fn fold_blocks(&self, f: &mut dyn FnMut(&[u8])) -> Result<(), String> {
-        f(self.blob());
+    fn fold_blocks(&self, f: &mut dyn FnMut(&[u8]) -> ControlFlow<()>) -> Result<(), String> {
+        let _ = f(self.blob());
         Ok(())
     }
 }
@@ -1142,12 +1155,13 @@ impl TensorReader for Hdf5Reader {
             .collect())
     }
 
-    fn fold_blocks(&self, f: &mut dyn FnMut(&[u8])) -> Result<(), String> {
+    fn fold_blocks(&self, f: &mut dyn FnMut(&[u8]) -> ControlFlow<()>) -> Result<(), String> {
         let shape = &self.shape;
         if shape.is_empty() {
             return with_hdf5_block_bytes(&self.dataset, Self::hyperslab(&[]), &self.dtype, |b| {
                 f(b)
-            });
+            })
+            .map(|_| ());
         }
         let outer = shape[0];
         let inner: usize = shape[1..].iter().product::<usize>().max(1);
@@ -1158,9 +1172,13 @@ impl TensorReader for Hdf5Reader {
             let mut ranges: Vec<Range<usize>> = Vec::with_capacity(shape.len());
             ranges.push(i..hi);
             ranges.extend(shape[1..].iter().map(|&d| 0..d));
-            with_hdf5_block_bytes(&self.dataset, Self::hyperslab(&ranges), &self.dtype, |b| {
-                f(b)
-            })?;
+            let flow =
+                with_hdf5_block_bytes(&self.dataset, Self::hyperslab(&ranges), &self.dtype, |b| {
+                    f(b)
+                })?;
+            if flow.is_break() {
+                break;
+            }
             i = hi;
         }
         Ok(())
@@ -1422,7 +1440,7 @@ mod tests {
         drop(f);
 
         let t = fixture(&path, "w", &[4, 5], (0, 80));
-        let s = tensor_stats(&t, ViewDtype::Stored).unwrap();
+        let s = tensor_stats(&t, ViewDtype::Stored, &AtomicBool::new(false)).unwrap();
         assert_eq!(s.count, 20);
         assert_eq!((s.min, s.max), (0.0, 19.0));
         assert!((s.mean - 9.5).abs() < 1e-9);
@@ -1529,7 +1547,7 @@ mod hdf5_tests {
             .expect("tensor");
         eprintln!("tensor {} dtype={} shape={:?}", t.name, t.dtype, t.shape);
         let started = std::time::Instant::now();
-        match tensor_stats(&t, ViewDtype::Stored) {
+        match tensor_stats(&t, ViewDtype::Stored, &AtomicBool::new(false)) {
             Ok(s) => eprintln!("ok in {:?}: {s:?}", started.elapsed()),
             Err(e) => eprintln!("ERR in {:?}: {e}", started.elapsed()),
         }
@@ -1571,7 +1589,7 @@ mod hdf5_tests {
 
         // Exact stats over the whole dataset (raw byte read + streaming scan).
         // Values 0..=19, so mean 9.5 and one zero.
-        let st = tensor_stats(&t, ViewDtype::Stored).unwrap();
+        let st = tensor_stats(&t, ViewDtype::Stored, &AtomicBool::new(false)).unwrap();
         assert_eq!(st.count, 20);
         assert_eq!((st.min, st.max), (0.0, 19.0));
         assert!((st.mean - 9.5).abs() < 1e-9);
@@ -1618,7 +1636,7 @@ mod hdf5_tests {
         assert_eq!(p.values[0], vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0]);
 
         // Stats under the packed view see all eight unpacked nibbles.
-        let st = tensor_stats(&t, ViewDtype::U4Packed).unwrap();
+        let st = tensor_stats(&t, ViewDtype::U4Packed, &AtomicBool::new(false)).unwrap();
         assert_eq!(st.count, 8);
         assert_eq!((st.min, st.max), (0.0, 4.0));
 
