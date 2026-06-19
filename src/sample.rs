@@ -109,27 +109,48 @@ impl ViewDtype {
     }
 
     /// Display width (chars, incl. a 1-col gap) for one value cell in the
-    /// numeric grid — narrow for small integers so many columns fit, wider for
-    /// big ints and scientific-notation floats. 4-bit views are just `-8..=15`.
-    pub fn cell_width(self, stored: &str) -> usize {
+    /// numeric grid. Floats use a fixed scientific-notation width. Integer
+    /// views size to the *actual* values: given the exact whole-tensor `range`
+    /// (min, max), a sparse 16-bit tensor of two-digit numbers packs as many
+    /// columns as a 4-bit view, instead of always reserving room for `-32768`.
+    /// Without a range (stats not computed yet) it falls back to the dtype's
+    /// theoretical maximum width.
+    pub fn cell_width(self, stored: &str, range: Option<(f64, f64)>) -> usize {
+        // Floats render in scientific notation — a fixed width regardless of
+        // magnitude (e.g. `-1.234e-05`).
+        if !self.is_integer(stored) {
+            return 11;
+        }
+        let digits = match range {
+            Some((lo, hi)) => int_digits(lo).max(int_digits(hi)),
+            None => self.int_max_digits(stored),
+        };
+        // +1 for a separating space; a small floor keeps tiny values readable.
+        (digits + 1).max(3)
+    }
+
+    /// Widest decimal width (digits plus any minus sign) this integer view can
+    /// produce, used to size cells before the exact value range is known.
+    fn int_max_digits(self, stored: &str) -> usize {
         let dt = match self {
-            ViewDtype::U4Lo
-            | ViewDtype::U4Hi
-            | ViewDtype::U4Packed
-            | ViewDtype::I4Lo
-            | ViewDtype::I4Hi
-            | ViewDtype::I4Packed => return 4,
+            ViewDtype::U4Lo | ViewDtype::U4Hi | ViewDtype::U4Packed => return 2, // 0..=15
+            ViewDtype::I4Lo | ViewDtype::I4Hi | ViewDtype::I4Packed => return 2, // -8..=7
             ViewDtype::As(dt) => dt,
             ViewDtype::Stored => stored,
         };
         match dt {
-            "I8" | "U8" | "BOOL" => 5,
-            "I16" | "U16" => 7,
-            "I32" | "U32" => 12,
-            "I64" | "U64" => 21,
-            _ => 11, // F16/BF16/F32/F64 — scientific notation
+            "I8" | "U8" | "BOOL" => 4, // -128
+            "I16" | "U16" => 6,        // -32768
+            "I32" | "U32" => 11,       // -2147483648
+            "I64" | "U64" => 20,       // -9223372036854775808
+            _ => 10,
         }
     }
+}
+
+/// Decimal width of an integer-valued `f64` (digit count plus a leading minus).
+fn int_digits(v: f64) -> usize {
+    (v as i64).to_string().len()
 }
 
 impl ViewDtype {
@@ -216,14 +237,16 @@ pub struct Sample {
 }
 
 /// How [`sample_tensor`] chooses which rows/columns to show.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum SampleMode {
     /// Evenly-spaced indices across the whole matrix (the default overview).
     #[default]
     Grid,
-    /// The first and last few rows and columns, contiguously — to inspect edge
+    /// The first and last rows and columns, contiguously — to inspect edge
     /// padding (e.g. is a tensor zero-padded, or padded with something else).
-    Edges,
+    /// `row_tail` / `col_tail` bias the fixed budget toward the tail: `0.0`
+    /// shows only the first rows/cols, `1.0` only the last, `0.5` is balanced.
+    Edges { row_tail: f32, col_tail: f32 },
 }
 
 /// Sample a 1D/2D/3D tensor into at most `max_rows` x `max_cols` values. For a
@@ -279,9 +302,9 @@ pub fn sample_tensor(
             sample_indices(total_rows, max_rows.max(1)),
             sample_indices(total_cols, max_cols.max(1)),
         ),
-        SampleMode::Edges => (
-            edge_indices(total_rows, max_rows.max(1)),
-            edge_indices(total_cols, max_cols.max(1)),
+        SampleMode::Edges { row_tail, col_tail } => (
+            edge_indices(total_rows, max_rows.max(1), row_tail),
+            edge_indices(total_cols, max_cols.max(1), col_tail),
         ),
     };
 
@@ -334,16 +357,30 @@ fn sample_indices(n: usize, k: usize) -> Vec<usize> {
 }
 
 /// The first and last indices of `0..n` (so padding at either end is visible),
-/// filling the available space: each side is `(max - 1) / 2`, reserving one
-/// slot for the "⋯" / "⋮" gap the UI draws between the two halves. Returns all
-/// of `0..n` when that already fits without a gap.
-fn edge_indices(n: usize, max: usize) -> Vec<usize> {
+/// filling the available space. The total shown is `2 * ((max - 1) / 2)` (the
+/// screen budget, leaving one slot for the "⋯" / "⋮" gap the UI draws between
+/// the halves). `tail_frac` splits that budget between the head (first) and
+/// tail (last): `0.0` is all-first, `1.0` is all-last, `0.5` is balanced.
+/// Returns all of `0..n` when the budget already covers it (no gap).
+fn edge_indices(n: usize, max: usize, tail_frac: f32) -> Vec<usize> {
     let per_side = (max.saturating_sub(1) / 2).max(1);
-    if n <= 2 * per_side {
+    let total = 2 * per_side;
+    if n <= total {
         return (0..n).collect();
     }
-    let mut idx: Vec<usize> = (0..per_side).collect();
-    idx.extend((n - per_side)..n);
+    let tail = ((tail_frac.clamp(0.0, 1.0) * total as f32).round() as usize).min(total);
+    let head = total - tail;
+    // A window entirely at one end is contiguous (no gap); otherwise the head
+    // and tail blocks are disjoint (`head + tail = total < n`) and the UI marks
+    // the skipped middle with a gap.
+    if head == 0 {
+        return ((n - tail)..n).collect();
+    }
+    if tail == 0 {
+        return (0..head).collect();
+    }
+    let mut idx: Vec<usize> = (0..head).collect();
+    idx.extend((n - tail)..n);
     idx
 }
 
@@ -1169,19 +1206,27 @@ mod tests {
 
     #[test]
     fn edge_indices_takes_first_and_last() {
-        // Small enough to show whole (n <= 2*per_side): no gap.
-        assert_eq!(edge_indices(5, 100), vec![0, 1, 2, 3, 4]);
-        // Fills the screen: per side = (max - 1) / 2, reserving one slot for the
-        // gap. With max = 100 that's 49 first and 49 last of 1000, with a gap.
-        let e = edge_indices(1000, 100);
+        // Small enough to show whole (n <= total): no gap.
+        assert_eq!(edge_indices(5, 100, 0.5), vec![0, 1, 2, 3, 4]);
+        // Balanced (tail_frac = 0.5) fills the screen: total = 2*((max-1)/2),
+        // split evenly. With max = 100 that's 49 first and 49 last of 1000.
+        let e = edge_indices(1000, 100, 0.5);
         assert_eq!(e.len(), 2 * 49);
         assert_eq!(&e[..3], &[0, 1, 2]);
         assert_eq!(e[48], 48);
         assert_eq!(e[49], 951);
         assert_eq!(e.last(), Some(&999));
-        // Tight budget: per side = (8 - 1) / 2 = 3, fitting the screen.
-        let e2 = edge_indices(100, 8);
-        assert_eq!(e2, vec![0, 1, 2, 97, 98, 99]);
+        // Tight budget: total = 2*((8-1)/2) = 6, balanced = 3 + 3.
+        assert_eq!(edge_indices(100, 8, 0.5), vec![0, 1, 2, 97, 98, 99]);
+        // All-tail (tail_frac = 1.0): only the last `total` indices, contiguous.
+        assert_eq!(edge_indices(100, 8, 1.0), vec![94, 95, 96, 97, 98, 99]);
+        // All-head (tail_frac = 0.0): only the first `total`, contiguous.
+        assert_eq!(edge_indices(100, 8, 0.0), vec![0, 1, 2, 3, 4, 5]);
+        // Biased toward the tail: fewer first, more last (still a gap).
+        let b = edge_indices(100, 14, 0.75); // total = 12 -> 3 first, 9 last
+        assert_eq!(&b[..3], &[0, 1, 2]);
+        assert_eq!(b.len(), 12);
+        assert_eq!(&b[3..], &[91, 92, 93, 94, 95, 96, 97, 98, 99]);
     }
 
     #[test]

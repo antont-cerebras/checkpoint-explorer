@@ -71,6 +71,17 @@ pub enum StatsView<'a> {
     Ready(&'a Stats),
 }
 
+impl StatsView<'_> {
+    /// The exact whole-tensor value range, available only once the scan has
+    /// finished. Used to size numeric cells to the data actually present.
+    pub fn value_range(&self) -> Option<(f64, f64)> {
+        match self {
+            StatsView::Ready(s) => Some((s.min, s.max)),
+            _ => None,
+        }
+    }
+}
+
 pub struct UI;
 
 impl UI {
@@ -528,8 +539,8 @@ impl UI {
         write!(out, " ")?;
         let logical = sample.view.logical_shape(&tensor.shape, &tensor.dtype);
         write_view_shape(&mut out, &tensor.shape, &logical)?;
-        let what = if sample.mode == SampleMode::Edges {
-            "first/last"
+        let what = if matches!(sample.mode, SampleMode::Edges { .. }) {
+            "edges"
         } else {
             "sampled"
         };
@@ -598,10 +609,10 @@ impl UI {
     /// Render a sampled tensor as a grid of numeric values with row/column
     /// indices (edges included).
     pub fn draw_values(tensor: &TensorInfo, sample: &Sample, stats: StatsView) -> Result<()> {
-        // Cell width adapts to the view's dtype: floats need room for scientific
-        // notation, while sub-byte / small-int views are 1-3 digits, so we pack
-        // many narrow columns onto the screen.
-        let cw = sample.view.cell_width(&tensor.dtype);
+        // Cell width adapts to the data: floats need room for scientific
+        // notation, while small integers (incl. sparse values in a wide dtype)
+        // are 1-3 digits, so we pack many narrow columns onto the screen.
+        let cw = sample.view.cell_width(&tensor.dtype, stats.value_range());
         let stdout = io::stdout();
         let mut out = BufWriter::new(stdout.lock());
         // Synchronized, in-place overwrite (see `draw_heatmap`) to avoid flicker.
@@ -615,16 +626,26 @@ impl UI {
         write_view_shape(&mut out, &tensor.shape, &logical)?;
         // In edges mode the grid is the first/last rows & columns (for padding);
         // otherwise an evenly-spaced overview.
-        let edges = sample.mode == SampleMode::Edges;
-        let what = if edges { "first/last" } else { "sampled" };
-        write!(
-            out,
-            " → {what} {} of {} rows × {} of {} cols (indices shown)",
-            sample.rows.len(),
-            sample.total_rows,
-            sample.cols.len(),
-            sample.total_cols
-        )?;
+        let edges = matches!(sample.mode, SampleMode::Edges { .. });
+        if edges {
+            write!(
+                out,
+                " → edges: {} of {} rows × {} of {} cols (indices shown)",
+                edge_desc(&sample.rows, sample.total_rows),
+                sample.total_rows,
+                edge_desc(&sample.cols, sample.total_cols),
+                sample.total_cols
+            )?;
+        } else {
+            write!(
+                out,
+                " → sampled {} of {} rows × {} of {} cols (indices shown)",
+                sample.rows.len(),
+                sample.total_rows,
+                sample.cols.len(),
+                sample.total_cols
+            )?;
+        }
         line_end(&mut out)?;
         write_stats_view(&mut out, stats)?;
         if sample.slices > 1 {
@@ -1017,22 +1038,45 @@ fn write_view_footer(out: &mut impl Write, sample: &Sample, heatmap: bool) -> Re
         ("m", "heatmap")
     };
     let mut items = vec![switch];
+    let edges = matches!(sample.mode, SampleMode::Edges { .. });
+    // In the edges view the arrows rebalance first vs. last (Shift snaps to one
+    // end); slice stepping moves to `[`/`]` so the arrows are free for this.
+    if edges {
+        items.push(("← →", "first/last cols"));
+        items.push(("↑ ↓", "first/last rows"));
+        items.push(("+Shift", "one end"));
+    }
     if sample.slices > 1 {
-        items.push(("← →", "step"));
-        items.push(("Shift+← →", "jump 5%"));
+        if edges {
+            items.push(("[ ]", "slice"));
+        } else {
+            items.push(("← →", "step"));
+            items.push(("Shift+← →", "jump 5%"));
+        }
         items.push(("/", "index or %"));
     }
     if sample.overridable {
         items.push(("d", "dtype"));
     }
     // Toggle between the overview grid and the first/last rows & cols (edges).
-    items.push(if sample.mode == SampleMode::Edges {
-        ("e", "grid")
-    } else {
-        ("e", "edges")
-    });
+    items.push(if edges { ("e", "grid") } else { ("e", "edges") });
     items.push(("", "any other key to return..."));
     hint_line(out, &items)
+}
+
+/// Describe an edges-view index slice for the header — e.g. `first 26 & last 25`,
+/// `last 50`, `first 50`, or `all 50` when the whole axis fits — so the current
+/// first/last split (and any bias the user dialed in) is visible at a glance.
+fn edge_desc(idx: &[usize], total: usize) -> String {
+    let n = idx.len();
+    if n >= total {
+        return format!("all {n}");
+    }
+    match idx.windows(2).position(|w| w[1] != w[0] + 1) {
+        Some(g) => format!("first {} & last {}", g + 1, n - (g + 1)),
+        None if idx.first() == Some(&0) => format!("first {n}"),
+        None => format!("last {n}"),
+    }
 }
 
 /// Render a text-input field: the typed `text` plus a block cursor, on the
