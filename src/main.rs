@@ -98,6 +98,20 @@ struct Args {
         help = "Starting slice for a 3D tensor: an index (e.g. 12) or a percentage (e.g. 50%)"
     )]
     slice: Option<String>,
+
+    #[arg(
+        long,
+        requires = "tensor",
+        help = "Start computing statistics immediately when opening the detail view (data views always compute them)"
+    )]
+    compute_stats: bool,
+
+    #[arg(
+        long,
+        requires = "tensor",
+        help = "Render the requested view once and exit, without entering interactive navigation"
+    )]
+    exit: bool,
 }
 
 fn main() -> Result<()> {
@@ -140,6 +154,8 @@ fn main() -> Result<()> {
         edges,
         zebra: args.zebra,
         slice: args.slice,
+        compute_stats: args.compute_stats,
+        exit_after: args.exit,
     });
 
     let mut explorer = Explorer::new(files, health_reports, open);
