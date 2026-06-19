@@ -160,11 +160,11 @@ actual data of 1D/2D/3D tensors:
   background (a constant-width band per row or column); `z` cycles the striping
   between rows, columns, and off.
 
-Both views sample an evenly-spaced overview by default. Press `e` to toggle an
-**edges view** that instead shows the first *and* last rows and columns (as many
-as fit), with a dotted `⋯` / `⋮` separator marking the skipped middle — handy
-for seeing how a tensor is padded at its edges (e.g. zero padding vs. something
-else). In the edges view the **arrow keys move the divider** between the first
+Both views open in the **edges view** by default — the first *and* last rows and
+columns (as many as fit), with a dotted `⋯` / `⋮` separator marking the skipped
+middle — handy for seeing how a tensor is padded at its edges (e.g. zero padding
+vs. something else). Press `e` to toggle the evenly-spaced **overview** instead.
+In the edges view the **arrow keys move the divider** between the first
 and last blocks: `←` / `→` slide the column divider (so `→` grows the first
 columns and shrinks the last, `←` the reverse), `↑` / `↓` slide the row divider,
 and holding `Shift` pushes it all the way to one end (e.g. `Shift`+`←` to see
