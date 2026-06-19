@@ -110,6 +110,33 @@ enum ScanOutcome {
     Cancelled,
 }
 
+/// A screen in the navigation history. The tree is the root; opening a tensor
+/// pushes a detail screen, and `m`/`v` push a data view.
+#[derive(Clone)]
+enum Screen {
+    Tree,
+    Detail {
+        tensor: String,
+        slice: usize,
+    },
+    Data {
+        tensor: String,
+        repr: Representation,
+        slice: usize,
+    },
+}
+
+/// What a screen asks the navigator to do when the user leaves it.
+enum Nav {
+    /// Go to a new screen (truncates any forward history, then pushes).
+    Open(Screen),
+    /// Step back / forward through the visited-screen history (Backspace / `\`).
+    Back,
+    Forward,
+    /// Quit the app.
+    Quit,
+}
+
 pub struct Explorer {
     files: Vec<PathBuf>,
     tensors: Vec<TensorInfo>,
@@ -613,17 +640,75 @@ impl Explorer {
     fn interactive_loop(&mut self) -> Result<()> {
         self.load_all_files()?;
 
-        // A `--tensor` request jumps straight to its view; once that screen is
-        // dismissed, fall through to normal browsing — unless `--exit` asked for
-        // a one-shot render, in which case we're done.
+        // Browser-style screen history: Backspace steps back through the screens
+        // you've visited, `\` steps forward, and any fresh navigation truncates
+        // the forward tail. The tree is the root.
+        let mut history = vec![Screen::Tree];
+        let mut cursor = 0usize;
+
+        // A `--tensor` request seeds the history with that screen — or, with
+        // `--exit`, renders it once and quits without entering the navigator.
         if let Some(req) = self.open.take() {
-            let exit_after = req.exit_after;
-            self.open_requested(req);
-            if exit_after {
+            let one_shot = req.exit_after;
+            let seeded = self.open_requested(req);
+            if one_shot {
                 return Ok(());
+            }
+            if let Some(screen) = seeded {
+                history.push(screen);
+                cursor = 1;
             }
         }
 
+        loop {
+            let nav = match history[cursor].clone() {
+                Screen::Tree => self.run_tree()?,
+                Screen::Detail { tensor, slice } => self.run_detail(
+                    &tensor,
+                    slice,
+                    StatsStart::OnDemand,
+                    Interaction::Interactive,
+                ),
+                Screen::Data {
+                    tensor,
+                    repr,
+                    slice,
+                } => {
+                    // Re-record the screen with where the user left it (slice /
+                    // representation), so back/forward returns there faithfully.
+                    let (nav, repr, slice) =
+                        self.run_data(&tensor, repr, slice, Interaction::Interactive);
+                    history[cursor] = Screen::Data {
+                        tensor,
+                        repr,
+                        slice,
+                    };
+                    nav
+                }
+            };
+            match nav {
+                Nav::Quit => break,
+                Nav::Open(screen) => {
+                    history.truncate(cursor + 1);
+                    history.push(screen);
+                    cursor += 1;
+                }
+                Nav::Back => cursor = cursor.saturating_sub(1),
+                Nav::Forward => {
+                    if cursor + 1 < history.len() {
+                        cursor += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The tree browser. Handles in-place keys (navigation, search, expand) and
+    /// returns a [`Nav`] when the user opens a tensor (`Enter`), moves through
+    /// the screen history (Backspace / `\`), or quits.
+    fn run_tree(&mut self) -> Result<Nav> {
         loop {
             let title = if self.files.len() == 1 {
                 self.files[0].to_string_lossy().to_string()
@@ -666,14 +751,14 @@ impl Explorer {
                         if self.search_mode {
                             self.exit_search_mode();
                         } else {
-                            break;
+                            return Ok(Nav::Quit);
                         }
                     }
                     KeyEvent {
                         code: KeyCode::Char('c'),
                         modifiers: KeyModifiers::CONTROL,
                         ..
-                    } => break,
+                    } => return Ok(Nav::Quit),
                     // `c` (no modifier) copies the selected tensor's source path.
                     // In search mode it falls through to be typed into the query.
                     KeyEvent {
@@ -737,22 +822,30 @@ impl Explorer {
                         ..
                     } => self.move_to_first_child(),
                     // Enter acts on the highlighted row in both modes: expand a
-                    // group or open a tensor/metadata detail. In search mode it
-                    // opens the result's detail (and stays in search); use Esc
-                    // or `q` to leave search.
+                    // group, or open a tensor detail (returned to the navigator).
                     KeyEvent {
                         code: KeyCode::Enter,
                         ..
-                    } => self.handle_selection(),
+                    } => {
+                        if let Some(screen) = self.handle_selection() {
+                            return Ok(Nav::Open(screen));
+                        }
+                    }
                     KeyEvent {
                         code: KeyCode::Char(' '),
                         ..
-                    } if !self.search_mode => self.handle_selection(),
+                    } if !self.search_mode => {
+                        if let Some(screen) = self.handle_selection() {
+                            return Ok(Nav::Open(screen));
+                        }
+                    }
                     // While searching, space is ignored rather than typed into the query.
                     KeyEvent {
                         code: KeyCode::Char(' '),
                         ..
                     } => {}
+                    // Backspace edits the query while searching, otherwise steps
+                    // back through the screen history.
                     KeyEvent {
                         code: KeyCode::Backspace,
                         ..
@@ -762,6 +855,15 @@ impl Explorer {
                         self.selected_idx = 0;
                         self.scroll_offset = 0;
                     }
+                    KeyEvent {
+                        code: KeyCode::Backspace,
+                        ..
+                    } => return Ok(Nav::Back),
+                    // `\` steps forward through the screen history.
+                    KeyEvent {
+                        code: KeyCode::Char('\\'),
+                        ..
+                    } if !self.search_mode => return Ok(Nav::Forward),
                     KeyEvent {
                         code: KeyCode::Char(c),
                         ..
@@ -776,8 +878,6 @@ impl Explorer {
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Status bar contents for the row under the cursor: a leading glyph, an
@@ -969,7 +1069,10 @@ impl Explorer {
         self.scroll_offset = 0;
     }
 
-    fn handle_selection(&mut self) {
+    /// Act on the highlighted tree row. Returns `Some(Screen::Detail)` when a
+    /// tensor was selected (the navigator opens it); groups expand and metadata
+    /// opens in place, returning `None`.
+    fn handle_selection(&mut self) -> Option<Screen> {
         let tree = if self.search_mode {
             &self.filtered_tree
         } else {
@@ -991,24 +1094,24 @@ impl Explorer {
                     }
                 }
                 TreeNode::Tensor { info } => {
-                    self.show_tensor_detail(
-                        info,
-                        0,
-                        StatsStart::OnDemand,
-                        Interaction::Interactive,
-                    );
+                    return Some(Screen::Detail {
+                        tensor: info.name.clone(),
+                        slice: 0,
+                    });
                 }
                 TreeNode::Metadata { info } => {
                     self.show_metadata_detail(info);
                 }
             }
         }
+        None
     }
 
     /// Apply a CLI `--tensor` request: locate the tensor, apply any dtype
-    /// override and edges/overview choice, then open the requested screen. If
-    /// the tensor isn't found, show a brief message and return to the browser.
-    fn open_requested(&self, req: OpenRequest) {
+    /// override and edges/overview choice, then either render it once (`--exit`)
+    /// or return the [`Screen`] to seed the navigator with. Returns `None` when
+    /// the tensor isn't found, the slice is invalid, or it was a one-shot render.
+    fn open_requested(&self, req: OpenRequest) -> Option<Screen> {
         let Some(tensor) = self.tensors.iter().find(|t| t.name == req.tensor).cloned() else {
             let _ = UI::draw_message(
                 "Tensor not found",
@@ -1021,7 +1124,7 @@ impl Explorer {
             if !req.exit_after {
                 let _ = event::read();
             }
-            return;
+            return None;
         };
         // Apply the dtype override (skipped for formats that can't reinterpret,
         // so the header never claims a view that isn't actually applied).
@@ -1061,43 +1164,86 @@ impl Explorer {
                     if !req.exit_after {
                         let _ = event::read();
                     }
-                    return;
+                    return None;
                 }
             },
             None => 0,
-        };
-        let interaction = if req.exit_after {
-            Interaction::OneShot
-        } else {
-            Interaction::Interactive
         };
         let stats_start = if req.compute_stats {
             StatsStart::Auto
         } else {
             StatsStart::OnDemand
         };
-        match req.view {
-            OpenView::Detail => {
-                self.show_tensor_detail(&tensor, start_slice, stats_start, interaction)
+        let screen = match req.view {
+            OpenView::Detail => Screen::Detail {
+                tensor: tensor.name.clone(),
+                slice: start_slice,
+            },
+            OpenView::Values => Screen::Data {
+                tensor: tensor.name.clone(),
+                repr: Representation::Values,
+                slice: start_slice,
+            },
+            OpenView::Heatmap => Screen::Data {
+                tensor: tensor.name.clone(),
+                repr: Representation::Heatmap,
+                slice: start_slice,
+            },
+        };
+
+        // One-shot (`--exit`): render the requested screen once and return None
+        // (the navigator is never entered).
+        if req.exit_after {
+            match &screen {
+                Screen::Detail { tensor, slice } => {
+                    self.run_detail(tensor, *slice, stats_start, Interaction::OneShot);
+                }
+                Screen::Data {
+                    tensor,
+                    repr,
+                    slice,
+                } => {
+                    self.run_data(tensor, *repr, *slice, Interaction::OneShot);
+                }
+                Screen::Tree => {}
             }
-            OpenView::Values => {
-                self.show_tensor_data(&tensor, Representation::Values, start_slice, interaction)
-            }
-            OpenView::Heatmap => {
-                self.show_tensor_data(&tensor, Representation::Heatmap, start_slice, interaction)
-            }
+            return None;
         }
+
+        // Interactive: `--compute-stats` pre-warms the detail's stats so they
+        // show on first render (the navigator itself always opens on-demand).
+        if stats_start == StatsStart::Auto
+            && let Screen::Detail { .. } = screen
+        {
+            let view = self
+                .dtype_overrides
+                .borrow()
+                .get(&tensor.name)
+                .copied()
+                .unwrap_or(ViewDtype::Stored);
+            let overridable = dtype_overridable(&tensor);
+            self.compute_stats_animated(&tensor, view, |sv| {
+                let _ = UI::draw_tensor_detail(&tensor, view, overridable, sv);
+            });
+        }
+        Some(screen)
     }
 
-    fn show_tensor_detail(
+    /// The tensor detail screen. Sub-views: `m` heatmap, `v` numeric values
+    /// (returned to the navigator as a new screen), `d` reinterpret dtype, `s`
+    /// compute statistics. Backspace / `\` step through the screen history; any
+    /// other key goes back to the tree. Returns the chosen [`Nav`].
+    fn run_detail(
         &self,
-        tensor: &TensorInfo,
+        tensor_name: &str,
         start_slice: usize,
         stats_start: StatsStart,
         interaction: Interaction,
-    ) {
-        // Detail screen with sub-views: `m` heatmap, `v` numeric values, `d`
-        // reinterpret dtype, `s` compute statistics, any other key returns.
+    ) -> Nav {
+        let Some(tensor) = self.tensors.iter().find(|t| t.name == tensor_name).cloned() else {
+            return Nav::Open(Screen::Tree);
+        };
+        let tensor = &tensor;
         let overridable = dtype_overridable(tensor);
         let mut first = true;
         loop {
@@ -1118,11 +1264,11 @@ impl Explorer {
             let stats = self.cached_stats(tensor, view);
             let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
             if UI::draw_tensor_detail(tensor, view, overridable, stats_view).is_err() {
-                return;
+                return Nav::Quit;
             }
             // One-shot mode: leave this frame up and exit without reading keys.
             if first && interaction == Interaction::OneShot {
-                return;
+                return Nav::Quit;
             }
             first = false;
             match event::read() {
@@ -1130,21 +1276,23 @@ impl Explorer {
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('m'),
                     ..
-                })) => self.show_tensor_data(
-                    tensor,
-                    Representation::Heatmap,
-                    start_slice,
-                    Interaction::Interactive,
-                ),
+                })) => {
+                    return Nav::Open(Screen::Data {
+                        tensor: tensor.name.clone(),
+                        repr: Representation::Heatmap,
+                        slice: start_slice,
+                    });
+                }
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('v'),
                     ..
-                })) => self.show_tensor_data(
-                    tensor,
-                    Representation::Values,
-                    start_slice,
-                    Interaction::Interactive,
-                ),
+                })) => {
+                    return Nav::Open(Screen::Data {
+                        tensor: tensor.name.clone(),
+                        repr: Representation::Values,
+                        slice: start_slice,
+                    });
+                }
                 // Compute exact whole-tensor statistics on demand, animating the
                 // spinner in the detail screen's Statistics line.
                 Ok(Event::Key(KeyEvent {
@@ -1169,9 +1317,19 @@ impl Explorer {
                         }
                     }
                 }
-                Ok(Event::Key(_)) => return,
+                // History navigation.
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Backspace,
+                    ..
+                })) => return Nav::Back,
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Char('\\'),
+                    ..
+                })) => return Nav::Forward,
+                // Any other key goes back to the tree.
+                Ok(Event::Key(_)) => return Nav::Open(Screen::Tree),
                 Ok(_) => {} // resize etc.: just redraw the detail
-                Err(_) => return,
+                Err(_) => return Nav::Quit,
             }
         }
     }
@@ -1181,13 +1339,22 @@ impl Explorer {
     /// screen). For 3D tensors this shows one 2D slice at a fixed first index
     /// (the 0th by default); `[`/`]` and the ← → arrows step through the slices,
     /// wrapping around at both ends. Any other key returns to the detail screen.
-    fn show_tensor_data(
+    /// A tensor data view (heatmap or numeric grid). Handles its keys in place
+    /// (slice nav, `m`/`v`, `e`, `z`, `d`); Backspace / `\` step through the
+    /// screen history and any other key goes back to the detail screen. Returns
+    /// the chosen [`Nav`] plus where the user left it (representation, slice) so
+    /// the navigator can record it for back/forward.
+    fn run_data(
         &self,
-        tensor: &TensorInfo,
+        tensor_name: &str,
         repr: Representation,
         start_slice: usize,
         interaction: Interaction,
-    ) {
+    ) -> (Nav, Representation, usize) {
+        let Some(tensor) = self.tensors.iter().find(|t| t.name == tensor_name).cloned() else {
+            return (Nav::Back, repr, start_slice);
+        };
+        let tensor = &tensor;
         let mut repr = repr;
         let mut slice = start_slice;
         loop {
@@ -1217,7 +1384,7 @@ impl Explorer {
                 let _ = self.draw_data_view(tensor, repr, slice, view, mode, sv);
             }) == ScanOutcome::Cancelled
             {
-                return;
+                return (Nav::Back, repr, slice);
             }
             let stats = self.cached_stats(tensor, view);
             let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
@@ -1237,14 +1404,14 @@ impl Explorer {
                         {
                             quit_immediately();
                         }
-                        return;
+                        return (Nav::Back, repr, slice);
                     }
                 };
 
             // One-shot mode (`--exit`): stats are computed above and the final
             // frame is now drawn, so leave it up and exit without reading keys.
             if interaction == Interaction::OneShot {
-                return;
+                return (Nav::Quit, repr, slice);
             }
 
             // Read one event (blocking), then coalesce any buffered follow-ups
@@ -1340,11 +1507,24 @@ impl Explorer {
                             KeyCode::Char('[') | KeyCode::Left if slices > 1 => {
                                 slice = (slice + slices - 1) % slices
                             }
-                            _ => return,
+                            // History navigation: Backspace back, `\` forward.
+                            KeyCode::Backspace => return (Nav::Back, repr, slice),
+                            KeyCode::Char('\\') => return (Nav::Forward, repr, slice),
+                            // Any other key goes back to the detail screen.
+                            _ => {
+                                return (
+                                    Nav::Open(Screen::Detail {
+                                        tensor: tensor.name.clone(),
+                                        slice,
+                                    }),
+                                    repr,
+                                    slice,
+                                );
+                            }
                         }
                     }
                     Ok(_) => {} // resize etc.: re-sample and redraw the same slice
-                    Err(_) => return,
+                    Err(_) => return (Nav::Back, repr, slice),
                 }
                 // Drain the next buffered event without blocking; once the queue
                 // is empty, fall out to redraw exactly once for the whole burst.
