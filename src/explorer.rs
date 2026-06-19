@@ -25,11 +25,12 @@ use crate::ui::{DrawConfig, StatsView, StripeMode, UI};
 use crate::utils::base64_encode;
 
 /// Whether the data views show the evenly-spaced overview or the first/last
-/// edges (padding) sample. Toggled with `e`, remembered for the session.
+/// edges (padding) sample. Toggled with `e`, remembered for the session;
+/// defaults to the edges view (most useful for inspecting padding).
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum EdgesView {
-    #[default]
     Overview,
+    #[default]
     Edges,
 }
 
