@@ -148,7 +148,11 @@ actual data of 1D/2D/3D tensors:
   blue→green→red scale, with a min/max legend. Each character row packs two
   data rows (upper/lower half-block) for higher vertical resolution.
 - `v` — a **numeric grid** of sampled values with row/column indices, including
-  the edges.
+  the edges. Column width adapts to the view's dtype, so narrow sub-byte / small
+  integer views (e.g. `u4`/`i4`, `I8`) pack many more columns onto the screen
+  than wide floats. When an index label is wider than its (narrow) cell, the
+  labels are staggered across two header rows ("leap-frog"), and — for the most
+  extreme cases — thinned so the ones shown don't collide.
 
 Both views sample an evenly-spaced overview by default. Press `e` to toggle an
 **edges view** that instead shows the first and last ~10 rows *and* columns
