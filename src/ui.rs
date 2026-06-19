@@ -598,7 +598,10 @@ impl UI {
     /// Render a sampled tensor as a grid of numeric values with row/column
     /// indices (edges included).
     pub fn draw_values(tensor: &TensorInfo, sample: &Sample, stats: StatsView) -> Result<()> {
-        const W: usize = 11;
+        // Cell width adapts to the view's dtype: floats need room for scientific
+        // notation, while sub-byte / small-int views are 1-3 digits, so we pack
+        // many narrow columns onto the screen.
+        let cw = sample.view.cell_width(&tensor.dtype);
         let stdout = io::stdout();
         let mut out = BufWriter::new(stdout.lock());
         // Synchronized, in-place overwrite (see `draw_heatmap`) to avoid flicker.
@@ -641,15 +644,76 @@ impl UI {
         let row_gap = gap(&sample.rows);
         let col_gap = gap(&sample.cols);
 
-        // Column-index header (with a "⋯" separator column at the gap).
-        write!(out, "{:>6} ", "")?;
-        for (j, &c) in sample.cols.iter().enumerate() {
-            write!(out, "{c:>W$}")?;
-            if Some(j) == col_gap {
-                write!(out, "{:>W$}", "⋯")?;
+        // Column-index header (with a "⋯" separator column at the gap). With
+        // wide cells the index fits in a single row; with narrow cells (sub-byte
+        // / small-int views) the index is as wide as a cell or wider, so we
+        // stagger the labels across two rows ("leap-frog") to keep them legible.
+        let idx_w = sample
+            .cols
+            .iter()
+            .map(|&c| c.to_string().len())
+            .max()
+            .unwrap_or(1);
+        if idx_w >= cw {
+            // Stagger labels across two rows ("leap-frog") so each may be up to
+            // two cells wide; and when even that is too tight (very wide indices
+            // over very narrow cells) skip every `step`-th label so the ones we
+            // do show don't collide. `step` is the smallest stride whose
+            // two-row spacing (`2 * step * cw`) fits a label plus a space.
+            let step = (idx_w + 1).div_ceil(2 * cw).max(1);
+            // Column offset (within the line) of the right edge of cell `j`,
+            // accounting for the 7-char row-label prefix and the extra "⋯" gap
+            // cell that sits after `col_gap`.
+            let right_edge = |j: usize| -> usize {
+                let gap_cells = matches!(col_gap, Some(g) if j > g) as usize;
+                7 + (j + 1 + gap_cells) * cw
+            };
+            let width = right_edge(sample.cols.len().saturating_sub(1)).max(7);
+            let mut top = vec![' '; width];
+            let mut bot = vec![' '; width];
+            let mut rank = 0usize; // position among the labels we actually show
+            for (j, &c) in sample.cols.iter().enumerate() {
+                if !j.is_multiple_of(step) {
+                    continue;
+                }
+                let label = c.to_string();
+                let end = right_edge(j);
+                let start = end.saturating_sub(label.len());
+                let buf = if rank.is_multiple_of(2) { &mut top } else { &mut bot };
+                for (k, ch) in label.chars().enumerate() {
+                    buf[start + k] = ch;
+                }
+                rank += 1;
             }
+            // Mark the skipped-columns gap with a dotted separator on both rows,
+            // but only where the cell is still blank — a label wider than a cell
+            // can overflow into the gap, and we must not clobber its digits.
+            if let Some(g) = col_gap {
+                let pos = right_edge(g) + cw - 1;
+                if pos < width {
+                    for buf in [&mut top, &mut bot] {
+                        if buf[pos] == ' ' {
+                            buf[pos] = '⋯';
+                        }
+                    }
+                }
+            }
+            let top: String = top.into_iter().collect();
+            let bot: String = bot.into_iter().collect();
+            write!(out, "{}", top.trim_end())?;
+            line_end(&mut out)?;
+            write!(out, "{}", bot.trim_end())?;
+            line_end(&mut out)?;
+        } else {
+            write!(out, "{:>6} ", "")?;
+            for (j, &c) in sample.cols.iter().enumerate() {
+                write!(out, "{c:>cw$}")?;
+                if Some(j) == col_gap {
+                    write!(out, "{:>cw$}", "⋯")?;
+                }
+            }
+            line_end(&mut out)?;
         }
-        line_end(&mut out)?;
 
         // Integer dtypes print as plain integers; floats use scientific notation.
         let integer = sample.view.is_integer(&tensor.dtype);
@@ -657,13 +721,13 @@ impl UI {
             write!(out, "{:>6} ", sample.rows[i])?;
             for (j, &v) in row.iter().enumerate() {
                 if integer {
-                    write!(out, "{:>W$}", v as i64)?;
+                    write!(out, "{:>cw$}", v as i64)?;
                 } else {
-                    write!(out, "{v:>W$.3e}")?;
+                    write!(out, "{v:>cw$.3e}")?;
                 }
                 if Some(j) == col_gap {
                     queue!(out, SetForegroundColor(palette::DIM))?;
-                    write!(out, "{:>W$}", "⋯")?;
+                    write!(out, "{:>cw$}", "⋯")?;
                     queue!(out, ResetColor)?;
                 }
             }
@@ -673,9 +737,9 @@ impl UI {
                 queue!(out, SetForegroundColor(palette::DIM))?;
                 write!(out, "{:>6} ", "⋮")?;
                 for j in 0..row.len() {
-                    write!(out, "{:>W$}", "⋮")?;
+                    write!(out, "{:>cw$}", "⋮")?;
                     if Some(j) == col_gap {
-                        write!(out, "{:>W$}", "⋱")?;
+                        write!(out, "{:>cw$}", "⋱")?;
                     }
                 }
                 queue!(out, ResetColor)?;

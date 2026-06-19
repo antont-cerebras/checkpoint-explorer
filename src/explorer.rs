@@ -1051,8 +1051,10 @@ impl Explorer {
             // so it can sample twice as many rows as there are lines.
             crate::sample::sample_tensor(tensor, text_rows * 2, max_cols, slice, view, mode)?
         } else {
-            // Numeric cells are ~11 wide plus a row-index column.
-            let max_cols = ((cols as usize).saturating_sub(7) / 11).max(1);
+            // Numeric cell width depends on the dtype (sub-byte ints are narrow,
+            // so many more columns fit); plus a 7-char row-index column.
+            let cell = view.cell_width(&tensor.dtype);
+            let max_cols = ((cols as usize).saturating_sub(7) / cell).max(1);
             crate::sample::sample_tensor(tensor, text_rows, max_cols, slice, view, mode)?
         };
         let info = (sample.slices, sample.overridable, sample.slice);

@@ -107,6 +107,29 @@ impl ViewDtype {
             _ => true, // all 4-bit views are integer-valued
         }
     }
+
+    /// Display width (chars, incl. a 1-col gap) for one value cell in the
+    /// numeric grid — narrow for small integers so many columns fit, wider for
+    /// big ints and scientific-notation floats. 4-bit views are just `-8..=15`.
+    pub fn cell_width(self, stored: &str) -> usize {
+        let dt = match self {
+            ViewDtype::U4Lo
+            | ViewDtype::U4Hi
+            | ViewDtype::U4Packed
+            | ViewDtype::I4Lo
+            | ViewDtype::I4Hi
+            | ViewDtype::I4Packed => return 4,
+            ViewDtype::As(dt) => dt,
+            ViewDtype::Stored => stored,
+        };
+        match dt {
+            "I8" | "U8" | "BOOL" => 5,
+            "I16" | "U16" => 7,
+            "I32" | "U32" => 12,
+            "I64" | "U64" => 21,
+            _ => 11, // F16/BF16/F32/F64 — scientific notation
+        }
+    }
 }
 
 impl ViewDtype {
