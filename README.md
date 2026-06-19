@@ -161,12 +161,13 @@ Both views sample an evenly-spaced overview by default. Press `e` to toggle an
 **edges view** that instead shows the first *and* last rows and columns (as many
 as fit), with a dotted `⋯` / `⋮` separator marking the skipped middle — handy
 for seeing how a tensor is padded at its edges (e.g. zero padding vs. something
-else). In the edges view the **arrow keys rebalance** how much of each end is
-shown: `←` / `→` shift the columns toward the first / last, `↑` / `↓` the rows,
-and holding `Shift` snaps all the way to one end (e.g. `Shift`+`→` to see only
-the last columns). The header shows the current split (e.g. `first 8 & last 18`).
-The edges choice and the split are remembered for the session, so they stick as
-you move between tensors.
+else). In the edges view the **arrow keys move the divider** between the first
+and last blocks: `←` / `→` slide the column divider (so `→` grows the first
+columns and shrinks the last, `←` the reverse), `↑` / `↓` slide the row divider,
+and holding `Shift` pushes it all the way to one end (e.g. `Shift`+`←` to see
+only the last columns). The header shows the current split (e.g.
+`first 8 & last 18`). The edges choice and the split are remembered for the
+session, so they stick as you move between tensors.
 
 For **3D tensors** (e.g. stacked MoE experts, shape `[experts, rows, cols]`) the
 preview shows a 2D matrix at a fixed leading index — the 0th by default. The
@@ -174,8 +175,8 @@ preview shows a 2D matrix at a fixed leading index — the 0th by default. The
 ~5% at a time (both wrap around at the ends); `/` prompts for a slice to jump to —
 either an exact index or a percentage like `50%` (0% = first, 100% = last).
 Out-of-range entries are rejected with a message rather than jumping. (In the
-edges view the arrows rebalance the first/last split instead, so there slices
-step with `[` / `]` — `/` still works.)
+edges view the arrows move the first/last divider instead, so there slices step
+with `[` / `]` — `/` still works.)
 Within either view, `m` and `v` switch between the heatmap and numeric
 representations in place, `e` toggles the edges view, and `Ctrl+C` quits the app
 from anywhere.
