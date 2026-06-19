@@ -57,6 +57,9 @@ pub struct Explorer {
     /// session-remembered alongside [`Self::data_view_edges`].
     data_view_row_tail: Cell<f32>,
     data_view_col_tail: Cell<f32>,
+    /// Whether the numeric grid's zebra striping runs down the columns rather
+    /// than across the rows. Session-remembered; toggled with `z`.
+    data_view_stripe_cols: Cell<bool>,
 }
 
 impl Explorer {
@@ -80,6 +83,7 @@ impl Explorer {
             data_view_edges: Cell::new(false),
             data_view_row_tail: Cell::new(0.5),
             data_view_col_tail: Cell::new(0.5),
+            data_view_stripe_cols: Cell::new(false),
         }
     }
 
@@ -1004,6 +1008,11 @@ impl Explorer {
                         KeyCode::Char('e') | KeyCode::Char('E') => {
                             self.data_view_edges.set(!self.data_view_edges.get())
                         }
+                        // Switch the numeric grid's zebra striping between rows
+                        // and columns; remembered for the session.
+                        KeyCode::Char('z') | KeyCode::Char('Z') => self
+                            .data_view_stripe_cols
+                            .set(!self.data_view_stripe_cols.get()),
                         // In the edges view the arrows move the divider between
                         // the first and last blocks (Shift pushes it fully to one
                         // end): e.g. `→` slides the column divider right, growing
@@ -1094,7 +1103,8 @@ impl Explorer {
         if heatmap {
             UI::draw_heatmap(tensor, &sample, stats).map_err(|e| e.to_string())?;
         } else {
-            UI::draw_values(tensor, &sample, stats).map_err(|e| e.to_string())?;
+            UI::draw_values(tensor, &sample, stats, self.data_view_stripe_cols.get())
+                .map_err(|e| e.to_string())?;
         }
         Ok(info)
     }

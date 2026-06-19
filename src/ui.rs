@@ -39,6 +39,11 @@ mod palette {
     /// a light foreground is hard to read on the bright green.
     pub const OK_BG: Color = Color::Green;
     pub const OK_FG: Color = Color::Black;
+    /// Zebra striping for the numeric grid — two subtle dark backgrounds (one
+    /// "dark", one "less dark") that alternate to guide the eye along the rows
+    /// or columns, like a dim highlighter.
+    pub const STRIPE_DARK: Color = Color::AnsiValue(234);
+    pub const STRIPE_LITE: Color = Color::AnsiValue(237);
 }
 
 pub struct DrawConfig<'a> {
@@ -593,7 +598,7 @@ impl UI {
         line_end(&mut out)?;
 
         line_end(&mut out)?;
-        write_view_footer(&mut out, sample, true)?;
+        write_view_footer(&mut out, sample, true, false)?;
 
         // Clear the footer's tail and everything below (no trailing newline),
         // then end the synchronized frame.
@@ -608,7 +613,12 @@ impl UI {
 
     /// Render a sampled tensor as a grid of numeric values with row/column
     /// indices (edges included).
-    pub fn draw_values(tensor: &TensorInfo, sample: &Sample, stats: StatsView) -> Result<()> {
+    pub fn draw_values(
+        tensor: &TensorInfo,
+        sample: &Sample,
+        stats: StatsView,
+        stripe_cols: bool,
+    ) -> Result<()> {
         // Cell width adapts to the data: floats need room for scientific
         // notation, while small integers (incl. sparse values in a wide dtype)
         // are 1-3 digits, so we pack many narrow columns onto the screen.
@@ -729,11 +739,17 @@ impl UI {
             }
             let top: String = top.into_iter().collect();
             let bot: String = bot.into_iter().collect();
+            // The index labels are dimmed so they recede behind the values.
+            queue!(out, SetForegroundColor(palette::DIM))?;
             write!(out, "{}", top.trim_end())?;
+            queue!(out, ResetColor)?;
             line_end(&mut out)?;
+            queue!(out, SetForegroundColor(palette::DIM))?;
             write!(out, "{}", bot.trim_end())?;
+            queue!(out, ResetColor)?;
             line_end(&mut out)?;
         } else {
+            queue!(out, SetForegroundColor(palette::DIM))?;
             write!(out, "{:>lw$}", "")?;
             for (j, &c) in sample.cols.iter().enumerate() {
                 write!(out, "{c:>cw$}")?;
@@ -741,25 +757,52 @@ impl UI {
                     write!(out, "{:>cw$}", "⋯")?;
                 }
             }
+            queue!(out, ResetColor)?;
             line_end(&mut out)?;
         }
 
         // Integer dtypes print as plain integers; floats use scientific notation.
         let integer = sample.view.is_integer(&tensor.dtype);
+        // Alternating "dim highlighter" backgrounds: one band per visual row (or
+        // per visual column, including the gap cell, when `stripe_cols`).
+        let stripe = |k: usize| {
+            if k.is_multiple_of(2) {
+                palette::STRIPE_DARK
+            } else {
+                palette::STRIPE_LITE
+            }
+        };
         for (i, row) in sample.values.iter().enumerate() {
+            // Row-striping paints the whole band (label + values) in one go.
+            if !stripe_cols {
+                queue!(out, SetBackgroundColor(stripe(i)))?;
+            }
+            // Dimmed row index (then back to the default fg, keeping the bg).
+            queue!(out, SetForegroundColor(palette::DIM))?;
             write!(out, "{:>lw$}", sample.rows[i])?;
+            queue!(out, SetForegroundColor(Color::Reset))?;
+            let mut vcol = 0usize; // visual column ordinal (counts the gap cell)
             for (j, &v) in row.iter().enumerate() {
+                if stripe_cols {
+                    queue!(out, SetBackgroundColor(stripe(vcol)))?;
+                }
                 if integer {
                     write!(out, "{:>cw$}", v as i64)?;
                 } else {
                     write!(out, "{v:>cw$.3e}")?;
                 }
+                vcol += 1;
                 if Some(j) == col_gap {
+                    if stripe_cols {
+                        queue!(out, SetBackgroundColor(stripe(vcol)))?;
+                    }
                     queue!(out, SetForegroundColor(palette::DIM))?;
                     write!(out, "{:>cw$}", "⋯")?;
-                    queue!(out, ResetColor)?;
+                    queue!(out, SetForegroundColor(Color::Reset))?;
+                    vcol += 1;
                 }
             }
+            queue!(out, ResetColor)?;
             line_end(&mut out)?;
             // Dotted row after the gap to mark the rows that were skipped.
             if Some(i) == row_gap {
@@ -777,7 +820,7 @@ impl UI {
         }
 
         line_end(&mut out)?;
-        write_view_footer(&mut out, sample, false)?;
+        write_view_footer(&mut out, sample, false, stripe_cols)?;
 
         queue!(
             out,
@@ -1035,7 +1078,12 @@ fn write_slice_header(out: &mut impl Write, sample: &Sample) -> Result<()> {
 /// Footer for the data views: offers the other representation (`m`/`v` switch
 /// in place, no trip back to the detail screen) and mentions slice navigation
 /// only when there is more than one slice to move between. Keys highlighted.
-fn write_view_footer(out: &mut impl Write, sample: &Sample, heatmap: bool) -> Result<()> {
+fn write_view_footer(
+    out: &mut impl Write,
+    sample: &Sample,
+    heatmap: bool,
+    stripe_cols: bool,
+) -> Result<()> {
     let switch = if heatmap {
         ("v", "numeric values")
     } else {
@@ -1064,6 +1112,14 @@ fn write_view_footer(out: &mut impl Write, sample: &Sample, heatmap: bool) -> Re
     }
     // Toggle between the overview grid and the first/last rows & cols (edges).
     items.push(if edges { ("e", "grid") } else { ("e", "edges") });
+    // Switch the zebra striping between rows and columns (numeric grid only).
+    if !heatmap {
+        items.push(if stripe_cols {
+            ("z", "stripe rows")
+        } else {
+            ("z", "stripe cols")
+        });
+    }
     items.push(("", "any other key to return..."));
     hint_line(out, &items)
 }
