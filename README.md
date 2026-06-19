@@ -148,9 +148,15 @@ keep exploring.
 | `/` | Enter search mode to filter tensors |
 | `c` | Copy the selected row's path (tensor file, or a group/root's file or directory) |
 | `h` | Show the checkpoint health report (when there is a mismatch) |
+| `Backspace` / `\` | Step **back** / **forward** through the screens you've visited (browser-style history) — e.g. reopen a view you just left |
 | `Esc` | Exit search mode |
 | `q` | Quit the application (or exit search mode if active) |
 | `Ctrl+C` | Force quit |
+
+`Backspace` and `\` move through a history of the screens you've been on (the
+tree, a tensor's detail, and its data views), so if you leave a screen by a
+stray key you can step right back to it — and forward again. (While the tree's
+search box is active, `Backspace` edits the query instead.)
 
 A status bar pinned to the bottom shows the file the selected tensor lives in
 (or, for a group/root, the single file or the shared directory of its tensors).

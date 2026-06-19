@@ -179,6 +179,7 @@ impl UI {
                     ("E/C", "all"),
                     ("/", "search"),
                     ("c", "copy"),
+                    ("⌫/\\", "back/fwd"),
                     ("q", "quit"),
                 ],
             )?;
@@ -502,7 +503,10 @@ impl UI {
             key_hint(&mut out, "d")?;
             write!(out, " to reinterpret the dtype, ")?;
         }
-        write!(out, "any other key to return...")?;
+        key_hint(&mut out, "⌫")?;
+        write!(out, " / ")?;
+        key_hint(&mut out, "\\")?;
+        write!(out, " to step back / forward, any other key to return...")?;
 
         // No trailing newline (avoids scrolling); clear anything below.
         queue!(
@@ -1150,6 +1154,9 @@ fn write_view_footer(
             StripeMode::Off => ("z", "zebra: off"),
         });
     }
+    // Step back / forward through the screen history.
+    items.push(("⌫", "back"));
+    items.push(("\\", "fwd"));
     items.push(("", "any other key to return..."));
     hint_line(out, &items)
 }
