@@ -679,7 +679,11 @@ impl UI {
                 let label = c.to_string();
                 let end = right_edge(j);
                 let start = end.saturating_sub(label.len());
-                let buf = if rank.is_multiple_of(2) { &mut top } else { &mut bot };
+                let buf = if rank.is_multiple_of(2) {
+                    &mut top
+                } else {
+                    &mut bot
+                };
                 for (k, ch) in label.chars().enumerate() {
                     buf[start + k] = ch;
                 }

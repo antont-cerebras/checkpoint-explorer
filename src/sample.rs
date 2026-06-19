@@ -226,9 +226,6 @@ pub enum SampleMode {
     Edges,
 }
 
-/// Per-side row/column count for [`SampleMode::Edges`] (capped to fit the screen).
-const EDGE: usize = 10;
-
 /// Sample a 1D/2D/3D tensor into at most `max_rows` x `max_cols` values. For a
 /// 3D tensor `[d0, d1, d2]`, `slice` selects the leading index and the `d1 x d2`
 /// matrix at that index is sampled (clamped to a valid slice). `view` overrides
@@ -283,8 +280,8 @@ pub fn sample_tensor(
             sample_indices(total_cols, max_cols.max(1)),
         ),
         SampleMode::Edges => (
-            edge_indices(total_rows, max_rows.max(1), EDGE),
-            edge_indices(total_cols, max_cols.max(1), EDGE),
+            edge_indices(total_rows, max_rows.max(1)),
+            edge_indices(total_cols, max_cols.max(1)),
         ),
     };
 
@@ -336,11 +333,12 @@ fn sample_indices(n: usize, k: usize) -> Vec<usize> {
     idx
 }
 
-/// The first and last `edge` indices of `0..n` (so padding at either end is
-/// visible), capped so at most `max` are returned and they fit the screen.
-/// Returns all of `0..n` when that already fits without a gap.
-fn edge_indices(n: usize, max: usize, edge: usize) -> Vec<usize> {
-    let per_side = edge.min(max.max(2) / 2).max(1);
+/// The first and last indices of `0..n` (so padding at either end is visible),
+/// filling the available space: each side is `(max - 1) / 2`, reserving one
+/// slot for the "⋯" / "⋮" gap the UI draws between the two halves. Returns all
+/// of `0..n` when that already fits without a gap.
+fn edge_indices(n: usize, max: usize) -> Vec<usize> {
+    let per_side = (max.saturating_sub(1) / 2).max(1);
     if n <= 2 * per_side {
         return (0..n).collect();
     }
@@ -1172,15 +1170,18 @@ mod tests {
     #[test]
     fn edge_indices_takes_first_and_last() {
         // Small enough to show whole (n <= 2*per_side): no gap.
-        assert_eq!(edge_indices(5, 100, 10), vec![0, 1, 2, 3, 4]);
-        // First 10 and last 10 of 100, with a gap in between.
-        let e = edge_indices(100, 100, 10);
-        assert_eq!(e.len(), 20);
-        assert_eq!(&e[..10], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        assert_eq!(&e[10..], &[90, 91, 92, 93, 94, 95, 96, 97, 98, 99]);
-        // Capped by `max` (per side = max/2) so it fits the screen.
-        let e2 = edge_indices(100, 8, 10);
-        assert_eq!(e2, vec![0, 1, 2, 3, 96, 97, 98, 99]);
+        assert_eq!(edge_indices(5, 100), vec![0, 1, 2, 3, 4]);
+        // Fills the screen: per side = (max - 1) / 2, reserving one slot for the
+        // gap. With max = 100 that's 49 first and 49 last of 1000, with a gap.
+        let e = edge_indices(1000, 100);
+        assert_eq!(e.len(), 2 * 49);
+        assert_eq!(&e[..3], &[0, 1, 2]);
+        assert_eq!(e[48], 48);
+        assert_eq!(e[49], 951);
+        assert_eq!(e.last(), Some(&999));
+        // Tight budget: per side = (8 - 1) / 2 = 3, fitting the screen.
+        let e2 = edge_indices(100, 8);
+        assert_eq!(e2, vec![0, 1, 2, 97, 98, 99]);
     }
 
     #[test]
