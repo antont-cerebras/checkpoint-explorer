@@ -1006,100 +1006,117 @@ impl Explorer {
                     }
                 };
 
-            match event::read() {
-                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
-                Ok(Event::Key(KeyEvent {
-                    code, modifiers, ..
-                })) => {
-                    let shift = modifiers.contains(KeyModifiers::SHIFT);
-                    let edges = matches!(mode, SampleMode::Edges { .. });
-                    // One arrow press moves the divider by a single index
-                    // (step = 1 / budget); Shift snaps the split to one end.
-                    let nudge = |cell: &Cell<f32>, toward_tail: bool, budget: usize| {
-                        let step = if shift {
-                            1.0
-                        } else {
-                            1.0 / budget.max(1) as f32
+            // Read one event (blocking), then coalesce any buffered follow-ups
+            // (an arrow key's auto-repeat) before redrawing. Each redraw
+            // re-samples the tensor — slower than the key-repeat rate — so
+            // without draining, held keys pile up and the separator keeps
+            // "coasting" through the backlog after release. Applying the whole
+            // burst, then redrawing once, keeps it smooth and stops the moment
+            // the key lifts.
+            let mut pending = event::read();
+            loop {
+                match pending {
+                    Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+                    Ok(Event::Key(KeyEvent {
+                        code, modifiers, ..
+                    })) => {
+                        let shift = modifiers.contains(KeyModifiers::SHIFT);
+                        let edges = matches!(mode, SampleMode::Edges { .. });
+                        // One arrow press moves the divider by a single index
+                        // (step = 1 / budget); Shift snaps the split to one end.
+                        let nudge = |cell: &Cell<f32>, toward_tail: bool, budget: usize| {
+                            let step = if shift {
+                                1.0
+                            } else {
+                                1.0 / budget.max(1) as f32
+                            };
+                            let delta = if toward_tail { step } else { -step };
+                            cell.set((cell.get() + delta).clamp(0.0, 1.0));
                         };
-                        let delta = if toward_tail { step } else { -step };
-                        cell.set((cell.get() + delta).clamp(0.0, 1.0));
-                    };
-                    match code {
-                        // Switch representation in place, keeping the current slice.
-                        KeyCode::Char('m') => heatmap = true,
-                        KeyCode::Char('v') => heatmap = false,
-                        // Toggle the edges (first/last rows & columns) view, for
-                        // inspecting padding; remembered for the session.
-                        KeyCode::Char('e') | KeyCode::Char('E') => self
-                            .data_view_edges
-                            .set(self.data_view_edges.get().toggled()),
-                        // Cycle the numeric grid's zebra striping rows → cols →
-                        // off; remembered for the session.
-                        KeyCode::Char('z') | KeyCode::Char('Z') => self
-                            .data_view_stripe
-                            .set(self.data_view_stripe.get().next()),
-                        // In the edges view the arrows move the divider between
-                        // the first and last blocks (Shift pushes it fully to one
-                        // end): e.g. `→` slides the column divider right, growing
-                        // the first columns and shrinking the last; `↓` slides the
-                        // row divider down. They take precedence over slice
-                        // stepping, which stays on `[` / `]` and `/` while edges
-                        // is active.
-                        KeyCode::Up if edges => {
-                            nudge(&self.data_view_row_tail, true, self.edge_row_budget.get())
-                        }
-                        KeyCode::Down if edges => {
-                            nudge(&self.data_view_row_tail, false, self.edge_row_budget.get())
-                        }
-                        KeyCode::Left if edges => {
-                            nudge(&self.data_view_col_tail, true, self.edge_col_budget.get())
-                        }
-                        KeyCode::Right if edges => {
-                            nudge(&self.data_view_col_tail, false, self.edge_col_budget.get())
-                        }
-                        // Open the dtype menu; `d` or `D`.
-                        KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
-                            if let Some(chosen) = self.prompt_dtype(
-                                tensor,
-                                DtypePreview::Data {
-                                    heatmap,
-                                    slice,
-                                    mode,
-                                },
-                            ) {
-                                let mut overrides = self.dtype_overrides.borrow_mut();
-                                if chosen == ViewDtype::Stored {
-                                    overrides.remove(&tensor.name);
-                                } else {
-                                    overrides.insert(tensor.name.clone(), chosen);
+                        match code {
+                            // Switch representation in place, keeping the current slice.
+                            KeyCode::Char('m') => heatmap = true,
+                            KeyCode::Char('v') => heatmap = false,
+                            // Toggle the edges (first/last rows & columns) view, for
+                            // inspecting padding; remembered for the session.
+                            KeyCode::Char('e') | KeyCode::Char('E') => self
+                                .data_view_edges
+                                .set(self.data_view_edges.get().toggled()),
+                            // Cycle the numeric grid's zebra striping rows → cols →
+                            // off; remembered for the session.
+                            KeyCode::Char('z') | KeyCode::Char('Z') => self
+                                .data_view_stripe
+                                .set(self.data_view_stripe.get().next()),
+                            // In the edges view the arrows move the divider between
+                            // the first and last blocks (Shift pushes it fully to one
+                            // end): e.g. `→` slides the column divider right, growing
+                            // the first columns and shrinking the last; `↓` slides the
+                            // row divider down. They take precedence over slice
+                            // stepping, which stays on `[` / `]` and `/` while edges
+                            // is active.
+                            KeyCode::Up if edges => {
+                                nudge(&self.data_view_row_tail, true, self.edge_row_budget.get())
+                            }
+                            KeyCode::Down if edges => {
+                                nudge(&self.data_view_row_tail, false, self.edge_row_budget.get())
+                            }
+                            KeyCode::Left if edges => {
+                                nudge(&self.data_view_col_tail, true, self.edge_col_budget.get())
+                            }
+                            KeyCode::Right if edges => {
+                                nudge(&self.data_view_col_tail, false, self.edge_col_budget.get())
+                            }
+                            // Open the dtype menu; `d` or `D`.
+                            KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
+                                if let Some(chosen) = self.prompt_dtype(
+                                    tensor,
+                                    DtypePreview::Data {
+                                        heatmap,
+                                        slice,
+                                        mode,
+                                    },
+                                ) {
+                                    let mut overrides = self.dtype_overrides.borrow_mut();
+                                    if chosen == ViewDtype::Stored {
+                                        overrides.remove(&tensor.name);
+                                    } else {
+                                        overrides.insert(tensor.name.clone(), chosen);
+                                    }
                                 }
                             }
-                        }
-                        // Jump straight to a slice by typing its index.
-                        KeyCode::Char('/') if slices > 1 => {
-                            if let Some(n) = self.prompt_slice(slices) {
-                                slice = n;
+                            // Jump straight to a slice by typing its index.
+                            KeyCode::Char('/') if slices > 1 => {
+                                if let Some(n) = self.prompt_slice(slices) {
+                                    slice = n;
+                                }
                             }
+                            // Shift + arrows jump ~5% of the slices at once (wrapping).
+                            KeyCode::Right if slices > 1 && shift => {
+                                slice = (slice + slice_step(slices)) % slices
+                            }
+                            KeyCode::Left if slices > 1 && shift => {
+                                slice = (slice + slices - slice_step(slices)) % slices
+                            }
+                            // Plain arrows / brackets step one slice (wrapping).
+                            KeyCode::Char(']') | KeyCode::Right if slices > 1 => {
+                                slice = (slice + 1) % slices
+                            }
+                            KeyCode::Char('[') | KeyCode::Left if slices > 1 => {
+                                slice = (slice + slices - 1) % slices
+                            }
+                            _ => return,
                         }
-                        // Shift + arrows jump ~5% of the slices at once (wrapping).
-                        KeyCode::Right if slices > 1 && shift => {
-                            slice = (slice + slice_step(slices)) % slices
-                        }
-                        KeyCode::Left if slices > 1 && shift => {
-                            slice = (slice + slices - slice_step(slices)) % slices
-                        }
-                        // Plain arrows / brackets step one slice (wrapping).
-                        KeyCode::Char(']') | KeyCode::Right if slices > 1 => {
-                            slice = (slice + 1) % slices
-                        }
-                        KeyCode::Char('[') | KeyCode::Left if slices > 1 => {
-                            slice = (slice + slices - 1) % slices
-                        }
-                        _ => return,
                     }
+                    Ok(_) => {} // resize etc.: re-sample and redraw the same slice
+                    Err(_) => return,
                 }
-                Ok(_) => {} // resize etc.: re-sample and redraw the same slice
-                Err(_) => return,
+                // Drain the next buffered event without blocking; once the queue
+                // is empty, fall out to redraw exactly once for the whole burst.
+                if event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+                    pending = event::read();
+                } else {
+                    break;
+                }
             }
         }
     }
