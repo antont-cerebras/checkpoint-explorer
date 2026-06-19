@@ -1004,14 +1004,17 @@ impl Explorer {
                         KeyCode::Char('e') | KeyCode::Char('E') => {
                             self.data_view_edges.set(!self.data_view_edges.get())
                         }
-                        // In the edges view the arrows rebalance how much of the
-                        // first vs. last rows/cols is shown (Shift snaps to one
-                        // end). They take precedence over slice stepping, which
-                        // stays on `[` / `]` and `/` while edges is active.
-                        KeyCode::Up if edges => nudge(&self.data_view_row_tail, false),
-                        KeyCode::Down if edges => nudge(&self.data_view_row_tail, true),
-                        KeyCode::Left if edges => nudge(&self.data_view_col_tail, false),
-                        KeyCode::Right if edges => nudge(&self.data_view_col_tail, true),
+                        // In the edges view the arrows move the divider between
+                        // the first and last blocks (Shift pushes it fully to one
+                        // end): e.g. `→` slides the column divider right, growing
+                        // the first columns and shrinking the last; `↓` slides the
+                        // row divider down. They take precedence over slice
+                        // stepping, which stays on `[` / `]` and `/` while edges
+                        // is active.
+                        KeyCode::Up if edges => nudge(&self.data_view_row_tail, true),
+                        KeyCode::Down if edges => nudge(&self.data_view_row_tail, false),
+                        KeyCode::Left if edges => nudge(&self.data_view_col_tail, true),
+                        KeyCode::Right if edges => nudge(&self.data_view_col_tail, false),
                         // Open the dtype menu; `d` or `D`.
                         KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
                             if let Some(chosen) = self.prompt_dtype(

@@ -664,6 +664,10 @@ impl UI {
         };
         let row_gap = gap(&sample.rows);
         let col_gap = gap(&sample.cols);
+        // Width of the row-index column. Values are right-aligned in their own
+        // cells (each with ≥1 leading space), so no extra separator is needed —
+        // keeping the whole grid one column further left.
+        let lw = 6usize;
 
         // Column-index header (with a "⋯" separator column at the gap). With
         // wide cells the index fits in a single row; with narrow cells (sub-byte
@@ -683,13 +687,13 @@ impl UI {
             // two-row spacing (`2 * step * cw`) fits a label plus a space.
             let step = (idx_w + 1).div_ceil(2 * cw).max(1);
             // Column offset (within the line) of the right edge of cell `j`,
-            // accounting for the 7-char row-label prefix and the extra "⋯" gap
-            // cell that sits after `col_gap`.
+            // accounting for the row-label prefix and the extra "⋯" gap cell
+            // that sits after `col_gap`.
             let right_edge = |j: usize| -> usize {
                 let gap_cells = matches!(col_gap, Some(g) if j > g) as usize;
-                7 + (j + 1 + gap_cells) * cw
+                lw + (j + 1 + gap_cells) * cw
             };
-            let width = right_edge(sample.cols.len().saturating_sub(1)).max(7);
+            let width = right_edge(sample.cols.len().saturating_sub(1)).max(lw);
             let mut top = vec![' '; width];
             let mut bot = vec![' '; width];
             let mut rank = 0usize; // position among the labels we actually show
@@ -730,7 +734,7 @@ impl UI {
             write!(out, "{}", bot.trim_end())?;
             line_end(&mut out)?;
         } else {
-            write!(out, "{:>6} ", "")?;
+            write!(out, "{:>lw$}", "")?;
             for (j, &c) in sample.cols.iter().enumerate() {
                 write!(out, "{c:>cw$}")?;
                 if Some(j) == col_gap {
@@ -743,7 +747,7 @@ impl UI {
         // Integer dtypes print as plain integers; floats use scientific notation.
         let integer = sample.view.is_integer(&tensor.dtype);
         for (i, row) in sample.values.iter().enumerate() {
-            write!(out, "{:>6} ", sample.rows[i])?;
+            write!(out, "{:>lw$}", sample.rows[i])?;
             for (j, &v) in row.iter().enumerate() {
                 if integer {
                     write!(out, "{:>cw$}", v as i64)?;
@@ -760,7 +764,7 @@ impl UI {
             // Dotted row after the gap to mark the rows that were skipped.
             if Some(i) == row_gap {
                 queue!(out, SetForegroundColor(palette::DIM))?;
-                write!(out, "{:>6} ", "⋮")?;
+                write!(out, "{:>lw$}", "⋮")?;
                 for j in 0..row.len() {
                     write!(out, "{:>cw$}", "⋮")?;
                     if Some(j) == col_gap {
