@@ -106,6 +106,31 @@ checkpoint-explorer *.safetensors *.gguf
 checkpoint-explorer model.safetensors checkpoint-*.safetensors
 ```
 
+### Open a tensor directly
+Jump straight to a tensor's preview on startup instead of navigating the tree —
+handy for scripting or revisiting a known tensor:
+```bash
+# Open a tensor's detail screen
+checkpoint-explorer model.hdf5 --tensor model.layers.0.mlp.down_proj.weight
+
+# Open straight into the numeric values grid, reinterpreted as packed 4-bit,
+# in the first/last edges submode
+checkpoint-explorer model.hdf5 \
+  --tensor model.layers.0.block_sparse_moe.experts.down_proj.weight \
+  --dtype u4-packed --values --edge
+```
+Flags (all require `--tensor`):
+
+| Flag | Effect |
+|------|--------|
+| `--tensor <NAME>` | Open this tensor (exact name) on startup |
+| `--values` / `--heatmap` | Open the numeric grid / the heatmap (default: the detail screen) |
+| `--dtype <DTYPE>` | Reinterpret the dtype: `u4-packed`, `u4-lo`, `u4-hi`, `i4-packed`, `i4-lo`, `i4-hi`, or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
+| `--edge` (alias `--edges`) / `--overview` | Force the first/last edges submode / the evenly-spaced overview |
+
+Dismissing the opened screen drops you into the normal tree browser, so you can
+keep exploring.
+
 ### Keyboard Controls
 
 | Key | Action |
