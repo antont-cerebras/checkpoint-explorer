@@ -558,6 +558,25 @@ impl Explorer {
         self.update_filtered_tree();
     }
 
+    /// Move the tree cursor onto the tensor named `name`, expanding any
+    /// collapsed groups so it's visible. Used when returning to the tree from a
+    /// tensor's detail/data view (and when the app was opened with `--tensor`),
+    /// so you land back on the tensor you were looking at.
+    fn reveal_tensor(&mut self, name: &str) {
+        if !self.search_mode {
+            TreeBuilder::expand_to_tensor(&mut self.tree, name);
+            self.flatten_tree();
+        }
+        let tree = if self.search_mode {
+            &self.filtered_tree
+        } else {
+            &self.flattened_tree
+        };
+        if let Some(idx) = tree.iter().position(|(node, _)| node.name() == name) {
+            self.selected_idx = idx;
+        }
+    }
+
     /// Expand or collapse every group, then reset the cursor to the top since
     /// the visible rows change wholesale.
     fn set_all_expanded(&mut self, expanded: bool) {
@@ -661,6 +680,13 @@ impl Explorer {
         }
 
         loop {
+            // The tensor the screen we're about to run belongs to (if any), so
+            // that on returning to the tree we can land back on it.
+            let screen_tensor = match &history[cursor] {
+                Screen::Detail { tensor, .. } | Screen::Data { tensor, .. } => Some(tensor.clone()),
+                Screen::Tree => None,
+            };
+
             let nav = match history[cursor].clone() {
                 Screen::Tree => self.run_tree()?,
                 Screen::Detail { tensor, slice } => self.run_detail(
@@ -699,6 +725,14 @@ impl Explorer {
                         cursor += 1;
                     }
                 }
+            }
+
+            // Returning to the tree from a tensor's detail/data view: select that
+            // tensor (revealing it) so you land where you were.
+            if matches!(history[cursor], Screen::Tree)
+                && let Some(name) = screen_tensor
+            {
+                self.reveal_tensor(&name);
             }
         }
 
@@ -1384,7 +1418,16 @@ impl Explorer {
                 let _ = self.draw_data_view(tensor, repr, slice, view, mode, sv);
             }) == ScanOutcome::Cancelled
             {
-                return (Nav::Back, repr, slice);
+                // Cancelling the scan leaves the data view the same way a normal
+                // exit does — to the tensor's detail screen, not back to the tree.
+                return (
+                    Nav::Open(Screen::Detail {
+                        tensor: tensor.name.clone(),
+                        slice,
+                    }),
+                    repr,
+                    slice,
+                );
             }
             let stats = self.cached_stats(tensor, view);
             let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
@@ -1404,7 +1447,14 @@ impl Explorer {
                         {
                             quit_immediately();
                         }
-                        return (Nav::Back, repr, slice);
+                        return (
+                            Nav::Open(Screen::Detail {
+                                tensor: tensor.name.clone(),
+                                slice,
+                            }),
+                            repr,
+                            slice,
+                        );
                     }
                 };
 
