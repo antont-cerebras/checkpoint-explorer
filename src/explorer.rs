@@ -13,6 +13,8 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use crate::gguf::GGUFFile;
@@ -98,6 +100,14 @@ enum Interaction {
 enum StatsStart {
     Auto,
     OnDemand,
+}
+
+/// How a statistics scan ended: it finished (result cached) or the user pressed
+/// a key to abort it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanOutcome {
+    Completed,
+    Cancelled,
 }
 
 pub struct Explorer {
@@ -186,24 +196,31 @@ impl Explorer {
             .copied()
     }
 
-    /// Exact statistics for `(tensor, view)`, computing and caching them on a
-    /// miss. The scan runs on a worker thread; while it runs, `redraw` is called
-    /// each frame with a [`StatsView::Computing`] state so the caller can animate
-    /// a spinner *in place* on its own screen. Stays responsive to Ctrl-C (which
-    /// cancels); small tensors finish before the spinner ever appears. `None` if
-    /// statistics aren't available.
+    /// Compute and cache exact statistics for `(tensor, view)` on a miss. The
+    /// scan runs on a worker thread; while it runs, `redraw` is called each frame
+    /// with a [`StatsView::Computing`] state so the caller can animate a spinner
+    /// *in place* on its own screen. Ctrl-C quits the app; **any other key
+    /// cancels** the scan (the worker stops at the next block) and returns
+    /// [`ScanOutcome::Cancelled`] right away, so a slow scan never traps the UI.
+    /// Small tensors finish before the spinner ever appears.
     fn compute_stats_animated(
         &self,
         tensor: &TensorInfo,
         view: ViewDtype,
         mut redraw: impl FnMut(StatsView),
-    ) -> Option<Stats> {
-        if let Some(s) = self.cached_stats(tensor, view) {
-            return Some(s);
+    ) -> ScanOutcome {
+        if self.cached_stats(tensor, view).is_some() {
+            return ScanOutcome::Completed;
         }
 
+        // `cancel` lets a key press abort the scan cooperatively; we set it and
+        // return without joining, so the UI is responsive and the worker winds
+        // down on its own at the next block boundary.
+        let cancel = Arc::new(AtomicBool::new(false));
         let owned = tensor.clone();
-        let handle = std::thread::spawn(move || crate::sample::tensor_stats(&owned, view));
+        let worker_cancel = Arc::clone(&cancel);
+        let handle =
+            std::thread::spawn(move || crate::sample::tensor_stats(&owned, view, &worker_cancel));
 
         const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         let started = std::time::Instant::now();
@@ -218,12 +235,15 @@ impl Explorer {
                 });
                 frame += 1;
             }
-            // Frame delay that also stays responsive to Ctrl-C while we wait.
+            // Frame delay that also stays responsive to keys while we wait.
             if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false)
                 && let Ok(Event::Key(key)) = event::read()
-                && is_ctrl_c(&key)
             {
-                quit_immediately();
+                if is_ctrl_c(&key) {
+                    quit_immediately();
+                }
+                cancel.store(true, Ordering::Relaxed);
+                return ScanOutcome::Cancelled;
             }
         }
 
@@ -232,18 +252,18 @@ impl Explorer {
                 self.stats_cache
                     .borrow_mut()
                     .insert((tensor.name.clone(), view), s);
-                Some(s)
+                ScanOutcome::Completed
             }
             // Surface a failure instead of silently doing nothing.
             Ok(Err(msg)) => {
                 let _ = UI::draw_message("Statistics unavailable", &msg);
                 let _ = event::read();
-                None
+                ScanOutcome::Completed
             }
             Err(_) => {
                 let _ = UI::draw_message("Statistics unavailable", "the scan thread panicked");
                 let _ = event::read();
-                None
+                ScanOutcome::Completed
             }
         }
     }
@@ -1191,10 +1211,14 @@ impl Explorer {
             // Exact stats power the value range, heatmap scale and stats line.
             // Compute them once (cached), animating the spinner on this very
             // heatmap/grid — the data view redraws each frame with the running
-            // timer in its stats line.
-            self.compute_stats_animated(tensor, view, |sv| {
+            // timer in its stats line. A key press cancels the scan and leaves
+            // the view (back to the detail screen).
+            if self.compute_stats_animated(tensor, view, |sv| {
                 let _ = self.draw_data_view(tensor, repr, slice, view, mode, sv);
-            });
+            }) == ScanOutcome::Cancelled
+            {
+                return;
+            }
             let stats = self.cached_stats(tensor, view);
             let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
 

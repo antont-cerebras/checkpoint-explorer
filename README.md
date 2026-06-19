@@ -227,7 +227,8 @@ browsing the tree stays fast). Results are cached per tensor (and per dtype
 override) for the session, and the scan time is shown dimmed next to the stats.
 Scanning a multi-GB tensor takes a moment the first time (it's largely
 disk/NFS-bound); the scan runs on a worker thread with an animated spinner and a
-running timer, and `Ctrl+C` cancels.
+running timer. Pressing any key cancels the scan and returns (`Ctrl+C` quits the
+app), so a slow scan never traps you.
 
 Both views also sample a grid that fits the screen (they never read the whole
 tensor for the *display* — only each sampled row's column span). Both the
