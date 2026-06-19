@@ -70,6 +70,10 @@ pub struct OpenRequest {
     /// Optional starting slice (3D tensors), as a raw `N` or `N%` string
     /// resolved against the tensor's slice count.
     pub slice: Option<String>,
+    /// Start the statistics scan immediately on the detail view.
+    pub compute_stats: bool,
+    /// Render the view once and exit without interactive navigation.
+    pub exit_after: bool,
 }
 
 /// Which representation a tensor data view renders.
@@ -79,6 +83,21 @@ enum Representation {
     Heatmap,
     /// Numeric values grid (`v`).
     Values,
+}
+
+/// Whether a screen waits for keys or renders once and returns (`--exit`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Interaction {
+    Interactive,
+    OneShot,
+}
+
+/// Whether the detail view starts the stats scan on open (`--compute-stats`) or
+/// leaves it for the user to trigger with `s`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StatsStart {
+    Auto,
+    OnDemand,
 }
 
 pub struct Explorer {
@@ -548,14 +567,25 @@ impl Explorer {
             return Ok(());
         }
 
+        // In one-shot mode (`--exit`) the last rendered frame is left on screen
+        // instead of being cleared, so it can be read / captured after exit.
+        let one_shot = self.open.as_ref().is_some_and(|o| o.exit_after);
+
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, terminal::Clear(ClearType::All), cursor::Hide)?;
 
         let result = self.interactive_loop();
 
-        execute!(stdout, terminal::Clear(ClearType::All), cursor::Show)?;
-        terminal::disable_raw_mode()?;
+        if one_shot {
+            execute!(stdout, cursor::Show)?;
+            terminal::disable_raw_mode()?;
+            // Move the shell prompt below the rendered frame.
+            println!();
+        } else {
+            execute!(stdout, terminal::Clear(ClearType::All), cursor::Show)?;
+            terminal::disable_raw_mode()?;
+        }
 
         result
     }
@@ -564,9 +594,14 @@ impl Explorer {
         self.load_all_files()?;
 
         // A `--tensor` request jumps straight to its view; once that screen is
-        // dismissed, fall through to normal browsing.
+        // dismissed, fall through to normal browsing — unless `--exit` asked for
+        // a one-shot render, in which case we're done.
         if let Some(req) = self.open.take() {
+            let exit_after = req.exit_after;
             self.open_requested(req);
+            if exit_after {
+                return Ok(());
+            }
         }
 
         loop {
@@ -936,7 +971,12 @@ impl Explorer {
                     }
                 }
                 TreeNode::Tensor { info } => {
-                    self.show_tensor_detail(info, 0);
+                    self.show_tensor_detail(
+                        info,
+                        0,
+                        StatsStart::OnDemand,
+                        Interaction::Interactive,
+                    );
                 }
                 TreeNode::Metadata { info } => {
                     self.show_metadata_detail(info);
@@ -957,7 +997,10 @@ impl Explorer {
                     req.tensor
                 ),
             );
-            let _ = event::read();
+            // Don't wait for a key in one-shot mode (it would defeat `--exit`).
+            if !req.exit_after {
+                let _ = event::read();
+            }
             return;
         };
         // Apply the dtype override (skipped for formats that can't reinterpret,
@@ -995,25 +1038,48 @@ impl Explorer {
                 Ok(None) => 0,
                 Err(msg) => {
                     let _ = UI::draw_message("Invalid --slice", &msg);
-                    let _ = event::read();
+                    if !req.exit_after {
+                        let _ = event::read();
+                    }
                     return;
                 }
             },
             None => 0,
         };
+        let interaction = if req.exit_after {
+            Interaction::OneShot
+        } else {
+            Interaction::Interactive
+        };
+        let stats_start = if req.compute_stats {
+            StatsStart::Auto
+        } else {
+            StatsStart::OnDemand
+        };
         match req.view {
-            OpenView::Detail => self.show_tensor_detail(&tensor, start_slice),
-            OpenView::Values => self.show_tensor_data(&tensor, Representation::Values, start_slice),
+            OpenView::Detail => {
+                self.show_tensor_detail(&tensor, start_slice, stats_start, interaction)
+            }
+            OpenView::Values => {
+                self.show_tensor_data(&tensor, Representation::Values, start_slice, interaction)
+            }
             OpenView::Heatmap => {
-                self.show_tensor_data(&tensor, Representation::Heatmap, start_slice)
+                self.show_tensor_data(&tensor, Representation::Heatmap, start_slice, interaction)
             }
         }
     }
 
-    fn show_tensor_detail(&self, tensor: &TensorInfo, start_slice: usize) {
+    fn show_tensor_detail(
+        &self,
+        tensor: &TensorInfo,
+        start_slice: usize,
+        stats_start: StatsStart,
+        interaction: Interaction,
+    ) {
         // Detail screen with sub-views: `m` heatmap, `v` numeric values, `d`
         // reinterpret dtype, `s` compute statistics, any other key returns.
         let overridable = dtype_overridable(tensor);
+        let mut first = true;
         loop {
             let view = self
                 .dtype_overrides
@@ -1021,23 +1087,44 @@ impl Explorer {
                 .get(&tensor.name)
                 .copied()
                 .unwrap_or(ViewDtype::Stored);
-            // Show stats only if already computed (here or from a data view) —
-            // don't scan automatically so browsing the tree stays fast.
+            // Normally stats show only if already computed (browsing the tree
+            // stays fast); `--compute-stats` kicks off the scan on first open,
+            // animating the spinner right on this detail screen.
+            if first && stats_start == StatsStart::Auto {
+                self.compute_stats_animated(tensor, view, |sv| {
+                    let _ = UI::draw_tensor_detail(tensor, view, overridable, sv);
+                });
+            }
             let stats = self.cached_stats(tensor, view);
             let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
             if UI::draw_tensor_detail(tensor, view, overridable, stats_view).is_err() {
                 return;
             }
+            // One-shot mode: leave this frame up and exit without reading keys.
+            if first && interaction == Interaction::OneShot {
+                return;
+            }
+            first = false;
             match event::read() {
                 Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('m'),
                     ..
-                })) => self.show_tensor_data(tensor, Representation::Heatmap, start_slice),
+                })) => self.show_tensor_data(
+                    tensor,
+                    Representation::Heatmap,
+                    start_slice,
+                    Interaction::Interactive,
+                ),
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('v'),
                     ..
-                })) => self.show_tensor_data(tensor, Representation::Values, start_slice),
+                })) => self.show_tensor_data(
+                    tensor,
+                    Representation::Values,
+                    start_slice,
+                    Interaction::Interactive,
+                ),
                 // Compute exact whole-tensor statistics on demand, animating the
                 // spinner in the detail screen's Statistics line.
                 Ok(Event::Key(KeyEvent {
@@ -1074,7 +1161,13 @@ impl Explorer {
     /// screen). For 3D tensors this shows one 2D slice at a fixed first index
     /// (the 0th by default); `[`/`]` and the ← → arrows step through the slices,
     /// wrapping around at both ends. Any other key returns to the detail screen.
-    fn show_tensor_data(&self, tensor: &TensorInfo, repr: Representation, start_slice: usize) {
+    fn show_tensor_data(
+        &self,
+        tensor: &TensorInfo,
+        repr: Representation,
+        start_slice: usize,
+        interaction: Interaction,
+    ) {
         let mut repr = repr;
         let mut slice = start_slice;
         loop {
@@ -1114,7 +1207,8 @@ impl Explorer {
                     }
                     Err(msg) => {
                         let _ = UI::draw_message("Data preview unavailable", &msg);
-                        if let Ok(Event::Key(key)) = event::read()
+                        if interaction == Interaction::Interactive
+                            && let Ok(Event::Key(key)) = event::read()
                             && is_ctrl_c(&key)
                         {
                             quit_immediately();
@@ -1122,6 +1216,12 @@ impl Explorer {
                         return;
                     }
                 };
+
+            // One-shot mode (`--exit`): stats are computed above and the final
+            // frame is now drawn, so leave it up and exit without reading keys.
+            if interaction == Interaction::OneShot {
+                return;
+            }
 
             // Read one event (blocking), then coalesce any buffered follow-ups
             // (an arrow key's auto-repeat) before redrawing. Each redraw

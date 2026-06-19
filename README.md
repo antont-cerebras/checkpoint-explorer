@@ -129,6 +129,8 @@ Flags (all require `--tensor`):
 | `--edge` (alias `--edges`) / `--overview` | Force the first/last edges submode / the evenly-spaced overview |
 | `--zebra <rows\|cols\|off>` | Zebra-stripe the numeric grid by rows, columns, or off |
 | `--slice <INDEX>` | Starting slice for a 3D tensor: an index (`12`) or a percentage (`50%`) |
+| `--compute-stats` | Start the statistics scan immediately on the detail view (data views always compute them) |
+| `--exit` | Render the requested view once and exit, without entering interactive navigation |
 
 Dismissing the opened screen drops you into the normal tree browser, so you can
 keep exploring.
