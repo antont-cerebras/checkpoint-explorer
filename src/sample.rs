@@ -362,9 +362,15 @@ fn sample_indices(n: usize, k: usize) -> Vec<usize> {
 /// the halves). `tail_frac` splits that budget between the head (first) and
 /// tail (last): `0.0` is all-first, `1.0` is all-last, `0.5` is balanced.
 /// Returns all of `0..n` when the budget already covers it (no gap).
+/// The total number of indices the edges view shows for one axis with `max`
+/// cells available (leaving one slot for the "⋯" / "⋮" gap). Exposed so the UI
+/// can size an arrow-key step to exactly one index (`1 / edge_total`).
+pub fn edge_total(max: usize) -> usize {
+    2 * (max.saturating_sub(1) / 2).max(1)
+}
+
 fn edge_indices(n: usize, max: usize, tail_frac: f32) -> Vec<usize> {
-    let per_side = (max.saturating_sub(1) / 2).max(1);
-    let total = 2 * per_side;
+    let total = edge_total(max);
     if n <= total {
         return (0..n).collect();
     }

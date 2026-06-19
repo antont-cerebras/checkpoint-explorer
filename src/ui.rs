@@ -87,6 +87,27 @@ impl StatsView<'_> {
     }
 }
 
+/// The numeric grid's zebra striping: a subtle alternating background down the
+/// rows, down the columns, or none. Cycled with `z`.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum StripeMode {
+    #[default]
+    Rows,
+    Cols,
+    Off,
+}
+
+impl StripeMode {
+    /// The next mode in the `z` cycle: rows → cols → off → rows.
+    pub fn next(self) -> Self {
+        match self {
+            StripeMode::Rows => StripeMode::Cols,
+            StripeMode::Cols => StripeMode::Off,
+            StripeMode::Off => StripeMode::Rows,
+        }
+    }
+}
+
 pub struct UI;
 
 impl UI {
@@ -598,7 +619,7 @@ impl UI {
         line_end(&mut out)?;
 
         line_end(&mut out)?;
-        write_view_footer(&mut out, sample, true, false)?;
+        write_view_footer(&mut out, sample, true, StripeMode::Off)?;
 
         // Clear the footer's tail and everything below (no trailing newline),
         // then end the synchronized frame.
@@ -617,7 +638,7 @@ impl UI {
         tensor: &TensorInfo,
         sample: &Sample,
         stats: StatsView,
-        stripe_cols: bool,
+        stripe: StripeMode,
     ) -> Result<()> {
         // Cell width adapts to the data: floats need room for scientific
         // notation, while small integers (incl. sparse values in a wide dtype)
@@ -763,9 +784,10 @@ impl UI {
 
         // Integer dtypes print as plain integers; floats use scientific notation.
         let integer = sample.view.is_integer(&tensor.dtype);
-        // Alternating "dim highlighter" backgrounds: one band per visual row (or
-        // per visual column, including the gap cell, when `stripe_cols`).
-        let stripe = |k: usize| {
+        // Alternating "dim highlighter" backgrounds: a full band per visual row,
+        // or — for columns — a background hugging just the digits of each visual
+        // column (so it never colours the empty alignment padding).
+        let band = |k: usize| {
             if k.is_multiple_of(2) {
                 palette::STRIPE_DARK
             } else {
@@ -773,32 +795,27 @@ impl UI {
             }
         };
         for (i, row) in sample.values.iter().enumerate() {
-            // Row-striping paints the whole band (label + values) in one go.
-            if !stripe_cols {
-                queue!(out, SetBackgroundColor(stripe(i)))?;
+            // Row striping paints the whole band (label + values) in one go.
+            if stripe == StripeMode::Rows {
+                queue!(out, SetBackgroundColor(band(i)))?;
             }
-            // Dimmed row index (then back to the default fg, keeping the bg).
+            // Dimmed row index (then back to the default fg, keeping any bg).
             queue!(out, SetForegroundColor(palette::DIM))?;
             write!(out, "{:>lw$}", sample.rows[i])?;
             queue!(out, SetForegroundColor(Color::Reset))?;
             let mut vcol = 0usize; // visual column ordinal (counts the gap cell)
             for (j, &v) in row.iter().enumerate() {
-                if stripe_cols {
-                    queue!(out, SetBackgroundColor(stripe(vcol)))?;
-                }
-                if integer {
-                    write!(out, "{:>cw$}", v as i64)?;
+                let s = if integer {
+                    format!("{:>cw$}", v as i64)
                 } else {
-                    write!(out, "{v:>cw$.3e}")?;
-                }
+                    format!("{v:>cw$.3e}")
+                };
+                let bg = (stripe == StripeMode::Cols).then(|| band(vcol));
+                write_grid_cell(&mut out, &s, bg, false)?;
                 vcol += 1;
                 if Some(j) == col_gap {
-                    if stripe_cols {
-                        queue!(out, SetBackgroundColor(stripe(vcol)))?;
-                    }
-                    queue!(out, SetForegroundColor(palette::DIM))?;
-                    write!(out, "{:>cw$}", "⋯")?;
-                    queue!(out, SetForegroundColor(Color::Reset))?;
+                    let bg = (stripe == StripeMode::Cols).then(|| band(vcol));
+                    write_grid_cell(&mut out, &format!("{:>cw$}", "⋯"), bg, true)?;
                     vcol += 1;
                 }
             }
@@ -820,7 +837,7 @@ impl UI {
         }
 
         line_end(&mut out)?;
-        write_view_footer(&mut out, sample, false, stripe_cols)?;
+        write_view_footer(&mut out, sample, false, stripe)?;
 
         queue!(
             out,
@@ -1082,7 +1099,7 @@ fn write_view_footer(
     out: &mut impl Write,
     sample: &Sample,
     heatmap: bool,
-    stripe_cols: bool,
+    stripe: StripeMode,
 ) -> Result<()> {
     let switch = if heatmap {
         ("v", "numeric values")
@@ -1112,16 +1129,46 @@ fn write_view_footer(
     }
     // Toggle between the overview grid and the first/last rows & cols (edges).
     items.push(if edges { ("e", "grid") } else { ("e", "edges") });
-    // Switch the zebra striping between rows and columns (numeric grid only).
+    // Cycle the zebra striping rows → cols → off (numeric grid only); the label
+    // shows the current mode.
     if !heatmap {
-        items.push(if stripe_cols {
-            ("z", "stripe rows")
-        } else {
-            ("z", "stripe cols")
+        items.push(match stripe {
+            StripeMode::Rows => ("z", "zebra: rows"),
+            StripeMode::Cols => ("z", "zebra: cols"),
+            StripeMode::Off => ("z", "zebra: off"),
         });
     }
     items.push(("", "any other key to return..."));
     hint_line(out, &items)
+}
+
+/// Write one right-aligned numeric cell (already formatted to the cell width).
+/// When `bg` is set (column striping), the background covers a *constant* band —
+/// the whole cell except its first column — so every column's stripe is the
+/// same width and a one-space gutter separates neighbouring stripes (values are
+/// right-aligned and never fill that first column). `dim` dims the glyphs (used
+/// for the "⋯" gap marker).
+fn write_grid_cell(out: &mut impl Write, s: &str, bg: Option<Color>, dim: bool) -> Result<()> {
+    if dim {
+        queue!(out, SetForegroundColor(palette::DIM))?;
+    }
+    match bg {
+        // Leave the first column an uncoloured gutter and band the rest, so the
+        // stripe is the same width for every column.
+        Some(c) => {
+            let split = s.char_indices().nth(1).map_or(s.len(), |(i, _)| i);
+            let (gutter, band) = s.split_at(split);
+            write!(out, "{gutter}")?;
+            queue!(out, SetBackgroundColor(c))?;
+            write!(out, "{band}")?;
+            queue!(out, SetBackgroundColor(Color::Reset))?;
+        }
+        None => write!(out, "{s}")?,
+    }
+    if dim {
+        queue!(out, SetForegroundColor(Color::Reset))?;
+    }
+    Ok(())
 }
 
 /// Describe an edges-view index slice for the header — e.g. `first 26 & last 25`,
