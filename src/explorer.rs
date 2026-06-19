@@ -65,6 +65,20 @@ pub struct OpenRequest {
     /// `Some(true)` forces the edges submode, `Some(false)` the overview;
     /// `None` keeps the default.
     pub edges: Option<bool>,
+    /// Optional zebra-striping mode to apply (numeric grid).
+    pub zebra: Option<StripeMode>,
+    /// Optional starting slice (3D tensors), as a raw `N` or `N%` string
+    /// resolved against the tensor's slice count.
+    pub slice: Option<String>,
+}
+
+/// Which representation a tensor data view renders.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Representation {
+    /// ASCII heatmap (`m`).
+    Heatmap,
+    /// Numeric values grid (`v`).
+    Values,
 }
 
 pub struct Explorer {
@@ -922,7 +936,7 @@ impl Explorer {
                     }
                 }
                 TreeNode::Tensor { info } => {
-                    self.show_tensor_detail(info);
+                    self.show_tensor_detail(info, 0);
                 }
                 TreeNode::Metadata { info } => {
                     self.show_metadata_detail(info);
@@ -965,14 +979,38 @@ impl Explorer {
                 EdgesView::Overview
             });
         }
+        if let Some(zebra) = req.zebra {
+            self.data_view_stripe.set(zebra);
+        }
+        // Resolve the starting slice against this tensor's slice count (3D only;
+        // 1D/2D have a single slice). Accepts an index or a percentage.
+        let slices = if tensor.shape.len() == 3 {
+            tensor.shape[0]
+        } else {
+            1
+        };
+        let start_slice = match req.slice.as_deref() {
+            Some(s) => match parse_slice_input(s, slices) {
+                Ok(Some(n)) => n,
+                Ok(None) => 0,
+                Err(msg) => {
+                    let _ = UI::draw_message("Invalid --slice", &msg);
+                    let _ = event::read();
+                    return;
+                }
+            },
+            None => 0,
+        };
         match req.view {
-            OpenView::Detail => self.show_tensor_detail(&tensor),
-            OpenView::Values => self.show_tensor_data(&tensor, false),
-            OpenView::Heatmap => self.show_tensor_data(&tensor, true),
+            OpenView::Detail => self.show_tensor_detail(&tensor, start_slice),
+            OpenView::Values => self.show_tensor_data(&tensor, Representation::Values, start_slice),
+            OpenView::Heatmap => {
+                self.show_tensor_data(&tensor, Representation::Heatmap, start_slice)
+            }
         }
     }
 
-    fn show_tensor_detail(&self, tensor: &TensorInfo) {
+    fn show_tensor_detail(&self, tensor: &TensorInfo, start_slice: usize) {
         // Detail screen with sub-views: `m` heatmap, `v` numeric values, `d`
         // reinterpret dtype, `s` compute statistics, any other key returns.
         let overridable = dtype_overridable(tensor);
@@ -995,11 +1033,11 @@ impl Explorer {
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('m'),
                     ..
-                })) => self.show_tensor_data(tensor, true),
+                })) => self.show_tensor_data(tensor, Representation::Heatmap, start_slice),
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('v'),
                     ..
-                })) => self.show_tensor_data(tensor, false),
+                })) => self.show_tensor_data(tensor, Representation::Values, start_slice),
                 // Compute exact whole-tensor statistics on demand, animating the
                 // spinner in the detail screen's Statistics line.
                 Ok(Event::Key(KeyEvent {
@@ -1031,15 +1069,14 @@ impl Explorer {
         }
     }
 
-    /// Draw a heatmap (`heatmap = true`) or numeric grid for the tensor, sized
-    /// to the terminal. `m`/`v` switch representation in place (no trip back to
-    /// the detail screen). For 3D tensors this shows one 2D slice at a fixed
-    /// first index (the 0th by default); `[`/`]` and the ← → arrows step
-    /// through the slices, wrapping around at both ends. Any other key returns
-    /// to the detail screen.
-    fn show_tensor_data(&self, tensor: &TensorInfo, heatmap: bool) {
-        let mut heatmap = heatmap;
-        let mut slice = 0usize;
+    /// Draw the heatmap or numeric grid for the tensor, sized to the terminal.
+    /// `m`/`v` switch representation in place (no trip back to the detail
+    /// screen). For 3D tensors this shows one 2D slice at a fixed first index
+    /// (the 0th by default); `[`/`]` and the ← → arrows step through the slices,
+    /// wrapping around at both ends. Any other key returns to the detail screen.
+    fn show_tensor_data(&self, tensor: &TensorInfo, repr: Representation, start_slice: usize) {
+        let mut repr = repr;
+        let mut slice = start_slice;
         loop {
             // Edges (padding) vs. grid is a session-remembered preference, so it
             // sticks as you move between tensors and in/out of the preview.
@@ -1063,14 +1100,14 @@ impl Explorer {
             // heatmap/grid — the data view redraws each frame with the running
             // timer in its stats line.
             self.compute_stats_animated(tensor, view, |sv| {
-                let _ = self.draw_data_view(tensor, heatmap, slice, view, mode, sv);
+                let _ = self.draw_data_view(tensor, repr, slice, view, mode, sv);
             });
             let stats = self.cached_stats(tensor, view);
             let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
 
             // (slices, overridable, clamped slice) on success.
             let (slices, overridable) =
-                match self.draw_data_view(tensor, heatmap, slice, view, mode, stats_view) {
+                match self.draw_data_view(tensor, repr, slice, view, mode, stats_view) {
                     Ok((slices, overridable, clamped)) => {
                         slice = clamped;
                         (slices, overridable)
@@ -1115,8 +1152,8 @@ impl Explorer {
                         };
                         match code {
                             // Switch representation in place, keeping the current slice.
-                            KeyCode::Char('m') => heatmap = true,
-                            KeyCode::Char('v') => heatmap = false,
+                            KeyCode::Char('m') => repr = Representation::Heatmap,
+                            KeyCode::Char('v') => repr = Representation::Values,
                             // Toggle the edges (first/last rows & columns) view, for
                             // inspecting padding; remembered for the session.
                             KeyCode::Char('e') | KeyCode::Char('E') => self
@@ -1148,14 +1185,9 @@ impl Explorer {
                             }
                             // Open the dtype menu; `d` or `D`.
                             KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
-                                if let Some(chosen) = self.prompt_dtype(
-                                    tensor,
-                                    DtypePreview::Data {
-                                        heatmap,
-                                        slice,
-                                        mode,
-                                    },
-                                ) {
+                                if let Some(chosen) = self
+                                    .prompt_dtype(tensor, DtypePreview::Data { repr, slice, mode })
+                                {
                                     let mut overrides = self.dtype_overrides.borrow_mut();
                                     if chosen == ViewDtype::Stored {
                                         overrides.remove(&tensor.name);
@@ -1201,14 +1233,14 @@ impl Explorer {
         }
     }
 
-    /// Sample and draw the heatmap (`heatmap = true`) or numeric grid for
-    /// `(slice, view)`, sized to the terminal. Returns `(slices, overridable,
-    /// clamped_slice)` on success, or an error message for the caller to show.
-    /// Shared by the data-view loop and the dtype menu's live preview.
+    /// Sample and draw the heatmap or numeric grid for `(slice, view)`, sized to
+    /// the terminal. Returns `(slices, overridable, clamped_slice)` on success,
+    /// or an error message for the caller to show. Shared by the data-view loop
+    /// and the dtype menu's live preview.
     fn draw_data_view(
         &self,
         tensor: &TensorInfo,
-        heatmap: bool,
+        repr: Representation,
         slice: usize,
         view: ViewDtype,
         mode: SampleMode,
@@ -1216,16 +1248,17 @@ impl Explorer {
     ) -> Result<(usize, bool, usize), String> {
         let (cols, rows) = terminal::size().unwrap_or((100, 40));
         let text_rows = (rows as usize).saturating_sub(8).max(1);
-        let (max_rows, max_cols) = if heatmap {
+        let (max_rows, max_cols) = match repr {
             // The heatmap packs two data rows per text line (half blocks), so it
             // can sample twice as many rows as there are lines.
-            (text_rows * 2, (cols as usize).saturating_sub(1).max(1))
-        } else {
+            Representation::Heatmap => (text_rows * 2, (cols as usize).saturating_sub(1).max(1)),
             // Numeric cell width depends on the actual values (small ints — even
             // in a wide dtype — pack many columns); plus a 7-char row-index
             // column. The exact range comes from stats once computed.
-            let cell = view.cell_width(&tensor.dtype, stats.value_range());
-            (text_rows, ((cols as usize).saturating_sub(7) / cell).max(1))
+            Representation::Values => {
+                let cell = view.cell_width(&tensor.dtype, stats.value_range());
+                (text_rows, ((cols as usize).saturating_sub(7) / cell).max(1))
+            }
         };
         // Remember the edges-view budgets so an arrow press can move the divider
         // by exactly one index (step = 1 / budget).
@@ -1235,11 +1268,14 @@ impl Explorer {
             .set(crate::sample::edge_total(max_cols));
         let sample = crate::sample::sample_tensor(tensor, max_rows, max_cols, slice, view, mode)?;
         let info = (sample.slices, sample.overridable, sample.slice);
-        if heatmap {
-            UI::draw_heatmap(tensor, &sample, stats).map_err(|e| e.to_string())?;
-        } else {
-            UI::draw_values(tensor, &sample, stats, self.data_view_stripe.get())
-                .map_err(|e| e.to_string())?;
+        match repr {
+            Representation::Heatmap => {
+                UI::draw_heatmap(tensor, &sample, stats).map_err(|e| e.to_string())?;
+            }
+            Representation::Values => {
+                UI::draw_values(tensor, &sample, stats, self.data_view_stripe.get())
+                    .map_err(|e| e.to_string())?;
+            }
         }
         Ok(info)
     }
@@ -1269,12 +1305,8 @@ impl Explorer {
                 DtypePreview::Detail => {
                     UI::draw_tensor_detail(tensor, options[idx], true, stats_view).is_ok()
                 }
-                DtypePreview::Data {
-                    heatmap,
-                    slice,
-                    mode,
-                } => self
-                    .draw_data_view(tensor, heatmap, slice, options[idx], mode, stats_view)
+                DtypePreview::Data { repr, slice, mode } => self
+                    .draw_data_view(tensor, repr, slice, options[idx], mode, stats_view)
                     .is_ok(),
             };
             if !preview_ok {
@@ -1365,7 +1397,7 @@ impl Explorer {
 enum DtypePreview {
     Detail,
     Data {
-        heatmap: bool,
+        repr: Representation,
         slice: usize,
         mode: SampleMode,
     },

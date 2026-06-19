@@ -108,6 +108,18 @@ impl StripeMode {
     }
 }
 
+/// Parse a CLI `--zebra` value (`rows`, `cols`, or `off`) into a [`StripeMode`].
+pub fn parse_stripe_mode(s: &str) -> Result<StripeMode, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "rows" | "row" => Ok(StripeMode::Rows),
+        "cols" | "col" | "columns" | "column" => Ok(StripeMode::Cols),
+        "off" | "none" => Ok(StripeMode::Off),
+        _ => Err(format!(
+            "unknown zebra mode '{s}'; expected rows, cols, or off"
+        )),
+    }
+}
+
 pub struct UI;
 
 impl UI {

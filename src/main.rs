@@ -81,6 +81,23 @@ struct Args {
         help = "Show the evenly-spaced overview submode"
     )]
     overview: bool,
+
+    #[arg(
+        long,
+        value_name = "MODE",
+        requires = "tensor",
+        value_parser = ui::parse_stripe_mode,
+        help = "Zebra-stripe the numeric grid by rows, cols, or off"
+    )]
+    zebra: Option<ui::StripeMode>,
+
+    #[arg(
+        long,
+        value_name = "INDEX",
+        requires = "tensor",
+        help = "Starting slice for a 3D tensor: an index (e.g. 12) or a percentage (e.g. 50%)"
+    )]
+    slice: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -121,6 +138,8 @@ fn main() -> Result<()> {
         view,
         dtype: args.dtype,
         edges,
+        zebra: args.zebra,
+        slice: args.slice,
     });
 
     let mut explorer = Explorer::new(files, health_reports, open);

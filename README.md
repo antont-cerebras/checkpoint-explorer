@@ -127,6 +127,8 @@ Flags (all require `--tensor`):
 | `--values` / `--heatmap` | Open the numeric grid / the heatmap (default: the detail screen) |
 | `--dtype <DTYPE>` | Reinterpret the dtype: `u4-packed`, `u4-lo`, `u4-hi`, `i4-packed`, `i4-lo`, `i4-hi`, or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
 | `--edge` (alias `--edges`) / `--overview` | Force the first/last edges submode / the evenly-spaced overview |
+| `--zebra <rows\|cols\|off>` | Zebra-stripe the numeric grid by rows, columns, or off |
+| `--slice <INDEX>` | Starting slice for a 3D tensor: an index (`12`) or a percentage (`50%`) |
 
 Dismissing the opened screen drops you into the normal tree browser, so you can
 keep exploring.
