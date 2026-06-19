@@ -157,7 +157,8 @@ actual data of 1D/2D/3D tensors:
   across two header rows ("leap-frog"), and — for the most extreme cases —
   thinned so the ones shown don't collide. To make the grid easier on the eyes
   the indices are dimmed and the cells get a subtle alternating "zebra"
-  background; `z` switches the striping between rows and columns.
+  background (a constant-width band per row or column); `z` cycles the striping
+  between rows, columns, and off.
 
 Both views sample an evenly-spaced overview by default. Press `e` to toggle an
 **edges view** that instead shows the first *and* last rows and columns (as many

@@ -21,8 +21,26 @@ use crate::sample::{SampleMode, Stats, ViewDtype};
 use crate::tree::{
     Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key,
 };
-use crate::ui::{DrawConfig, StatsView, UI};
+use crate::ui::{DrawConfig, StatsView, StripeMode, UI};
 use crate::utils::base64_encode;
+
+/// Whether the data views show the evenly-spaced overview or the first/last
+/// edges (padding) sample. Toggled with `e`, remembered for the session.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum EdgesView {
+    #[default]
+    Overview,
+    Edges,
+}
+
+impl EdgesView {
+    fn toggled(self) -> Self {
+        match self {
+            EdgesView::Overview => EdgesView::Edges,
+            EdgesView::Edges => EdgesView::Overview,
+        }
+    }
+}
 
 pub struct Explorer {
     files: Vec<PathBuf>,
@@ -50,16 +68,20 @@ pub struct Explorer {
     /// Whether the data views show the edges (padding) sample rather than the
     /// evenly-spaced grid. Session-scoped: remembered as you move between
     /// tensors and in/out of the preview.
-    data_view_edges: Cell<bool>,
+    data_view_edges: Cell<EdgesView>,
     /// In the edges view, how the fixed row/column budget is split between the
     /// first (head) and last (tail) indices: `0.0` shows only the first, `1.0`
     /// only the last, `0.5` is balanced. Adjustable with the arrow keys and
     /// session-remembered alongside [`Self::data_view_edges`].
     data_view_row_tail: Cell<f32>,
     data_view_col_tail: Cell<f32>,
-    /// Whether the numeric grid's zebra striping runs down the columns rather
-    /// than across the rows. Session-remembered; toggled with `z`.
-    data_view_stripe_cols: Cell<bool>,
+    /// The last edges-view row/column budgets actually rendered, so an arrow
+    /// press can move the divider by exactly one index (step = 1 / budget).
+    edge_row_budget: Cell<usize>,
+    edge_col_budget: Cell<usize>,
+    /// The numeric grid's zebra striping (rows / columns / off). Session-
+    /// remembered; cycled with `z`.
+    data_view_stripe: Cell<StripeMode>,
 }
 
 impl Explorer {
@@ -80,10 +102,12 @@ impl Explorer {
             health_reports,
             dtype_overrides: RefCell::new(HashMap::new()),
             stats_cache: RefCell::new(HashMap::new()),
-            data_view_edges: Cell::new(false),
+            data_view_edges: Cell::new(EdgesView::default()),
             data_view_row_tail: Cell::new(0.5),
             data_view_col_tail: Cell::new(0.5),
-            data_view_stripe_cols: Cell::new(false),
+            edge_row_budget: Cell::new(1),
+            edge_col_budget: Cell::new(1),
+            data_view_stripe: Cell::new(StripeMode::default()),
         }
     }
 
@@ -934,20 +958,17 @@ impl Explorer {
     /// through the slices, wrapping around at both ends. Any other key returns
     /// to the detail screen.
     fn show_tensor_data(&self, tensor: &TensorInfo, heatmap: bool) {
-        // How far each arrow press shifts the edges head/tail split.
-        const BIAS_STEP: f32 = 0.1;
         let mut heatmap = heatmap;
         let mut slice = 0usize;
         loop {
             // Edges (padding) vs. grid is a session-remembered preference, so it
             // sticks as you move between tensors and in/out of the preview.
-            let mode = if self.data_view_edges.get() {
-                SampleMode::Edges {
+            let mode = match self.data_view_edges.get() {
+                EdgesView::Edges => SampleMode::Edges {
                     row_tail: self.data_view_row_tail.get(),
                     col_tail: self.data_view_col_tail.get(),
-                }
-            } else {
-                SampleMode::Grid
+                },
+                EdgesView::Overview => SampleMode::Grid,
             };
             // The dtype reinterpretation remembered for this tensor, if any.
             let view = self
@@ -992,10 +1013,14 @@ impl Explorer {
                 })) => {
                     let shift = modifiers.contains(KeyModifiers::SHIFT);
                     let edges = matches!(mode, SampleMode::Edges { .. });
-                    // Shift the head/tail split toward `1.0` (last) or `0.0`
-                    // (first); plain arrows nudge, Shift snaps to that end.
-                    let nudge = |cell: &Cell<f32>, toward_tail: bool| {
-                        let step = if shift { 1.0 } else { BIAS_STEP };
+                    // One arrow press moves the divider by a single index
+                    // (step = 1 / budget); Shift snaps the split to one end.
+                    let nudge = |cell: &Cell<f32>, toward_tail: bool, budget: usize| {
+                        let step = if shift {
+                            1.0
+                        } else {
+                            1.0 / budget.max(1) as f32
+                        };
                         let delta = if toward_tail { step } else { -step };
                         cell.set((cell.get() + delta).clamp(0.0, 1.0));
                     };
@@ -1005,14 +1030,14 @@ impl Explorer {
                         KeyCode::Char('v') => heatmap = false,
                         // Toggle the edges (first/last rows & columns) view, for
                         // inspecting padding; remembered for the session.
-                        KeyCode::Char('e') | KeyCode::Char('E') => {
-                            self.data_view_edges.set(!self.data_view_edges.get())
-                        }
-                        // Switch the numeric grid's zebra striping between rows
-                        // and columns; remembered for the session.
+                        KeyCode::Char('e') | KeyCode::Char('E') => self
+                            .data_view_edges
+                            .set(self.data_view_edges.get().toggled()),
+                        // Cycle the numeric grid's zebra striping rows → cols →
+                        // off; remembered for the session.
                         KeyCode::Char('z') | KeyCode::Char('Z') => self
-                            .data_view_stripe_cols
-                            .set(!self.data_view_stripe_cols.get()),
+                            .data_view_stripe
+                            .set(self.data_view_stripe.get().next()),
                         // In the edges view the arrows move the divider between
                         // the first and last blocks (Shift pushes it fully to one
                         // end): e.g. `→` slides the column divider right, growing
@@ -1020,10 +1045,18 @@ impl Explorer {
                         // row divider down. They take precedence over slice
                         // stepping, which stays on `[` / `]` and `/` while edges
                         // is active.
-                        KeyCode::Up if edges => nudge(&self.data_view_row_tail, true),
-                        KeyCode::Down if edges => nudge(&self.data_view_row_tail, false),
-                        KeyCode::Left if edges => nudge(&self.data_view_col_tail, true),
-                        KeyCode::Right if edges => nudge(&self.data_view_col_tail, false),
+                        KeyCode::Up if edges => {
+                            nudge(&self.data_view_row_tail, true, self.edge_row_budget.get())
+                        }
+                        KeyCode::Down if edges => {
+                            nudge(&self.data_view_row_tail, false, self.edge_row_budget.get())
+                        }
+                        KeyCode::Left if edges => {
+                            nudge(&self.data_view_col_tail, true, self.edge_col_budget.get())
+                        }
+                        KeyCode::Right if edges => {
+                            nudge(&self.data_view_col_tail, false, self.edge_col_budget.get())
+                        }
                         // Open the dtype menu; `d` or `D`.
                         KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
                             if let Some(chosen) = self.prompt_dtype(
@@ -1086,24 +1119,29 @@ impl Explorer {
     ) -> Result<(usize, bool, usize), String> {
         let (cols, rows) = terminal::size().unwrap_or((100, 40));
         let text_rows = (rows as usize).saturating_sub(8).max(1);
-        let sample = if heatmap {
-            let max_cols = (cols as usize).saturating_sub(1).max(1);
-            // The heatmap packs two data rows per text line (half blocks),
-            // so it can sample twice as many rows as there are lines.
-            crate::sample::sample_tensor(tensor, text_rows * 2, max_cols, slice, view, mode)?
+        let (max_rows, max_cols) = if heatmap {
+            // The heatmap packs two data rows per text line (half blocks), so it
+            // can sample twice as many rows as there are lines.
+            (text_rows * 2, (cols as usize).saturating_sub(1).max(1))
         } else {
             // Numeric cell width depends on the actual values (small ints — even
             // in a wide dtype — pack many columns); plus a 7-char row-index
             // column. The exact range comes from stats once computed.
             let cell = view.cell_width(&tensor.dtype, stats.value_range());
-            let max_cols = ((cols as usize).saturating_sub(7) / cell).max(1);
-            crate::sample::sample_tensor(tensor, text_rows, max_cols, slice, view, mode)?
+            (text_rows, ((cols as usize).saturating_sub(7) / cell).max(1))
         };
+        // Remember the edges-view budgets so an arrow press can move the divider
+        // by exactly one index (step = 1 / budget).
+        self.edge_row_budget
+            .set(crate::sample::edge_total(max_rows));
+        self.edge_col_budget
+            .set(crate::sample::edge_total(max_cols));
+        let sample = crate::sample::sample_tensor(tensor, max_rows, max_cols, slice, view, mode)?;
         let info = (sample.slices, sample.overridable, sample.slice);
         if heatmap {
             UI::draw_heatmap(tensor, &sample, stats).map_err(|e| e.to_string())?;
         } else {
-            UI::draw_values(tensor, &sample, stats, self.data_view_stripe_cols.get())
+            UI::draw_values(tensor, &sample, stats, self.data_view_stripe.get())
                 .map_err(|e| e.to_string())?;
         }
         Ok(info)
