@@ -270,6 +270,26 @@ impl TreeBuilder {
         result
     }
 
+    /// Expand every group on the path to the tensor named `name`, so it becomes
+    /// visible (selectable) in the flattened tree. Returns whether it was found.
+    pub fn expand_to_tensor(nodes: &mut [TreeNode], name: &str) -> bool {
+        for node in nodes.iter_mut() {
+            if let TreeNode::Tensor { info } = node
+                && info.name == name
+            {
+                return true;
+            } else if let TreeNode::Group {
+                children, expanded, ..
+            } = node
+                && Self::expand_to_tensor(children, name)
+            {
+                *expanded = true;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Recursively set the `expanded` flag on every group in the tree.
     pub fn set_all_expanded(nodes: &mut [TreeNode], expanded: bool) {
         for node in nodes {
