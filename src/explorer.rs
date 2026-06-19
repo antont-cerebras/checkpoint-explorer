@@ -51,6 +51,12 @@ pub struct Explorer {
     /// evenly-spaced grid. Session-scoped: remembered as you move between
     /// tensors and in/out of the preview.
     data_view_edges: Cell<bool>,
+    /// In the edges view, how the fixed row/column budget is split between the
+    /// first (head) and last (tail) indices: `0.0` shows only the first, `1.0`
+    /// only the last, `0.5` is balanced. Adjustable with the arrow keys and
+    /// session-remembered alongside [`Self::data_view_edges`].
+    data_view_row_tail: Cell<f32>,
+    data_view_col_tail: Cell<f32>,
 }
 
 impl Explorer {
@@ -72,6 +78,8 @@ impl Explorer {
             dtype_overrides: RefCell::new(HashMap::new()),
             stats_cache: RefCell::new(HashMap::new()),
             data_view_edges: Cell::new(false),
+            data_view_row_tail: Cell::new(0.5),
+            data_view_col_tail: Cell::new(0.5),
         }
     }
 
@@ -922,13 +930,18 @@ impl Explorer {
     /// through the slices, wrapping around at both ends. Any other key returns
     /// to the detail screen.
     fn show_tensor_data(&self, tensor: &TensorInfo, heatmap: bool) {
+        // How far each arrow press shifts the edges head/tail split.
+        const BIAS_STEP: f32 = 0.1;
         let mut heatmap = heatmap;
         let mut slice = 0usize;
         loop {
             // Edges (padding) vs. grid is a session-remembered preference, so it
             // sticks as you move between tensors and in/out of the preview.
             let mode = if self.data_view_edges.get() {
-                SampleMode::Edges
+                SampleMode::Edges {
+                    row_tail: self.data_view_row_tail.get(),
+                    col_tail: self.data_view_col_tail.get(),
+                }
             } else {
                 SampleMode::Grid
             };
@@ -974,6 +987,14 @@ impl Explorer {
                     code, modifiers, ..
                 })) => {
                     let shift = modifiers.contains(KeyModifiers::SHIFT);
+                    let edges = matches!(mode, SampleMode::Edges { .. });
+                    // Shift the head/tail split toward `1.0` (last) or `0.0`
+                    // (first); plain arrows nudge, Shift snaps to that end.
+                    let nudge = |cell: &Cell<f32>, toward_tail: bool| {
+                        let step = if shift { 1.0 } else { BIAS_STEP };
+                        let delta = if toward_tail { step } else { -step };
+                        cell.set((cell.get() + delta).clamp(0.0, 1.0));
+                    };
                     match code {
                         // Switch representation in place, keeping the current slice.
                         KeyCode::Char('m') => heatmap = true,
@@ -983,6 +1004,14 @@ impl Explorer {
                         KeyCode::Char('e') | KeyCode::Char('E') => {
                             self.data_view_edges.set(!self.data_view_edges.get())
                         }
+                        // In the edges view the arrows rebalance how much of the
+                        // first vs. last rows/cols is shown (Shift snaps to one
+                        // end). They take precedence over slice stepping, which
+                        // stays on `[` / `]` and `/` while edges is active.
+                        KeyCode::Up if edges => nudge(&self.data_view_row_tail, false),
+                        KeyCode::Down if edges => nudge(&self.data_view_row_tail, true),
+                        KeyCode::Left if edges => nudge(&self.data_view_col_tail, false),
+                        KeyCode::Right if edges => nudge(&self.data_view_col_tail, true),
                         // Open the dtype menu; `d` or `D`.
                         KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
                             if let Some(chosen) = self.prompt_dtype(
@@ -1051,9 +1080,10 @@ impl Explorer {
             // so it can sample twice as many rows as there are lines.
             crate::sample::sample_tensor(tensor, text_rows * 2, max_cols, slice, view, mode)?
         } else {
-            // Numeric cell width depends on the dtype (sub-byte ints are narrow,
-            // so many more columns fit); plus a 7-char row-index column.
-            let cell = view.cell_width(&tensor.dtype);
+            // Numeric cell width depends on the actual values (small ints — even
+            // in a wide dtype — pack many columns); plus a 7-char row-index
+            // column. The exact range comes from stats once computed.
+            let cell = view.cell_width(&tensor.dtype, stats.value_range());
             let max_cols = ((cols as usize).saturating_sub(7) / cell).max(1);
             crate::sample::sample_tensor(tensor, text_rows, max_cols, slice, view, mode)?
         };

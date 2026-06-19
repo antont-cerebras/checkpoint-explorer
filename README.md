@@ -148,25 +148,34 @@ actual data of 1D/2D/3D tensors:
   blue→green→red scale, with a min/max legend. Each character row packs two
   data rows (upper/lower half-block) for higher vertical resolution.
 - `v` — a **numeric grid** of sampled values with row/column indices, including
-  the edges. Column width adapts to the view's dtype, so narrow sub-byte / small
-  integer views (e.g. `u4`/`i4`, `I8`) pack many more columns onto the screen
-  than wide floats. When an index label is wider than its (narrow) cell, the
-  labels are staggered across two header rows ("leap-frog"), and — for the most
-  extreme cases — thinned so the ones shown don't collide.
+  the edges. Column width adapts to the *actual* values (from the exact stats),
+  so a tensor of small numbers packs many more columns onto the screen — even a
+  16-bit dtype whose values happen to be one- or two-digit (common for sparse /
+  quantized formats) gets as many columns as a 4-bit view, instead of always
+  reserving room for `-32768`. Floats use a fixed scientific-notation width.
+  When an index label is wider than its (narrow) cell, the labels are staggered
+  across two header rows ("leap-frog"), and — for the most extreme cases —
+  thinned so the ones shown don't collide.
 
 Both views sample an evenly-spaced overview by default. Press `e` to toggle an
-**edges view** that instead shows the first and last ~10 rows *and* columns
-(with a dotted `⋯` / `⋮` separator marking the skipped middle) — handy for
-seeing how a tensor is padded at its edges (e.g. zero padding vs. something
-else). The choice is remembered for the session, so it sticks as you move
-between tensors.
+**edges view** that instead shows the first *and* last rows and columns (as many
+as fit), with a dotted `⋯` / `⋮` separator marking the skipped middle — handy
+for seeing how a tensor is padded at its edges (e.g. zero padding vs. something
+else). In the edges view the **arrow keys rebalance** how much of each end is
+shown: `←` / `→` shift the columns toward the first / last, `↑` / `↓` the rows,
+and holding `Shift` snaps all the way to one end (e.g. `Shift`+`→` to see only
+the last columns). The header shows the current split (e.g. `first 8 & last 18`).
+The edges choice and the split are remembered for the session, so they stick as
+you move between tensors.
 
 For **3D tensors** (e.g. stacked MoE experts, shape `[experts, rows, cols]`) the
 preview shows a 2D matrix at a fixed leading index — the 0th by default. The
 `←` / `→` arrows step through the slices one at a time and `Shift`+`←` / `→` jump
 ~5% at a time (both wrap around at the ends); `/` prompts for a slice to jump to —
 either an exact index or a percentage like `50%` (0% = first, 100% = last).
-Out-of-range entries are rejected with a message rather than jumping.
+Out-of-range entries are rejected with a message rather than jumping. (In the
+edges view the arrows rebalance the first/last split instead, so there slices
+step with `[` / `]` — `/` still works.)
 Within either view, `m` and `v` switch between the heatmap and numeric
 representations in place, `e` toggles the edges view, and `Ctrl+C` quits the app
 from anywhere.
