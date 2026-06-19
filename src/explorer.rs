@@ -43,6 +43,30 @@ impl EdgesView {
     }
 }
 
+/// Which screen to jump straight to for a `--tensor` opened from the CLI.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OpenView {
+    /// The tensor detail screen.
+    Detail,
+    /// The numeric values grid (`v`).
+    Values,
+    /// The ASCII heatmap (`m`).
+    Heatmap,
+}
+
+/// A tensor + view to open on startup, from the CLI flags.
+pub struct OpenRequest {
+    /// Exact tensor name to open.
+    pub tensor: String,
+    /// Which screen to show.
+    pub view: OpenView,
+    /// Optional dtype reinterpretation to apply first.
+    pub dtype: Option<ViewDtype>,
+    /// `Some(true)` forces the edges submode, `Some(false)` the overview;
+    /// `None` keeps the default.
+    pub edges: Option<bool>,
+}
+
 pub struct Explorer {
     files: Vec<PathBuf>,
     tensors: Vec<TensorInfo>,
@@ -83,10 +107,17 @@ pub struct Explorer {
     /// The numeric grid's zebra striping (rows / columns / off). Session-
     /// remembered; cycled with `z`.
     data_view_stripe: Cell<StripeMode>,
+    /// A tensor/view to jump straight to on startup (from CLI flags); consumed
+    /// once after loading, then normal browsing resumes.
+    open: Option<OpenRequest>,
 }
 
 impl Explorer {
-    pub fn new(files: Vec<PathBuf>, health_reports: Vec<crate::health::HealthReport>) -> Self {
+    pub fn new(
+        files: Vec<PathBuf>,
+        health_reports: Vec<crate::health::HealthReport>,
+        open: Option<OpenRequest>,
+    ) -> Self {
         Self {
             files,
             tensors: Vec::new(),
@@ -109,6 +140,7 @@ impl Explorer {
             edge_row_budget: Cell::new(1),
             edge_col_budget: Cell::new(1),
             data_view_stripe: Cell::new(StripeMode::default()),
+            open,
         }
     }
 
@@ -517,6 +549,12 @@ impl Explorer {
     fn interactive_loop(&mut self) -> Result<()> {
         self.load_all_files()?;
 
+        // A `--tensor` request jumps straight to its view; once that screen is
+        // dismissed, fall through to normal browsing.
+        if let Some(req) = self.open.take() {
+            self.open_requested(req);
+        }
+
         loop {
             let title = if self.files.len() == 1 {
                 self.files[0].to_string_lossy().to_string()
@@ -890,6 +928,47 @@ impl Explorer {
                     self.show_metadata_detail(info);
                 }
             }
+        }
+    }
+
+    /// Apply a CLI `--tensor` request: locate the tensor, apply any dtype
+    /// override and edges/overview choice, then open the requested screen. If
+    /// the tensor isn't found, show a brief message and return to the browser.
+    fn open_requested(&self, req: OpenRequest) {
+        let Some(tensor) = self.tensors.iter().find(|t| t.name == req.tensor).cloned() else {
+            let _ = UI::draw_message(
+                "Tensor not found",
+                &format!(
+                    "No tensor named '{}' in this checkpoint — opening the browser instead.",
+                    req.tensor
+                ),
+            );
+            let _ = event::read();
+            return;
+        };
+        // Apply the dtype override (skipped for formats that can't reinterpret,
+        // so the header never claims a view that isn't actually applied).
+        if let Some(dt) = req.dtype
+            && dtype_overridable(&tensor)
+        {
+            let mut overrides = self.dtype_overrides.borrow_mut();
+            if dt == ViewDtype::Stored {
+                overrides.remove(&tensor.name);
+            } else {
+                overrides.insert(tensor.name.clone(), dt);
+            }
+        }
+        if let Some(edges) = req.edges {
+            self.data_view_edges.set(if edges {
+                EdgesView::Edges
+            } else {
+                EdgesView::Overview
+            });
+        }
+        match req.view {
+            OpenView::Detail => self.show_tensor_detail(&tensor),
+            OpenView::Values => self.show_tensor_data(&tensor, false),
+            OpenView::Heatmap => self.show_tensor_data(&tensor, true),
         }
     }
 
@@ -1448,7 +1527,7 @@ mod tests {
     /// Build an explorer whose flattened tree has the given row depths (the
     /// node contents don't matter for coarse navigation, only the depths).
     fn explorer_with_depths(depths: &[usize]) -> Explorer {
-        let mut e = Explorer::new(Vec::new(), Vec::new());
+        let mut e = Explorer::new(Vec::new(), Vec::new(), None);
         e.flattened_tree = depths
             .iter()
             .map(|&d| {
@@ -1538,7 +1617,7 @@ mod tests {
 
     #[test]
     fn move_to_first_child_enters_an_expanded_group() {
-        let mut e = Explorer::new(Vec::new(), Vec::new());
+        let mut e = Explorer::new(Vec::new(), Vec::new(), None);
         // idx0: expanded group with a child; idx1: that child (depth 1);
         // idx2: a childless group at depth 0.
         e.flattened_tree = vec![

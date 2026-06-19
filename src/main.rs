@@ -15,7 +15,7 @@ use clap::Parser;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::explorer::Explorer;
+use crate::explorer::{Explorer, OpenRequest, OpenView};
 
 #[derive(Parser)]
 #[command(name = "checkpoint-explorer")]
@@ -38,6 +38,49 @@ struct Args {
         help = "Skip the checkpoint health check (index vs. files on disk)"
     )]
     no_health_check: bool,
+
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Open a specific tensor on startup (exact name); combine with --dtype/--values/--heatmap/--edge"
+    )]
+    tensor: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "DTYPE",
+        requires = "tensor",
+        value_parser = sample::parse_view_dtype,
+        help = "Reinterpret the opened tensor's dtype: u4-packed, u4-lo, u4-hi, i4-packed, i4-lo, i4-hi, f16, bf16, i16, u16, f32, i32, u32, f64, i64, u64, i8, u8, stored"
+    )]
+    dtype: Option<sample::ViewDtype>,
+
+    #[arg(
+        long,
+        requires = "tensor",
+        conflicts_with = "heatmap",
+        help = "Open the opened tensor's numeric values grid"
+    )]
+    values: bool,
+
+    #[arg(long, requires = "tensor", help = "Open the opened tensor's heatmap")]
+    heatmap: bool,
+
+    #[arg(
+        long,
+        visible_alias = "edges",
+        requires = "tensor",
+        conflicts_with = "overview",
+        help = "Show the first/last edges (padding) submode"
+    )]
+    edge: bool,
+
+    #[arg(
+        long,
+        requires = "tensor",
+        help = "Show the evenly-spaced overview submode"
+    )]
+    overview: bool,
 }
 
 fn main() -> Result<()> {
@@ -59,7 +102,28 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let mut explorer = Explorer::new(files, health_reports);
+    let view = if args.values {
+        OpenView::Values
+    } else if args.heatmap {
+        OpenView::Heatmap
+    } else {
+        OpenView::Detail
+    };
+    let edges = if args.edge {
+        Some(true)
+    } else if args.overview {
+        Some(false)
+    } else {
+        None
+    };
+    let open = args.tensor.map(|tensor| OpenRequest {
+        tensor,
+        view,
+        dtype: args.dtype,
+        edges,
+    });
+
+    let mut explorer = Explorer::new(files, health_reports, open);
     explorer.run()
 }
 

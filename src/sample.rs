@@ -210,6 +210,41 @@ pub fn view_options(stored: &str) -> Vec<ViewDtype> {
     opts
 }
 
+/// Parse a CLI dtype-override string (e.g. `u4-packed`, `i4-lo`, `f16`,
+/// `stored`) into a [`ViewDtype`]. Case-insensitive; `-` and `_` are
+/// interchangeable. Used by the `--dtype` flag.
+pub fn parse_view_dtype(s: &str) -> Result<ViewDtype, String> {
+    let norm = s.trim().to_ascii_lowercase().replace('_', "-");
+    Ok(match norm.as_str() {
+        "stored" => ViewDtype::Stored,
+        "u4" | "u4-packed" => ViewDtype::U4Packed,
+        "u4-lo" => ViewDtype::U4Lo,
+        "u4-hi" => ViewDtype::U4Hi,
+        "i4" | "i4-packed" => ViewDtype::I4Packed,
+        "i4-lo" => ViewDtype::I4Lo,
+        "i4-hi" => ViewDtype::I4Hi,
+        "f16" => ViewDtype::As("F16"),
+        "bf16" => ViewDtype::As("BF16"),
+        "f32" => ViewDtype::As("F32"),
+        "f64" => ViewDtype::As("F64"),
+        "i8" => ViewDtype::As("I8"),
+        "u8" => ViewDtype::As("U8"),
+        "i16" => ViewDtype::As("I16"),
+        "u16" => ViewDtype::As("U16"),
+        "i32" => ViewDtype::As("I32"),
+        "u32" => ViewDtype::As("U32"),
+        "i64" => ViewDtype::As("I64"),
+        "u64" => ViewDtype::As("U64"),
+        "bool" => ViewDtype::As("BOOL"),
+        _ => {
+            return Err(format!(
+                "unknown dtype view '{s}'; expected one of: stored, u4-lo, u4-hi, u4-packed, \
+                 i4-lo, i4-hi, i4-packed, f16, bf16, f32, f64, i8, u8, i16, u16, i32, u32, i64, u64"
+            ));
+        }
+    })
+}
+
 /// A downsampled grid of tensor values plus the original indices it came from.
 pub struct Sample {
     /// Original row indices that were sampled (logical rows).
