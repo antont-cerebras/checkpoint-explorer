@@ -27,20 +27,25 @@ use crate::ui::{DrawConfig, Legend, StatsView, StripeMode, UI};
 use crate::utils::base64_encode;
 
 /// Whether the data views show the evenly-spaced overview or the first/last
-/// edges (padding) sample. Toggled with `e`, remembered for the session;
-/// defaults to the edges view (most useful for inspecting padding).
+/// How a data view lays out the values it shows: an evenly-spaced overview, the
+/// first/last edges (padding) sample, or a contiguous pannable window. Cycled
+/// with `e`, remembered for the session; defaults to the edges view (most useful
+/// for inspecting padding).
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
-enum EdgesView {
+enum DataLayout {
     Overview,
     #[default]
     Edges,
+    Window,
 }
 
-impl EdgesView {
-    fn toggled(self) -> Self {
+impl DataLayout {
+    /// The next layout in the `e` cycle: Overview → Edges → Window → Overview.
+    fn next(self) -> Self {
         match self {
-            EdgesView::Overview => EdgesView::Edges,
-            EdgesView::Edges => EdgesView::Overview,
+            DataLayout::Overview => DataLayout::Edges,
+            DataLayout::Edges => DataLayout::Window,
+            DataLayout::Window => DataLayout::Overview,
         }
     }
 }
@@ -160,20 +165,28 @@ pub struct Explorer {
     /// Exact whole-tensor statistics, cached per (tensor name, view) since the
     /// scan is expensive. Session-scoped.
     stats_cache: RefCell<HashMap<(String, ViewDtype), Stats>>,
-    /// Whether the data views show the edges (padding) sample rather than the
-    /// evenly-spaced grid. Session-scoped: remembered as you move between
-    /// tensors and in/out of the preview.
-    data_view_edges: Cell<EdgesView>,
+    /// Which layout the data views use (overview / edges / window). Session-
+    /// scoped: remembered as you move between tensors and in/out of the preview.
+    data_view_layout: Cell<DataLayout>,
     /// In the edges view, how the fixed row/column budget is split between the
     /// first (head) and last (tail) indices: `0.0` shows only the first, `1.0`
     /// only the last, `0.5` is balanced. Adjustable with the arrow keys and
-    /// session-remembered alongside [`Self::data_view_edges`].
+    /// session-remembered alongside [`Self::data_view_layout`].
     data_view_row_tail: Cell<f32>,
     data_view_col_tail: Cell<f32>,
     /// The last edges-view row/column budgets actually rendered, so an arrow
     /// press can move the divider by exactly one index (step = 1 / budget).
     edge_row_budget: Cell<usize>,
     edge_col_budget: Cell<usize>,
+    /// The window view's top-left corner (row/column offset into the matrix).
+    /// Clamped to a valid position on every draw (read back from the rendered
+    /// sample), so panning behaves at the edges. Session-remembered.
+    data_view_win_row: Cell<usize>,
+    data_view_win_col: Cell<usize>,
+    /// The last window's visible size (rows/cols actually shown), so a
+    /// `Shift`+arrow press can stride by one screenful.
+    win_page_rows: Cell<usize>,
+    win_page_cols: Cell<usize>,
     /// The numeric grid's zebra striping (rows / columns / off). Session-
     /// remembered; cycled with `z`.
     data_view_stripe: Cell<StripeMode>,
@@ -204,11 +217,15 @@ impl Explorer {
             health_reports,
             dtype_overrides: RefCell::new(HashMap::new()),
             stats_cache: RefCell::new(HashMap::new()),
-            data_view_edges: Cell::new(EdgesView::default()),
+            data_view_layout: Cell::new(DataLayout::default()),
             data_view_row_tail: Cell::new(0.5),
             data_view_col_tail: Cell::new(0.5),
             edge_row_budget: Cell::new(1),
             edge_col_budget: Cell::new(1),
+            data_view_win_row: Cell::new(0),
+            data_view_win_col: Cell::new(0),
+            win_page_rows: Cell::new(1),
+            win_page_cols: Cell::new(1),
             data_view_stripe: Cell::new(StripeMode::default()),
             open,
         }
@@ -1201,10 +1218,10 @@ impl Explorer {
             }
         }
         if let Some(edges) = req.edges {
-            self.data_view_edges.set(if edges {
-                EdgesView::Edges
+            self.data_view_layout.set(if edges {
+                DataLayout::Edges
             } else {
-                EdgesView::Overview
+                DataLayout::Overview
             });
         }
         if let Some(zebra) = req.zebra {
@@ -1440,14 +1457,18 @@ impl Explorer {
         let mut repr = repr;
         let mut slice = start_slice;
         loop {
-            // Edges (padding) vs. grid is a session-remembered preference, so it
+            // The data-view layout is a session-remembered preference, so it
             // sticks as you move between tensors and in/out of the preview.
-            let mode = match self.data_view_edges.get() {
-                EdgesView::Edges => SampleMode::Edges {
+            let mode = match self.data_view_layout.get() {
+                DataLayout::Edges => SampleMode::Edges {
                     row_tail: self.data_view_row_tail.get(),
                     col_tail: self.data_view_col_tail.get(),
                 },
-                EdgesView::Overview => SampleMode::Grid,
+                DataLayout::Overview => SampleMode::Grid,
+                DataLayout::Window => SampleMode::Window {
+                    row_off: self.data_view_win_row.get(),
+                    col_off: self.data_view_win_col.get(),
+                },
             };
             // The dtype reinterpretation remembered for this tensor, if any.
             let view = self
@@ -1534,7 +1555,9 @@ impl Explorer {
                         code, modifiers, ..
                     })) => {
                         let shift = modifiers.contains(KeyModifiers::SHIFT);
+                        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
                         let edges = matches!(mode, SampleMode::Edges { .. });
+                        let window = matches!(mode, SampleMode::Window { .. });
                         // One arrow press moves the divider by a single index
                         // (step = 1 / budget); Shift snaps the split to one end.
                         let nudge = |cell: &Cell<f32>, toward_tail: bool, budget: usize| {
@@ -1546,15 +1569,33 @@ impl Explorer {
                             let delta = if toward_tail { step } else { -step };
                             cell.set((cell.get() + delta).clamp(0.0, 1.0));
                         };
+                        // Pan the window along one axis. Ctrl jumps fully to an
+                        // edge (`usize::MAX` is clamped back to the last position
+                        // on the next draw), Shift strides one screenful, a plain
+                        // arrow moves a single row/column.
+                        let pan = |cell: &Cell<usize>, forward: bool, page: usize| {
+                            let cur = cell.get();
+                            let next = if ctrl {
+                                if forward { usize::MAX } else { 0 }
+                            } else {
+                                let step = if shift { page.max(1) } else { 1 };
+                                if forward {
+                                    cur.saturating_add(step)
+                                } else {
+                                    cur.saturating_sub(step)
+                                }
+                            };
+                            cell.set(next);
+                        };
                         match code {
                             // Switch representation in place, keeping the current slice.
                             KeyCode::Char('m') => repr = Representation::Heatmap,
                             KeyCode::Char('v') => repr = Representation::Values,
-                            // Toggle the edges (first/last rows & columns) view, for
-                            // inspecting padding; remembered for the session.
+                            // Cycle the data-view layout overview → edges → window
+                            // → overview; remembered for the session.
                             KeyCode::Char('e') | KeyCode::Char('E') => self
-                                .data_view_edges
-                                .set(self.data_view_edges.get().toggled()),
+                                .data_view_layout
+                                .set(self.data_view_layout.get().next()),
                             // Cycle the numeric grid's zebra striping rows → cols →
                             // off; remembered for the session.
                             KeyCode::Char('z') | KeyCode::Char('Z') => self
@@ -1579,6 +1620,30 @@ impl Explorer {
                             KeyCode::Right if edges => {
                                 nudge(&self.data_view_col_tail, false, self.edge_col_budget.get())
                             }
+                            // In the window view the arrows pan the visible block
+                            // (Shift strides a screenful; Ctrl+arrow also jumps to
+                            // an edge on terminals that send it); slice stepping
+                            // stays on `[` / `]` and `/`.
+                            KeyCode::Up if window => {
+                                pan(&self.data_view_win_row, false, self.win_page_rows.get())
+                            }
+                            KeyCode::Down if window => {
+                                pan(&self.data_view_win_row, true, self.win_page_rows.get())
+                            }
+                            KeyCode::Left if window => {
+                                pan(&self.data_view_win_col, false, self.win_page_cols.get())
+                            }
+                            KeyCode::Right if window => {
+                                pan(&self.data_view_win_col, true, self.win_page_cols.get())
+                            }
+                            // Jump straight to an edge (clamped on the next draw):
+                            // Home/End to the first/last column, PageUp/PageDown to
+                            // the first/last row. Plain navigation keys, so they
+                            // work everywhere (unlike Ctrl+arrow).
+                            KeyCode::Home if window => self.data_view_win_col.set(0),
+                            KeyCode::End if window => self.data_view_win_col.set(usize::MAX),
+                            KeyCode::PageUp if window => self.data_view_win_row.set(0),
+                            KeyCode::PageDown if window => self.data_view_win_row.set(usize::MAX),
                             // Open the dtype menu; `d` or `D`.
                             KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
                                 if let Some(chosen) = self
@@ -1693,6 +1758,17 @@ impl Explorer {
         self.edge_col_budget
             .set(crate::sample::edge_total(max_cols));
         let sample = crate::sample::sample_tensor(tensor, max_rows, max_cols, slice, view, mode)?;
+        // In the window layout, read the clamped top-left corner and the visible
+        // size back from the rendered sample, so panning stays in bounds and a
+        // Shift+arrow strides exactly one screenful.
+        if let SampleMode::Window { .. } = mode {
+            self.data_view_win_row
+                .set(sample.rows.first().copied().unwrap_or(0));
+            self.data_view_win_col
+                .set(sample.cols.first().copied().unwrap_or(0));
+            self.win_page_rows.set(sample.rows.len().max(1));
+            self.win_page_cols.set(sample.cols.len().max(1));
+        }
         let info = (sample.slices, sample.overridable, sample.slice);
         match repr {
             Representation::Heatmap => {

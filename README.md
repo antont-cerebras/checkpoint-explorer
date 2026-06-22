@@ -205,14 +205,24 @@ those, so a tensor stored as e.g. `(128, 3088, 1, 748)` previews as the 3D
 Both views open in the **edges view** by default — the first *and* last rows and
 columns (as many as fit), with a dotted `⋯` / `⋮` separator marking the skipped
 middle — handy for seeing how a tensor is padded at its edges (e.g. zero padding
-vs. something else). Press `e` to toggle the evenly-spaced **overview** instead.
+vs. something else). Press `e` to cycle the layout: **overview** (evenly-spaced)
+→ **edges** → **window** → back to overview.
 In the edges view the **arrow keys move the divider** between the first
 and last blocks: `←` / `→` slide the column divider (so `→` grows the first
 columns and shrinks the last, `←` the reverse), `↑` / `↓` slide the row divider,
 and holding `Shift` pushes it all the way to one end (e.g. `Shift`+`←` to see
 only the last columns). The header shows the current split (e.g.
-`first 8 & last 18`). The edges choice and the split are remembered for the
+`first 8 & last 18`). The layout choice and the split are remembered for the
 session, so they stick as you move between tensors.
+
+The **window** layout shows a contiguous block of the *actual* neighbouring
+values (no downsampling) that you pan around with the **arrow keys**: a plain
+arrow moves one row/column and `Shift`+arrow strides a whole screenful. To jump
+straight to an edge, `Home` / `End` go to the first / last column and `PageUp` /
+`PageDown` to the first / last row (`Ctrl`+arrow does the same on terminals that
+send it). The header shows the visible range (e.g. `window: rows 120–179 of
+3088`). The pan position is remembered for the session and clamped to stay in
+bounds.
 
 For **3D tensors** (e.g. stacked MoE experts, shape `[experts, rows, cols]`) the
 preview shows a 2D matrix at a fixed leading index — the 0th by default. The
@@ -220,11 +230,11 @@ preview shows a 2D matrix at a fixed leading index — the 0th by default. The
 ~5% at a time (both wrap around at the ends); `/` prompts for a slice to jump to —
 either an exact index or a percentage like `50%` (0% = first, 100% = last).
 Out-of-range entries are rejected with a message rather than jumping. (In the
-edges view the arrows move the first/last divider instead, so there slices step
-with `[` / `]` — `/` still works.)
+edges and window layouts the arrows are claimed by the divider / panning, so
+there slices step with `[` / `]` — `/` still works.)
 Within either view, `m` and `v` switch between the heatmap and numeric
-representations in place, `e` toggles the edges view, and `Ctrl+C` quits the app
-from anywhere.
+representations in place, `e` cycles the layout (overview → edges → window), and
+`Ctrl+C` quits the app from anywhere.
 
 #### Statistics
 

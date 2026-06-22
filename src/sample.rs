@@ -283,6 +283,11 @@ pub enum SampleMode {
     /// `row_tail` / `col_tail` bias the fixed budget toward the tail: `0.0`
     /// shows only the first rows/cols, `1.0` only the last, `0.5` is balanced.
     Edges { row_tail: f32, col_tail: f32 },
+    /// A contiguous window into the matrix, its top-left corner at
+    /// `(row_off, col_off)` — pan it around to read the actual neighbouring
+    /// values rather than a downsample. Offsets are clamped so the window never
+    /// runs past the end.
+    Window { row_off: usize, col_off: usize },
 }
 
 /// Sample a 1D/2D/3D tensor into at most `max_rows` x `max_cols` values. For a
@@ -356,6 +361,10 @@ pub fn sample_tensor(
             edge_indices(total_rows, max_rows.max(1), row_tail),
             edge_indices(total_cols, max_cols.max(1), col_tail),
         ),
+        SampleMode::Window { row_off, col_off } => (
+            window_indices(total_rows, max_rows.max(1), row_off),
+            window_indices(total_cols, max_cols.max(1), col_off),
+        ),
     };
 
     let reader = open_reader(t)?;
@@ -389,6 +398,19 @@ pub fn sample_tensor(
         overridable,
         mode,
     })
+}
+
+/// Up to `k` *contiguous* indices in `0..n`, starting at `off` but clamped so
+/// the window never runs past the end (and pinned to `0` when the whole axis
+/// fits). The first returned index is the clamped offset, which the caller
+/// reads back to keep its stored pan position in bounds.
+fn window_indices(n: usize, k: usize, off: usize) -> Vec<usize> {
+    let k = k.min(n);
+    if k == 0 {
+        return Vec::new();
+    }
+    let start = off.min(n - k);
+    (start..start + k).collect()
 }
 
 /// Up to `k` evenly-spaced indices in `0..n`, always including `0` and `n-1`.
@@ -1301,6 +1323,69 @@ mod tests {
         assert_eq!(&b[..3], &[0, 1, 2]);
         assert_eq!(b.len(), 12);
         assert_eq!(&b[3..], &[91, 92, 93, 94, 95, 96, 97, 98, 99]);
+    }
+
+    #[test]
+    fn window_indices_is_contiguous_and_clamped() {
+        // Whole axis fits: the offset is ignored, starts at 0.
+        assert_eq!(window_indices(5, 10, 3), vec![0, 1, 2, 3, 4]);
+        // A k-wide window at an in-range offset is contiguous.
+        assert_eq!(window_indices(100, 4, 10), vec![10, 11, 12, 13]);
+        // Offset past the end clamps so the window still shows k indices ending
+        // at n-1 (this is what keeps panning stuck-to-the-edge well-behaved).
+        assert_eq!(window_indices(100, 4, 999), vec![96, 97, 98, 99]);
+        // Exactly at the last valid offset.
+        assert_eq!(window_indices(10, 3, 7), vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn samples_a_contiguous_window_at_an_offset() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_explorer_sample_win");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // 6x6 f32, value[r][c] = r*6 + c.
+        let header = br#"{"w":{"dtype":"F32","shape":[6,6],"data_offsets":[0,144]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for i in 0..36u32 {
+            f.write_all(&(i as f32).to_le_bytes()).unwrap();
+        }
+        drop(f);
+
+        let t = fixture(&path, "w", &[6, 6], (0, 144));
+        // A 3x3 window with its corner at (2, 1) is the contiguous block
+        // rows 2..5, cols 1..4 — no downsampling.
+        let mode = SampleMode::Window {
+            row_off: 2,
+            col_off: 1,
+        };
+        let s = sample_tensor(&t, 3, 3, 0, ViewDtype::Stored, mode).unwrap();
+        assert_eq!(s.rows, vec![2, 3, 4]);
+        assert_eq!(s.cols, vec![1, 2, 3]);
+        for (i, &r) in s.rows.iter().enumerate() {
+            for (j, &c) in s.cols.iter().enumerate() {
+                assert_eq!(s.values[i][j], (r * 6 + c) as f64);
+            }
+        }
+        // An offset past the end clamps so the window stays in bounds (its first
+        // index is the clamped corner the UI reads back).
+        let clamped = sample_tensor(
+            &t,
+            3,
+            3,
+            0,
+            ViewDtype::Stored,
+            SampleMode::Window {
+                row_off: 99,
+                col_off: 99,
+            },
+        )
+        .unwrap();
+        assert_eq!(clamped.rows, vec![3, 4, 5]);
+        assert_eq!(clamped.cols, vec![3, 4, 5]);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

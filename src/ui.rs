@@ -642,10 +642,10 @@ impl UI {
         write!(out, " ")?;
         let logical = sample.view.logical_shape(&tensor.shape, &tensor.dtype);
         write_view_shape(&mut *out, &tensor.shape, &logical)?;
-        let what = if matches!(sample.mode, SampleMode::Edges { .. }) {
-            "edges"
-        } else {
-            "sampled"
+        let what = match sample.mode {
+            SampleMode::Edges { .. } => "edges",
+            SampleMode::Window { .. } => "window",
+            SampleMode::Grid => "sampled",
         };
         write!(
             out,
@@ -731,27 +731,34 @@ impl UI {
         write!(out, " ")?;
         let logical = sample.view.logical_shape(&tensor.shape, &tensor.dtype);
         write_view_shape(&mut *out, &tensor.shape, &logical)?;
-        // In edges mode the grid is the first/last rows & columns (for padding);
-        // otherwise an evenly-spaced overview.
+        // Describe the layout: a contiguous window, the first/last edges (for
+        // padding), or an evenly-spaced overview.
         let edges = matches!(sample.mode, SampleMode::Edges { .. });
-        if edges {
-            write!(
+        match sample.mode {
+            SampleMode::Edges { .. } => write!(
                 out,
                 " → edges: {} of {} rows × {} of {} cols (indices shown)",
                 edge_desc(&sample.rows, sample.total_rows),
                 sample.total_rows,
                 edge_desc(&sample.cols, sample.total_cols),
                 sample.total_cols
-            )?;
-        } else {
-            write!(
+            )?,
+            SampleMode::Window { .. } => write!(
+                out,
+                " → window: rows {} of {} × cols {} of {} (contiguous)",
+                span_desc(&sample.rows),
+                sample.total_rows,
+                span_desc(&sample.cols),
+                sample.total_cols
+            )?,
+            SampleMode::Grid => write!(
                 out,
                 " → sampled {} of {} rows × {} of {} cols (indices shown)",
                 sample.rows.len(),
                 sample.total_rows,
                 sample.cols.len(),
                 sample.total_cols
-            )?;
+            )?,
         }
         line_end(&mut *out)?;
         write_stats_view(&mut *out, stats)?;
@@ -1556,14 +1563,20 @@ fn write_slice_header(out: &mut impl Write, sample: &Sample) -> Result<()> {
         "slice {} of {} (fixed leading index) — ",
         sample.slice, sample.slices
     )?;
-    hint_line(
-        out,
-        &[
-            ("← →", "step"),
-            ("Shift+← →", "jump 5% (both wrap)"),
-            ("/", "index or %"),
-        ],
-    )
+    // The overview frees the arrows for slice stepping; the edges and window
+    // layouts claim them (divider / pan), so slices move on `[` / `]` there.
+    if matches!(sample.mode, SampleMode::Grid) {
+        hint_line(
+            out,
+            &[
+                ("← →", "step"),
+                ("Shift+← →", "jump 5% (both wrap)"),
+                ("/", "index or %"),
+            ],
+        )
+    } else {
+        hint_line(out, &[("[ ]", "step"), ("/", "index or %")])
+    }
 }
 
 /// Footer for the data views: offers the other representation (`m`/`v` switch
@@ -1582,15 +1595,23 @@ fn write_view_footer(
     };
     let mut items = vec![switch];
     let edges = matches!(sample.mode, SampleMode::Edges { .. });
+    let window = matches!(sample.mode, SampleMode::Window { .. });
     // In the edges view the arrows rebalance first vs. last (Shift snaps to one
-    // end); slice stepping moves to `[`/`]` so the arrows are free for this.
+    // end); in the window view they pan the block (Shift a screenful, Ctrl to an
+    // edge). Either way slice stepping moves to `[`/`]` so the arrows are free.
     if edges {
         items.push(("← →", "first/last cols"));
         items.push(("↑ ↓", "first/last rows"));
         items.push(("+Shift", "one end"));
     }
+    if window {
+        items.push(("←↑↓→", "pan"));
+        items.push(("+Shift", "page"));
+        items.push(("Home/End", "col edge"));
+        items.push(("PgUp/Dn", "row edge"));
+    }
     if sample.slices > 1 {
-        if edges {
+        if edges || window {
             items.push(("[ ]", "slice"));
         } else {
             items.push(("← →", "step"));
@@ -1601,8 +1622,13 @@ fn write_view_footer(
     if sample.overridable {
         items.push(("d", "dtype"));
     }
-    // Toggle between the overview grid and the first/last rows & cols (edges).
-    items.push(if edges { ("e", "grid") } else { ("e", "edges") });
+    // Cycle the layout overview → edges → window → overview; the label names the
+    // layout `e` switches to next.
+    items.push(match sample.mode {
+        SampleMode::Grid => ("e", "edges"),
+        SampleMode::Edges { .. } => ("e", "window"),
+        SampleMode::Window { .. } => ("e", "overview"),
+    });
     // Cycle the zebra striping rows → cols → off (numeric grid only); the label
     // shows the current mode.
     if !heatmap {
@@ -1650,6 +1676,15 @@ fn write_grid_cell(out: &mut impl Write, s: &str, bg: Option<Color>, dim: bool) 
         queue!(out, SetForegroundColor(Color::Reset))?;
     }
     Ok(())
+}
+
+/// Describe a contiguous window's extent along one axis — e.g. `120–179` for the
+/// rows/cols currently shown (the header pairs it with the axis total).
+fn span_desc(idx: &[usize]) -> String {
+    match (idx.first(), idx.last()) {
+        (Some(a), Some(b)) => format!("{a}–{b}"),
+        _ => "—".to_string(),
+    }
 }
 
 /// Describe an edges-view index slice for the header — e.g. `first 26 & last 25`,
