@@ -739,40 +739,52 @@ impl Explorer {
         Ok(())
     }
 
+    /// Render the tree browser frame into `out`, returning the (possibly
+    /// adjusted) scroll offset. Shared by the live loop and screen-copy.
+    fn draw_tree(&self, out: &mut impl Write) -> Result<usize> {
+        let title = if self.files.len() == 1 {
+            self.files[0].to_string_lossy().to_string()
+        } else {
+            "Multiple files".to_string()
+        };
+        let tree_to_display = if self.search_mode {
+            &self.filtered_tree
+        } else {
+            &self.flattened_tree
+        };
+        let (status_icon, status_ok, status_bar) = self.status_bar();
+        let config = DrawConfig {
+            tree: tree_to_display,
+            current_file: &title,
+            file_idx: 0,
+            total_files: 1,
+            selected_idx: self.selected_idx,
+            scroll_offset: self.scroll_offset,
+            search_mode: self.search_mode,
+            search_query: &self.search_query,
+            status_icon,
+            status_ok,
+            status_bar: &status_bar,
+            health_warning: !self.health_reports.is_empty(),
+        };
+        UI::draw_screen(out, &config)
+    }
+
+    /// Copy the current tree screen's text to the clipboard (the `c` shortcut).
+    fn copy_tree_screen(&mut self) {
+        let text = screen_text(|buf| {
+            let _ = self.draw_tree(buf);
+        });
+        copy_to_clipboard(&text);
+        self.copied_flash = Some("screen contents".to_string());
+    }
+
     /// The tree browser. Handles in-place keys (navigation, search, expand) and
     /// returns a [`Nav`] when the user opens a tensor (`Enter`), moves through
     /// the screen history (Backspace / `\`), or quits.
     fn run_tree(&mut self) -> Result<Nav> {
         loop {
-            let title = if self.files.len() == 1 {
-                self.files[0].to_string_lossy().to_string()
-            } else {
-                "Multiple files".to_string()
-            };
-
-            let tree_to_display = if self.search_mode {
-                &self.filtered_tree
-            } else {
-                &self.flattened_tree
-            };
-
-            let (status_icon, status_ok, status_bar) = self.status_bar();
-
-            let config = DrawConfig {
-                tree: tree_to_display,
-                current_file: &title,
-                file_idx: 0,
-                total_files: 1,
-                selected_idx: self.selected_idx,
-                scroll_offset: self.scroll_offset,
-                search_mode: self.search_mode,
-                search_query: &self.search_query,
-                status_icon,
-                status_ok,
-                status_bar: &status_bar,
-                health_warning: !self.health_reports.is_empty(),
-            };
-            self.scroll_offset = UI::draw_screen(&config)?;
+            self.scroll_offset = self.draw_tree(&mut live_out())?;
 
             if let Event::Key(key_event) = event::read()? {
                 // The copy confirmation only lasts until the next key press.
@@ -793,10 +805,15 @@ impl Explorer {
                         modifiers: KeyModifiers::CONTROL,
                         ..
                     } => return Ok(Nav::Quit),
-                    // `c` (no modifier) copies the selected tensor's source path.
-                    // In search mode it falls through to be typed into the query.
+                    // `c` (no modifier) copies the screen's text; `f` copies the
+                    // selected row's source File. In search mode both fall
+                    // through to be typed into the query.
                     KeyEvent {
                         code: KeyCode::Char('c'),
+                        ..
+                    } if !self.search_mode => self.copy_tree_screen(),
+                    KeyEvent {
+                        code: KeyCode::Char('f'),
                         ..
                     } if !self.search_mode => self.copy_selected_path(),
                     // `h` shows the checkpoint health report (when there is one).
@@ -1257,7 +1274,7 @@ impl Explorer {
                 .unwrap_or(ViewDtype::Stored);
             let overridable = dtype_overridable(&tensor);
             self.compute_stats_animated(&tensor, view, |sv| {
-                let _ = UI::draw_tensor_detail(&tensor, view, overridable, sv);
+                let _ = UI::draw_tensor_detail(&mut live_out(), &tensor, view, overridable, sv);
             });
         }
         Some(screen)
@@ -1292,12 +1309,14 @@ impl Explorer {
             // animating the spinner right on this detail screen.
             if first && stats_start == StatsStart::Auto {
                 self.compute_stats_animated(tensor, view, |sv| {
-                    let _ = UI::draw_tensor_detail(tensor, view, overridable, sv);
+                    let _ = UI::draw_tensor_detail(&mut live_out(), tensor, view, overridable, sv);
                 });
             }
             let stats = self.cached_stats(tensor, view);
             let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
-            if UI::draw_tensor_detail(tensor, view, overridable, stats_view).is_err() {
+            if UI::draw_tensor_detail(&mut live_out(), tensor, view, overridable, stats_view)
+                .is_err()
+            {
                 return Nav::Quit;
             }
             // One-shot mode: leave this frame up and exit without reading keys.
@@ -1334,7 +1353,8 @@ impl Explorer {
                     ..
                 })) => {
                     self.compute_stats_animated(tensor, view, |sv| {
-                        let _ = UI::draw_tensor_detail(tensor, view, overridable, sv);
+                        let _ =
+                            UI::draw_tensor_detail(&mut live_out(), tensor, view, overridable, sv);
                     });
                 }
                 // Reinterpret the dtype from the detail screen too.
@@ -1350,6 +1370,16 @@ impl Explorer {
                             overrides.insert(tensor.name.clone(), chosen);
                         }
                     }
+                }
+                // Copy the detail screen's text to the clipboard.
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Char('c'),
+                    ..
+                })) => {
+                    let text = screen_text(|buf| {
+                        let _ = UI::draw_tensor_detail(buf, tensor, view, overridable, stats_view);
+                    });
+                    copy_to_clipboard(&text);
                 }
                 // History navigation.
                 Ok(Event::Key(KeyEvent {
@@ -1415,7 +1445,7 @@ impl Explorer {
             // timer in its stats line. A key press cancels the scan and leaves
             // the view (back to the detail screen).
             if self.compute_stats_animated(tensor, view, |sv| {
-                let _ = self.draw_data_view(tensor, repr, slice, view, mode, sv);
+                let _ = self.draw_data_view(&mut live_out(), tensor, repr, slice, view, mode, sv);
             }) == ScanOutcome::Cancelled
             {
                 // Cancelling the scan leaves the data view the same way a normal
@@ -1433,30 +1463,37 @@ impl Explorer {
             let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
 
             // (slices, overridable, clamped slice) on success.
-            let (slices, overridable) =
-                match self.draw_data_view(tensor, repr, slice, view, mode, stats_view) {
-                    Ok((slices, overridable, clamped)) => {
-                        slice = clamped;
-                        (slices, overridable)
+            let (slices, overridable) = match self.draw_data_view(
+                &mut live_out(),
+                tensor,
+                repr,
+                slice,
+                view,
+                mode,
+                stats_view,
+            ) {
+                Ok((slices, overridable, clamped)) => {
+                    slice = clamped;
+                    (slices, overridable)
+                }
+                Err(msg) => {
+                    let _ = UI::draw_message("Data preview unavailable", &msg);
+                    if interaction == Interaction::Interactive
+                        && let Ok(Event::Key(key)) = event::read()
+                        && is_ctrl_c(&key)
+                    {
+                        quit_immediately();
                     }
-                    Err(msg) => {
-                        let _ = UI::draw_message("Data preview unavailable", &msg);
-                        if interaction == Interaction::Interactive
-                            && let Ok(Event::Key(key)) = event::read()
-                            && is_ctrl_c(&key)
-                        {
-                            quit_immediately();
-                        }
-                        return (
-                            Nav::Open(Screen::Detail {
-                                tensor: tensor.name.clone(),
-                                slice,
-                            }),
-                            repr,
+                    return (
+                        Nav::Open(Screen::Detail {
+                            tensor: tensor.name.clone(),
                             slice,
-                        );
-                    }
-                };
+                        }),
+                        repr,
+                        slice,
+                    );
+                }
+            };
 
             // One-shot mode (`--exit`): stats are computed above and the final
             // frame is now drawn, so leave it up and exit without reading keys.
@@ -1557,6 +1594,15 @@ impl Explorer {
                             KeyCode::Char('[') | KeyCode::Left if slices > 1 => {
                                 slice = (slice + slices - 1) % slices
                             }
+                            // Copy the data view's text to the clipboard.
+                            KeyCode::Char('c') => {
+                                let text = screen_text(|buf| {
+                                    let _ = self.draw_data_view(
+                                        buf, tensor, repr, slice, view, mode, stats_view,
+                                    );
+                                });
+                                copy_to_clipboard(&text);
+                            }
                             // History navigation: Backspace back, `\` forward.
                             KeyCode::Backspace => return (Nav::Back, repr, slice),
                             KeyCode::Char('\\') => return (Nav::Forward, repr, slice),
@@ -1591,8 +1637,10 @@ impl Explorer {
     /// the terminal. Returns `(slices, overridable, clamped_slice)` on success,
     /// or an error message for the caller to show. Shared by the data-view loop
     /// and the dtype menu's live preview.
+    #[allow(clippy::too_many_arguments)] // a render helper; the params are all distinct
     fn draw_data_view(
         &self,
+        out: &mut impl Write,
         tensor: &TensorInfo,
         repr: Representation,
         slice: usize,
@@ -1624,10 +1672,10 @@ impl Explorer {
         let info = (sample.slices, sample.overridable, sample.slice);
         match repr {
             Representation::Heatmap => {
-                UI::draw_heatmap(tensor, &sample, stats).map_err(|e| e.to_string())?;
+                UI::draw_heatmap(out, tensor, &sample, stats).map_err(|e| e.to_string())?;
             }
             Representation::Values => {
-                UI::draw_values(tensor, &sample, stats, self.data_view_stripe.get())
+                UI::draw_values(out, tensor, &sample, stats, self.data_view_stripe.get())
                     .map_err(|e| e.to_string())?;
             }
         }
@@ -1657,10 +1705,19 @@ impl Explorer {
             let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
             let preview_ok = match preview {
                 DtypePreview::Detail => {
-                    UI::draw_tensor_detail(tensor, options[idx], true, stats_view).is_ok()
+                    UI::draw_tensor_detail(&mut live_out(), tensor, options[idx], true, stats_view)
+                        .is_ok()
                 }
                 DtypePreview::Data { repr, slice, mode } => self
-                    .draw_data_view(tensor, repr, slice, options[idx], mode, stats_view)
+                    .draw_data_view(
+                        &mut live_out(),
+                        tensor,
+                        repr,
+                        slice,
+                        options[idx],
+                        mode,
+                        stats_view,
+                    )
                     .is_ok(),
             };
             if !preview_ok {
@@ -1870,6 +1927,65 @@ fn collect_source_paths(node: &TreeNode, out: &mut BTreeSet<String>) {
         }
         TreeNode::Metadata { .. } => {}
     }
+}
+
+/// A buffered writer over the live stdout for the screen-draw functions. The
+/// buffering makes each frame flush atomically (no progressive paint / flicker).
+fn live_out() -> io::BufWriter<io::StdoutLock<'static>> {
+    io::BufWriter::new(io::stdout().lock())
+}
+
+/// Render whatever screen is currently shown into a plain-text string (ANSI
+/// escapes stripped), for the "copy screen contents" shortcut.
+fn screen_text(render: impl FnOnce(&mut Vec<u8>)) -> String {
+    let mut buf = Vec::new();
+    render(&mut buf);
+    strip_ansi(&buf)
+}
+
+/// Strip ANSI escape sequences (CSI / OSC / charset selects) and carriage
+/// returns from terminal output, leaving the plain text the user sees.
+fn strip_ansi(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {}
+            '\x1b' => match chars.next() {
+                // CSI: ESC [ … <final 0x40–0x7e>
+                Some('[') => {
+                    for d in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&d) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] … terminated by BEL or ESC \
+                Some(']') => {
+                    while let Some(d) = chars.next() {
+                        if d == '\x07' {
+                            break;
+                        }
+                        if d == '\x1b' {
+                            chars.next(); // consume the trailing '\'
+                            break;
+                        }
+                    }
+                }
+                // Two-byte escapes (charset selects etc.): drop the next char.
+                Some(_) => {}
+                None => {}
+            },
+            other => out.push(other),
+        }
+    }
+    // Trim trailing whitespace on each line and drop trailing blank lines.
+    let mut lines: Vec<&str> = out.lines().map(|l| l.trim_end()).collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 /// Copy `text` to the terminal clipboard via the OSC 52 escape sequence. This

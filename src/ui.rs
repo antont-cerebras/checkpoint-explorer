@@ -123,16 +123,12 @@ pub fn parse_stripe_mode(s: &str) -> Result<StripeMode, String> {
 pub struct UI;
 
 impl UI {
-    pub fn draw_screen(config: &DrawConfig) -> Result<usize> {
-        // Render the whole frame into one buffered writer and flush it once.
-        // `io::Stdout` is line-buffered, so writing directly would flush on
-        // every newline and paint the frame progressively; a `BufWriter` makes
-        // the update atomic. Combined with overwriting in place (clearing each
-        // line rather than the whole screen up front), this removes the flicker
-        // that a per-frame `Clear(All)` produced.
-        let stdout = io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
-
+    /// Render the tree browser into `out` (a buffered stdout for the live
+    /// screen, or an in-memory buffer when capturing the screen for copy).
+    /// Writing the whole frame at once and flushing once — combined with
+    /// overwriting in place (clearing each line rather than the whole screen up
+    /// front) — removes the flicker a per-frame `Clear(All)` produced.
+    pub fn draw_screen(out: &mut impl Write, config: &DrawConfig) -> Result<usize> {
         let (terminal_width, terminal_height) = terminal::size()?;
         let header_height = 3;
         // One bottom line for the status bar (the per-checkpoint totals now live
@@ -155,7 +151,7 @@ impl UI {
         if config.health_warning {
             queue!(out, SetForegroundColor(palette::ERROR))?;
             write!(out, "   ⚠ index/file mismatch — press ")?;
-            key_hint(&mut out, "h")?;
+            key_hint(&mut *out, "h")?;
             queue!(out, ResetColor)?;
         }
         write!(out, "\r\n")?;
@@ -164,13 +160,13 @@ impl UI {
             queue!(out, SetForegroundColor(palette::DIM))?;
             write!(out, "Search ")?;
             queue!(out, ResetColor)?;
-            input_box(&mut out, config.search_query, 16)?;
+            input_box(&mut *out, config.search_query, 16)?;
             write!(out, "  ")?;
-            hint_line(&mut out, &[("Enter", "view"), ("Esc/q", "exit")])?;
+            hint_line(&mut *out, &[("Enter", "view"), ("Esc/q", "exit")])?;
             write!(out, "\r\n")?;
         } else {
             hint_line(
-                &mut out,
+                &mut *out,
                 &[
                     ("↑/↓", "navigate"),
                     ("←/→", "parent/child"),
@@ -178,7 +174,8 @@ impl UI {
                     ("Enter/Space", "expand"),
                     ("E/C", "all"),
                     ("/", "search"),
-                    ("c", "copy"),
+                    ("c", "copy screen"),
+                    ("f", "copy file"),
                     ("⌫/\\", "back/fwd"),
                     ("q", "quit"),
                 ],
@@ -216,7 +213,7 @@ impl UI {
                 )?;
             }
 
-            Self::draw_node(node, *depth, &mut out)?;
+            Self::draw_node(node, *depth, &mut *out)?;
 
             if is_selected {
                 queue!(out, ResetColor)?;
@@ -236,7 +233,7 @@ impl UI {
                 "No results found for \"{}\" | Press ",
                 config.search_query
             )?;
-            key_hint(&mut out, "Esc")?;
+            key_hint(&mut *out, "Esc")?;
             write!(out, " to exit search\r")?;
         } else if !config.status_bar.is_empty() {
             // A colored chip: leading glyph + the path/text, truncated tail-first
@@ -363,26 +360,25 @@ impl UI {
     /// gates the `d` hint. Rendered flicker-free so it can also serve as the
     /// live preview while choosing a dtype in the menu.
     pub fn draw_tensor_detail(
+        out: &mut impl Write,
         tensor: &TensorInfo,
         view: ViewDtype,
         overridable: bool,
         stats: StatsView,
     ) -> Result<()> {
-        let stdout = io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
         queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
 
         write!(out, "Tensor Details")?;
-        line_end(&mut out)?;
+        line_end(&mut *out)?;
         write!(out, "==============")?;
-        line_end(&mut out)?;
+        line_end(&mut *out)?;
         write!(out, "Name: {}", tensor.name)?;
-        line_end(&mut out)?;
+        line_end(&mut *out)?;
 
         // Data type, with the active reinterpretation highlighted.
         write!(out, "Data Type: ")?;
-        write_view_dtype(&mut out, &tensor.dtype, view)?;
-        line_end(&mut out)?;
+        write_view_dtype(&mut *out, &tensor.dtype, view)?;
+        line_end(&mut *out)?;
 
         // Shape and parameter count reflect the override (a packed view unpacks
         // several values per stored element, growing the last dimension); show
@@ -390,15 +386,15 @@ impl UI {
         let shape = view.logical_shape(&tensor.shape, &tensor.dtype);
         let num_elements: usize = shape.iter().product();
         write!(out, "Shape: ")?;
-        write_view_shape(&mut out, &tensor.shape, &shape)?;
-        line_end(&mut out)?;
+        write_view_shape(&mut *out, &tensor.shape, &shape)?;
+        line_end(&mut *out)?;
         write!(
             out,
             "Parameters: {} ({})",
             format_parameters(num_elements),
             with_thousands(num_elements)
         )?;
-        line_end(&mut out)?;
+        line_end(&mut *out)?;
 
         write!(out, "Size: {}", format_size(tensor.size_bytes))?;
         // On-disk size + codec on the same line, for formats that track
@@ -427,7 +423,7 @@ impl UI {
             }
             Storage::Unknown => {}
         }
-        line_end(&mut out)?;
+        line_end(&mut *out)?;
         // Where the data lives within the file.
         match &tensor.layout {
             Layout::ByteRange { start, end } => {
@@ -437,7 +433,7 @@ impl UI {
                     with_thousands(*start as usize),
                     with_thousands(*end as usize)
                 )?;
-                line_end(&mut out)?;
+                line_end(&mut *out)?;
             }
             Layout::Offset(offset) => {
                 write!(
@@ -445,7 +441,7 @@ impl UI {
                     "Data offset: {}  (within tensor data)",
                     with_thousands(*offset as usize)
                 )?;
-                line_end(&mut out)?;
+                line_end(&mut *out)?;
             }
             Layout::Chunked { chunk, num_chunks } => {
                 write!(
@@ -454,13 +450,13 @@ impl UI {
                     format_shape(chunk),
                     with_thousands(*num_chunks)
                 )?;
-                line_end(&mut out)?;
+                line_end(&mut *out)?;
             }
             Layout::None => {}
         }
         write!(out, "File: {}", tensor.source_path)?;
-        line_end(&mut out)?;
-        line_end(&mut out)?;
+        line_end(&mut *out)?;
+        line_end(&mut *out)?;
 
         // Exact whole-tensor statistics: shown once computed, else a hint.
         match stats {
@@ -474,38 +470,40 @@ impl UI {
                     fmt_value(s.min, integer),
                     fmt_value(s.max, integer)
                 )?;
-                write_stats_line(&mut out, s)?;
+                write_stats_line(&mut *out, s)?;
             }
             StatsView::Computing { spinner, elapsed } => {
                 write!(out, "Statistics: ")?;
-                write_computing(&mut out, spinner, elapsed)?;
+                write_computing(&mut *out, spinner, elapsed)?;
             }
             StatsView::Pending => {
                 queue!(out, SetForegroundColor(palette::DIM))?;
                 write!(out, "Statistics: press ")?;
                 queue!(out, ResetColor)?;
-                key_hint(&mut out, "s")?;
+                key_hint(&mut *out, "s")?;
                 queue!(out, SetForegroundColor(palette::DIM))?;
                 write!(out, " to scan the full tensor")?;
                 queue!(out, ResetColor)?;
             }
         }
-        line_end(&mut out)?;
-        line_end(&mut out)?;
+        line_end(&mut *out)?;
+        line_end(&mut *out)?;
 
         // Footer hints (keys highlighted).
         write!(out, "Press ")?;
-        key_hint(&mut out, "m")?;
+        key_hint(&mut *out, "m")?;
         write!(out, " for a heatmap, ")?;
-        key_hint(&mut out, "v")?;
+        key_hint(&mut *out, "v")?;
         write!(out, " for numeric values, ")?;
         if overridable {
-            key_hint(&mut out, "d")?;
+            key_hint(&mut *out, "d")?;
             write!(out, " to reinterpret the dtype, ")?;
         }
-        key_hint(&mut out, "⌫")?;
+        key_hint(&mut *out, "c")?;
+        write!(out, " to copy, ")?;
+        key_hint(&mut *out, "⌫")?;
         write!(out, " / ")?;
-        key_hint(&mut out, "\\")?;
+        key_hint(&mut *out, "\\")?;
         write!(out, " to step back / forward, any other key to return...")?;
 
         // No trailing newline (avoids scrolling); clear anything below.
@@ -550,9 +548,12 @@ impl UI {
     /// upper-half block `▀` whose foreground is the value above and background
     /// the value below, so one text row shows two data rows — doubling the
     /// vertical resolution (a terminal cell is ~twice as tall as it is wide).
-    pub fn draw_heatmap(tensor: &TensorInfo, sample: &Sample, stats: StatsView) -> Result<()> {
-        let stdout = io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
+    pub fn draw_heatmap(
+        out: &mut impl Write,
+        tensor: &TensorInfo,
+        sample: &Sample,
+        stats: StatsView,
+    ) -> Result<()> {
         // Present the whole frame atomically (the terminal buffers everything
         // between Begin/End and paints it in one go, so a redraw never shows a
         // half-updated screen — this is what eliminates the flicker). We also
@@ -562,7 +563,7 @@ impl UI {
         queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
 
         write!(out, "Heatmap: {}", tensor.name)?;
-        line_end(&mut out)?;
+        line_end(&mut *out)?;
         let integer = sample.view.is_integer(&tensor.dtype);
         // Use the exact whole-tensor range (and color scale) once stats are
         // ready; otherwise fall back to the sampled range, flagged as such.
@@ -577,10 +578,10 @@ impl UI {
         } else {
             " (sampled)"
         };
-        write_view_dtype(&mut out, &tensor.dtype, sample.view)?;
+        write_view_dtype(&mut *out, &tensor.dtype, sample.view)?;
         write!(out, " ")?;
         let logical = sample.view.logical_shape(&tensor.shape, &tensor.dtype);
-        write_view_shape(&mut out, &tensor.shape, &logical)?;
+        write_view_shape(&mut *out, &tensor.shape, &logical)?;
         let what = if matches!(sample.mode, SampleMode::Edges { .. }) {
             "edges"
         } else {
@@ -592,13 +593,13 @@ impl UI {
             sample.rows.len(),
             sample.cols.len(),
         )?;
-        line_end(&mut out)?;
-        write_stats_view(&mut out, stats)?;
+        line_end(&mut *out)?;
+        write_stats_view(&mut *out, stats)?;
         if sample.slices > 1 {
-            write_slice_header(&mut out, sample)?;
-            line_end(&mut out)?;
+            write_slice_header(&mut *out, sample)?;
+            line_end(&mut *out)?;
         }
-        line_end(&mut out)?;
+        line_end(&mut *out)?;
 
         let range = rmax - rmin;
         let norm = |v: f64| {
@@ -620,11 +621,11 @@ impl UI {
                 write!(out, "▀")?;
             }
             queue!(out, ResetColor)?;
-            line_end(&mut out)?;
+            line_end(&mut *out)?;
             r += 2;
         }
 
-        line_end(&mut out)?;
+        line_end(&mut *out)?;
         write!(out, "{lo} low ")?;
         for i in 0..24 {
             queue!(out, SetForegroundColor(heat_color(i as f64 / 23.0)))?;
@@ -632,10 +633,10 @@ impl UI {
         }
         queue!(out, ResetColor)?;
         write!(out, " high {hi}")?;
-        line_end(&mut out)?;
+        line_end(&mut *out)?;
 
-        line_end(&mut out)?;
-        write_view_footer(&mut out, sample, true, StripeMode::Off)?;
+        line_end(&mut *out)?;
+        write_view_footer(&mut *out, sample, true, StripeMode::Off)?;
 
         // Clear the footer's tail and everything below (no trailing newline),
         // then end the synchronized frame.
@@ -651,6 +652,7 @@ impl UI {
     /// Render a sampled tensor as a grid of numeric values with row/column
     /// indices (edges included).
     pub fn draw_values(
+        out: &mut impl Write,
         tensor: &TensorInfo,
         sample: &Sample,
         stats: StatsView,
@@ -660,17 +662,15 @@ impl UI {
         // notation, while small integers (incl. sparse values in a wide dtype)
         // are 1-3 digits, so we pack many narrow columns onto the screen.
         let cw = sample.view.cell_width(&tensor.dtype, stats.value_range());
-        let stdout = io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
         // Synchronized, in-place overwrite (see `draw_heatmap`) to avoid flicker.
         queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
 
         write!(out, "Values: {}", tensor.name)?;
-        line_end(&mut out)?;
-        write_view_dtype(&mut out, &tensor.dtype, sample.view)?;
+        line_end(&mut *out)?;
+        write_view_dtype(&mut *out, &tensor.dtype, sample.view)?;
         write!(out, " ")?;
         let logical = sample.view.logical_shape(&tensor.shape, &tensor.dtype);
-        write_view_shape(&mut out, &tensor.shape, &logical)?;
+        write_view_shape(&mut *out, &tensor.shape, &logical)?;
         // In edges mode the grid is the first/last rows & columns (for padding);
         // otherwise an evenly-spaced overview.
         let edges = matches!(sample.mode, SampleMode::Edges { .. });
@@ -693,13 +693,13 @@ impl UI {
                 sample.total_cols
             )?;
         }
-        line_end(&mut out)?;
-        write_stats_view(&mut out, stats)?;
+        line_end(&mut *out)?;
+        write_stats_view(&mut *out, stats)?;
         if sample.slices > 1 {
-            write_slice_header(&mut out, sample)?;
-            line_end(&mut out)?;
+            write_slice_header(&mut *out, sample)?;
+            line_end(&mut *out)?;
         }
-        line_end(&mut out)?;
+        line_end(&mut *out)?;
 
         // In edges mode, the index after which rows/cols jump (the padding
         // boundary), so we can draw a dotted separator there. `None` in grid
@@ -780,11 +780,11 @@ impl UI {
             queue!(out, SetForegroundColor(palette::DIM))?;
             write!(out, "{}", top.trim_end())?;
             queue!(out, ResetColor)?;
-            line_end(&mut out)?;
+            line_end(&mut *out)?;
             queue!(out, SetForegroundColor(palette::DIM))?;
             write!(out, "{}", bot.trim_end())?;
             queue!(out, ResetColor)?;
-            line_end(&mut out)?;
+            line_end(&mut *out)?;
         } else {
             queue!(out, SetForegroundColor(palette::DIM))?;
             write!(out, "{:>lw$}", "")?;
@@ -795,7 +795,7 @@ impl UI {
                 }
             }
             queue!(out, ResetColor)?;
-            line_end(&mut out)?;
+            line_end(&mut *out)?;
         }
 
         // Integer dtypes print as plain integers; floats use scientific notation.
@@ -827,16 +827,16 @@ impl UI {
                     format!("{v:>cw$.3e}")
                 };
                 let bg = (stripe == StripeMode::Cols).then(|| band(vcol));
-                write_grid_cell(&mut out, &s, bg, false)?;
+                write_grid_cell(&mut *out, &s, bg, false)?;
                 vcol += 1;
                 if Some(j) == col_gap {
                     let bg = (stripe == StripeMode::Cols).then(|| band(vcol));
-                    write_grid_cell(&mut out, &format!("{:>cw$}", "⋯"), bg, true)?;
+                    write_grid_cell(&mut *out, &format!("{:>cw$}", "⋯"), bg, true)?;
                     vcol += 1;
                 }
             }
             queue!(out, ResetColor)?;
-            line_end(&mut out)?;
+            line_end(&mut *out)?;
             // Dotted row after the gap to mark the rows that were skipped.
             if Some(i) == row_gap {
                 queue!(out, SetForegroundColor(palette::DIM))?;
@@ -848,12 +848,12 @@ impl UI {
                     }
                 }
                 queue!(out, ResetColor)?;
-                line_end(&mut out)?;
+                line_end(&mut *out)?;
             }
         }
 
-        line_end(&mut out)?;
-        write_view_footer(&mut out, sample, false, stripe)?;
+        line_end(&mut *out)?;
+        write_view_footer(&mut *out, sample, false, stripe)?;
 
         queue!(
             out,
@@ -1154,6 +1154,8 @@ fn write_view_footer(
             StripeMode::Off => ("z", "zebra: off"),
         });
     }
+    // Copy the screen's text to the clipboard.
+    items.push(("c", "copy"));
     // Step back / forward through the screen history.
     items.push(("⌫", "back"));
     items.push(("\\", "fwd"));
