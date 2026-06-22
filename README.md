@@ -250,8 +250,12 @@ browsing the tree stays fast). Results are cached per tensor (and per dtype
 override) for the session, and the scan time is shown dimmed next to the stats.
 Scanning a multi-GB tensor takes a moment the first time (it's largely
 disk/NFS-bound); the scan runs on a worker thread with an animated spinner and a
-running timer. Pressing any key cancels the scan and returns (`Ctrl+C` quits the
-app), so a slow scan never traps you.
+running timer. In the heatmap/numeric views the scan stays **out of your way** —
+you can keep switching the layout (overview / edges / window), panning, stepping
+slices, and reinterpreting the dtype while it computes; the values are shown from
+the sampled range until the exact stats land. Switching the dtype restarts the
+scan for the new view. Leaving the view cancels it. (On the detail screen, where
+there's nothing else to do, any key cancels the scan; `Ctrl+C` always quits.)
 
 Both views also sample a grid that fits the screen (they never read the whole
 tensor for the *display* — only each sampled row's column span). Both the

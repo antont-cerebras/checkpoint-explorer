@@ -772,9 +772,51 @@ fn reduce_view_bytes(bytes: &[u8], item: usize, view: ViewDtype, dtype: &str) ->
         .reduce(|| Acc::ID, Acc::merge)
 }
 
-/// Largest block, in elements, read at once when scanning a tensor for stats —
-/// keeps peak memory bounded regardless of tensor size.
+/// Largest block, in elements, read at once when scanning a contiguous tensor
+/// (the default reader) for stats — keeps peak memory bounded regardless of size.
 const STATS_BLOCK_ELEMS: usize = 16 << 20; // ≈16M elements
+
+/// Target tile size, in elements, for the chunk-aligned HDF5 stats scan. Small
+/// on purpose: each tile read holds libhdf5's lock only briefly, so a concurrent
+/// foreground read stays responsive while a background scan runs. Each chunk is
+/// still decompressed once, so the total scan work is unchanged.
+#[cfg(feature = "hdf5")]
+const STATS_TILE_ELEMS: usize = 2 << 20; // ≈2M elements
+
+/// A chunk-aligned tile shape whose element count stays within `budget`, growing
+/// inner (faster-varying) dimensions first for read contiguity. Each extent is a
+/// multiple of the chunk extent (clamped to the shape), so tiles land on the
+/// chunk grid and libhdf5 decompresses each chunk exactly once. Never smaller
+/// than a single chunk (the smallest aligned read), even if that exceeds budget.
+#[cfg(feature = "hdf5")]
+fn stats_tile_shape(shape: &[usize], chunk: &[usize], budget: usize) -> Vec<usize> {
+    let n = shape.len();
+    // Start at one chunk per dimension (clamped to the shape).
+    let mut tile: Vec<usize> = (0..n)
+        .map(|d| chunk[d].max(1).min(shape[d].max(1)))
+        .collect();
+    // Grow inner dimensions first while staying within the element budget.
+    for d in (0..n).rev() {
+        if tile[d] >= shape[d] {
+            continue; // already spans the whole dimension
+        }
+        let others: usize = tile
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != d)
+            .map(|(_, &t)| t)
+            .product::<usize>()
+            .max(1);
+        let c = chunk[d].max(1);
+        // Largest chunk-multiple for this dimension that keeps `tile` ≤ budget.
+        let grown = ((budget / others / c).max(1) * c).min(shape[d]);
+        tile[d] = grown;
+        if grown < shape[d] {
+            break; // this dimension is the frontier; leave outer dims at one chunk
+        }
+    }
+    tile
+}
 
 /// Format-agnostic access to one tensor's stored bytes. An implementation opens
 /// its backing store once (a memory-mapped safetensors file, an HDF5 dataset, …)
@@ -927,14 +969,27 @@ fn gather_region(
 /// Compute exact statistics over the whole tensor under `view`, scanning every
 /// element once and decoding in parallel. Works the same for any backing format
 /// via [`TensorReader`]; a non-`Stored` view reinterprets the raw stored bytes.
-pub fn tensor_stats(t: &TensorInfo, view: ViewDtype, cancel: &AtomicBool) -> Result<Stats, String> {
+pub fn tensor_stats(
+    t: &TensorInfo,
+    view: ViewDtype,
+    cancel: &AtomicBool,
+    pause: &AtomicBool,
+) -> Result<Stats, String> {
     let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
     let started = std::time::Instant::now();
     let reader = open_reader(t)?;
     let mut acc = Acc::ID;
     reader.fold_blocks(&mut |bytes| {
         acc = Acc::merge(acc, reduce_view_bytes(bytes, item, view, &t.dtype));
-        // Stop between blocks when the caller cancels (e.g. a key press).
+        // Wait here while paused — this is between block reads, so the backing
+        // file's lock (libhdf5 serialises all access) is released, letting a
+        // foreground read such as the dtype menu's live preview run without
+        // contending; the scan resumes from this block when unpaused. Cancel
+        // takes priority so a paused scan still tears down promptly.
+        while pause.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+        // Stop between blocks when the caller cancels (e.g. leaving the view).
         if cancel.load(Ordering::Relaxed) {
             ControlFlow::Break(())
         } else {
@@ -1221,45 +1276,43 @@ impl TensorReader for Hdf5Reader {
             })
             .map(|_| ());
         }
-        let outer = shape[0];
-        let inner: usize = shape[1..].iter().product::<usize>().max(1);
-        // Stream in leading-dim blocks sized to the element budget, but rounded
-        // up to a whole number of chunk rows. A block that splits the chunk's
-        // leading extent makes libhdf5 decompress each overlapping chunk once per
-        // block it touches — e.g. a 1-row block against a 4-row chunk
-        // decompresses every chunk 4×. Aligning to the chunk reads each once.
-        let chunk0 = self
-            .dataset
-            .chunk()
-            .and_then(|c| c.first().copied())
-            .unwrap_or(1)
-            .max(1);
-        let budget_rows = (STATS_BLOCK_ELEMS / inner).max(1);
-        // Cap the block so a tall chunk can't force a multi-GiB read; past that we
-        // accept some redundant decompression in exchange for bounded memory.
-        const MAX_BLOCK_ELEMS: usize = 256 << 20;
-        let max_rows = (MAX_BLOCK_ELEMS / inner).max(1);
-        let block = if chunk0 <= max_rows {
-            budget_rows.max(chunk0).div_ceil(chunk0) * chunk0
-        } else {
-            budget_rows
-        };
-        let mut i = 0;
-        while i < outer {
-            let hi = (i + block).min(outer);
-            let mut ranges: Vec<Range<usize>> = Vec::with_capacity(shape.len());
-            ranges.push(i..hi);
-            ranges.extend(shape[1..].iter().map(|&d| 0..d));
+        // Walk the tensor in chunk-aligned tiles bounded by a small element
+        // budget. Aligning to the chunk grid means libhdf5 decompresses each
+        // chunk exactly once (a tile that split a chunk would re-decompress it);
+        // keeping the tiles small means the dataset lock — libhdf5 serialises all
+        // access — is released between reads, so a concurrent foreground read
+        // (e.g. re-sampling the data view while this scan runs in the background)
+        // isn't stuck behind a big block. A contiguous dataset has no chunks, so
+        // we tile on a unit grid (any split is free without compression).
+        let ndim = shape.len();
+        let chunk = self.dataset.chunk().unwrap_or_else(|| vec![1; ndim]);
+        let tile = stats_tile_shape(shape, &chunk, STATS_TILE_ELEMS);
+        let mut origin = vec![0usize; ndim];
+        loop {
+            let ranges: Vec<Range<usize>> = (0..ndim)
+                .map(|d| origin[d]..(origin[d] + tile[d]).min(shape[d]))
+                .collect();
             let flow =
                 with_hdf5_block_bytes(&self.dataset, Self::hyperslab(&ranges), &self.dtype, |b| {
                     f(b)
                 })?;
             if flow.is_break() {
-                break;
+                return Ok(());
             }
-            i = hi;
+            // Advance the tile odometer, innermost dimension first.
+            let mut d = ndim - 1;
+            loop {
+                origin[d] += tile[d];
+                if origin[d] < shape[d] {
+                    break;
+                }
+                origin[d] = 0;
+                if d == 0 {
+                    return Ok(());
+                }
+                d -= 1;
+            }
         }
-        Ok(())
     }
 }
 
@@ -1465,6 +1518,22 @@ mod tests {
         assert_eq!(&b[..3], &[0, 1, 2]);
         assert_eq!(b.len(), 12);
         assert_eq!(&b[3..], &[91, 92, 93, 94, 95, 96, 97, 98, 99]);
+    }
+
+    #[cfg(feature = "hdf5")]
+    #[test]
+    fn stats_tile_shape_is_chunk_aligned_and_bounded() {
+        // Monolith case: fill the innermost dim fully, then one chunk of the next.
+        assert_eq!(
+            stats_tile_shape(&[128, 3088, 1, 2992], &[4, 97, 1, 187], 2 << 20),
+            vec![4, 97, 1, 2992]
+        );
+        // Contiguous (unit chunks): inner dim fills, outer dim is the frontier.
+        let c = stats_tile_shape(&[100, 50], &[1, 1], 1000);
+        assert_eq!(c, vec![20, 50]);
+        assert!(c.iter().product::<usize>() <= 1000);
+        // A single chunk already over budget → tile is exactly one chunk.
+        assert_eq!(stats_tile_shape(&[10, 10], &[10, 10], 4), vec![10, 10]);
     }
 
     #[test]
@@ -1682,7 +1751,13 @@ mod tests {
         drop(f);
 
         let t = fixture(&path, "w", &[4, 5], (0, 80));
-        let s = tensor_stats(&t, ViewDtype::Stored, &AtomicBool::new(false)).unwrap();
+        let s = tensor_stats(
+            &t,
+            ViewDtype::Stored,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(s.count, 20);
         assert_eq!((s.min, s.max), (0.0, 19.0));
         assert!((s.mean - 9.5).abs() < 1e-9);
@@ -1854,7 +1929,12 @@ mod hdf5_tests {
             .expect("tensor");
         eprintln!("tensor {} dtype={} shape={:?}", t.name, t.dtype, t.shape);
         let started = std::time::Instant::now();
-        match tensor_stats(&t, ViewDtype::Stored, &AtomicBool::new(false)) {
+        match tensor_stats(
+            &t,
+            ViewDtype::Stored,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        ) {
             Ok(s) => eprintln!("ok in {:?}: {s:?}", started.elapsed()),
             Err(e) => eprintln!("ERR in {:?}: {e}", started.elapsed()),
         }
@@ -1896,7 +1976,13 @@ mod hdf5_tests {
 
         // Exact stats over the whole dataset (raw byte read + streaming scan).
         // Values 0..=19, so mean 9.5 and one zero.
-        let st = tensor_stats(&t, ViewDtype::Stored, &AtomicBool::new(false)).unwrap();
+        let st = tensor_stats(
+            &t,
+            ViewDtype::Stored,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(st.count, 20);
         assert_eq!((st.min, st.max), (0.0, 19.0));
         assert!((st.mean - 9.5).abs() < 1e-9);
@@ -1943,7 +2029,13 @@ mod hdf5_tests {
         assert_eq!(p.values[0], vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0]);
 
         // Stats under the packed view see all eight unpacked nibbles.
-        let st = tensor_stats(&t, ViewDtype::U4Packed, &AtomicBool::new(false)).unwrap();
+        let st = tensor_stats(
+            &t,
+            ViewDtype::U4Packed,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(st.count, 8);
         assert_eq!((st.min, st.max), (0.0, 4.0));
 

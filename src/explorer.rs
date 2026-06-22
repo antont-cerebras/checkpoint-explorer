@@ -102,6 +102,54 @@ struct CachedReader {
     reader: Box<dyn crate::sample::TensorReader>,
 }
 
+/// A spinner cycled while a statistics scan runs (Braille dots).
+const STATS_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// A statistics scan running on a worker thread for a data view's current
+/// `(tensor, view)`. The view stays fully interactive while it runs; the main
+/// loop polls [`Self::handle`], caches the result when it lands, and animates the
+/// spinner meanwhile. Dropping the job — because the view closed or the dtype
+/// changed — cancels the worker at its next block boundary so no work is wasted.
+struct ScanJob {
+    view: ViewDtype,
+    cancel: Arc<AtomicBool>,
+    /// Set to make the worker wait between blocks (releasing the file lock) so a
+    /// foreground read can run uncontended; cleared to resume where it left off.
+    pause: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<Result<Stats, String>>>,
+    started: std::time::Instant,
+}
+
+impl Drop for ScanJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The last sample a data view rendered, reused when nothing that affects it
+/// changed. This keeps the spinner-frame redraws during a stats scan from
+/// re-reading (and, for HDF5, re-decompressing) the tensor every frame — those
+/// reads block on the scan worker's HDF5 lock, which otherwise lags the UI and
+/// lets keystrokes pile up. Keyed by everything the sampled grid depends on.
+struct CachedSample {
+    key: SampleKey,
+    sample: crate::sample::Sample,
+}
+
+/// Everything that determines a data view's sampled grid. `max_rows`/`max_cols`
+/// fold in the terminal size and (for the numeric grid) the stats-derived cell
+/// width, so the key changes — and the grid re-samples once — when the exact
+/// stats land.
+type SampleKey = (
+    String,         // tensor name
+    Representation, // heatmap vs numeric grid
+    usize,          // slice
+    ViewDtype,      // dtype reinterpretation
+    SampleMode,     // layout + offsets / tails
+    usize,          // max_rows
+    usize,          // max_cols
+);
+
 /// Whether a screen waits for keys or renders once and returns (`--exit`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Interaction {
@@ -206,6 +254,9 @@ pub struct Explorer {
     /// The open reader for the data view's current tensor, reused across redraws
     /// (replaced when the viewed tensor changes). See [`CachedReader`].
     reader_cache: RefCell<Option<CachedReader>>,
+    /// The last sampled grid a data view drew, reused across identical redraws
+    /// (e.g. the spinner ticks during a stats scan). See [`CachedSample`].
+    sample_cache: RefCell<Option<CachedSample>>,
 }
 
 impl Explorer {
@@ -242,6 +293,7 @@ impl Explorer {
             data_view_stripe: Cell::new(StripeMode::default()),
             open,
             reader_cache: RefCell::new(None),
+            sample_cache: RefCell::new(None),
         }
     }
 
@@ -281,6 +333,27 @@ impl Explorer {
             .copied()
     }
 
+    /// Start a statistics scan for `(tensor, view)` on a worker thread. Used by
+    /// the data view, which polls the returned [`ScanJob`] and stays interactive
+    /// while it runs (see [`Self::run_data`]).
+    fn spawn_stats_scan(&self, tensor: &TensorInfo, view: ViewDtype) -> ScanJob {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
+        let owned = tensor.clone();
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_pause = Arc::clone(&pause);
+        let handle = std::thread::spawn(move || {
+            crate::sample::tensor_stats(&owned, view, &worker_cancel, &worker_pause)
+        });
+        ScanJob {
+            view,
+            cancel,
+            pause,
+            handle: Some(handle),
+            started: std::time::Instant::now(),
+        }
+    }
+
     /// Compute and cache exact statistics for `(tensor, view)` on a miss. The
     /// scan runs on a worker thread; while it runs, `redraw` is called each frame
     /// with a [`StatsView::Computing`] state so the caller can animate a spinner
@@ -302,10 +375,14 @@ impl Explorer {
         // return without joining, so the UI is responsive and the worker winds
         // down on its own at the next block boundary.
         let cancel = Arc::new(AtomicBool::new(false));
+        // The detail-screen scan has nothing to interleave with, so it never pauses.
+        let pause = Arc::new(AtomicBool::new(false));
         let owned = tensor.clone();
         let worker_cancel = Arc::clone(&cancel);
-        let handle =
-            std::thread::spawn(move || crate::sample::tensor_stats(&owned, view, &worker_cancel));
+        let worker_pause = Arc::clone(&pause);
+        let handle = std::thread::spawn(move || {
+            crate::sample::tensor_stats(&owned, view, &worker_cancel, &worker_pause)
+        });
 
         const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         let started = std::time::Instant::now();
@@ -1497,6 +1574,11 @@ impl Explorer {
         let tensor = &tensor;
         let mut repr = repr;
         let mut slice = start_slice;
+        // The exact-stats scan for the current `(tensor, view)`, running on a
+        // worker thread so the view stays interactive while it computes; `None`
+        // once the stats are cached. `spin_frame` advances the spinner.
+        let mut scan: Option<ScanJob> = None;
+        let mut spin_frame = 0usize;
         loop {
             // The data-view layout is a session-remembered preference, so it
             // sticks as you move between tensors and in/out of the preview.
@@ -1519,28 +1601,54 @@ impl Explorer {
                 .copied()
                 .unwrap_or(ViewDtype::Stored);
 
-            // Exact stats power the value range, heatmap scale and stats line.
-            // Compute them once (cached), animating the spinner on this very
-            // heatmap/grid — the data view redraws each frame with the running
-            // timer in its stats line. A key press cancels the scan and leaves
-            // the view (back to the detail screen).
-            if self.compute_stats_animated(tensor, view, |sv| {
-                let _ = self.draw_data_view(&mut live_out(), tensor, repr, slice, view, mode, sv);
-            }) == ScanOutcome::Cancelled
-            {
-                // Cancelling the scan leaves the data view the same way a normal
-                // exit does — to the tensor's detail screen, not back to the tree.
-                return (
-                    Nav::Open(Screen::Detail {
-                        tensor: tensor.name.clone(),
-                        slice,
-                    }),
-                    repr,
-                    slice,
-                );
-            }
+            // Exact stats power the value range, heatmap scale and stats line, but
+            // the scan can take a while on a big tensor. Run it on a worker thread
+            // and keep the view fully interactive while it computes: switching the
+            // dtype restarts the scan for the new view, while a layout/slice/pan
+            // change just re-renders (the stats are whole-tensor, layout-agnostic).
+            // The result is cached the moment it lands.
             let stats = self.cached_stats(tensor, view);
-            let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
+            let stats_view = match &stats {
+                Some(s) => {
+                    scan = None;
+                    StatsView::Ready(s)
+                }
+                None => {
+                    // (Re)start the scan when none is running or it's for a stale
+                    // view; dropping the old job cancels its worker.
+                    if scan.as_ref().is_none_or(|j| j.view != view) {
+                        scan = Some(self.spawn_stats_scan(tensor, view));
+                    }
+                    let finished = scan
+                        .as_ref()
+                        .and_then(|j| j.handle.as_ref())
+                        .is_some_and(|h| h.is_finished());
+                    // One-shot mode (`--exit`) has no interactivity, so just wait
+                    // for the scan; interactively, harvest it once it's finished.
+                    if interaction == Interaction::OneShot || finished {
+                        let mut job = scan.take().unwrap();
+                        if let Some(h) = job.handle.take()
+                            && let Ok(Ok(s)) = h.join()
+                        {
+                            self.stats_cache
+                                .borrow_mut()
+                                .insert((tensor.name.clone(), view), s);
+                        }
+                        continue; // redraw with the freshly cached stats
+                    }
+                    // Hold off the spinner briefly so a quick scan doesn't flash it.
+                    let job = scan.as_ref().unwrap();
+                    if job.started.elapsed() >= std::time::Duration::from_millis(120) {
+                        spin_frame = spin_frame.wrapping_add(1);
+                        StatsView::Computing {
+                            spinner: STATS_SPINNER[spin_frame % STATS_SPINNER.len()],
+                            elapsed: job.started.elapsed(),
+                        }
+                    } else {
+                        StatsView::Pending
+                    }
+                }
+            };
 
             // (slices, overridable, clamped slice) on success.
             let (slices, overridable) = match self.draw_data_view(
@@ -1581,14 +1689,30 @@ impl Explorer {
                 return (Nav::Quit, repr, slice);
             }
 
-            // Read one event (blocking), then coalesce any buffered follow-ups
-            // (an arrow key's auto-repeat) before redrawing. Each redraw
-            // re-samples the tensor — slower than the key-repeat rate — so
-            // without draining, held keys pile up and the separator keeps
-            // "coasting" through the backlog after release. Applying the whole
-            // burst, then redrawing once, keeps it smooth and stops the moment
-            // the key lifts.
-            let mut pending = event::read();
+            // Read one event, then coalesce any buffered follow-ups (an arrow
+            // key's auto-repeat) before redrawing. Each redraw re-samples the
+            // tensor — slower than the key-repeat rate — so without draining, held
+            // keys pile up and the separator keeps "coasting" through the backlog
+            // after release. Applying the whole burst, then redrawing once, keeps
+            // it smooth and stops the moment the key lifts. While a scan is
+            // running we poll instead of blocking, so the spinner keeps ticking
+            // and a finished scan is harvested promptly.
+            let mut pending = if let Some(job) = &scan {
+                if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false) {
+                    // Input pending — give the foreground priority: pause the scan
+                    // (it releases the HDF5 lock between blocks) so the re-sample
+                    // this keypress triggers isn't stuck behind a long block read,
+                    // which is what made dtype/layout changes lag and buffer keys.
+                    // It resumes the moment input goes idle (the else branch).
+                    job.pause.store(true, Ordering::Relaxed);
+                    event::read()
+                } else {
+                    job.pause.store(false, Ordering::Relaxed);
+                    continue; // idle — let the scan run; spinner reuses the cache
+                }
+            } else {
+                event::read()
+            };
             loop {
                 match pending {
                     Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
@@ -1685,7 +1809,12 @@ impl Explorer {
                             KeyCode::End if window => self.data_view_win_col.set(usize::MAX),
                             KeyCode::PageUp if window => self.data_view_win_row.set(0),
                             KeyCode::PageDown if window => self.data_view_win_row.set(usize::MAX),
-                            // Open the dtype menu; `d` or `D`.
+                            // Open the dtype menu; `d` or `D`. The scan keeps
+                            // running (paused while input flows, see the event
+                            // wait below), so its live previews read uncontended
+                            // and an accidental press you `Esc` out of never throws
+                            // away a long computation. Picking a *different* dtype
+                            // changes the view, which restarts the scan for it.
                             KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
                                 if let Some(chosen) = self
                                     .prompt_dtype(tensor, DtypePreview::Data { repr, slice, mode })
@@ -1798,27 +1927,53 @@ impl Explorer {
             .set(crate::sample::edge_total(max_rows));
         self.edge_col_budget
             .set(crate::sample::edge_total(max_cols));
-        let sample = self.with_reader(tensor, |reader| {
-            crate::sample::sample_tensor_with(reader, tensor, max_rows, max_cols, slice, view, mode)
-        })?;
-        // In the window layout, read the clamped top-left corner and the visible
-        // size back from the rendered sample, so panning stays in bounds and a
-        // Shift+arrow strides exactly one screenful.
-        if let SampleMode::Window { .. } = mode {
-            self.data_view_win_row
-                .set(sample.rows.first().copied().unwrap_or(0));
-            self.data_view_win_col
-                .set(sample.cols.first().copied().unwrap_or(0));
-            self.win_page_rows.set(sample.rows.len().max(1));
-            self.win_page_cols.set(sample.cols.len().max(1));
+        // Reuse the last sample when nothing that affects the grid changed. This
+        // is what keeps a stats scan's spinner-frame redraws from re-reading the
+        // tensor every frame (which would block on the worker's HDF5 lock and lag
+        // the UI); only an actual change — dtype, layout, slice, pan, resize, or
+        // the exact stats landing — re-samples.
+        let key: SampleKey = (
+            tensor.name.clone(),
+            repr,
+            slice,
+            view,
+            mode,
+            max_rows,
+            max_cols,
+        );
+        let hit = self
+            .sample_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.key == key);
+        if !hit {
+            let sample = self.with_reader(tensor, |reader| {
+                crate::sample::sample_tensor_with(
+                    reader, tensor, max_rows, max_cols, slice, view, mode,
+                )
+            })?;
+            // In the window layout, read the clamped top-left corner and the
+            // visible size back from the rendered sample, so panning stays in
+            // bounds and a Shift+arrow strides exactly one screenful.
+            if let SampleMode::Window { .. } = mode {
+                self.data_view_win_row
+                    .set(sample.rows.first().copied().unwrap_or(0));
+                self.data_view_win_col
+                    .set(sample.cols.first().copied().unwrap_or(0));
+                self.win_page_rows.set(sample.rows.len().max(1));
+                self.win_page_cols.set(sample.cols.len().max(1));
+            }
+            *self.sample_cache.borrow_mut() = Some(CachedSample { key, sample });
         }
+        let cache = self.sample_cache.borrow();
+        let sample = &cache.as_ref().unwrap().sample;
         let info = (sample.slices, sample.overridable, sample.slice);
         match repr {
             Representation::Heatmap => {
-                UI::draw_heatmap(out, tensor, &sample, stats).map_err(|e| e.to_string())?;
+                UI::draw_heatmap(out, tensor, sample, stats).map_err(|e| e.to_string())?;
             }
             Representation::Values => {
-                UI::draw_values(out, tensor, &sample, stats, self.data_view_stripe.get())
+                UI::draw_values(out, tensor, sample, stats, self.data_view_stripe.get())
                     .map_err(|e| e.to_string())?;
             }
         }
