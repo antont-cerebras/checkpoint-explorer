@@ -146,7 +146,8 @@ keep exploring.
 | `Enter` / `Space` | Expand/collapse groups, view tensor details |
 | `E` / `C` | Expand all / collapse all groups |
 | `/` | Enter search mode to filter tensors |
-| `c` | Copy the selected row's path (tensor file, or a group/root's file or directory) |
+| `c` | Copy the current screen's text to the clipboard (works on every screen) |
+| `f` | Copy the selected row's File path (tensor file, or a group/root's file or directory) |
 | `h` | Show the checkpoint health report (when there is a mismatch) |
 | `Backspace` / `\` | Step **back** / **forward** through the screens you've visited (browser-style history) — e.g. reopen a view you just left |
 | `Esc` | Exit search mode |
@@ -158,11 +159,13 @@ tree, a tensor's detail, and its data views), so if you leave a screen by a
 stray key you can step right back to it — and forward again. (While the tree's
 search box is active, `Backspace` edits the query instead.)
 
-A status bar pinned to the bottom shows the file the selected tensor lives in
-(or, for a group/root, the single file or the shared directory of its tensors).
-Pressing `c` copies that path to the clipboard via the OSC 52 terminal escape —
-so copying the root yields the file or the checkpoint directory — and it works
-over SSH/tmux when the terminal supports it.
+`c` copies the **text of the current screen** to the clipboard — the tree
+listing, a tensor's detail, or a data view's grid — via the OSC 52 terminal
+escape, so it reaches your local clipboard even over SSH/tmux (when the terminal
+supports it). A status bar pinned to the bottom of the tree shows the file the
+selected tensor lives in (or, for a group/root, the single file or the shared
+directory of its tensors); `f` copies that path (so copying the root yields the
+file or the checkpoint directory).
 
 ### Search Feature
 
