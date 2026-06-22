@@ -128,6 +128,17 @@ pub fn parse_stripe_mode(s: &str) -> Result<StripeMode, String> {
     }
 }
 
+/// Which screen a legend explains. The legend (`l`) is context-sensitive — it
+/// lists only the glyphs and colour cues that appear on the screen it was opened
+/// from.
+#[derive(Clone, Copy)]
+pub enum Legend {
+    Tree,
+    Detail,
+    Heatmap,
+    Values,
+}
+
 pub struct UI;
 
 impl UI {
@@ -180,6 +191,7 @@ impl UI {
                 ("Enter/Space", "expand"),
                 ("E/C", "all"),
                 ("/", "search"),
+                ("l", "legend"),
                 ("c", "copy screen"),
                 ("f", "copy file"),
                 ("⌫/\\", "back/fwd"),
@@ -547,6 +559,8 @@ impl UI {
         }
         key_hint(&mut *out, "c")?;
         write!(out, " to copy, ")?;
+        key_hint(&mut *out, "l")?;
+        write!(out, " for the legend, ")?;
         key_hint(&mut *out, "⌫")?;
         write!(out, " / ")?;
         key_hint(&mut *out, "\\")?;
@@ -1213,6 +1227,267 @@ impl UI {
         stdout.flush()?;
         Ok(())
     }
+
+    /// Draw a context-sensitive legend explaining the glyphs (and a few colour
+    /// cues) on whichever screen the user opened it from (`l`). Full-screen and
+    /// flicker-free, like the detail view; the caller waits for a key, then
+    /// redraws its own screen over it.
+    pub fn draw_legend(legend: Legend) -> Result<()> {
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
+        queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
+
+        let title = match legend {
+            Legend::Tree => "Legend — checkpoint tree",
+            Legend::Detail => "Legend — tensor details",
+            Legend::Heatmap => "Legend — heatmap",
+            Legend::Values => "Legend — numeric values",
+        };
+        queue!(out, SetForegroundColor(palette::ACCENT))?;
+        write!(out, "{title}")?;
+        queue!(out, ResetColor, SetForegroundColor(palette::DIM))?;
+        line_end(&mut out)?;
+        write!(out, "{}", "─".repeat(title.chars().count()))?;
+        queue!(out, ResetColor)?;
+        line_end(&mut out)?;
+        line_end(&mut out)?;
+
+        match legend {
+            Legend::Tree => {
+                let rows = [
+                    (
+                        Some(palette::ACCENT),
+                        "▾ ▸",
+                        "a group, expanded / collapsed (Enter or Space toggles it)",
+                    ),
+                    (Some(palette::DIM), "·", "a tensor (a stored array)"),
+                    (Some(palette::DIM), "≡", "a metadata entry"),
+                    (
+                        None,
+                        "☰ N",
+                        "number of layers (numbered sub-groups) in the group",
+                    ),
+                    (None, "▦ N", "number of tensors in the group / checkpoint"),
+                    (
+                        None,
+                        "A → B",
+                        "logical size → on-disk size (shown only when they differ)",
+                    ),
+                    (
+                        Some(palette::DIM),
+                        "⇩ lz4",
+                        "compressed on disk; the codec is named after the glyph",
+                    ),
+                    (Some(palette::DIM), "(raw)", "stored uncompressed on disk"),
+                    (None, "", ""),
+                    (
+                        Some(palette::DTYPE),
+                        "I16",
+                        "the tensor's data type is tinted (warm amber)",
+                    ),
+                    (
+                        None,
+                        "▪ ▸",
+                        "status bar: a single source file / a directory of shards",
+                    ),
+                ];
+                let col = legend_desc_col(&rows, 0);
+                for (color, sym, desc) in rows {
+                    legend_line(&mut out, color, sym, desc, col)?;
+                }
+            }
+            Legend::Detail => {
+                let rows = [
+                    (
+                        Some(palette::DIM),
+                        "⇩ lz4",
+                        "on-disk compression codec; the N× beside it is the ratio (logical ÷ stored)",
+                    ),
+                    (
+                        Some(palette::KEY),
+                        "as",
+                        "the active dtype reinterpretation (press d), e.g. 'BF16 as u4 (packed)'",
+                    ),
+                    (
+                        None,
+                        "A – B",
+                        "a byte range within the file (the tensor's data offsets)",
+                    ),
+                    (Some(palette::DIM), "·", "separates fields on a line"),
+                    (
+                        Some(palette::KEY),
+                        "⠋",
+                        "a statistics scan is running (press s to start; any key cancels)",
+                    ),
+                ];
+                let col = legend_desc_col(&rows, 0);
+                for (color, sym, desc) in rows {
+                    legend_line(&mut out, color, sym, desc, col)?;
+                }
+                legend_line(&mut out, None, "", "", col)?;
+                queue!(
+                    out,
+                    terminal::Clear(ClearType::CurrentLine),
+                    SetForegroundColor(palette::DIM)
+                )?;
+                write!(
+                    out,
+                    "  Statistics:  zeros = fraction of exactly-zero values · non-finite = count of NaN/∞"
+                )?;
+                queue!(out, ResetColor)?;
+                write!(out, "\r\n")?;
+            }
+            Legend::Heatmap => {
+                let rows = [
+                    (
+                        None,
+                        "▀",
+                        "one cell packs two data rows: its top half is the upper row, its lower half the next",
+                    ),
+                    (
+                        None,
+                        "A → B",
+                        "the stored dtype/shape → the sampled grid size and value range",
+                    ),
+                ];
+                let col = legend_desc_col(&rows, 0);
+                for (color, sym, desc) in rows {
+                    legend_line(&mut out, color, sym, desc, col)?;
+                }
+                // The actual colour ramp, so the scale is unambiguous.
+                queue!(out, terminal::Clear(ClearType::CurrentLine))?;
+                write!(out, "  ")?;
+                queue!(out, SetForegroundColor(palette::DIM))?;
+                write!(out, "low ")?;
+                queue!(out, ResetColor)?;
+                for i in 0..24 {
+                    queue!(out, SetForegroundColor(heat_color(i as f64 / 23.0)))?;
+                    write!(out, "█")?;
+                }
+                queue!(out, ResetColor, SetForegroundColor(palette::DIM))?;
+                write!(out, " high")?;
+                queue!(out, ResetColor)?;
+                write!(out, "   colour scale: cool = low value, warm = high value")?;
+                write!(out, "\r\n")?;
+            }
+            Legend::Values => {
+                let rows = [
+                    (
+                        Some(palette::DIM),
+                        "12  34",
+                        "row / column indices into the full tensor (dimmed), not data values",
+                    ),
+                    (
+                        Some(palette::DIM),
+                        "⋯",
+                        "columns were skipped here (the gap between the first and last columns)",
+                    ),
+                    (Some(palette::DIM), "⋮", "rows were skipped here"),
+                    (
+                        Some(palette::DIM),
+                        "⋱",
+                        "both rows and columns were skipped (the corner)",
+                    ),
+                    (
+                        None,
+                        "1.2e-3",
+                        "floats use scientific notation; integers print plain",
+                    ),
+                ];
+                // Reserve room for the wider zebra swatch row drawn below.
+                let col = legend_desc_col(&rows, 8);
+                for (color, sym, desc) in rows {
+                    legend_line(&mut out, color, sym, desc, col)?;
+                }
+                // A live zebra swatch, since it is a background cue, not a glyph.
+                queue!(out, terminal::Clear(ClearType::CurrentLine))?;
+                write!(out, "  ")?;
+                queue!(out, SetBackgroundColor(palette::STRIPE_DARK))?;
+                write!(out, " 12 ")?;
+                queue!(out, SetBackgroundColor(palette::STRIPE_LITE))?;
+                write!(out, " 34 ")?;
+                queue!(out, SetBackgroundColor(Color::Reset))?;
+                queue!(out, cursor::MoveToColumn(col))?;
+                write!(
+                    out,
+                    "zebra striping traces a row or column (cycle rows/cols/off with z)"
+                )?;
+                write!(out, "\r\n")?;
+            }
+        }
+
+        queue!(out, terminal::Clear(ClearType::CurrentLine))?;
+        write!(out, "\r\n")?;
+        queue!(out, SetForegroundColor(palette::DIM))?;
+        write!(out, "Press any key to close.")?;
+        queue!(out, ResetColor)?;
+
+        queue!(
+            out,
+            terminal::Clear(ClearType::FromCursorDown),
+            EndSynchronizedUpdate
+        )?;
+        out.flush()?;
+        Ok(())
+    }
+}
+
+/// Worst-case display width of a legend symbol: every non-ASCII glyph is counted
+/// as two cells. The symbols are box-drawing / geometric glyphs whose rendered
+/// width is terminal-dependent (one cell in many terminals, two in others), so
+/// assuming the wider case keeps the description column from ever overlapping
+/// the symbol — see [`legend_desc_col`].
+fn legend_symbol_width(symbol: &str) -> usize {
+    symbol
+        .chars()
+        .map(|c| if c.is_ascii() { 1 } else { 2 })
+        .sum()
+}
+
+/// The column (0-based) at which every legend description should start: past a
+/// two-space indent, the widest symbol, and a two-space gap. `reserve` is an
+/// extra minimum width for a non-symbol row drawn separately (e.g. the zebra
+/// swatch) so its description lines up too.
+fn legend_desc_col(rows: &[(Option<Color>, &str, &str)], reserve: usize) -> u16 {
+    let widest = rows
+        .iter()
+        .map(|(_, sym, _)| legend_symbol_width(sym))
+        .max()
+        .unwrap_or(0)
+        .max(reserve);
+    (2 + widest + 2) as u16
+}
+
+/// Write one legend row: the `symbol` (in `color`, or the default foreground
+/// when `None`), then its description starting at the absolute column `desc_col`.
+/// The description is positioned with a cursor move rather than space-padding, so
+/// it lines up no matter how wide the terminal renders the symbol glyphs. The
+/// whole line is cleared first so the skipped gap shows nothing from the screen
+/// underneath. An all-empty row is just a blank separator line.
+fn legend_line(
+    out: &mut impl Write,
+    color: Option<Color>,
+    symbol: &str,
+    desc: &str,
+    desc_col: u16,
+) -> Result<()> {
+    queue!(out, terminal::Clear(ClearType::CurrentLine))?;
+    if symbol.is_empty() && desc.is_empty() {
+        write!(out, "\r\n")?;
+        return Ok(());
+    }
+    write!(out, "  ")?;
+    match color {
+        Some(c) => {
+            queue!(out, SetForegroundColor(c))?;
+            write!(out, "{symbol}")?;
+            queue!(out, SetForegroundColor(Color::Reset))?;
+        }
+        None => write!(out, "{symbol}")?,
+    }
+    queue!(out, cursor::MoveToColumn(desc_col))?;
+    write!(out, "{desc}\r\n")?;
+    Ok(())
 }
 
 /// Write `text` in `color`, unless `selected` — then write it plain so the
@@ -1339,6 +1614,8 @@ fn write_view_footer(
     }
     // Copy the screen's text to the clipboard.
     items.push(("c", "copy"));
+    // Open the legend for this view's glyphs.
+    items.push(("l", "legend"));
     // Step back / forward through the screen history.
     items.push(("⌫", "back"));
     items.push(("\\", "fwd"));

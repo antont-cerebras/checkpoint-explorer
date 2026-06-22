@@ -146,6 +146,7 @@ keep exploring.
 | `Enter` / `Space` | Expand/collapse groups, view tensor details |
 | `E` / `C` | Expand all / collapse all groups |
 | `/` | Enter search mode to filter tensors |
+| `l` | Show a legend explaining the symbols on the current screen (works on every screen) |
 | `c` | Copy the current screen's text to the clipboard (works on every screen) |
 | `f` | Copy the selected row's File path (tensor file, or a group/root's file or directory) |
 | `h` | Show the checkpoint health report (when there is a mismatch) |
@@ -310,7 +311,7 @@ the source already uses (a re-encode, where a plain copy would do).
 
 ```
 Checkpoint Explorer - model.safetensors (1/1)
-↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · Enter/Space expand · E/C all · / search · c copy screen · f copy file · ⌫/\ back/fwd · q quit
+↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · Enter/Space expand · E/C all · / search · l legend · c copy screen · f copy file · ⌫/\ back/fwd · q quit
 ────────────────────────────────────────────────────────────────────────────────
 
 ▾ model.safetensors (▦ 342, 1.5B params, 1.2 GiB)
