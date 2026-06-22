@@ -1223,7 +1223,27 @@ impl TensorReader for Hdf5Reader {
         }
         let outer = shape[0];
         let inner: usize = shape[1..].iter().product::<usize>().max(1);
-        let block = (STATS_BLOCK_ELEMS / inner).max(1);
+        // Stream in leading-dim blocks sized to the element budget, but rounded
+        // up to a whole number of chunk rows. A block that splits the chunk's
+        // leading extent makes libhdf5 decompress each overlapping chunk once per
+        // block it touches — e.g. a 1-row block against a 4-row chunk
+        // decompresses every chunk 4×. Aligning to the chunk reads each once.
+        let chunk0 = self
+            .dataset
+            .chunk()
+            .and_then(|c| c.first().copied())
+            .unwrap_or(1)
+            .max(1);
+        let budget_rows = (STATS_BLOCK_ELEMS / inner).max(1);
+        // Cap the block so a tall chunk can't force a multi-GiB read; past that we
+        // accept some redundant decompression in exchange for bounded memory.
+        const MAX_BLOCK_ELEMS: usize = 256 << 20;
+        let max_rows = (MAX_BLOCK_ELEMS / inner).max(1);
+        let block = if chunk0 <= max_rows {
+            budget_rows.max(chunk0).div_ceil(chunk0) * chunk0
+        } else {
+            budget_rows
+        };
         let mut i = 0;
         while i < outer {
             let hi = (i + block).min(outer);
