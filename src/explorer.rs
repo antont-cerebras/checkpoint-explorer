@@ -1205,12 +1205,13 @@ impl Explorer {
         if let Some(zebra) = req.zebra {
             self.data_view_stripe.set(zebra);
         }
-        // Resolve the starting slice against this tensor's slice count (3D only;
-        // 1D/2D have a single slice). Accepts an index or a percentage.
-        let slices = if tensor.shape.len() == 3 {
-            tensor.shape[0]
-        } else {
-            1
+        // Resolve the starting slice against this tensor's slice count — the
+        // leading dimension of the squeezed shape (so an (N, M, 1, K) tensor
+        // pages through N slices, matching the data view); 1D/2D have a single
+        // slice. Accepts an index or a percentage.
+        let slices = match crate::sample::squeezed_shape(&tensor.shape).as_slice() {
+            [d0, _, _] => *d0,
+            _ => 1,
         };
         let start_slice = match req.slice.as_deref() {
             Some(s) => match parse_slice_input(s, slices) {

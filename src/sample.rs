@@ -291,6 +291,16 @@ pub enum SampleMode {
 /// how bytes are decoded (e.g. as packed 4-bit), which for a packed view
 /// expands the last dimension; it applies to safetensors and HDF5. `mode`
 /// selects an evenly-spaced grid or the first/last rows & columns (edges).
+/// A tensor's shape with size-1 dimensions removed. A dimension of length 1
+/// holds a single index, so it carries no data and contributes a no-op stride
+/// to the row-major layout — the flat byte sequence is identical with or without
+/// it. Dropping such dimensions lets an `(N, M, 1, K)` tensor preview as the 3D
+/// `(N, M, K)` it effectively is. An all-ones (or already empty) shape squeezes
+/// to a single element, returned as the empty slice.
+pub fn squeezed_shape(shape: &[usize]) -> Vec<usize> {
+    shape.iter().copied().filter(|&d| d != 1).collect()
+}
+
 pub fn sample_tensor(
     t: &TensorInfo,
     max_rows: usize,
@@ -314,14 +324,18 @@ pub fn sample_tensor(
     let item = item_size(&t.dtype);
     let packing = item.map(|bytes| view.packing(bytes)).unwrap_or(1);
 
-    let (total_rows, stored_cols, slices) = match t.shape.as_slice() {
+    // Size-1 dimensions don't change the flat layout, so we fold rows/cols/slices
+    // from the squeezed shape (region reads below still use the real shape — flat
+    // indices are layout-invariant under squeezing).
+    let (total_rows, stored_cols, slices) = match squeezed_shape(&t.shape).as_slice() {
+        [] => (1usize, 1usize, 1usize),
         [n] => (1usize, *n, 1usize),
         [r, c] => (*r, *c, 1usize),
         [d0, d1, d2] => (*d1, *d2, *d0),
-        _ => {
+        rest => {
             return Err(format!(
                 "data preview supports 1D, 2D and 3D tensors only (this one is {}D)",
-                t.shape.len()
+                rest.len()
             ));
         }
     };
@@ -1485,6 +1499,71 @@ mod tests {
                 .slice,
             1
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn squeezes_size_one_dimensions() {
+        // Pure shape logic: size-1 dims drop out, anything left is unchanged.
+        assert_eq!(squeezed_shape(&[128, 3088, 1, 748]), vec![128, 3088, 748]);
+        assert_eq!(squeezed_shape(&[1, 5]), vec![5]);
+        assert_eq!(squeezed_shape(&[128, 1, 748]), vec![128, 748]);
+        assert_eq!(squeezed_shape(&[2, 3, 4]), vec![2, 3, 4]);
+        assert_eq!(squeezed_shape(&[1, 1, 1]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn previews_a_4d_tensor_with_a_unit_dim_as_3d() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_explorer_sample_4d1");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // [2, 1, 3, 4] f32 — same 24 bytes as the [2, 3, 4] case, with an inert
+        // size-1 dim wedged in the middle. value[s][r][c] = s*12 + r*4 + c.
+        let header = br#"{"w":{"dtype":"F32","shape":[2,1,3,4],"data_offsets":[0,96]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for i in 0..24u32 {
+            f.write_all(&(i as f32).to_le_bytes()).unwrap();
+        }
+        drop(f);
+
+        // Squeezed to (2, 3, 4): 2 slices, each a 3×4 matrix. Slice 1 is
+        // [[12..16],[16..20],[20..24]] — identical to the plain 3D case, proving
+        // the reads are layout-correct (not just the row/col/slice counts).
+        let t = fixture(&path, "w", &[2, 1, 3, 4], (0, 96));
+        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        assert_eq!((s.total_rows, s.total_cols), (3, 4));
+        assert_eq!((s.slices, s.slice), (2, 1));
+        for (i, &r) in s.rows.iter().enumerate() {
+            for (j, &c) in s.cols.iter().enumerate() {
+                assert_eq!(s.values[i][j], (12 + r * 4 + c) as f64);
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn previews_a_leading_unit_dim_as_lower_rank() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_explorer_sample_1xn");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // [1, 5] f32 → squeezes to a single row of 5.
+        let header = br#"{"w":{"dtype":"F32","shape":[1,5],"data_offsets":[0,20]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for i in 0..5u32 {
+            f.write_all(&(i as f32).to_le_bytes()).unwrap();
+        }
+        drop(f);
+
+        let t = fixture(&path, "w", &[1, 5], (0, 20));
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        assert_eq!((s.total_rows, s.total_cols, s.slices), (1, 5, 1));
+        assert_eq!(s.values[0], vec![0.0, 1.0, 2.0, 3.0, 4.0]);
         let _ = std::fs::remove_file(&path);
     }
 
