@@ -949,22 +949,22 @@ impl Explorer {
         };
 
         match node {
-            TreeNode::Tensor { info } => ("📄", false, info.source_path.clone()),
+            TreeNode::Tensor { info } => ("▪", false, info.source_path.clone()),
             TreeNode::Group { .. } => {
                 let mut files = BTreeSet::new();
                 collect_source_paths(node, &mut files);
                 match files.len() {
                     0 => ("", false, String::new()),
-                    1 => ("📄", false, files.into_iter().next().unwrap()),
+                    1 => ("▪", false, files.into_iter().next().unwrap()),
                     n => match common_dir(&files) {
                         // When the files share a directory, show that instead of
                         // a long list — most checkpoints live in one folder.
-                        Some(dir) => ("📁", false, format!("{n} files in {dir}")),
+                        Some(dir) => ("▸", false, format!("{n} files in {dir}")),
                         None => {
                             let first = file_name(files.iter().next().unwrap());
                             let last = file_name(files.iter().next_back().unwrap());
                             (
-                                "📁",
+                                "▸",
                                 false,
                                 format!("stored across {n} files: {first} … {last}"),
                             )
