@@ -25,7 +25,9 @@ use crate::explorer::{Explorer, OpenRequest, OpenView};
 
 #[derive(Parser)]
 #[command(name = "checkpoint-explorer")]
-#[command(about = "Interactive explorer for model checkpoints (.safetensors, .gguf, .npy, .npz, .hdf5)")]
+#[command(
+    about = "Interactive explorer for model checkpoints (.safetensors, .gguf, .npy, .npz, .hdf5)"
+)]
 #[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
@@ -116,6 +118,14 @@ struct ExploreArgs {
         help = "Starting slice for a 3D tensor: an index (e.g. 12) or a percentage (e.g. 50%)"
     )]
     slice: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "DIMS",
+        requires = "tensor",
+        help = "Reinterpret the tensor's shape (same element count); dims like 10,100 or -1,768 (one dim may be -1/*/_ to infer)"
+    )]
+    shape: Option<String>,
 
     #[arg(
         long,
@@ -213,6 +223,7 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         edges,
         zebra: args.zebra,
         slice: args.slice,
+        shape: args.shape,
         compute_stats: args.compute_stats,
         exit_after: args.exit,
     });

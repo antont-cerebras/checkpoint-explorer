@@ -292,6 +292,18 @@ quit. Options for a 16-bit tensor:
 
 The header shows the active reinterpretation (e.g. `BF16 as u4 (packed)`).
 
+#### Shape override
+
+Press `r` (or `--shape`) to **reinterpret the dimensions** — handy for a flat
+array dumped without structure, or to fold a tensor into a more readable grid.
+Enter dimensions separated by `,`, space, or `x` (e.g. `10, 100` / `10x100`);
+the product must equal the tensor's element count, and one dimension may be a
+wildcard (`-1`, `*`, or `_`) that's inferred from the rest, like NumPy's
+`reshape(-1, …)`. An empty entry clears the override. The data isn't moved — any
+reshape with a matching element count is a valid row-major reinterpretation — and
+it composes with the dtype override (which then expands the new last dimension).
+The header shows it against the stored shape, e.g. `(1182629888) as (128, 3088, 748)`.
+
 ### Repacking HDF5 checkpoints (`--features hdf5`)
 
 Cerebras-style HDF5 checkpoints compress their chunks with LZ4, which — being

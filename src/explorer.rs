@@ -77,6 +77,9 @@ pub struct OpenRequest {
     /// Optional starting slice (3D tensors), as a raw `N` or `N%` string
     /// resolved against the tensor's slice count.
     pub slice: Option<String>,
+    /// Optional shape override (a reshape with a matching element count), as a
+    /// raw string like `10,100` or `-1,768`.
+    pub shape: Option<String>,
     /// Start the statistics scan immediately on the detail view.
     pub compute_stats: bool,
     /// Render the view once and exit without interactive navigation.
@@ -126,6 +129,16 @@ impl Drop for ScanJob {
     }
 }
 
+/// The outcome of the reshape prompt (`r`).
+enum ReshapeChoice {
+    /// Apply this shape override.
+    Set(Vec<usize>),
+    /// Clear any override (entered empty).
+    Clear,
+    /// Leave the override unchanged (`Esc`).
+    Cancel,
+}
+
 /// The last sample a data view rendered, reused when nothing that affects it
 /// changed. This keeps the spinner-frame redraws during a stats scan from
 /// re-reading (and, for HDF5, re-decompressing) the tensor every frame — those
@@ -148,6 +161,7 @@ type SampleKey = (
     SampleMode,     // layout + offsets / tails
     usize,          // max_rows
     usize,          // max_cols
+    Vec<usize>,     // effective shape (stored, or a shape override)
 );
 
 /// Whether a screen waits for keys or renders once and returns (`--exit`).
@@ -220,6 +234,9 @@ pub struct Explorer {
     /// Per-tensor dtype reinterpretation chosen in the data views, keyed by
     /// tensor name. Session-scoped: remembered until the app exits.
     dtype_overrides: RefCell<HashMap<String, ViewDtype>>,
+    /// Per-tensor shape override (a reshape with the same element count) chosen
+    /// in the data views with `r`, keyed by tensor name. Session-scoped.
+    shape_overrides: RefCell<HashMap<String, Vec<usize>>>,
     /// Exact whole-tensor statistics, cached per (tensor name, view) since the
     /// scan is expensive. Session-scoped.
     stats_cache: RefCell<HashMap<(String, ViewDtype), Stats>>,
@@ -280,6 +297,7 @@ impl Explorer {
             copied_flash: None,
             health_reports,
             dtype_overrides: RefCell::new(HashMap::new()),
+            shape_overrides: RefCell::new(HashMap::new()),
             stats_cache: RefCell::new(HashMap::new()),
             data_view_layout: Cell::new(DataLayout::default()),
             data_view_row_tail: Cell::new(0.5),
@@ -1419,6 +1437,25 @@ impl Explorer {
                 overrides.insert(tensor.name.clone(), dt);
             }
         }
+        // Apply the shape override (a reshape with a matching element count).
+        if let Some(s) = req.shape.as_deref()
+            && dtype_overridable(&tensor)
+        {
+            match parse_shape_input(s, tensor.num_elements) {
+                Ok(shape) => {
+                    self.shape_overrides
+                        .borrow_mut()
+                        .insert(tensor.name.clone(), shape);
+                }
+                Err(msg) => {
+                    let _ = UI::draw_message("Invalid --shape", &msg);
+                    if !req.exit_after {
+                        let _ = event::read();
+                    }
+                    return None;
+                }
+            }
+        }
         if let Some(edges) = req.edges {
             self.data_view_layout.set(if edges {
                 DataLayout::Edges
@@ -1430,10 +1467,16 @@ impl Explorer {
             self.data_view_stripe.set(zebra);
         }
         // Resolve the starting slice against this tensor's slice count — the
-        // leading dimension of the squeezed shape (so an (N, M, 1, K) tensor
-        // pages through N slices, matching the data view); 1D/2D have a single
-        // slice. Accepts an index or a percentage.
-        let slices = match crate::sample::squeezed_shape(&tensor.shape).as_slice() {
+        // leading dimension of the (possibly overridden) squeezed shape (so an
+        // (N, M, 1, K) tensor pages through N slices, matching the data view);
+        // 1D/2D have a single slice. Accepts an index or a percentage.
+        let eff_shape = self
+            .shape_overrides
+            .borrow()
+            .get(&tensor.name)
+            .cloned()
+            .unwrap_or_else(|| tensor.shape.clone());
+        let slices = match crate::sample::squeezed_shape(&eff_shape).as_slice() {
             [d0, _, _] => *d0,
             _ => 1,
         };
@@ -1504,8 +1547,15 @@ impl Explorer {
                 .copied()
                 .unwrap_or(ViewDtype::Stored);
             let overridable = dtype_overridable(&tensor);
+            let shape = self
+                .shape_overrides
+                .borrow()
+                .get(&tensor.name)
+                .cloned()
+                .unwrap_or_else(|| tensor.shape.clone());
             self.compute_stats_animated(&tensor, view, |sv| {
-                let _ = UI::draw_tensor_detail(&mut live_out(), &tensor, view, overridable, sv);
+                let _ =
+                    UI::draw_tensor_detail(&mut live_out(), &tensor, &shape, view, overridable, sv);
             });
         }
         Some(screen)
@@ -1535,18 +1585,38 @@ impl Explorer {
                 .get(&tensor.name)
                 .copied()
                 .unwrap_or(ViewDtype::Stored);
+            let shape = self
+                .shape_overrides
+                .borrow()
+                .get(&tensor.name)
+                .cloned()
+                .unwrap_or_else(|| tensor.shape.clone());
             // Normally stats show only if already computed (browsing the tree
             // stays fast); `--compute-stats` kicks off the scan on first open,
             // animating the spinner right on this detail screen.
             if first && stats_start == StatsStart::Auto {
                 self.compute_stats_animated(tensor, view, |sv| {
-                    let _ = UI::draw_tensor_detail(&mut live_out(), tensor, view, overridable, sv);
+                    let _ = UI::draw_tensor_detail(
+                        &mut live_out(),
+                        tensor,
+                        &shape,
+                        view,
+                        overridable,
+                        sv,
+                    );
                 });
             }
             let stats = self.cached_stats(tensor, view);
             let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
-            if UI::draw_tensor_detail(&mut live_out(), tensor, view, overridable, stats_view)
-                .is_err()
+            if UI::draw_tensor_detail(
+                &mut live_out(),
+                tensor,
+                &shape,
+                view,
+                overridable,
+                stats_view,
+            )
+            .is_err()
             {
                 return Nav::Quit;
             }
@@ -1584,8 +1654,14 @@ impl Explorer {
                     ..
                 })) => {
                     self.compute_stats_animated(tensor, view, |sv| {
-                        let _ =
-                            UI::draw_tensor_detail(&mut live_out(), tensor, view, overridable, sv);
+                        let _ = UI::draw_tensor_detail(
+                            &mut live_out(),
+                            tensor,
+                            &shape,
+                            view,
+                            overridable,
+                            sv,
+                        );
                     });
                 }
                 // Reinterpret the dtype from the detail screen too.
@@ -1602,13 +1678,38 @@ impl Explorer {
                         }
                     }
                 }
+                // Reshape (shape override) from the detail screen too.
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Char('r') | KeyCode::Char('R'),
+                    ..
+                })) if overridable => {
+                    let current = self.shape_overrides.borrow().get(&tensor.name).cloned();
+                    match self.prompt_reshape(tensor, current.as_deref()) {
+                        ReshapeChoice::Set(s) => {
+                            self.shape_overrides
+                                .borrow_mut()
+                                .insert(tensor.name.clone(), s);
+                        }
+                        ReshapeChoice::Clear => {
+                            self.shape_overrides.borrow_mut().remove(&tensor.name);
+                        }
+                        ReshapeChoice::Cancel => {}
+                    }
+                }
                 // Copy the detail screen's text to the clipboard.
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('c'),
                     ..
                 })) => {
                     let text = screen_text(|buf| {
-                        let _ = UI::draw_tensor_detail(buf, tensor, view, overridable, stats_view);
+                        let _ = UI::draw_tensor_detail(
+                            buf,
+                            tensor,
+                            &shape,
+                            view,
+                            overridable,
+                            stats_view,
+                        );
                     });
                     copy_to_clipboard(&text);
                 }
@@ -1911,6 +2012,27 @@ impl Explorer {
                                     }
                                 }
                             }
+                            // Reshape: reinterpret the dimensions (`r`). The new
+                            // shape must have the same element count; an empty
+                            // entry clears the override. Reset the slice since the
+                            // slice count can change.
+                            KeyCode::Char('r') | KeyCode::Char('R') if overridable => {
+                                let current =
+                                    self.shape_overrides.borrow().get(&tensor.name).cloned();
+                                match self.prompt_reshape(tensor, current.as_deref()) {
+                                    ReshapeChoice::Set(s) => {
+                                        self.shape_overrides
+                                            .borrow_mut()
+                                            .insert(tensor.name.clone(), s);
+                                        slice = 0;
+                                    }
+                                    ReshapeChoice::Clear => {
+                                        self.shape_overrides.borrow_mut().remove(&tensor.name);
+                                        slice = 0;
+                                    }
+                                    ReshapeChoice::Cancel => {}
+                                }
+                            }
                             // Jump straight to a slice by typing its index.
                             KeyCode::Char('/') if slices > 1 => {
                                 if let Some(n) = self.prompt_slice(slices) {
@@ -2016,6 +2138,15 @@ impl Explorer {
         // tensor every frame (which would block on the worker's HDF5 lock and lag
         // the UI); only an actual change — dtype, layout, slice, pan, resize, or
         // the exact stats landing — re-samples.
+        // The effective shape: a session shape override if set, else the stored
+        // shape. Region reads still use the real stored shape, so any reshape
+        // with a matching element count is a valid row-major reinterpretation.
+        let eff_shape = self
+            .shape_overrides
+            .borrow()
+            .get(&tensor.name)
+            .cloned()
+            .unwrap_or_else(|| tensor.shape.clone());
         let key: SampleKey = (
             tensor.name.clone(),
             repr,
@@ -2024,6 +2155,7 @@ impl Explorer {
             mode,
             max_rows,
             max_cols,
+            eff_shape.clone(),
         );
         let hit = self
             .sample_cache
@@ -2033,7 +2165,7 @@ impl Explorer {
         if !hit {
             let sample = self.with_reader(tensor, |reader| {
                 crate::sample::sample_tensor_with(
-                    reader, tensor, max_rows, max_cols, slice, view, mode,
+                    reader, tensor, &eff_shape, max_rows, max_cols, slice, view, mode,
                 )
             })?;
             // In the window layout, read the clamped top-left corner and the
@@ -2080,16 +2212,28 @@ impl Explorer {
             .copied()
             .unwrap_or(ViewDtype::Stored);
         let mut idx = options.iter().position(|v| *v == current).unwrap_or(0);
+        // The shape override (if any) is fixed while the dtype menu is open.
+        let shape = self
+            .shape_overrides
+            .borrow()
+            .get(&tensor.name)
+            .cloned()
+            .unwrap_or_else(|| tensor.shape.clone());
         loop {
             // Live preview of the highlighted view, then the menu overlay.
             // Only read cached stats — navigating the menu must never trigger a scan.
             let stats = self.cached_stats(tensor, options[idx]);
             let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
             let preview_ok = match preview {
-                DtypePreview::Detail => {
-                    UI::draw_tensor_detail(&mut live_out(), tensor, options[idx], true, stats_view)
-                        .is_ok()
-                }
+                DtypePreview::Detail => UI::draw_tensor_detail(
+                    &mut live_out(),
+                    tensor,
+                    &shape,
+                    options[idx],
+                    true,
+                    stats_view,
+                )
+                .is_ok(),
                 DtypePreview::Data { repr, slice, mode } => self
                     .draw_data_view(
                         &mut live_out(),
@@ -2128,6 +2272,58 @@ impl Explorer {
     /// 100% the last). Returns the chosen slice, or `None` if cancelled / left
     /// empty. Out-of-range entries are reported in the prompt, not jumped to.
     /// Ctrl-C quits the app outright.
+    /// Prompt for a shape override (`r`). The entry is a list of dimensions
+    /// (separated by `,`, space, or `x`) whose product must equal the tensor's
+    /// element count. Enter on an empty entry clears any override; `Esc`
+    /// cancels. Prefilled with the current override, if any.
+    fn prompt_reshape(&self, tensor: &TensorInfo, current: Option<&[usize]>) -> ReshapeChoice {
+        let mut input = current
+            .map(|s| {
+                s.iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let mut error: Option<String> = None;
+        loop {
+            if UI::draw_reshape_prompt(tensor.num_elements, &tensor.shape, &input, error.as_deref())
+                .is_err()
+            {
+                return ReshapeChoice::Cancel;
+            }
+            match event::read() {
+                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+                Ok(Event::Key(KeyEvent { code, .. })) => match code {
+                    KeyCode::Enter => {
+                        if input.trim().is_empty() {
+                            return ReshapeChoice::Clear;
+                        }
+                        match parse_shape_input(&input, tensor.num_elements) {
+                            Ok(shape) => return ReshapeChoice::Set(shape),
+                            Err(msg) => error = Some(msg),
+                        }
+                    }
+                    KeyCode::Esc => return ReshapeChoice::Cancel,
+                    KeyCode::Backspace => {
+                        input.pop();
+                        error = None;
+                    }
+                    // Accept digits, separators, and wildcard tokens (`*`, `-1`, `_`).
+                    KeyCode::Char(c)
+                        if c.is_ascii_digit() || matches!(c, ',' | ' ' | 'x' | '*' | '-' | '_') =>
+                    {
+                        input.push(c);
+                        error = None;
+                    }
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(_) => return ReshapeChoice::Cancel,
+            }
+        }
+    }
+
     fn prompt_slice(&self, slices: usize) -> Option<usize> {
         let mut input = String::new();
         let mut error: Option<String> = None;
@@ -2454,6 +2650,55 @@ fn common_dir(paths: &BTreeSet<String>) -> Option<String> {
     }
 }
 
+/// Parse a shape-override entry — dimensions separated by `,`, space, or `x`
+/// (e.g. `10, 100` / `10x100`) — validating that the product equals `elements`
+/// (the tensor's element count). One dimension may be a wildcard (`-1`, `*`, or
+/// `_`), inferred from the count (like NumPy's `reshape(-1, …)`).
+fn parse_shape_input(input: &str, elements: usize) -> Result<Vec<usize>, String> {
+    let tokens: Vec<&str> = input
+        .split(|c: char| c == ',' || c == 'x' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return Err("enter one or more dimensions".to_string());
+    }
+    let mut dims: Vec<Option<usize>> = Vec::with_capacity(tokens.len());
+    let mut wildcard: Option<usize> = None;
+    for tok in &tokens {
+        if matches!(*tok, "*" | "-1" | "_") {
+            if wildcard.is_some() {
+                return Err("only one inferred dimension (`-1`, `*`, `_`) is allowed".to_string());
+            }
+            wildcard = Some(dims.len());
+            dims.push(None);
+        } else {
+            let d = tok
+                .parse::<usize>()
+                .map_err(|_| format!("invalid dimension: {tok}"))?;
+            if d == 0 {
+                return Err("dimensions must be non-zero".to_string());
+            }
+            dims.push(Some(d));
+        }
+    }
+    // Product of the explicitly-given dimensions.
+    let known: usize = dims.iter().flatten().product();
+    if let Some(w) = wildcard {
+        if known == 0 || !elements.is_multiple_of(known) {
+            return Err(format!(
+                "can't infer a whole dimension for {elements} elements"
+            ));
+        }
+        dims[w] = Some(elements / known);
+    }
+    let resolved: Vec<usize> = dims.into_iter().map(Option::unwrap).collect();
+    let product: usize = resolved.iter().product();
+    if product != elements {
+        return Err(format!("{product} elements, but the tensor has {elements}"));
+    }
+    Ok(resolved)
+}
+
 /// Whether a tensor's dtype can be reinterpreted — formats whose raw stored
 /// bytes we read ourselves (safetensors, NumPy, HDF5).
 fn dtype_overridable(tensor: &TensorInfo) -> bool {
@@ -2649,6 +2894,26 @@ mod tests {
         assert!(parse_slice_input("-5%", 360).is_err());
         assert!(parse_slice_input("abc", 360).is_err());
         assert!(parse_slice_input("%", 360).is_err());
+    }
+
+    #[test]
+    fn parse_shape_input_validates_and_infers() {
+        // Explicit dims with assorted separators; product must match.
+        assert_eq!(parse_shape_input("10, 100", 1000), Ok(vec![10, 100]));
+        assert_eq!(parse_shape_input("2 3 4", 24), Ok(vec![2, 3, 4]));
+        assert_eq!(parse_shape_input("4x5", 20), Ok(vec![4, 5]));
+        // A single wildcard is inferred from the element count (`-1`, `*`, `_`).
+        assert_eq!(parse_shape_input("-1, 100", 1000), Ok(vec![10, 100]));
+        assert_eq!(parse_shape_input("100, *", 1000), Ok(vec![100, 10]));
+        assert_eq!(parse_shape_input("_", 42), Ok(vec![42]));
+        assert_eq!(parse_shape_input("2, _, 4", 24), Ok(vec![2, 3, 4]));
+        // Errors: wrong product, non-divisible wildcard, two wildcards, zero, junk.
+        assert!(parse_shape_input("10, 10", 1000).is_err());
+        assert!(parse_shape_input("-1, 3", 1000).is_err()); // 1000 % 3 != 0
+        assert!(parse_shape_input("-1, -1", 1000).is_err());
+        assert!(parse_shape_input("0, 5", 0).is_err());
+        assert!(parse_shape_input("", 10).is_err());
+        assert!(parse_shape_input("abc", 10).is_err());
     }
 
     /// Build an explorer whose flattened tree has the given row depths (the

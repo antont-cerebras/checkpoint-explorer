@@ -406,6 +406,7 @@ impl UI {
     pub fn draw_tensor_detail(
         out: &mut impl Write,
         tensor: &TensorInfo,
+        shape: &[usize],
         view: ViewDtype,
         overridable: bool,
         stats: StatsView,
@@ -428,13 +429,14 @@ impl UI {
         write_view_dtype(&mut *out, &tensor.dtype, view)?;
         line_end(&mut *out)?;
 
-        // Shape and parameter count reflect the override (a packed view unpacks
-        // several values per stored element, growing the last dimension); show
+        // Shape and parameter count reflect the overrides: `shape` is the
+        // effective (possibly reshaped) shape, and a packed dtype view unpacks
+        // several values per stored element, growing the last dimension. Show
         // `stored as reinterpreted` just like the dtype line above.
-        let shape = view.logical_shape(&tensor.shape, &tensor.dtype);
-        let num_elements: usize = shape.iter().product();
+        let logical = view.logical_shape(shape, &tensor.dtype);
+        let num_elements: usize = logical.iter().product();
         paint(&mut *out, false, palette::DIM, "Shape: ")?;
-        write_view_shape(&mut *out, &tensor.shape, &shape)?;
+        write_view_shape(&mut *out, &tensor.shape, &logical)?;
         line_end(&mut *out)?;
         paint(&mut *out, false, palette::DIM, "Parameters: ")?;
         write!(out, "{} ", format_parameters(num_elements))?;
@@ -556,6 +558,8 @@ impl UI {
         if overridable {
             key_hint(&mut *out, "d")?;
             write!(out, " to reinterpret the dtype, ")?;
+            key_hint(&mut *out, "r")?;
+            write!(out, " to reshape, ")?;
         }
         key_hint(&mut *out, "c")?;
         write!(out, " to copy, ")?;
@@ -640,8 +644,7 @@ impl UI {
         };
         write_view_dtype(&mut *out, &tensor.dtype, sample.view)?;
         write!(out, " ")?;
-        let logical = sample.view.logical_shape(&tensor.shape, &tensor.dtype);
-        write_view_shape(&mut *out, &tensor.shape, &logical)?;
+        write_view_shape(&mut *out, &tensor.shape, &sample.display_shape)?;
         let what = match sample.mode {
             SampleMode::Edges { .. } => "edges",
             SampleMode::Window { .. } => "window",
@@ -729,8 +732,7 @@ impl UI {
         line_end(&mut *out)?;
         write_view_dtype(&mut *out, &tensor.dtype, sample.view)?;
         write!(out, " ")?;
-        let logical = sample.view.logical_shape(&tensor.shape, &tensor.dtype);
-        write_view_shape(&mut *out, &tensor.shape, &logical)?;
+        write_view_shape(&mut *out, &tensor.shape, &sample.display_shape)?;
         // Describe the layout: a contiguous window, the first/last edges (for
         // padding), or an evenly-spaced overview.
         let edges = matches!(sample.mode, SampleMode::Edges { .. });
@@ -1016,6 +1018,58 @@ impl UI {
         queue!(out, ResetColor)?;
 
         // Feedback line below (out-of-range / invalid input).
+        queue!(
+            out,
+            cursor::MoveTo(0, h.saturating_sub(1)),
+            terminal::Clear(ClearType::CurrentLine)
+        )?;
+        if let Some(msg) = error {
+            queue!(out, SetForegroundColor(palette::ERROR))?;
+            write!(out, "{msg}")?;
+            queue!(out, ResetColor)?;
+        }
+
+        out.flush()?;
+        Ok(())
+    }
+
+    /// The reshape prompt (`r`): shows the stored shape and the element count the
+    /// entry must multiply to, the input box, and a feedback line for errors.
+    pub fn draw_reshape_prompt(
+        elements: usize,
+        stored: &[usize],
+        input: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
+        let (_w, h) = terminal::size()?;
+
+        queue!(
+            out,
+            cursor::MoveTo(0, h.saturating_sub(2)),
+            terminal::Clear(ClearType::CurrentLine),
+            SetForegroundColor(palette::KEY)
+        )?;
+        write!(out, "Reshape {} ", format_shape(stored))?;
+        queue!(out, SetForegroundColor(palette::DIM))?;
+        write!(
+            out,
+            "(dims multiplying to {elements}; `-1`/`*`/`_` infers one; empty clears)"
+        )?;
+        queue!(out, ResetColor)?;
+        write!(out, "  ")?;
+        input_box(&mut out, input, 16)?;
+        write!(out, "  ")?;
+        key_hint(&mut out, "Enter")?;
+        queue!(out, SetForegroundColor(palette::DIM))?;
+        write!(out, " to apply · ")?;
+        queue!(out, ResetColor)?;
+        key_hint(&mut out, "Esc")?;
+        queue!(out, SetForegroundColor(palette::DIM))?;
+        write!(out, " to cancel")?;
+        queue!(out, ResetColor)?;
+
         queue!(
             out,
             cursor::MoveTo(0, h.saturating_sub(1)),
@@ -1621,6 +1675,7 @@ fn write_view_footer(
     }
     if sample.overridable {
         items.push(("d", "dtype"));
+        items.push(("r", "reshape"));
     }
     // Cycle the layout overview → edges → window → overview; the label names the
     // layout `e` switches to next.
