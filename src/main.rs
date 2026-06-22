@@ -10,6 +10,7 @@ mod hdf5_lz4;
 #[cfg(feature = "hdf5")]
 mod hdf5_zstd;
 mod health;
+mod npy;
 mod sample;
 mod tree;
 mod ui;
@@ -24,7 +25,7 @@ use crate::explorer::{Explorer, OpenRequest, OpenView};
 
 #[derive(Parser)]
 #[command(name = "checkpoint-explorer")]
-#[command(about = "Interactive explorer for model checkpoints (.safetensors, .gguf, .hdf5)")]
+#[command(about = "Interactive explorer for model checkpoints (.safetensors, .gguf, .npy, .npz, .hdf5)")]
 #[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
@@ -39,7 +40,7 @@ struct Cli {
 #[derive(ClapArgs)]
 struct ExploreArgs {
     #[arg(
-        help = "Checkpoint files, directories, or glob patterns to explore (e.g., *.safetensors, model-*.gguf, *.hdf5)"
+        help = "Checkpoint files, directories, or glob patterns to explore (e.g., *.safetensors, model-*.gguf, *.npy, *.npz, *.hdf5)"
     )]
     paths: Vec<PathBuf>,
 
@@ -336,7 +337,10 @@ fn collect_safetensors_files(
 
             if expanded_path.is_file() {
                 let ext = expanded_path.extension().and_then(|s| s.to_str());
-                if matches!(ext, Some("safetensors" | "gguf" | "h5" | "hdf5")) {
+                if matches!(
+                    ext,
+                    Some("safetensors" | "gguf" | "h5" | "hdf5" | "npy" | "npz")
+                ) {
                     files.push(expanded_path.clone());
                 } else {
                     eprintln!(
@@ -403,9 +407,9 @@ fn scan_directory(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>) -> Resu
     // HDF5 is only scanned for when compiled in, to avoid surfacing files the
     // build cannot read.
     let exts: &[&str] = if cfg!(feature = "hdf5") {
-        &["safetensors", "gguf", "h5", "hdf5"]
+        &["safetensors", "gguf", "h5", "hdf5", "npy", "npz"]
     } else {
-        &["safetensors", "gguf"]
+        &["safetensors", "gguf", "npy", "npz"]
     };
     let glob_prefix = if recursive { "**/" } else { "" };
     let patterns: Vec<String> = exts

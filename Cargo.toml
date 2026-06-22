@@ -18,6 +18,10 @@ fuzzy-matcher = "0.3"
 # Zero-copy reads (mmap) + parallel scans for whole-tensor statistics.
 memmap2 = "0.9"
 rayon = "1"
+# Read NumPy `.npz` archives (a ZIP of `.npy` entries). Pure-Rust: the `deflate`
+# feature is backed by flate2's miniz_oxide backend, so the default build stays
+# free of system dependencies. `.npy` itself needs no ZIP support.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # Optional: read Cerebras-style HDF5 checkpoints. Off by default so the
 # default build stays pure-Rust with no system dependencies; the `static`
 # feature builds a bundled libhdf5 from source (needs a C toolchain + cmake).

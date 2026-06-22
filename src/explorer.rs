@@ -445,6 +445,12 @@ impl Explorer {
                 Some("gguf") => {
                     self.load_gguf_file(file_path)?;
                 }
+                Some("npy") => {
+                    self.load_numpy_file(file_path)?;
+                }
+                Some("npz") => {
+                    self.load_npz_file(file_path)?;
+                }
                 Some("h5") | Some("hdf5") => {
                     #[cfg(feature = "hdf5")]
                     self.load_hdf5_file(file_path)?;
@@ -569,6 +575,84 @@ impl Explorer {
             });
         }
 
+        Ok(())
+    }
+
+    /// Load a NumPy `.npy` file: one array behind a small header, then raw
+    /// row-major little-endian data running to EOF. The byte range is absolute
+    /// (the data follows the header), and the tensor is named after the file.
+    fn load_numpy_file(&mut self, file_path: &PathBuf) -> Result<()> {
+        let source_path = absolute_path(file_path);
+        let mut file = File::open(file_path)
+            .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
+        let header = crate::npy::parse_header(&mut file)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", file_path.display()))?;
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let name = file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("array")
+            .to_string();
+        let num_elements = header.shape.iter().product::<usize>();
+        self.tensors.push(TensorInfo {
+            name,
+            dtype: header.dtype,
+            shape: header.shape,
+            size_bytes: (file_len as usize).saturating_sub(header.data_offset),
+            num_elements,
+            storage: Storage::Unknown,
+            source_path,
+            layout: Layout::ByteRange {
+                start: header.data_offset as u64,
+                end: file_len,
+            },
+        });
+        Ok(())
+    }
+
+    /// Load a NumPy `.npz` archive: a ZIP whose `<name>.npy` entries are each a
+    /// `.npy` array. We read each entry's header (decompressing only that much)
+    /// to list the tensors; the reader decompresses the full entry on demand.
+    fn load_npz_file(&mut self, file_path: &PathBuf) -> Result<()> {
+        let source_path = absolute_path(file_path);
+        let file = File::open(file_path)
+            .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
+        let mut zip = zip::ZipArchive::new(file)
+            .with_context(|| format!("Failed to read .npz archive: {}", file_path.display()))?;
+        let entries: Vec<String> = zip.file_names().map(String::from).collect();
+        for entry_name in entries {
+            let Some(name) = entry_name.strip_suffix(".npy") else {
+                continue; // not an array entry
+            };
+            let mut entry = zip.by_name(&entry_name).with_context(|| {
+                format!("Failed to read {entry_name} in {}", file_path.display())
+            })?;
+            let stored_bytes = entry.compressed_size() as usize;
+            let uncompressed = entry.size() as usize;
+            let compressed = entry.compression() != zip::CompressionMethod::Stored;
+            let header = crate::npy::parse_header(&mut entry)
+                .map_err(|e| anyhow::anyhow!("{}: {entry_name}: {e}", file_path.display()))?;
+            let num_elements = header.shape.iter().product::<usize>();
+            let storage = if compressed {
+                Storage::Compressed {
+                    codec: "deflate".to_string(),
+                    stored_bytes,
+                }
+            } else {
+                Storage::Raw
+            };
+            self.tensors.push(TensorInfo {
+                name: name.to_string(),
+                dtype: header.dtype,
+                shape: header.shape,
+                // Data bytes = the entry's uncompressed size minus its header.
+                size_bytes: uncompressed.saturating_sub(header.data_offset),
+                num_elements,
+                storage,
+                source_path: source_path.clone(),
+                layout: Layout::None,
+            });
+        }
         Ok(())
     }
 
@@ -2371,13 +2455,13 @@ fn common_dir(paths: &BTreeSet<String>) -> Option<String> {
 }
 
 /// Whether a tensor's dtype can be reinterpreted — formats whose raw stored
-/// bytes we read ourselves (safetensors and HDF5).
+/// bytes we read ourselves (safetensors, NumPy, HDF5).
 fn dtype_overridable(tensor: &TensorInfo) -> bool {
     matches!(
         std::path::Path::new(&tensor.source_path)
             .extension()
             .and_then(|e| e.to_str()),
-        Some("safetensors") | Some("h5") | Some("hdf5")
+        Some("safetensors" | "h5" | "hdf5" | "npy" | "npz")
     )
 }
 

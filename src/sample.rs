@@ -340,10 +340,10 @@ pub(crate) fn sample_tensor_with(
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("");
-    // Dtype overrides reinterpret raw stored bytes; supported for safetensors
-    // and HDF5. For any other format fall back to the stored dtype so the
-    // header never mislabels what's shown.
-    let overridable = matches!(ext, "safetensors" | "h5" | "hdf5");
+    // Dtype overrides reinterpret raw stored bytes; supported for the formats we
+    // read byte-for-byte (safetensors, NumPy, HDF5). For any other format fall
+    // back to the stored dtype so the header never mislabels what's shown.
+    let overridable = matches!(ext, "safetensors" | "h5" | "hdf5" | "npy" | "npz");
     let view = if overridable { view } else { ViewDtype::Stored };
 
     // A packed override unpacks several 4-bit values from each stored element,
@@ -877,7 +877,9 @@ pub(crate) fn open_reader(t: &TensorInfo) -> Result<Box<dyn TensorReader>, Strin
         .and_then(|e| e.to_str())
         .unwrap_or("");
     match ext {
-        "safetensors" => Ok(Box::new(SafetensorsReader::open(t)?)),
+        "safetensors" => Ok(Box::new(BlobReader::open_safetensors(t)?)),
+        "npy" => Ok(Box::new(BlobReader::open_npy(t)?)),
+        "npz" => Ok(Box::new(BlobReader::open_npz(t)?)),
         #[cfg(feature = "hdf5")]
         "h5" | "hdf5" => Ok(Box::new(Hdf5Reader::open(t)?)),
         _ => Err("reading tensor data is not supported for this format".to_string()),
@@ -1061,33 +1063,97 @@ fn read_sampled(
 }
 
 /// Memory-mapped reader for a safetensors tensor.
-struct SafetensorsReader {
-    mmap: memmap2::Mmap,
+/// Backing bytes for a tensor stored as one contiguous little-endian row-major
+/// blob: either a memory-mapped file (safetensors, `.npy`) or an owned buffer (a
+/// decompressed `.npz` entry).
+enum Backing {
+    Mmap(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl Backing {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Backing::Mmap(m) => &m[..],
+            Backing::Owned(v) => v,
+        }
+    }
+}
+
+/// Reader for a tensor that is one contiguous little-endian row-major blob.
+/// Serves safetensors, NumPy `.npy`, and (decompressed) `.npz` entries; the
+/// region/scan logic is identical once the backing bytes and data range are set.
+struct BlobReader {
+    backing: Backing,
     data_start: usize,
     data_end: usize,
     shape: Vec<usize>,
     item: usize,
 }
 
-impl SafetensorsReader {
-    fn open(t: &TensorInfo) -> Result<Self, String> {
+impl BlobReader {
+    /// safetensors: `ByteRange` is relative to the data blob, which starts after
+    /// the 8-byte header length and the JSON header.
+    fn open_safetensors(t: &TensorInfo) -> Result<Self, String> {
         let Layout::ByteRange { start, end } = t.layout else {
             return Err("tensor data location is unknown".to_string());
         };
         let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
-        let file = std::fs::File::open(&t.source_path).map_err(|e| e.to_string())?;
-        // SAFETY: read-only inspection; we accept that a concurrent external
-        // write could change the mapping (standard tradeoff for mmap readers).
-        let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+        let mmap = mmap_file(&t.source_path)?;
         let header_len =
             u64::from_le_bytes(mmap.get(0..8).ok_or("file too small")?.try_into().unwrap());
         let data_start = (8 + header_len + start) as usize;
         let data_end = (8 + header_len + end) as usize;
-        if data_end > mmap.len() {
+        Self::mmapped(mmap, data_start, data_end, t, item)
+    }
+
+    /// `.npy`: `ByteRange` holds absolute file offsets — the raw data directly
+    /// follows the header, so it can be mapped in place.
+    fn open_npy(t: &TensorInfo) -> Result<Self, String> {
+        let Layout::ByteRange { start, end } = t.layout else {
+            return Err("tensor data location is unknown".to_string());
+        };
+        let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
+        let mmap = mmap_file(&t.source_path)?;
+        Self::mmapped(mmap, start as usize, end as usize, t, item)
+    }
+
+    /// `.npz`: decompress the entry named `<tensor>.npy` into memory and serve
+    /// from it (compressed entries can't be mapped in place).
+    fn open_npz(t: &TensorInfo) -> Result<Self, String> {
+        use std::io::Read;
+        let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
+        let file = std::fs::File::open(&t.source_path).map_err(|e| e.to_string())?;
+        let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+        let entry_name = format!("{}.npy", t.name);
+        let mut entry = zip
+            .by_name(&entry_name)
+            .map_err(|e| format!("{entry_name}: {e}"))?;
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        let header = crate::npy::parse_header(&mut std::io::Cursor::new(&bytes))?;
+        let data_end = bytes.len();
+        Ok(Self {
+            backing: Backing::Owned(bytes),
+            data_start: header.data_offset,
+            data_end,
+            shape: t.shape.clone(),
+            item,
+        })
+    }
+
+    fn mmapped(
+        mmap: memmap2::Mmap,
+        data_start: usize,
+        data_end: usize,
+        t: &TensorInfo,
+        item: usize,
+    ) -> Result<Self, String> {
+        if data_end > mmap.len() || data_start > data_end {
             return Err("tensor data range is out of bounds".to_string());
         }
         Ok(Self {
-            mmap,
+            backing: Backing::Mmap(mmap),
             data_start,
             data_end,
             shape: t.shape.clone(),
@@ -1096,11 +1162,18 @@ impl SafetensorsReader {
     }
 
     fn blob(&self) -> &[u8] {
-        &self.mmap[self.data_start..self.data_end]
+        &self.backing.bytes()[self.data_start..self.data_end]
     }
 }
 
-impl TensorReader for SafetensorsReader {
+/// Memory-map a file read-only. SAFETY: read-only inspection; we accept that a
+/// concurrent external write could change the mapping (standard mmap tradeoff).
+fn mmap_file(path: &str) -> Result<memmap2::Mmap, String> {
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string()) }
+}
+
+impl TensorReader for BlobReader {
     fn shape(&self) -> &[usize] {
         &self.shape
     }
@@ -1110,7 +1183,7 @@ impl TensorReader for SafetensorsReader {
         Ok(gather_region(self.blob(), &full, ranges, self.item))
     }
 
-    /// Zero-copy full scan: the tensor's bytes are already mapped contiguously.
+    /// Zero-copy full scan: the tensor's bytes are already contiguous.
     fn fold_blocks(&self, f: &mut dyn FnMut(&[u8]) -> ControlFlow<()>) -> Result<(), String> {
         let _ = f(self.blob());
         Ok(())
@@ -1666,6 +1739,105 @@ mod tests {
         for (i, &r) in s.rows.iter().enumerate() {
             for (j, &c) in s.cols.iter().enumerate() {
                 assert_eq!(s.values[i][j], (r * 5 + c) as f64);
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Build a `.npy` byte image (v1.0 header + row-major f32 data) and return
+    /// it with the data offset, for the reader tests below.
+    fn npy_image(shape_dict: &str, values: &[f32]) -> (Vec<u8>, usize) {
+        let dict = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_dict}, }}");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x93NUMPY\x01\x00");
+        bytes.extend_from_slice(&(dict.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(dict.as_bytes());
+        let data_offset = bytes.len();
+        for v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        (bytes, data_offset)
+    }
+
+    #[test]
+    fn samples_a_npy_array() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_explorer_npy");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.npy");
+        // 3x4 f32, value[r][c] = r*4 + c.
+        let vals: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let (bytes, data_offset) = npy_image("(3, 4)", &vals);
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+
+        let t = TensorInfo {
+            name: "w".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![3, 4],
+            size_bytes: 48,
+            num_elements: 12,
+            storage: crate::tree::Storage::Unknown,
+            source_path: path.to_string_lossy().into_owned(),
+            layout: Layout::ByteRange {
+                start: data_offset as u64,
+                end: bytes.len() as u64,
+            },
+        };
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        assert_eq!((s.total_rows, s.total_cols), (3, 4));
+        for (i, &r) in s.rows.iter().enumerate() {
+            for (j, &c) in s.cols.iter().enumerate() {
+                assert_eq!(s.values[i][j], (r * 4 + c) as f64);
+            }
+        }
+        // Stats scan reads the same contiguous blob.
+        let st = tensor_stats(
+            &t,
+            ViewDtype::Stored,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!((st.count, st.min, st.max), (12, 0.0, 11.0));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn samples_a_deflated_npz_entry() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_explorer_npz");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("a.npz");
+        // A 2x3 f32 array stored as a DEFLATE-compressed `w.npy` entry, to
+        // exercise the decompress-into-memory reader path.
+        let vals: Vec<f32> = (0..6).map(|i| i as f32).collect();
+        let (npy, _) = npy_image("(2, 3)", &vals);
+        let f = std::fs::File::create(&path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("w.npy", opts).unwrap();
+        zw.write_all(&npy).unwrap();
+        zw.finish().unwrap();
+
+        let t = TensorInfo {
+            name: "w".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![2, 3],
+            size_bytes: 24,
+            num_elements: 6,
+            storage: crate::tree::Storage::Unknown,
+            source_path: path.to_string_lossy().into_owned(),
+            layout: Layout::None,
+        };
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        assert_eq!((s.total_rows, s.total_cols), (2, 3));
+        for (i, &r) in s.rows.iter().enumerate() {
+            for (j, &c) in s.cols.iter().enumerate() {
+                assert_eq!(s.values[i][j], (r * 3 + c) as f64);
             }
         }
         let _ = std::fs::remove_file(&path);
