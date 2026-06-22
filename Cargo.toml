@@ -39,3 +39,8 @@ zstd = { version = "0.13", optional = true }
 
 [features]
 hdf5 = ["dep:hdf5-metno", "dep:ndarray", "dep:hdf5-metno-sys", "dep:lz4_flex", "dep:half", "dep:zstd"]
+
+# Diagnostic: dump dataset shape/chunk/filter layout of an HDF5 file.
+[[example]]
+name = "h5layout"
+required-features = ["hdf5"]
