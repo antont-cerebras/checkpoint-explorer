@@ -181,7 +181,9 @@ Press `Enter` to open the highlighted result's details (you stay in search), and
 ### Tensor data preview
 
 From a tensor's detail screen (open it with `Enter`/`Space`), you can preview the
-actual data of 1D/2D/3D tensors:
+actual data of 1D/2D/3D tensors. Size-1 dimensions are ignored when counting
+those, so a tensor stored as e.g. `(128, 3088, 1, 748)` previews as the 3D
+`(128, 3088, 748)` it effectively is:
 
 - `m` — an **ASCII heatmap**: each sampled element is a colored block on a
   blue→green→red scale, with a min/max legend. Each character row packs two
