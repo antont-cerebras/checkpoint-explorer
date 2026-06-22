@@ -23,7 +23,7 @@ use crate::sample::{SampleMode, Stats, ViewDtype};
 use crate::tree::{
     Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key,
 };
-use crate::ui::{DrawConfig, StatsView, StripeMode, UI};
+use crate::ui::{DrawConfig, Legend, StatsView, StripeMode, UI};
 use crate::utils::base64_encode;
 
 /// Whether the data views show the evenly-spaced overview or the first/last
@@ -822,6 +822,11 @@ impl Explorer {
                         code: KeyCode::Char('h'),
                         ..
                     } if !self.search_mode => self.show_health_report(),
+                    // `l` opens the legend for the tree's glyphs.
+                    KeyEvent {
+                        code: KeyCode::Char('l'),
+                        ..
+                    } if !self.search_mode => self.show_legend(Legend::Tree),
                     // `E` / `C` expand / collapse every group at once.
                     KeyEvent {
                         code: KeyCode::Char('E'),
@@ -1388,6 +1393,12 @@ impl Explorer {
                     });
                     copy_to_clipboard(&text);
                 }
+                // `l` opens the legend for the detail screen's glyphs, then
+                // returns here (the loop redraws the detail over it).
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Char('l'),
+                    ..
+                })) => self.show_legend(Legend::Detail),
                 // History navigation.
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Backspace,
@@ -1610,6 +1621,12 @@ impl Explorer {
                                 });
                                 copy_to_clipboard(&text);
                             }
+                            // Open the legend for this representation, then
+                            // redraw the data view over it.
+                            KeyCode::Char('l') => self.show_legend(match repr {
+                                Representation::Heatmap => Legend::Heatmap,
+                                Representation::Values => Legend::Values,
+                            }),
                             // History navigation: Backspace back, `\` forward.
                             KeyCode::Backspace => return (Nav::Back, repr, slice),
                             KeyCode::Char('\\') => return (Nav::Forward, repr, slice),
@@ -2028,6 +2045,18 @@ impl Explorer {
             "Rebuild with `--features hdf5` to enable repacking.",
         );
         let _ = event::read();
+    }
+
+    /// Show the context-sensitive legend for the current screen (`l`), then wait
+    /// for any key to dismiss it (Ctrl-C still quits). The caller's loop redraws
+    /// its own screen over the overlay on the next iteration.
+    fn show_legend(&self, legend: Legend) {
+        if UI::draw_legend(legend).is_ok()
+            && let Ok(Event::Key(key)) = event::read()
+            && is_ctrl_c(&key)
+        {
+            quit_immediately();
+        }
     }
 }
 
