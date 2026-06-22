@@ -1,6 +1,6 @@
 # Checkpoint Explorer
 
-An interactive terminal-based explorer for [`safetensors`](https://huggingface.co/docs/safetensors) and [GGUF](https://huggingface.co/docs/hub/gguf) files, designed to help you visualize and navigate the structure of machine learning models.
+An interactive terminal-based explorer for [`safetensors`](https://huggingface.co/docs/safetensors), [GGUF](https://huggingface.co/docs/hub/gguf), and NumPy (`.npy` / `.npz`) files, designed to help you visualize and navigate the structure of machine learning models.
 
 ![Demo](demo.gif)
 
@@ -17,6 +17,9 @@ An interactive terminal-based explorer for [`safetensors`](https://huggingface.c
 - 📏 **Human-readable sizes** (B, KB, MB, GB)
 - ⌨️ **Keyboard navigation** for smooth exploration
 - 🧠 **GGUF support** - view GGML format tensors with quantization types
+- 🔢 **NumPy support** - read `.npy` arrays and `.npz` archives (including
+  `np.savez_compressed`), with full data preview / statistics / dtype
+  reinterpretation; no extra system dependencies (pure-Rust deflate)
 - 🧊 **HDF5 checkpoint support** (opt-in `--features hdf5`) - read Cerebras-style
   `.h5`/`.hdf5` checkpoints, showing compression status and both the logical and
   on-disk (compressed) sizes
@@ -259,9 +262,14 @@ there's nothing else to do, any key cancels the scan; `Ctrl+C` always quits.)
 
 Both views also sample a grid that fits the screen (they never read the whole
 tensor for the *display* — only each sampled row's column span). Both the
-statistics and the data preview work for `safetensors` and HDF5
-(`--features hdf5`) of any size, reached through one format-agnostic reader; GGUF
-data preview is not yet supported.
+statistics and the data preview work for `safetensors`, NumPy (`.npy` / `.npz`),
+and HDF5 (`--features hdf5`) of any size, reached through one format-agnostic
+reader; GGUF data preview is not yet supported.
+
+NumPy `.npy` files hold a single array (named after the file); `.npz` archives
+expose each member array by name, and compressed archives
+(`np.savez_compressed`) are decompressed on demand. Fortran-ordered arrays are
+read correctly but shown transposed (their dimensions reversed).
 
 #### Dtype override
 
