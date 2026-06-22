@@ -92,6 +92,16 @@ enum Representation {
     Values,
 }
 
+/// An open reader for the tensor currently being viewed, kept across redraws so
+/// panning / slice-stepping a data view doesn't re-open the file every frame
+/// (re-opening dominates the cost and, for HDF5, also discards libhdf5's chunk
+/// cache — see the `window_pan_open_cost` benchmark).
+struct CachedReader {
+    source_path: String,
+    name: String,
+    reader: Box<dyn crate::sample::TensorReader>,
+}
+
 /// Whether a screen waits for keys or renders once and returns (`--exit`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Interaction {
@@ -193,6 +203,9 @@ pub struct Explorer {
     /// A tensor/view to jump straight to on startup (from CLI flags); consumed
     /// once after loading, then normal browsing resumes.
     open: Option<OpenRequest>,
+    /// The open reader for the data view's current tensor, reused across redraws
+    /// (replaced when the viewed tensor changes). See [`CachedReader`].
+    reader_cache: RefCell<Option<CachedReader>>,
 }
 
 impl Explorer {
@@ -228,7 +241,35 @@ impl Explorer {
             win_page_cols: Cell::new(1),
             data_view_stripe: Cell::new(StripeMode::default()),
             open,
+            reader_cache: RefCell::new(None),
         }
+    }
+
+    /// Run `f` with an open reader for `t`, reusing the cached one when it is
+    /// still for the same tensor and opening (and caching) a fresh one otherwise.
+    /// Lets the data view re-sample on every pan / slice step without paying the
+    /// file-open cost each frame.
+    fn with_reader<R>(
+        &self,
+        t: &TensorInfo,
+        f: impl FnOnce(&dyn crate::sample::TensorReader) -> Result<R, String>,
+    ) -> Result<R, String> {
+        {
+            let mut cache = self.reader_cache.borrow_mut();
+            let stale = cache
+                .as_ref()
+                .is_none_or(|c| c.source_path != t.source_path || c.name != t.name);
+            if stale {
+                let reader = crate::sample::open_reader(t)?;
+                *cache = Some(CachedReader {
+                    source_path: t.source_path.clone(),
+                    name: t.name.clone(),
+                    reader,
+                });
+            }
+        }
+        let cache = self.reader_cache.borrow();
+        f(cache.as_ref().unwrap().reader.as_ref())
     }
 
     /// Cached exact statistics for `(tensor, view)`, or `None` if not yet
@@ -1757,7 +1798,9 @@ impl Explorer {
             .set(crate::sample::edge_total(max_rows));
         self.edge_col_budget
             .set(crate::sample::edge_total(max_cols));
-        let sample = crate::sample::sample_tensor(tensor, max_rows, max_cols, slice, view, mode)?;
+        let sample = self.with_reader(tensor, |reader| {
+            crate::sample::sample_tensor_with(reader, tensor, max_rows, max_cols, slice, view, mode)
+        })?;
         // In the window layout, read the clamped top-left corner and the visible
         // size back from the rendered sample, so panning stays in bounds and a
         // Shift+arrow strides exactly one screenful.
