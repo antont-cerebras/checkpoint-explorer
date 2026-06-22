@@ -306,7 +306,29 @@ pub fn squeezed_shape(shape: &[usize]) -> Vec<usize> {
     shape.iter().copied().filter(|&d| d != 1).collect()
 }
 
+/// Convenience wrapper: open a reader for `t` and sample in one call. Interactive
+/// views use [`sample_tensor_with`] with a reader cached across redraws, so in the
+/// binary this one-shot form is currently used only by tests.
+#[allow(dead_code)]
 pub fn sample_tensor(
+    t: &TensorInfo,
+    max_rows: usize,
+    max_cols: usize,
+    slice: usize,
+    view: ViewDtype,
+    mode: SampleMode,
+) -> Result<Sample, String> {
+    let reader = open_reader(t)?;
+    sample_tensor_with(reader.as_ref(), t, max_rows, max_cols, slice, view, mode)
+}
+
+/// Like [`sample_tensor`], but reads through a caller-supplied open reader so an
+/// interactive view can reuse one across redraws (re-opening the file each frame
+/// dominates the cost — see the `window_pan_open_cost` benchmark — and for HDF5
+/// it also throws away libhdf5's chunk cache, forcing re-decompression). The
+/// reader must be for `t` (same file and dtype/shape).
+pub(crate) fn sample_tensor_with(
+    reader: &dyn TensorReader,
     t: &TensorInfo,
     max_rows: usize,
     max_cols: usize,
@@ -367,8 +389,7 @@ pub fn sample_tensor(
         ),
     };
 
-    let reader = open_reader(t)?;
-    let values = read_sampled(reader.as_ref(), t, total_cols, base, &rows, &cols, view)?;
+    let values = read_sampled(reader, t, total_cols, base, &rows, &cols, view)?;
 
     let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
     for row in &values {
@@ -761,7 +782,7 @@ const STATS_BLOCK_ELEMS: usize = 16 << 20; // ≈16M elements
 /// [`decode`] / [`decode_view`] expect. The sampling preview and the statistics
 /// scan are written once against this trait, so supporting a new format (e.g.
 /// remote/S3 shards) is just another implementation.
-trait TensorReader {
+pub(crate) trait TensorReader {
     /// The stored shape.
     fn shape(&self) -> &[usize];
 
@@ -808,7 +829,7 @@ trait TensorReader {
 }
 
 /// Open the right [`TensorReader`] for a tensor, dispatching by file extension.
-fn open_reader(t: &TensorInfo) -> Result<Box<dyn TensorReader>, String> {
+pub(crate) fn open_reader(t: &TensorInfo) -> Result<Box<dyn TensorReader>, String> {
     let ext = std::path::Path::new(&t.source_path)
         .extension()
         .and_then(|e| e.to_str())
@@ -1289,6 +1310,107 @@ fn f16_to_f64(bits: u16) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Manual benchmark for the window-pan hot path: compares re-opening the
+    /// reader on every pan (current `sample_tensor` behaviour) against reusing a
+    /// single open reader. Run with:
+    /// `cargo test --features hdf5 --release -- --ignored --nocapture window_pan_open_cost`
+    #[cfg(feature = "hdf5")]
+    #[test]
+    #[ignore = "manual benchmark"]
+    fn window_pan_open_cost() {
+        use std::time::Instant;
+        let dir = std::env::temp_dir().join("checkpoint_explorer_bench_pan");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bench.h5");
+        let _ = std::fs::remove_file(&path);
+        let (r, c) = (1500usize, 1500usize);
+        {
+            let file = hdf5_metno::File::create(&path).unwrap();
+            // Many small datasets so `member_names()` is realistically long, like
+            // a real checkpoint with hundreds of tensors.
+            for i in 0..400 {
+                let _ = file
+                    .new_dataset::<f32>()
+                    .shape([4, 4])
+                    .create(format!("layer.{i}.weight").as_str())
+                    .unwrap();
+            }
+            // One big gzip-compressed, chunked tensor we pan over.
+            let data: Vec<f32> = (0..r * c).map(|i| (i % 997) as f32).collect();
+            let ds = file
+                .new_dataset::<f32>()
+                .shape([r, c])
+                .chunk([128, 128])
+                .deflate(4)
+                .create("big.weight")
+                .unwrap();
+            ds.write_raw(&data).unwrap();
+        }
+        let t = TensorInfo {
+            name: "big.weight".to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![r, c],
+            size_bytes: r * c * 4,
+            num_elements: r * c,
+            storage: crate::tree::Storage::Unknown,
+            source_path: path.to_string_lossy().into_owned(),
+            layout: Layout::None,
+        };
+
+        const ITERS: usize = 60;
+        // (A) open-only, to isolate File::open + member_names + dataset open.
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            let _r = open_reader(&t).unwrap();
+        }
+        let open_only = t0.elapsed();
+
+        // (B) current behaviour: a full window sample per pan (reopens each time).
+        let t0 = Instant::now();
+        for i in 0..ITERS {
+            let _ = sample_tensor(
+                &t,
+                40,
+                40,
+                0,
+                ViewDtype::Stored,
+                SampleMode::Window {
+                    row_off: i,
+                    col_off: 0,
+                },
+            )
+            .unwrap();
+        }
+        let reopen_each = t0.elapsed();
+
+        // (C) proposed behaviour: open once, read the window region each pan.
+        let reader = open_reader(&t).unwrap();
+        let shape = reader.shape().to_vec();
+        let t0 = Instant::now();
+        for i in 0..ITERS {
+            let regions: Vec<Vec<Range<usize>>> =
+                (i..i + 40).map(|row| vec![row..row + 1, 0..40]).collect();
+            let _ = reader.read_regions(&regions).unwrap();
+        }
+        let reuse = t0.elapsed();
+        let _ = shape;
+
+        eprintln!("--- window pan, {ITERS} iters ---");
+        eprintln!(
+            "open-only (reopen each):   {open_only:?}  ({:?}/pan)",
+            open_only / ITERS as u32
+        );
+        eprintln!(
+            "sample_tensor (reopens):   {reopen_each:?}  ({:?}/pan)",
+            reopen_each / ITERS as u32
+        );
+        eprintln!(
+            "reused reader (read only): {reuse:?}  ({:?}/pan)",
+            reuse / ITERS as u32
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn sample_indices_includes_edges_and_is_bounded() {
