@@ -39,6 +39,11 @@ mod palette {
     /// a light foreground is hard to read on the bright green.
     pub const OK_BG: Color = Color::Green;
     pub const OK_FG: Color = Color::Black;
+    /// Group names and expand arrows in the tree — the primary accent (a bright
+    /// sky-cyan), so the structure stands out from the leaf tensors.
+    pub const ACCENT: Color = Color::AnsiValue(81);
+    /// A tensor's data type (warm amber, so the type pops).
+    pub const DTYPE: Color = Color::AnsiValue(215);
     /// Zebra striping for the numeric grid — two subtle dark backgrounds (one
     /// "dark", one "less dark") that alternate to guide the eye along the rows
     /// or columns, like a dim highlighter.
@@ -55,7 +60,7 @@ pub struct DrawConfig<'a> {
     pub scroll_offset: usize,
     pub search_mode: bool,
     pub search_query: &'a str,
-    /// Leading glyph for the status bar (e.g. `📄`, `📁`, `✓`), and whether it
+    /// Leading glyph for the status bar (e.g. `▪`, `▸`, `✓`), and whether it
     /// is a success message (the copy confirmation) for accent colouring.
     pub status_icon: &'a str,
     pub status_ok: bool,
@@ -182,8 +187,13 @@ impl UI {
             )?;
             write!(out, "\r\n")?;
         }
-        queue!(out, terminal::Clear(ClearType::CurrentLine))?;
-        write!(out, "{}\r\n", "=".repeat(80))?;
+        queue!(
+            out,
+            terminal::Clear(ClearType::CurrentLine),
+            SetForegroundColor(palette::DIM)
+        )?;
+        write!(out, "{}\r\n", "─".repeat(terminal_width as usize))?;
+        queue!(out, ResetColor)?;
 
         // Calculate scroll offset
         let new_scroll_offset = if config.selected_idx >= config.scroll_offset + available_height {
@@ -213,7 +223,7 @@ impl UI {
                 )?;
             }
 
-            Self::draw_node(node, *depth, &mut *out)?;
+            Self::draw_node(node, *depth, is_selected, &mut *out)?;
 
             if is_selected {
                 queue!(out, ResetColor)?;
@@ -258,7 +268,16 @@ impl UI {
         Ok(new_scroll_offset)
     }
 
-    fn draw_node(node: &TreeNode, depth: usize, out: &mut impl Write) -> Result<()> {
+    /// Render one tree row. `selected` rows are drawn plain so the caller's
+    /// highlight (inverse video) reads cleanly; other rows are colour-coded by
+    /// kind — group names in the accent and dtypes amber, with the name, shape
+    /// and size at full strength and only the leaf marker / storage tag dimmed.
+    fn draw_node(
+        node: &TreeNode,
+        depth: usize,
+        selected: bool,
+        out: &mut impl Write,
+    ) -> Result<()> {
         let indent = "  ".repeat(depth);
 
         match node {
@@ -271,17 +290,17 @@ impl UI {
                 total_size,
                 stored_size,
             } => {
-                let icon = if *expanded { "▼" } else { "▶" };
+                // ▾ open / ▸ collapsed — the arrow doubles as the folder marker.
+                let arrow = if *expanded { "▾" } else { "▸" };
                 // A repeated-block stack (e.g. a transformer's `layers` group)
-                // has children that are all numbered subgroups; surface how many
-                // there are so the depth is visible without expanding the tree.
+                // has children that are all numbered subgroups; the `☰` glyph
+                // counts them, `▦` the tensors — so depth is visible without
+                // expanding. When any descendant is compressed the on-disk total
+                // differs from the logical total; show both, mirroring tensors.
                 let layer_prefix = match layer_count(children) {
-                    Some(1) => "1 layer, ".to_string(),
-                    Some(n) => format!("{n} layers, "),
+                    Some(n) => format!("☰ {n}, "),
                     None => String::new(),
                 };
-                // When any descendant is compressed the on-disk total differs
-                // from the logical total; show both, mirroring tensor rows.
                 let size_field = if stored_size != total_size {
                     format!(
                         "{} → {}",
@@ -291,53 +310,57 @@ impl UI {
                 } else {
                     format_size(*total_size)
                 };
-                if depth == 0 {
+                write!(out, "{indent}")?;
+                paint(out, selected, palette::ACCENT, arrow)?;
+                write!(out, " ")?;
+                paint(out, selected, palette::ACCENT, name)?;
+                let meta = if depth == 0 {
                     // The checkpoint root: summarise the whole model, including
                     // the total parameter count (which used to live in a footer).
-                    writeln!(
-                        out,
-                        "{icon} 📦 {name} ({tensor_count} tensors, {} params, {size_field})\r",
+                    format!(
+                        " (▦ {tensor_count}, {} params, {size_field})",
                         format_parameters(*params)
-                    )?;
+                    )
                 } else {
-                    writeln!(
-                        out,
-                        "{}{} 📁 {} ({}{} tensors, {})\r",
-                        indent, icon, name, layer_prefix, tensor_count, size_field
-                    )?;
-                }
+                    format!(" ({layer_prefix}▦ {tensor_count}, {size_field})")
+                };
+                write!(out, "{meta}\r\n")?;
             }
             TreeNode::Tensor { info } => {
-                // In search mode (depth 0), show full name; otherwise show short name
+                // In search mode (depth 0), show full name; otherwise short name.
                 let display_name = if depth == 0 {
                     &info.name
                 } else {
                     info.name.split('.').next_back().unwrap_or(&info.name)
                 };
-                // Size field: for compressed tensors show both the logical size
-                // and the smaller on-disk size plus a codec marker; for formats
-                // that track it, mark raw; otherwise just the size.
-                let size_field = match &info.storage {
-                    Storage::Unknown => format_size(info.size_bytes),
-                    Storage::Raw => format!("{} (raw)", format_size(info.size_bytes)),
+                // The name, shape and size read at full strength; only the leaf
+                // marker and the storage tag (codec / "raw") are dimmed, and the
+                // dtype is tinted. `⇩` marks a compressed tensor.
+                write!(out, "{indent}  ")?;
+                paint(out, selected, palette::DIM, "·")?;
+                write!(out, " {display_name} [")?;
+                paint(out, selected, palette::DTYPE, &info.dtype)?;
+                write!(out, ", {}, ", format_shape(&info.shape))?;
+                match &info.storage {
                     Storage::Compressed {
                         codec,
                         stored_bytes,
-                    } => format!(
-                        "{} → {} ({codec})",
-                        format_size(info.size_bytes),
-                        format_size(*stored_bytes)
-                    ),
-                };
-                writeln!(
-                    out,
-                    "{}  📄 {} [{}, {}, {}]\r",
-                    indent,
-                    display_name,
-                    info.dtype,
-                    format_shape(&info.shape),
-                    size_field
-                )?;
+                    } => {
+                        write!(
+                            out,
+                            "{} → {} ",
+                            format_size(info.size_bytes),
+                            format_size(*stored_bytes)
+                        )?;
+                        paint(out, selected, palette::DIM, &format!("(⇩ {codec})"))?;
+                    }
+                    Storage::Raw => {
+                        write!(out, "{} ", format_size(info.size_bytes))?;
+                        paint(out, selected, palette::DIM, "(raw)")?;
+                    }
+                    Storage::Unknown => write!(out, "{}", format_size(info.size_bytes))?,
+                }
+                write!(out, "]\r\n")?;
             }
             TreeNode::Metadata { info } => {
                 let truncated_value = if info.value.len() > 50 {
@@ -345,11 +368,16 @@ impl UI {
                 } else {
                     info.value.clone()
                 };
-                writeln!(
+                write!(out, "{indent}  ")?;
+                paint(out, selected, palette::DIM, "≡")?;
+                write!(out, " {}", info.name)?;
+                paint(
                     out,
-                    "{}  🏷️  {} [{}]: {}\r",
-                    indent, info.name, info.value_type, truncated_value
+                    selected,
+                    palette::DIM,
+                    &format!(" [{}]: {truncated_value}", info.value_type),
                 )?;
+                write!(out, "\r\n")?;
             }
         }
         Ok(())
@@ -368,15 +396,19 @@ impl UI {
     ) -> Result<()> {
         queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
 
+        queue!(out, SetForegroundColor(palette::ACCENT))?;
         write!(out, "Tensor Details")?;
+        queue!(out, ResetColor, SetForegroundColor(palette::DIM))?;
         line_end(&mut *out)?;
-        write!(out, "==============")?;
+        write!(out, "{}", "─".repeat(14))?;
+        queue!(out, ResetColor)?;
         line_end(&mut *out)?;
-        write!(out, "Name: {}", tensor.name)?;
+        paint(&mut *out, false, palette::DIM, "Name: ")?;
+        write!(out, "{}", tensor.name)?;
         line_end(&mut *out)?;
 
         // Data type, with the active reinterpretation highlighted.
-        write!(out, "Data Type: ")?;
+        paint(&mut *out, false, palette::DIM, "Data Type: ")?;
         write_view_dtype(&mut *out, &tensor.dtype, view)?;
         line_end(&mut *out)?;
 
@@ -385,18 +417,21 @@ impl UI {
         // `stored as reinterpreted` just like the dtype line above.
         let shape = view.logical_shape(&tensor.shape, &tensor.dtype);
         let num_elements: usize = shape.iter().product();
-        write!(out, "Shape: ")?;
+        paint(&mut *out, false, palette::DIM, "Shape: ")?;
         write_view_shape(&mut *out, &tensor.shape, &shape)?;
         line_end(&mut *out)?;
-        write!(
-            out,
-            "Parameters: {} ({})",
-            format_parameters(num_elements),
-            with_thousands(num_elements)
+        paint(&mut *out, false, palette::DIM, "Parameters: ")?;
+        write!(out, "{} ", format_parameters(num_elements))?;
+        paint(
+            &mut *out,
+            false,
+            palette::DIM,
+            &format!("({})", with_thousands(num_elements)),
         )?;
         line_end(&mut *out)?;
 
-        write!(out, "Size: {}", format_size(tensor.size_bytes))?;
+        paint(&mut *out, false, palette::DIM, "Size: ")?;
+        write!(out, "{}", format_size(tensor.size_bytes))?;
         // On-disk size + codec on the same line, for formats that track
         // compression (HDF5); safetensors leaves it off entirely.
         match &tensor.storage {
@@ -408,10 +443,12 @@ impl UI {
                 // explicit (e.g. 4-bit weights in 16-bit words only reach ~2×
                 // under byte-oriented LZ4).
                 let ratio = tensor.size_bytes as f64 / (*stored_bytes).max(1) as f64;
-                write!(
-                    out,
-                    " · on disk: {} ({codec}, {ratio:.1}×)",
-                    format_size(*stored_bytes)
+                write!(out, " · on disk: {} ", format_size(*stored_bytes))?;
+                paint(
+                    &mut *out,
+                    false,
+                    palette::DIM,
+                    &format!("(⇩ {codec}, {ratio:.1}×)"),
                 )?;
             }
             Storage::Raw => {
@@ -427,26 +464,29 @@ impl UI {
         // Where the data lives within the file.
         match &tensor.layout {
             Layout::ByteRange { start, end } => {
+                paint(&mut *out, false, palette::DIM, "Data offsets: ")?;
                 write!(
                     out,
-                    "Data offsets: {} – {}  (within file data)",
+                    "{} – {}  (within file data)",
                     with_thousands(*start as usize),
                     with_thousands(*end as usize)
                 )?;
                 line_end(&mut *out)?;
             }
             Layout::Offset(offset) => {
+                paint(&mut *out, false, palette::DIM, "Data offset: ")?;
                 write!(
                     out,
-                    "Data offset: {}  (within tensor data)",
+                    "{}  (within tensor data)",
                     with_thousands(*offset as usize)
                 )?;
                 line_end(&mut *out)?;
             }
             Layout::Chunked { chunk, num_chunks } => {
+                paint(&mut *out, false, palette::DIM, "Chunks: ")?;
                 write!(
                     out,
-                    "Chunks: {} × {}",
+                    "{} × {}",
                     format_shape(chunk),
                     with_thousands(*num_chunks)
                 )?;
@@ -454,7 +494,8 @@ impl UI {
             }
             Layout::None => {}
         }
-        write!(out, "File: {}", tensor.source_path)?;
+        paint(&mut *out, false, palette::DIM, "File: ")?;
+        write!(out, "{}", tensor.source_path)?;
         line_end(&mut *out)?;
         line_end(&mut *out)?;
 
@@ -464,16 +505,17 @@ impl UI {
                 // min/max are exact integers for integer dtypes — show them as
                 // such (no `.0000`).
                 let integer = view.is_integer(&tensor.dtype);
+                paint(&mut *out, false, palette::DIM, "Statistics: ")?;
                 write!(
                     out,
-                    "Statistics: min {} · max {} · ",
+                    "min {} · max {} · ",
                     fmt_value(s.min, integer),
                     fmt_value(s.max, integer)
                 )?;
                 write_stats_line(&mut *out, s)?;
             }
             StatsView::Computing { spinner, elapsed } => {
-                write!(out, "Statistics: ")?;
+                paint(&mut *out, false, palette::DIM, "Statistics: ")?;
                 write_computing(&mut *out, spinner, elapsed)?;
             }
             StatsView::Pending => {
@@ -1044,6 +1086,20 @@ impl UI {
         stdout.flush()?;
         Ok(())
     }
+}
+
+/// Write `text` in `color`, unless `selected` — then write it plain so the
+/// caller's row highlight (inverse video) shows through. Only the foreground is
+/// touched (reset to default after), so any background the caller set persists.
+fn paint(out: &mut impl Write, selected: bool, color: Color, text: &str) -> Result<()> {
+    if selected {
+        write!(out, "{text}")?;
+    } else {
+        queue!(out, SetForegroundColor(color))?;
+        write!(out, "{text}")?;
+        queue!(out, SetForegroundColor(Color::Reset))?;
+    }
+    Ok(())
 }
 
 /// Write a key name highlighted (bold bright-cyan) so it stands out from the
