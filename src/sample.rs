@@ -270,6 +270,10 @@ pub struct Sample {
     pub overridable: bool,
     /// Which sampling produced this grid (evenly-spaced vs. edges).
     pub mode: SampleMode,
+    /// The shape the data is being viewed as — the effective (possibly
+    /// overridden) shape with the dtype packing applied to its last dimension.
+    /// The header shows it against the stored shape.
+    pub display_shape: Vec<usize>,
 }
 
 /// How [`sample_tensor`] chooses which rows/columns to show.
@@ -319,7 +323,16 @@ pub fn sample_tensor(
     mode: SampleMode,
 ) -> Result<Sample, String> {
     let reader = open_reader(t)?;
-    sample_tensor_with(reader.as_ref(), t, max_rows, max_cols, slice, view, mode)
+    sample_tensor_with(
+        reader.as_ref(),
+        t,
+        &t.shape,
+        max_rows,
+        max_cols,
+        slice,
+        view,
+        mode,
+    )
 }
 
 /// Like [`sample_tensor`], but reads through a caller-supplied open reader so an
@@ -327,9 +340,16 @@ pub fn sample_tensor(
 /// dominates the cost — see the `window_pan_open_cost` benchmark — and for HDF5
 /// it also throws away libhdf5's chunk cache, forcing re-decompression). The
 /// reader must be for `t` (same file and dtype/shape).
+/// `shape` is the shape to fold the flat data into for display — normally the
+/// tensor's stored shape, but a shape override (with the same element count)
+/// lets the caller reinterpret the dimensions. Region reads still go through
+/// `reader`'s real stored shape, so any reshape with a matching element count is
+/// a valid row-major reinterpretation.
+#[allow(clippy::too_many_arguments)] // distinct sampling parameters
 pub(crate) fn sample_tensor_with(
     reader: &dyn TensorReader,
     t: &TensorInfo,
+    shape: &[usize],
     max_rows: usize,
     max_cols: usize,
     slice: usize,
@@ -353,8 +373,9 @@ pub(crate) fn sample_tensor_with(
 
     // Size-1 dimensions don't change the flat layout, so we fold rows/cols/slices
     // from the squeezed shape (region reads below still use the real shape — flat
-    // indices are layout-invariant under squeezing).
-    let (total_rows, stored_cols, slices) = match squeezed_shape(&t.shape).as_slice() {
+    // indices are layout-invariant under squeezing, and under any reshape with a
+    // matching element count).
+    let (total_rows, stored_cols, slices) = match squeezed_shape(shape).as_slice() {
         [] => (1usize, 1usize, 1usize),
         [n] => (1usize, *n, 1usize),
         [r, c] => (*r, *c, 1usize),
@@ -418,6 +439,7 @@ pub(crate) fn sample_tensor_with(
         view,
         overridable,
         mode,
+        display_shape: view.logical_shape(shape, &t.dtype),
     })
 }
 
@@ -1024,34 +1046,53 @@ fn read_sampled(
     let item = item_size(dtype).ok_or_else(|| format!("unsupported dtype: {dtype}"))?;
     let shape = reader.shape().to_vec();
     let packing = view.packing(item);
+    // Elements per stored innermost row — used to detect when a sampled row's
+    // span crosses stored rows (only possible under a shape override).
+    let inner: usize = if shape.len() > 1 {
+        shape[1..].iter().product::<usize>().max(1)
+    } else {
+        1
+    };
     let first_col = *cols.first().unwrap();
     let last_col = *cols.last().unwrap();
     let container_for = |row_base: usize, col: usize| (row_base + col) / packing;
 
-    // One region per sampled row, covering that row's sampled-column span.
-    let regions: Vec<Vec<Range<usize>>> = rows
-        .iter()
-        .map(|&r| {
-            let row_base = base + r * total_cols;
-            region_for_span(
-                &shape,
-                container_for(row_base, first_col),
-                container_for(row_base, last_col),
-            )
-        })
-        .collect();
+    // Per sampled row: the region to read, and the flat container index its
+    // buffer starts at. A row's column span is normally within one stored
+    // innermost row, so we read just that span; a shape override can make it
+    // straddle stored rows, so then we read the full stored rows it covers (the
+    // buffer starts at the first of them). The flat container range is the same
+    // contiguous data either way — only the read selection differs.
+    let mut regions: Vec<Vec<Range<usize>>> = Vec::with_capacity(rows.len());
+    let mut starts: Vec<usize> = Vec::with_capacity(rows.len());
+    for &r in rows {
+        let row_base = base + r * total_cols;
+        let first = container_for(row_base, first_col);
+        let last = container_for(row_base, last_col);
+        if shape.len() <= 1 || first / inner == last / inner {
+            regions.push(region_for_span(&shape, first, last));
+            starts.push(first);
+        } else {
+            let (r0, r1) = (first / inner, last / inner);
+            let mut region = Vec::with_capacity(shape.len());
+            region.push(r0..r1 + 1);
+            region.extend(shape[1..].iter().map(|&d| 0..d));
+            regions.push(region);
+            starts.push(r0 * inner);
+        }
+    }
     let bufs = reader.read_regions(&regions)?;
 
     let out = rows
         .iter()
+        .zip(&starts)
         .zip(bufs)
-        .map(|(&r, buf)| {
+        .map(|((&r, &start), buf)| {
             let row_base = base + r * total_cols;
-            let first_container = container_for(row_base, first_col);
             cols.iter()
                 .map(|&c| {
                     let flat = row_base + c;
-                    let off = (flat / packing - first_container) * item;
+                    let off = (flat / packing - start) * item;
                     buf.get(off..off + item)
                         .map(|cont| decode_view(view, dtype, cont, flat % packing))
                         .unwrap_or(f64::NAN)
@@ -1838,6 +1879,47 @@ mod tests {
         for (i, &r) in s.rows.iter().enumerate() {
             for (j, &c) in s.cols.iter().enumerate() {
                 assert_eq!(s.values[i][j], (r * 3 + c) as f64);
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reshape_across_stored_rows() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_explorer_reshape");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // 4x5 f32 (value = flat index), reshaped to 5x4 — the override rows
+        // straddle the stored (4,5) rows, which used to read back as NaN.
+        let header = br#"{"w":{"dtype":"F32","shape":[4,5],"data_offsets":[0,80]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for i in 0..20u32 {
+            f.write_all(&(i as f32).to_le_bytes()).unwrap();
+        }
+        drop(f);
+
+        let t = fixture(&path, "w", &[4, 5], (0, 80));
+        let reader = open_reader(&t).unwrap();
+        let s = sample_tensor_with(
+            reader.as_ref(),
+            &t,
+            &[5, 4], // shape override
+            10,
+            10,
+            0,
+            ViewDtype::Stored,
+            SampleMode::Grid,
+        )
+        .unwrap();
+        assert_eq!((s.total_rows, s.total_cols), (5, 4));
+        assert_eq!(s.display_shape, vec![5, 4]);
+        // Every cell is the flat index r*4 + c — no NaNs from row-straddling.
+        for (i, &r) in s.rows.iter().enumerate() {
+            for (j, &c) in s.cols.iter().enumerate() {
+                assert_eq!(s.values[i][j], (r * 4 + c) as f64);
             }
         }
         let _ = std::fs::remove_file(&path);
