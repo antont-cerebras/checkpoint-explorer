@@ -913,25 +913,20 @@ impl Explorer {
             return Ok(());
         }
 
-        // In one-shot mode (`--exit`) the last rendered frame is left on screen
-        // instead of being cleared, so it can be read / captured after exit.
-        let one_shot = self.open.as_ref().is_some_and(|o| o.exit_after);
-
         terminal::enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, terminal::Clear(ClearType::All), cursor::Hide)?;
 
         let result = self.interactive_loop();
 
-        if one_shot {
-            execute!(stdout, cursor::Show)?;
-            terminal::disable_raw_mode()?;
-            // Move the shell prompt below the rendered frame.
-            println!();
-        } else {
-            execute!(stdout, terminal::Clear(ClearType::All), cursor::Show)?;
-            terminal::disable_raw_mode()?;
-        }
+        // Leave the last rendered frame on screen — don't clear it — and drop the
+        // shell prompt onto a fresh line just below it. This keeps whatever you
+        // were looking at visible after you quit (and lets `--exit` output be
+        // read / captured). The newline lands the prompt at the bottom left;
+        // disabling raw mode first so its `\n` becomes a CR+LF (column 0).
+        execute!(stdout, cursor::Show)?;
+        terminal::disable_raw_mode()?;
+        println!();
 
         result
     }
@@ -2895,13 +2890,16 @@ fn is_ctrl_c(key: &KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-/// Restore the terminal (leave raw mode, show the cursor, clear the screen) and
-/// exit the process immediately. Used for Ctrl-C from any of the detail/data
-/// sub-screens so it quits outright instead of stepping back one screen.
+/// Restore the terminal (leave raw mode, show the cursor) and exit the process
+/// immediately, leaving the last frame on screen with the prompt just below it.
+/// Used for Ctrl-C from any of the detail/data sub-screens so it quits outright
+/// instead of stepping back one screen.
 fn quit_immediately() -> ! {
     let mut stdout = io::stdout();
-    let _ = execute!(stdout, terminal::Clear(ClearType::All), cursor::Show);
+    let _ = execute!(stdout, cursor::Show);
     let _ = terminal::disable_raw_mode();
+    // Drop the prompt onto a fresh line below the preserved frame.
+    println!();
     std::process::exit(0);
 }
 
