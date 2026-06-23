@@ -21,7 +21,7 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::explorer::{Explorer, OpenRequest, OpenView};
+use crate::explorer::{DataLayout, Explorer, OpenRequest, OpenView};
 
 #[derive(Parser)]
 #[command(name = "checkpoint-explorer")]
@@ -92,14 +92,36 @@ struct ExploreArgs {
 
     #[arg(
         long,
-        visible_alias = "edges",
-        conflicts_with = "overview",
-        help = "Show the first/last edges (padding) submode"
+        conflicts_with_all = ["values", "heatmap"],
+        help = "Reveal the tensor highlighted in the tree browser instead of opening a view"
     )]
-    edge: bool,
+    tree: bool,
+
+    #[arg(
+        long,
+        visible_alias = "edges",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "0.5,0.5",
+        value_name = "RFRAC,CFRAC",
+        conflicts_with_all = ["overview", "window"],
+        help = "Show the first/last edges (padding) submode; optional ROW,COL head/tail split fractions 0..1 (0=first, 1=last, 0.5=balanced)"
+    )]
+    edge: Option<String>,
 
     #[arg(long, help = "Show the evenly-spaced overview submode")]
     overview: bool,
+
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "0,0",
+        value_name = "ROW,COL",
+        conflicts_with_all = ["edge", "overview"],
+        help = "Show the contiguous pannable window submode; optional ROW,COL top-left corner (default 0,0)"
+    )]
+    window: Option<String>,
 
     #[arg(
         long,
@@ -178,6 +200,42 @@ fn main() -> Result<()> {
     }
 }
 
+/// Parse a `ROW,COL` pair of non-negative integers (the `--window` top-left).
+fn parse_offset_pair(s: &str) -> Result<(usize, usize)> {
+    let (r, c) = s
+        .split_once(',')
+        .with_context(|| format!("expected ROW,COL (two integers), got '{s}'"))?;
+    let row = r
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid row '{r}'"))?;
+    let col = c
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid col '{c}'"))?;
+    Ok((row, col))
+}
+
+/// Parse a `RFRAC,CFRAC` pair of fractions in `0..=1` (the `--edge` head/tail
+/// split: 0 keeps only the first indices, 1 only the last, 0.5 is balanced).
+fn parse_fraction_pair(s: &str) -> Result<(f32, f32)> {
+    let (r, c) = s
+        .split_once(',')
+        .with_context(|| format!("expected RFRAC,CFRAC (two fractions 0..1), got '{s}'"))?;
+    let row: f32 = r
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid row '{r}'"))?;
+    let col: f32 = c
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid col '{c}'"))?;
+    if !(0.0..=1.0).contains(&row) || !(0.0..=1.0).contains(&col) {
+        anyhow::bail!("edge split fractions must be between 0 and 1, got '{s}'");
+    }
+    Ok((row, col))
+}
+
 fn run_explore(args: ExploreArgs) -> Result<()> {
     if args.paths.is_empty() {
         eprintln!("Error: Please specify one or more checkpoint files or directories to explore.");
@@ -200,24 +258,34 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         OpenView::Values
     } else if args.heatmap {
         OpenView::Heatmap
+    } else if args.tree {
+        OpenView::Tree
     } else {
         OpenView::Detail
     };
-    let edges = if args.edge {
-        Some(true)
+    let layout = if args.window.is_some() {
+        Some(DataLayout::Window)
+    } else if args.edge.is_some() {
+        Some(DataLayout::Edges)
     } else if args.overview {
-        Some(false)
+        Some(DataLayout::Overview)
     } else {
         None
     };
+    // Position within the layout: the window's top-left corner, or the edges
+    // head/tail split — parsed from the optional `--window`/`--edge` value.
+    let window_at = args.window.as_deref().map(parse_offset_pair).transpose()?;
+    let edge_split = args.edge.as_deref().map(parse_fraction_pair).transpose()?;
     // Seed an open request when a tensor is named *or* any view/override flag is
     // given — the latter targets the sole tensor when the checkpoint has one.
     let wants_open = args.tensor.is_some()
         || args.values
         || args.heatmap
+        || args.tree
         || args.dtype.is_some()
-        || args.edge
+        || args.edge.is_some()
         || args.overview
+        || args.window.is_some()
         || args.zebra.is_some()
         || args.slice.is_some()
         || args.shape.is_some()
@@ -227,7 +295,9 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         tensor: args.tensor,
         view,
         dtype: args.dtype,
-        edges,
+        layout,
+        window_at,
+        edge_split,
         zebra: args.zebra,
         slice: args.slice,
         shape: args.shape,

@@ -32,7 +32,7 @@ use crate::utils::base64_encode;
 /// with `e`, remembered for the session; defaults to the edges view (most useful
 /// for inspecting padding).
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
-enum DataLayout {
+pub enum DataLayout {
     Overview,
     #[default]
     Edges,
@@ -59,6 +59,9 @@ pub enum OpenView {
     Values,
     /// The ASCII heatmap (`m`).
     Heatmap,
+    /// The tree browser, with the tensor revealed and highlighted (no view
+    /// opened) — what `y` copies from the tree (`--tree`).
+    Tree,
 }
 
 /// A tensor + view to open on startup, from the CLI flags.
@@ -71,9 +74,14 @@ pub struct OpenRequest {
     pub view: OpenView,
     /// Optional dtype reinterpretation to apply first.
     pub dtype: Option<ViewDtype>,
-    /// `Some(true)` forces the edges submode, `Some(false)` the overview;
-    /// `None` keeps the default.
-    pub edges: Option<bool>,
+    /// Which data-view layout to force (`--edge`/`--overview`/`--window`);
+    /// `None` keeps the session default.
+    pub layout: Option<DataLayout>,
+    /// The window layout's top-left corner (row, col), from `--window=ROW,COL`.
+    pub window_at: Option<(usize, usize)>,
+    /// The edges layout's head/tail split (row, col fractions in `0..=1`), from
+    /// `--edge=RFRAC,CFRAC`.
+    pub edge_split: Option<(f32, f32)>,
     /// Optional zebra-striping mode to apply (numeric grid).
     pub zebra: Option<StripeMode>,
     /// Optional starting slice (3D tensors), as a raw `N` or `N%` string
@@ -109,6 +117,9 @@ struct CachedReader {
 
 /// A spinner cycled while a statistics scan runs (Braille dots).
 const STATS_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// The program name used when building the copyable CLI commands (`y`).
+const PROGRAM: &str = "checkpoint-explorer";
 
 /// A statistics scan running on a worker thread for a data view's current
 /// `(tensor, view)`. The view stays fully interactive while it runs; the main
@@ -1092,6 +1103,12 @@ impl Explorer {
                         code: KeyCode::Char('f'),
                         ..
                     } if !self.search_mode => self.copy_selected_path(),
+                    // `y` shows and copies the CLI command that reopens this view
+                    // — the highlighted tensor if one is selected, else the files.
+                    KeyEvent {
+                        code: KeyCode::Char('y'),
+                        ..
+                    } if !self.search_mode => self.copy_command(&self.command_for_tree_selection()),
                     // `h` shows the checkpoint health report (when there is one).
                     KeyEvent {
                         code: KeyCode::Char('h'),
@@ -1448,7 +1465,7 @@ impl Explorer {
     /// override and edges/overview choice, then either render it once (`--exit`)
     /// or return the [`Screen`] to seed the navigator with. Returns `None` when
     /// the tensor isn't found, the slice is invalid, or it was a one-shot render.
-    fn open_requested(&self, req: OpenRequest) -> Option<Screen> {
+    fn open_requested(&mut self, req: OpenRequest) -> Option<Screen> {
         // Resolve the target tensor: the named one, or — when `--tensor` is
         // omitted — the sole tensor if the checkpoint has exactly one (e.g. any
         // `.npy`, or a single-array `.npz`/HDF5/safetensors). Ambiguous otherwise.
@@ -1515,12 +1532,17 @@ impl Explorer {
                 }
             }
         }
-        if let Some(edges) = req.edges {
-            self.data_view_layout.set(if edges {
-                DataLayout::Edges
-            } else {
-                DataLayout::Overview
-            });
+        if let Some(layout) = req.layout {
+            self.data_view_layout.set(layout);
+        }
+        // Position within the layout (clamped to valid bounds on the first draw).
+        if let Some((row, col)) = req.window_at {
+            self.data_view_win_row.set(row);
+            self.data_view_win_col.set(col);
+        }
+        if let Some((row_tail, col_tail)) = req.edge_split {
+            self.data_view_row_tail.set(row_tail);
+            self.data_view_col_tail.set(col_tail);
         }
         if let Some(zebra) = req.zebra {
             self.data_view_stripe.set(zebra);
@@ -1573,6 +1595,14 @@ impl Explorer {
                 repr: Representation::Heatmap,
                 slice: start_slice,
             },
+            // `--tree`: don't open a view — land on the tree with this tensor
+            // revealed and highlighted (the dtype/shape overrides applied above
+            // stay set for when it's opened). Return `None` so the navigator
+            // stays on the tree (cursor 0) with the selection we just set.
+            OpenView::Tree => {
+                self.reveal_tensor(&tensor.name);
+                return None;
+            }
         };
 
         // One-shot (`--exit`): render the requested screen once and return None
@@ -1845,6 +1875,11 @@ impl Explorer {
                     });
                     copy_to_clipboard(&text);
                 }
+                // `y` shows and copies the CLI command that reopens this screen.
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Char('y'),
+                    ..
+                })) => self.copy_command(&self.command_for_detail(tensor)),
                 // `l` opens the legend for the detail screen's glyphs, then
                 // returns here (the loop redraws the detail over it).
                 Ok(Event::Key(KeyEvent {
@@ -2194,6 +2229,11 @@ impl Explorer {
                                     );
                                 });
                                 copy_to_clipboard(&text);
+                            }
+                            // `y` shows and copies the CLI command that reopens
+                            // this exact view.
+                            KeyCode::Char('y') => {
+                                self.copy_command(&self.command_for_data(tensor, repr, slice))
                             }
                             // Open the legend for this representation, then
                             // redraw the data view over it.
@@ -2745,6 +2785,131 @@ impl Explorer {
             quit_immediately();
         }
     }
+
+    /// Copy `command` to the clipboard and show it in a dismissible box, so the
+    /// user can both see and paste the exact invocation that reopens this screen
+    /// (the `y` shortcut). Any key returns; Ctrl-C still quits.
+    fn copy_command(&self, command: &str) {
+        copy_to_clipboard(command);
+        if UI::draw_command(command).is_ok()
+            && let Ok(Event::Key(key)) = event::read()
+            && is_ctrl_c(&key)
+        {
+            quit_immediately();
+        }
+    }
+
+    /// The command that reopens the current tree: the program and the file/dir
+    /// arguments it was launched with.
+    fn command_for_tree(&self) -> String {
+        let mut parts = vec![PROGRAM.to_string()];
+        parts.extend(self.files.iter().map(|p| shell_quote(&p.to_string_lossy())));
+        parts.join(" ")
+    }
+
+    /// The command `y` copies from the tree: when a tensor row is highlighted
+    /// (e.g. after backing out of its data view, which re-selects it), reproduce
+    /// *the tree with that tensor revealed* — `--tree`, plus any active
+    /// dtype/shape override — rather than opening its detail; for a group/root
+    /// row, the plain file list.
+    fn command_for_tree_selection(&self) -> String {
+        match self.flattened_tree.get(self.selected_idx) {
+            Some((TreeNode::Tensor { info }, _)) => {
+                let mut parts = self.command_base(info);
+                parts.push("--tree".to_string());
+                parts.join(" ")
+            }
+            _ => self.command_for_tree(),
+        }
+    }
+
+    /// `checkpoint-explorer <file> --tensor <name>`, plus the active dtype and
+    /// shape overrides — the shared prefix for the detail and data-view commands.
+    fn command_base(&self, tensor: &TensorInfo) -> Vec<String> {
+        let mut parts = vec![
+            PROGRAM.to_string(),
+            shell_quote(&tensor.source_path),
+            "--tensor".to_string(),
+            shell_quote(&tensor.name),
+        ];
+        if let Some(dt) = self.dtype_overrides.borrow().get(&tensor.name)
+            && let Some(value) = dt.cli_value()
+        {
+            parts.push("--dtype".to_string());
+            parts.push(value);
+        }
+        if let Some(shape) = self.shape_overrides.borrow().get(&tensor.name) {
+            parts.push("--shape".to_string());
+            parts.push(
+                shape
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        parts
+    }
+
+    /// The command that reopens this tensor's detail screen.
+    fn command_for_detail(&self, tensor: &TensorInfo) -> String {
+        self.command_base(tensor).join(" ")
+    }
+
+    /// The command that reopens this data view with its current representation,
+    /// layout, zebra striping and slice.
+    fn command_for_data(&self, tensor: &TensorInfo, repr: Representation, slice: usize) -> String {
+        let mut parts = self.command_base(tensor);
+        parts.push(
+            match repr {
+                Representation::Heatmap => "--heatmap",
+                Representation::Values => "--values",
+            }
+            .to_string(),
+        );
+        // The layout, with its position: the window's top-left corner and the
+        // edges head/tail split, so the command reopens the same view — not just
+        // the same layout at its default position. The bare flag (no value) is
+        // emitted at the default position to keep the command tidy.
+        parts.push(match self.data_view_layout.get() {
+            DataLayout::Overview => "--overview".to_string(),
+            DataLayout::Edges => {
+                let (rt, ct) = (self.data_view_row_tail.get(), self.data_view_col_tail.get());
+                if rt == 0.5 && ct == 0.5 {
+                    "--edge".to_string()
+                } else {
+                    format!("--edge={rt},{ct}")
+                }
+            }
+            DataLayout::Window => {
+                let (row, col) = (self.data_view_win_row.get(), self.data_view_win_col.get());
+                if row == 0 && col == 0 {
+                    "--window".to_string()
+                } else {
+                    format!("--window={row},{col}")
+                }
+            }
+        });
+        // Zebra applies only to the numeric grid; emit it only when it differs
+        // from the default (rows), which a fresh launch already uses.
+        if matches!(repr, Representation::Values) {
+            let zebra = match self.data_view_stripe.get() {
+                StripeMode::Rows => None,
+                StripeMode::Cols => Some("cols"),
+                StripeMode::Off => Some("off"),
+            };
+            if let Some(mode) = zebra {
+                parts.push("--zebra".to_string());
+                parts.push(mode.to_string());
+            }
+        }
+        // Slice 0 is the default, so only name a non-zero starting slice.
+        if slice > 0 {
+            parts.push("--slice".to_string());
+            parts.push(slice.to_string());
+        }
+        parts.join(" ")
+    }
 }
 
 /// Default output name for a repack: `<stem>.repacked.<ext>` beside the input.
@@ -2992,6 +3157,26 @@ fn strip_ansi(bytes: &[u8]) -> String {
         lines.pop();
     }
     lines.join("\n")
+}
+
+/// Quote `s` as a single shell argument: left bare when it's only made of safe
+/// characters (so plain tensor names and paths stay readable), else wrapped in
+/// single quotes with any embedded quote escaped. Used to build copyable CLI
+/// commands that survive paths/names containing spaces or shell metacharacters.
+fn shell_quote(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'_' | b'-' | b'.' | b'/' | b'=' | b',' | b'%' | b'+' | b':' | b'@'
+                )
+        });
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
 }
 
 /// Copy `text` to the terminal clipboard via the OSC 52 escape sequence. This

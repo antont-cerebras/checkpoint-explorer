@@ -67,6 +67,22 @@ impl ViewDtype {
         }
     }
 
+    /// The `--dtype` CLI value that re-selects this view (e.g. `f16`, `u4-packed`),
+    /// or `None` for the stored dtype (no flag needed). Inverse of
+    /// [`parse_view_dtype`].
+    pub fn cli_value(self) -> Option<String> {
+        Some(match self {
+            ViewDtype::Stored => return None,
+            ViewDtype::As(dt) => dt.to_ascii_lowercase(),
+            ViewDtype::U4Lo => "u4-lo".to_string(),
+            ViewDtype::U4Hi => "u4-hi".to_string(),
+            ViewDtype::U4Packed => "u4-packed".to_string(),
+            ViewDtype::I4Lo => "i4-lo".to_string(),
+            ViewDtype::I4Hi => "i4-hi".to_string(),
+            ViewDtype::I4Packed => "i4-packed".to_string(),
+        })
+    }
+
     /// A compact label for the selection menu (e.g. `stored`, `F16`, `u4·hi`).
     pub fn menu_label(self) -> &'static str {
         match self {

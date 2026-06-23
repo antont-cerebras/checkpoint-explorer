@@ -135,9 +135,10 @@ without `--tensor` is reported as ambiguous.
 |------|--------|
 | `--tensor <NAME>` | Open this tensor (exact name); optional for single-tensor checkpoints |
 | `--values` / `--heatmap` | Open the numeric grid / the heatmap (default: the detail screen) |
+| `--tree` | Reveal the tensor highlighted in the tree browser, without opening a view |
 | `--dtype <DTYPE>` | Reinterpret the dtype: `u4-packed`, `u4-lo`, `u4-hi`, `i4-packed`, `i4-lo`, `i4-hi`, or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
 | `--shape <DIMS>` | Reinterpret the shape (same element count): `10,100` / `10x100`; one dim may be `-1`/`*`/`_` to infer |
-| `--edge` (alias `--edges`) / `--overview` | Force the first/last edges submode / the evenly-spaced overview |
+| `--edge[=RFRAC,CFRAC]` (alias `--edges`) / `--overview` / `--window[=ROW,COL]` | Force the edges submode (optional head/tail split fractions `0..1`) / the overview / the contiguous window (optional top-left `ROW,COL`) |
 | `--zebra <rows\|cols\|off>` | Zebra-stripe the numeric grid by rows, columns, or off |
 | `--slice <INDEX>` | Starting slice for a 3D tensor: an index (`12`) or a percentage (`50%`) |
 | `--compute-stats` | Start the statistics scan immediately on the detail view (data views always compute them) |
@@ -160,6 +161,7 @@ keep exploring.
 | `l` | Show a legend explaining the symbols on the current screen (works on every screen) |
 | `c` | Copy the current screen's text to the clipboard (works on every screen) |
 | `f` | Copy the selected row's File path (tensor file, or a group/root's file or directory) |
+| `y` | Show and copy the CLI command that reopens this exact screen — file, tensor, dtype/shape overrides, view, layout, zebra, slice (works on every screen) |
 | `h` | Show the checkpoint health report (when there is a mismatch) |
 | `R` | Repack the current HDF5 checkpoint into a new file (HDF5 only) |
 | `Backspace` / `\` | Step **back** / **forward** through the screens you've visited (browser-style history) — e.g. reopen a view you just left |
@@ -179,6 +181,17 @@ supports it). A status bar pinned to the bottom of the tree shows the file the
 selected tensor lives in (or, for a group/root, the single file or the shared
 directory of its tensors); `f` copies that path (so copying the root yields the
 file or the checkpoint directory).
+
+`y` shows — and copies — the **CLI command that reopens the current screen** with
+its precise settings: the file and `--tensor`, any active `--dtype` / `--shape`
+override, the view (`--values` / `--heatmap`), the layout *and its position* (the
+window's top-left corner via `--window=ROW,COL`, or the edges head/tail split via
+`--edge=RFRAC,CFRAC`), the `--zebra` mode and the `--slice`. So a panned window or
+a re-balanced edges view round-trips exactly. On the tree it reproduces the
+*highlighted tensor* — `--tensor … --tree`, which reopens the tree with that
+tensor revealed (e.g. after backing out of its view) rather than opening it.
+Paste it to share or revisit an exact view; append `--exit` to render it once
+and drop back to the shell.
 
 ### Search Feature
 
