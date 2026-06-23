@@ -63,8 +63,10 @@ pub enum OpenView {
 
 /// A tensor + view to open on startup, from the CLI flags.
 pub struct OpenRequest {
-    /// Exact tensor name to open.
-    pub tensor: String,
+    /// Exact tensor name to open. `None` targets the sole tensor when the
+    /// checkpoint has exactly one (so a single-tensor file — always the case for
+    /// `.npy` — needs no `--tensor`); ambiguous otherwise.
+    pub tensor: Option<String>,
     /// Which screen to show.
     pub view: OpenView,
     /// Optional dtype reinterpretation to apply first.
@@ -1411,19 +1413,40 @@ impl Explorer {
     /// or return the [`Screen`] to seed the navigator with. Returns `None` when
     /// the tensor isn't found, the slice is invalid, or it was a one-shot render.
     fn open_requested(&self, req: OpenRequest) -> Option<Screen> {
-        let Some(tensor) = self.tensors.iter().find(|t| t.name == req.tensor).cloned() else {
-            let _ = UI::draw_message(
-                "Tensor not found",
-                &format!(
-                    "No tensor named '{}' in this checkpoint — opening the browser instead.",
-                    req.tensor
-                ),
-            );
-            // Don't wait for a key in one-shot mode (it would defeat `--exit`).
-            if !req.exit_after {
-                let _ = event::read();
-            }
-            return None;
+        // Resolve the target tensor: the named one, or — when `--tensor` is
+        // omitted — the sole tensor if the checkpoint has exactly one (e.g. any
+        // `.npy`, or a single-array `.npz`/HDF5/safetensors). Ambiguous otherwise.
+        let tensor = match &req.tensor {
+            Some(name) => match self.tensors.iter().find(|t| t.name == *name) {
+                Some(t) => t.clone(),
+                None => {
+                    let _ = UI::draw_message(
+                        "Tensor not found",
+                        &format!(
+                            "No tensor named '{name}' in this checkpoint — opening the browser instead."
+                        ),
+                    );
+                    if !req.exit_after {
+                        let _ = event::read();
+                    }
+                    return None;
+                }
+            },
+            None => match self.tensors.as_slice() {
+                [only] => only.clone(),
+                _ => {
+                    if self.tensors.len() > 1 {
+                        let _ = UI::draw_message(
+                            "Which tensor?",
+                            "This checkpoint has multiple tensors — name one with --tensor, or pick it in the browser.",
+                        );
+                        if !req.exit_after {
+                            let _ = event::read();
+                        }
+                    }
+                    return None;
+                }
+            },
         };
         // Apply the dtype override (skipped for formats that can't reinterpret,
         // so the header never claims a view that isn't actually applied).

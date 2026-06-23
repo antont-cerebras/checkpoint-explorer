@@ -62,14 +62,13 @@ struct ExploreArgs {
     #[arg(
         long,
         value_name = "NAME",
-        help = "Open a specific tensor on startup (exact name); combine with --dtype/--values/--heatmap/--edge"
+        help = "Open a specific tensor on startup (exact name); optional when the checkpoint has only one tensor (e.g. a .npy). Combine with --dtype/--shape/--values/--heatmap/--edge"
     )]
     tensor: Option<String>,
 
     #[arg(
         long,
         value_name = "DTYPE",
-        requires = "tensor",
         value_parser = sample::parse_view_dtype,
         help = "Reinterpret the opened tensor's dtype: u4-packed, u4-lo, u4-hi, i4-packed, i4-lo, i4-hi, f16, bf16, i16, u16, f32, i32, u32, f64, i64, u64, i8, u8, stored"
     )]
@@ -77,35 +76,28 @@ struct ExploreArgs {
 
     #[arg(
         long,
-        requires = "tensor",
         conflicts_with = "heatmap",
         help = "Open the opened tensor's numeric values grid"
     )]
     values: bool,
 
-    #[arg(long, requires = "tensor", help = "Open the opened tensor's heatmap")]
+    #[arg(long, help = "Open the opened tensor's heatmap")]
     heatmap: bool,
 
     #[arg(
         long,
         visible_alias = "edges",
-        requires = "tensor",
         conflicts_with = "overview",
         help = "Show the first/last edges (padding) submode"
     )]
     edge: bool,
 
-    #[arg(
-        long,
-        requires = "tensor",
-        help = "Show the evenly-spaced overview submode"
-    )]
+    #[arg(long, help = "Show the evenly-spaced overview submode")]
     overview: bool,
 
     #[arg(
         long,
         value_name = "MODE",
-        requires = "tensor",
         value_parser = ui::parse_stripe_mode,
         help = "Zebra-stripe the numeric grid by rows, cols, or off"
     )]
@@ -114,7 +106,6 @@ struct ExploreArgs {
     #[arg(
         long,
         value_name = "INDEX",
-        requires = "tensor",
         help = "Starting slice for a 3D tensor: an index (e.g. 12) or a percentage (e.g. 50%)"
     )]
     slice: Option<String>,
@@ -122,21 +113,18 @@ struct ExploreArgs {
     #[arg(
         long,
         value_name = "DIMS",
-        requires = "tensor",
         help = "Reinterpret the tensor's shape (same element count); dims like 10,100 or -1,768 (one dim may be -1/*/_ to infer)"
     )]
     shape: Option<String>,
 
     #[arg(
         long,
-        requires = "tensor",
         help = "Start computing statistics immediately when opening the detail view (data views always compute them)"
     )]
     compute_stats: bool,
 
     #[arg(
         long,
-        requires = "tensor",
         help = "Render the requested view once and exit, without entering interactive navigation"
     )]
     exit: bool,
@@ -216,8 +204,21 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
     } else {
         None
     };
-    let open = args.tensor.map(|tensor| OpenRequest {
-        tensor,
+    // Seed an open request when a tensor is named *or* any view/override flag is
+    // given — the latter targets the sole tensor when the checkpoint has one.
+    let wants_open = args.tensor.is_some()
+        || args.values
+        || args.heatmap
+        || args.dtype.is_some()
+        || args.edge
+        || args.overview
+        || args.zebra.is_some()
+        || args.slice.is_some()
+        || args.shape.is_some()
+        || args.compute_stats
+        || args.exit;
+    let open = wants_open.then_some(OpenRequest {
+        tensor: args.tensor,
         view,
         dtype: args.dtype,
         edges,
