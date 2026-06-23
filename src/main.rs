@@ -60,6 +60,12 @@ struct ExploreArgs {
     no_health_check: bool,
 
     #[arg(
+        long = "no-preload",
+        help = "Don't compute a tensor's statistics in the background when its detail screen opens (the scan reads the tensor, warming the OS/disk cache to speed up the heatmap/values views especially over NFS; with this flag, statistics are computed only when you press s)"
+    )]
+    no_preload: bool,
+
+    #[arg(
         long,
         value_name = "NAME",
         help = "Open a specific tensor on startup (exact name); optional when the checkpoint has only one tensor (e.g. a .npy). Combine with --dtype/--shape/--values/--heatmap/--edge"
@@ -229,7 +235,7 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         exit_after: args.exit,
     });
 
-    let mut explorer = Explorer::new(files, health_reports, open);
+    let mut explorer = Explorer::new(files, health_reports, open, !args.no_preload);
     explorer.run()
 }
 
