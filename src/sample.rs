@@ -1230,9 +1230,23 @@ impl TensorReader for BlobReader {
         Ok(gather_region(self.blob(), &full, ranges, self.item))
     }
 
-    /// Zero-copy full scan: the tensor's bytes are already contiguous.
+    /// Zero-copy full scan: the tensor's bytes are already contiguous, so hand
+    /// them straight to `f` — but in element-aligned chunks rather than one giant
+    /// call, so the caller's per-block work (progress bar, pause, cancel) runs
+    /// incrementally instead of only after the whole tensor has been reduced.
+    /// Each chunk is still a borrowed sub-slice (no copy); the reducer itself
+    /// parallelises within a chunk, so chunking this coarsely costs nothing.
     fn fold_blocks(&self, f: &mut dyn FnMut(&[u8]) -> ControlFlow<()>) -> Result<(), String> {
-        let _ = f(self.blob());
+        let blob = self.blob();
+        let chunk = STATS_BLOCK_ELEMS * self.item; // element-aligned by construction
+        let mut off = 0;
+        while off < blob.len() {
+            let hi = (off + chunk).min(blob.len());
+            if f(&blob[off..hi]).is_break() {
+                break;
+            }
+            off = hi;
+        }
         Ok(())
     }
 }
