@@ -276,6 +276,11 @@ pub struct Explorer {
     /// The last sampled grid a data view drew, reused across identical redraws
     /// (e.g. the spinner ticks during a stats scan). See [`CachedSample`].
     sample_cache: RefCell<Option<CachedSample>>,
+    /// Whether to compute a tensor's exact stats in the background when its
+    /// detail screen opens. Reading the whole tensor warms the OS/disk cache (the
+    /// dominant cost on NFS), so the heatmap/numeric view opens fast; the scan is
+    /// shown live on the detail screen's Statistics line. Off via `--no-preload`.
+    preload: bool,
 }
 
 impl Explorer {
@@ -283,6 +288,7 @@ impl Explorer {
         files: Vec<PathBuf>,
         health_reports: Vec<crate::health::HealthReport>,
         open: Option<OpenRequest>,
+        preload: bool,
     ) -> Self {
         Self {
             files,
@@ -314,6 +320,7 @@ impl Explorer {
             open,
             reader_cache: RefCell::new(None),
             sample_cache: RefCell::new(None),
+            preload,
         }
     }
 
@@ -1600,6 +1607,24 @@ impl Explorer {
         };
         let tensor = &tensor;
         let overridable = dtype_overridable(tensor);
+        // While this screen is up, compute the tensor's exact stats in the
+        // background and show the scan live on the Statistics line (a spinner +
+        // timer) rather than silently claiming "press s". The reduction streams
+        // the tensor in bounded blocks — never holding more than one block, so
+        // memory stays flat even for a multi-GB tensor — and warms the OS/disk
+        // cache (the dominant cost on NFS) as a side effect, so the heatmap /
+        // numeric view then opens fast; only the tiny result is kept. Dropping
+        // `scan` on any exit from this screen cancels the worker, so it never
+        // contends with the data-view scan we navigate into (whatever it warmed
+        // stays in the OS cache). Off via `--no-preload`; skipped when
+        // `--compute-stats` scans synchronously below, in one-shot mode, or for
+        // formats we don't byte-read (e.g. GGUF).
+        let warm = self.preload
+            && stats_start != StatsStart::Auto
+            && interaction == Interaction::Interactive
+            && overridable;
+        let mut scan: Option<ScanJob> = None;
+        let mut spin_frame = 0usize;
         let mut first = true;
         loop {
             let view = self
@@ -1614,9 +1639,8 @@ impl Explorer {
                 .get(&tensor.name)
                 .cloned()
                 .unwrap_or_else(|| tensor.shape.clone());
-            // Normally stats show only if already computed (browsing the tree
-            // stays fast); `--compute-stats` kicks off the scan on first open,
-            // animating the spinner right on this detail screen.
+            // `--compute-stats` kicks off the scan synchronously on first open,
+            // animating the spinner right here; normal browsing stays fast.
             if first && stats_start == StatsStart::Auto {
                 self.compute_stats_animated(tensor, view, |sv| {
                     let _ = UI::draw_tensor_detail(
@@ -1629,8 +1653,48 @@ impl Explorer {
                     );
                 });
             }
+            // Stats: shown if cached, else — while warming — a live spinner for
+            // the background scan. Switching the dtype (`d`) restarts it for the
+            // new view; the result is cached the moment it lands.
             let stats = self.cached_stats(tensor, view);
-            let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
+            let stats_view = match &stats {
+                Some(s) => {
+                    scan = None;
+                    StatsView::Ready(s)
+                }
+                None if warm => {
+                    if scan.as_ref().is_none_or(|j| j.view != view) {
+                        scan = Some(self.spawn_stats_scan(tensor, view));
+                    }
+                    let finished = scan
+                        .as_ref()
+                        .and_then(|j| j.handle.as_ref())
+                        .is_some_and(|h| h.is_finished());
+                    if finished {
+                        let mut job = scan.take().unwrap();
+                        if let Some(h) = job.handle.take()
+                            && let Ok(Ok(s)) = h.join()
+                        {
+                            self.stats_cache
+                                .borrow_mut()
+                                .insert((tensor.name.clone(), view), s);
+                        }
+                        continue; // redraw with the freshly cached stats
+                    }
+                    // Hold off the spinner briefly so a quick scan doesn't flash it.
+                    let job = scan.as_ref().unwrap();
+                    if job.started.elapsed() >= std::time::Duration::from_millis(120) {
+                        spin_frame = spin_frame.wrapping_add(1);
+                        StatsView::Computing {
+                            spinner: STATS_SPINNER[spin_frame % STATS_SPINNER.len()],
+                            elapsed: job.started.elapsed(),
+                        }
+                    } else {
+                        StatsView::Pending
+                    }
+                }
+                None => StatsView::Pending,
+            };
             if UI::draw_tensor_detail(
                 &mut live_out(),
                 tensor,
@@ -1648,7 +1712,22 @@ impl Explorer {
                 return Nav::Quit;
             }
             first = false;
-            match event::read() {
+            // Block for a key when idle; while the background scan runs, poll so
+            // the spinner keeps ticking and a finished scan is harvested promptly.
+            // Pending input pauses the scan (it releases the file lock between
+            // blocks) so the keypress's own work isn't stuck behind a block read.
+            let ev = if let Some(job) = &scan {
+                if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false) {
+                    job.pause.store(true, Ordering::Relaxed);
+                    event::read()
+                } else {
+                    job.pause.store(false, Ordering::Relaxed);
+                    continue;
+                }
+            } else {
+                event::read()
+            };
+            match ev {
                 Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('m'),
@@ -2942,7 +3021,7 @@ mod tests {
     /// Build an explorer whose flattened tree has the given row depths (the
     /// node contents don't matter for coarse navigation, only the depths).
     fn explorer_with_depths(depths: &[usize]) -> Explorer {
-        let mut e = Explorer::new(Vec::new(), Vec::new(), None);
+        let mut e = Explorer::new(Vec::new(), Vec::new(), None, false);
         e.flattened_tree = depths
             .iter()
             .map(|&d| {
@@ -3032,7 +3111,7 @@ mod tests {
 
     #[test]
     fn move_to_first_child_enters_an_expanded_group() {
-        let mut e = Explorer::new(Vec::new(), Vec::new(), None);
+        let mut e = Explorer::new(Vec::new(), Vec::new(), None, false);
         // idx0: expanded group with a child; idx1: that child (depth 1);
         // idx2: a childless group at depth 0.
         e.flattened_tree = vec![

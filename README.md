@@ -268,6 +268,18 @@ the sampled range until the exact stats land. Switching the dtype restarts the
 scan for the new view. Leaving the view cancels it. (On the detail screen, where
 there's nothing else to do, any key cancels the scan; `Ctrl+C` always quits.)
 
+**Preloading.** Opening a tensor's detail screen starts computing its statistics
+in the background, shown live on the *Statistics* line with a spinner and timer
+(instead of waiting for you to press `s`). The scan streams the tensor in bounded
+blocks — never holding more than one block, so memory stays flat even for a
+multi-gigabyte tensor — and reading every block warms the OS/disk cache (the
+dominant cost over NFS) as a side effect. So by the time you open the
+heatmap/numeric view the stats are ready and the data is already warm, and only
+the small result is kept. The scan is cancelled the moment you leave the detail
+screen, so it never competes with the interactive view, and whatever it read
+stays warm in the cache. Disable it with `--no-preload` (then statistics are
+computed only when you press `s`).
+
 Both views also sample a grid that fits the screen (they never read the whole
 tensor for the *display* — only each sampled row's column span). Both the
 statistics and the data preview work for `safetensors`, NumPy (`.npy` / `.npz`),
