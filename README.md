@@ -121,14 +121,22 @@ checkpoint-explorer model.hdf5 --tensor model.layers.0.mlp.down_proj.weight
 checkpoint-explorer model.hdf5 \
   --tensor model.layers.0.block_sparse_moe.experts.down_proj.weight \
   --dtype u4-packed --values --edge
+
+# --tensor is optional when the checkpoint holds a single tensor (always so for
+# a .npy): reshape a flat dump and view it as packed 4-bit, no name needed
+checkpoint-explorer weights.npy --shape 128,3088,2992 --dtype u4-packed --values
 ```
-Flags (all require `--tensor`):
+The flags below act on the opened tensor. `--tensor` names it (exact name), but
+is **optional when the checkpoint has only one tensor** — always the case for a
+`.npy`, and for a single-array `.npz`/HDF5/safetensors; with several, a view flag
+without `--tensor` is reported as ambiguous.
 
 | Flag | Effect |
 |------|--------|
-| `--tensor <NAME>` | Open this tensor (exact name) on startup |
+| `--tensor <NAME>` | Open this tensor (exact name); optional for single-tensor checkpoints |
 | `--values` / `--heatmap` | Open the numeric grid / the heatmap (default: the detail screen) |
 | `--dtype <DTYPE>` | Reinterpret the dtype: `u4-packed`, `u4-lo`, `u4-hi`, `i4-packed`, `i4-lo`, `i4-hi`, or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
+| `--shape <DIMS>` | Reinterpret the shape (same element count): `10,100` / `10x100`; one dim may be `-1`/`*`/`_` to infer |
 | `--edge` (alias `--edges`) / `--overview` | Force the first/last edges submode / the evenly-spaced overview |
 | `--zebra <rows\|cols\|off>` | Zebra-stripe the numeric grid by rows, columns, or off |
 | `--slice <INDEX>` | Starting slice for a 3D tensor: an index (`12`) or a percentage (`50%`) |
