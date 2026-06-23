@@ -80,7 +80,13 @@ pub struct DrawConfig<'a> {
 #[derive(Clone, Copy)]
 pub enum StatsView<'a> {
     Pending,
-    Computing { spinner: char, elapsed: Duration },
+    Computing {
+        spinner: char,
+        elapsed: Duration,
+        /// Fraction scanned so far (`0.0..=1.0`) for the progress bar, or `None`
+        /// when unknown (then only the spinner + timer show).
+        progress: Option<f64>,
+    },
     Ready(&'a Stats),
 }
 
@@ -532,9 +538,13 @@ impl UI {
                 )?;
                 write_stats_line(&mut *out, s)?;
             }
-            StatsView::Computing { spinner, elapsed } => {
+            StatsView::Computing {
+                spinner,
+                elapsed,
+                progress,
+            } => {
                 paint(&mut *out, false, palette::DIM, "Statistics: ")?;
-                write_computing(&mut *out, spinner, elapsed)?;
+                write_computing(&mut *out, spinner, elapsed, progress)?;
             }
             StatsView::Pending => {
                 queue!(out, SetForegroundColor(palette::DIM))?;
@@ -1820,8 +1830,12 @@ fn write_stats_view(out: &mut impl Write, stats: StatsView) -> Result<()> {
             write_stats_line(out, s)?;
             line_end(out)?;
         }
-        StatsView::Computing { spinner, elapsed } => {
-            write_computing(out, spinner, elapsed)?;
+        StatsView::Computing {
+            spinner,
+            elapsed,
+            progress,
+        } => {
+            write_computing(out, spinner, elapsed, progress)?;
             line_end(out)?;
         }
         StatsView::Pending => {}
@@ -1830,12 +1844,30 @@ fn write_stats_view(out: &mut impl Write, stats: StatsView) -> Result<()> {
 }
 
 /// Write the "scan in progress" stats segment: a spinner (accent colour), a
-/// dimmed label and the running elapsed time. Drawn in place of the stats.
-fn write_computing(out: &mut impl Write, spinner: char, elapsed: Duration) -> Result<()> {
+/// dimmed label, a progress bar with a percentage (when the fraction is known)
+/// and the running elapsed time. Drawn in place of the stats.
+fn write_computing(
+    out: &mut impl Write,
+    spinner: char,
+    elapsed: Duration,
+    progress: Option<f64>,
+) -> Result<()> {
     queue!(out, SetForegroundColor(palette::KEY))?;
     write!(out, "{spinner} ")?;
     queue!(out, SetForegroundColor(palette::DIM))?;
-    write!(out, "computing statistics… {}", fmt_duration(elapsed))?;
+    write!(out, "computing statistics… ")?;
+    if let Some(frac) = progress {
+        const WIDTH: usize = 16;
+        let frac = frac.clamp(0.0, 1.0);
+        let filled = (frac * WIDTH as f64).round() as usize;
+        write!(out, "[")?;
+        queue!(out, SetForegroundColor(palette::KEY))?;
+        write!(out, "{}", "█".repeat(filled))?;
+        queue!(out, SetForegroundColor(palette::DIM))?;
+        write!(out, "{}", "░".repeat(WIDTH - filled))?;
+        write!(out, "] {:>3.0}% · ", frac * 100.0)?;
+    }
+    write!(out, "{}", fmt_duration(elapsed))?;
     queue!(out, ResetColor)?;
     Ok(())
 }

@@ -9,7 +9,7 @@
 //! shards, is just another implementation).
 
 use std::ops::{ControlFlow, Range};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
@@ -998,6 +998,7 @@ pub fn tensor_stats(
     view: ViewDtype,
     cancel: &AtomicBool,
     pause: &AtomicBool,
+    progress: Option<&AtomicUsize>,
 ) -> Result<Stats, String> {
     let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
     let started = std::time::Instant::now();
@@ -1005,6 +1006,11 @@ pub fn tensor_stats(
     let mut acc = Acc::ID;
     reader.fold_blocks(&mut |bytes| {
         acc = Acc::merge(acc, reduce_view_bytes(bytes, item, view, &t.dtype));
+        // Report bytes scanned so the caller can show a progress bar. Summed over
+        // every block this equals the tensor's stored byte size (`size_bytes`).
+        if let Some(p) = progress {
+            p.fetch_add(bytes.len(), Ordering::Relaxed);
+        }
         // Wait here while paused — this is between block reads, so the backing
         // file's lock (libhdf5 serialises all access) is released, letting a
         // foreground read such as the dtype menu's live preview run without
@@ -1840,6 +1846,7 @@ mod tests {
             ViewDtype::Stored,
             &AtomicBool::new(false),
             &AtomicBool::new(false),
+            None,
         )
         .unwrap();
         assert_eq!((st.count, st.min, st.max), (12, 0.0, 11.0));
@@ -2010,6 +2017,7 @@ mod tests {
             ViewDtype::Stored,
             &AtomicBool::new(false),
             &AtomicBool::new(false),
+            None,
         )
         .unwrap();
         assert_eq!(s.count, 20);
@@ -2188,6 +2196,7 @@ mod hdf5_tests {
             ViewDtype::Stored,
             &AtomicBool::new(false),
             &AtomicBool::new(false),
+            None,
         ) {
             Ok(s) => eprintln!("ok in {:?}: {s:?}", started.elapsed()),
             Err(e) => eprintln!("ERR in {:?}: {e}", started.elapsed()),
@@ -2235,6 +2244,7 @@ mod hdf5_tests {
             ViewDtype::Stored,
             &AtomicBool::new(false),
             &AtomicBool::new(false),
+            None,
         )
         .unwrap();
         assert_eq!(st.count, 20);
@@ -2288,6 +2298,7 @@ mod hdf5_tests {
             ViewDtype::U4Packed,
             &AtomicBool::new(false),
             &AtomicBool::new(false),
+            None,
         )
         .unwrap();
         assert_eq!(st.count, 8);

@@ -260,8 +260,9 @@ detail screen shows the same stats on demand: press `s` to compute them (so
 browsing the tree stays fast). Results are cached per tensor (and per dtype
 override) for the session, and the scan time is shown dimmed next to the stats.
 Scanning a multi-GB tensor takes a moment the first time (it's largely
-disk/NFS-bound); the scan runs on a worker thread with an animated spinner and a
-running timer. In the heatmap/numeric views the scan stays **out of your way** —
+disk/NFS-bound); the scan runs on a worker thread with an animated spinner, a
+progress bar (the fraction scanned so far) and a running timer. In the
+heatmap/numeric views the scan stays **out of your way** —
 you can keep switching the layout (overview / edges / window), panning, stepping
 slices, and reinterpreting the dtype while it computes; the values are shown from
 the sampled range until the exact stats land. Switching the dtype restarts the
@@ -269,8 +270,8 @@ scan for the new view. Leaving the view cancels it. (On the detail screen, where
 there's nothing else to do, any key cancels the scan; `Ctrl+C` always quits.)
 
 **Preloading.** Opening a tensor's detail screen starts computing its statistics
-in the background, shown live on the *Statistics* line with a spinner and timer
-(instead of waiting for you to press `s`). The scan streams the tensor in bounded
+in the background, shown live on the *Statistics* line with a spinner, a progress
+bar and a timer (instead of waiting for you to press `s`). The scan streams the tensor in bounded
 blocks — never holding more than one block, so memory stays flat even for a
 multi-gigabyte tensor — and reading every block warms the OS/disk cache (the
 dominant cost over NFS) as a side effect. So by the time you open the
