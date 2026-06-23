@@ -14,7 +14,7 @@ use std::{
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use crate::gguf::GGUFFile;
@@ -123,6 +123,19 @@ struct ScanJob {
     pause: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<Result<Stats, String>>>,
     started: std::time::Instant,
+    /// Stored bytes the worker has scanned so far (it bumps this per block), and
+    /// the total it will scan (`size_bytes`). Together they drive the progress bar.
+    done: Arc<AtomicUsize>,
+    total: usize,
+}
+
+impl ScanJob {
+    /// Fraction of the tensor scanned so far (`0.0..=1.0`), or `None` when the
+    /// total is unknown (empty tensor) so the caller shows just the spinner.
+    fn progress(&self) -> Option<f64> {
+        (self.total > 0)
+            .then(|| (self.done.load(Ordering::Relaxed) as f64 / self.total as f64).min(1.0))
+    }
 }
 
 impl Drop for ScanJob {
@@ -366,11 +379,19 @@ impl Explorer {
     fn spawn_stats_scan(&self, tensor: &TensorInfo, view: ViewDtype) -> ScanJob {
         let cancel = Arc::new(AtomicBool::new(false));
         let pause = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicUsize::new(0));
         let owned = tensor.clone();
         let worker_cancel = Arc::clone(&cancel);
         let worker_pause = Arc::clone(&pause);
+        let worker_done = Arc::clone(&done);
         let handle = std::thread::spawn(move || {
-            crate::sample::tensor_stats(&owned, view, &worker_cancel, &worker_pause)
+            crate::sample::tensor_stats(
+                &owned,
+                view,
+                &worker_cancel,
+                &worker_pause,
+                Some(&*worker_done),
+            )
         });
         ScanJob {
             view,
@@ -378,6 +399,8 @@ impl Explorer {
             pause,
             handle: Some(handle),
             started: std::time::Instant::now(),
+            done,
+            total: tensor.size_bytes,
         }
     }
 
@@ -404,11 +427,20 @@ impl Explorer {
         let cancel = Arc::new(AtomicBool::new(false));
         // The detail-screen scan has nothing to interleave with, so it never pauses.
         let pause = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicUsize::new(0));
+        let total = tensor.size_bytes;
         let owned = tensor.clone();
         let worker_cancel = Arc::clone(&cancel);
         let worker_pause = Arc::clone(&pause);
+        let worker_done = Arc::clone(&done);
         let handle = std::thread::spawn(move || {
-            crate::sample::tensor_stats(&owned, view, &worker_cancel, &worker_pause)
+            crate::sample::tensor_stats(
+                &owned,
+                view,
+                &worker_cancel,
+                &worker_pause,
+                Some(&*worker_done),
+            )
         });
 
         const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -421,6 +453,8 @@ impl Explorer {
                 redraw(StatsView::Computing {
                     spinner: SPINNER[frame % SPINNER.len()],
                     elapsed: started.elapsed(),
+                    progress: (total > 0)
+                        .then(|| (done.load(Ordering::Relaxed) as f64 / total as f64).min(1.0)),
                 });
                 frame += 1;
             }
@@ -1688,6 +1722,7 @@ impl Explorer {
                         StatsView::Computing {
                             spinner: STATS_SPINNER[spin_frame % STATS_SPINNER.len()],
                             elapsed: job.started.elapsed(),
+                            progress: job.progress(),
                         }
                     } else {
                         StatsView::Pending
@@ -1930,6 +1965,7 @@ impl Explorer {
                         StatsView::Computing {
                             spinner: STATS_SPINNER[spin_frame % STATS_SPINNER.len()],
                             elapsed: job.started.elapsed(),
+                            progress: job.progress(),
                         }
                     } else {
                         StatsView::Pending
