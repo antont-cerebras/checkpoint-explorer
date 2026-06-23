@@ -179,7 +179,13 @@ impl TreeBuilder {
         let mut root_map: HashMap<String, Vec<TensorInfo>> = HashMap::new();
 
         for tensor in tensors {
-            let parts: Vec<&str> = tensor.name.split('.').collect();
+            // Group on `.` and `__`: dotted names (HDF5 / safetensors) fold as
+            // before, while underscore-flattened `.npy` names like
+            // `…_down_proj_weight__variant` fold on the `__` boundary. Mapping
+            // `__` → `.` keeps the rest of the path logic uniform; single `_`
+            // (within a module name) is left untouched.
+            let path = tensor.name.replace("__", ".");
+            let parts: Vec<&str> = path.split('.').collect();
             if parts.len() > 1 {
                 let prefix = parts[0].to_string();
                 root_map.entry(prefix).or_default().push(tensor.clone());
@@ -227,10 +233,10 @@ impl TreeBuilder {
         let mut direct_tensors = Vec::new();
 
         for tensor in tensors {
-            let remaining = tensor
-                .name
-                .strip_prefix(&format!("{prefix}."))
-                .unwrap_or(&tensor.name);
+            // Same `__` → `.` normalisation as `build_tree`, so the recursive
+            // prefix-stripping treats both separators uniformly.
+            let path = tensor.name.replace("__", ".");
+            let remaining = path.strip_prefix(&format!("{prefix}.")).unwrap_or(&path);
             let parts: Vec<&str> = remaining.split('.').collect();
 
             if parts.len() == 1 {
@@ -361,5 +367,90 @@ impl TreeBuilder {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tensor(name: &str) -> TensorInfo {
+        TensorInfo {
+            name: name.to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![2, 2],
+            size_bytes: 16,
+            num_elements: 4,
+            storage: Storage::Unknown,
+            source_path: "/tmp/x".to_string(),
+            layout: Layout::None,
+        }
+    }
+
+    /// Find a group by name among `nodes` (non-recursive), returning its children.
+    fn group<'a>(nodes: &'a [TreeNode], name: &str) -> &'a [TreeNode] {
+        nodes
+            .iter()
+            .find_map(|n| match n {
+                TreeNode::Group {
+                    name: g, children, ..
+                } if g == name => Some(children.as_slice()),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no group '{name}' in {:?}",
+                    nodes.iter().map(|n| n.name()).collect::<Vec<_>>()
+                )
+            })
+    }
+
+    fn leaf_names(nodes: &[TreeNode]) -> Vec<&str> {
+        nodes
+            .iter()
+            .filter_map(|n| match n {
+                TreeNode::Tensor { info } => Some(info.name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn folds_underscore_flattened_names_on_double_underscore() {
+        // `.npy` trace names use `__` to separate a tensor from its variant.
+        let base = "model_layers_0_block_sparse_moe_experts_down_proj_weight";
+        let tree = TreeBuilder::build_tree(&[
+            tensor(&format!("{base}__acthost_addr27264")),
+            tensor(&format!("{base}__checkpoint")),
+            tensor(&format!("{base}__post_transform")),
+        ]);
+        // One foldable group named after the base, holding the three variants as
+        // leaves (still keyed by their full names for lookup).
+        let children = group(&tree, base);
+        let mut variants = leaf_names(children);
+        variants.sort();
+        assert_eq!(
+            variants,
+            vec![
+                format!("{base}__acthost_addr27264"),
+                format!("{base}__checkpoint"),
+                format!("{base}__post_transform"),
+            ]
+        );
+    }
+
+    #[test]
+    fn dotted_names_still_fold_on_dots() {
+        let tree = TreeBuilder::build_tree(&[
+            tensor("model.layers.0.weight"),
+            tensor("model.layers.0.bias"),
+        ]);
+        // model -> layers -> 0 -> {weight, bias} (the `__` change is additive).
+        let layers = group(&tree, "model");
+        let zero = group(layers, "layers");
+        let leaves = group(zero, "0");
+        let mut names = leaf_names(leaves);
+        names.sort();
+        assert_eq!(names, vec!["model.layers.0.bias", "model.layers.0.weight"]);
     }
 }

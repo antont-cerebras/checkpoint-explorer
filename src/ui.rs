@@ -39,6 +39,8 @@ mod palette {
     /// a light foreground is hard to read on the bright green.
     pub const OK_BG: Color = Color::Green;
     pub const OK_FG: Color = Color::Black;
+    /// A success accent used as a *foreground* (e.g. the "✓ copied" confirmation).
+    pub const SUCCESS: Color = Color::Green;
     /// Group names and expand arrows in the tree — the primary accent (a bright
     /// sky-cyan), so the structure stands out from the leaf tensors.
     pub const ACCENT: Color = Color::AnsiValue(81);
@@ -200,6 +202,7 @@ impl UI {
                 ("l", "legend"),
                 ("c", "copy screen"),
                 ("f", "copy file"),
+                ("y", "copy command"),
                 ("⌫/\\", "back/fwd"),
             ];
             if config.can_repack {
@@ -353,7 +356,10 @@ impl UI {
                 let display_name = if depth == 0 {
                     &info.name
                 } else {
-                    info.name.split('.').next_back().unwrap_or(&info.name)
+                    // The last path component, treating `.` and `__` as separators
+                    // (so `…_down_proj_weight__variant` shows just `variant`).
+                    let after = info.name.rsplit("__").next().unwrap_or(&info.name);
+                    after.rsplit('.').next().unwrap_or(after)
                 };
                 // The name, shape and size read at full strength; only the leaf
                 // marker and the storage tag (codec / "raw") are dimmed, and the
@@ -573,6 +579,8 @@ impl UI {
         }
         key_hint(&mut *out, "c")?;
         write!(out, " to copy, ")?;
+        key_hint(&mut *out, "y")?;
+        write!(out, " to copy the command, ")?;
         key_hint(&mut *out, "l")?;
         write!(out, " for the legend, ")?;
         key_hint(&mut *out, "⌫")?;
@@ -1235,6 +1243,107 @@ impl UI {
         Ok(())
     }
 
+    /// Draw the copied CLI command as a borderless pop-up *over* the current
+    /// screen (the surrounding view stays visible above and below the band; the
+    /// caller redraws it on dismiss — the screen is not cleared). The command
+    /// sits on its **own line at column 0**, bracketed by horizontal rules but
+    /// with nothing before or after it on its row(s), so it can be selected
+    /// cleanly with the mouse or a multiplexer's copy mode — important when the
+    /// OSC-52 clipboard copy doesn't reach the terminal and it must be copied by
+    /// hand. The terminal soft-wraps a long command, but it stays one logical
+    /// line, so the selection still yields the whole command.
+    pub fn draw_command(command: &str) -> Result<()> {
+        let mut out = io::stdout();
+        let (term_w, term_h) = terminal::size()?;
+        let (term_w, term_h) = (term_w as usize, term_h as usize);
+        let rule = "─".repeat(term_w);
+
+        // How many rows the command occupies once soft-wrapped at full width;
+        // used to place the closing rule/footer below it. Centre the band.
+        let cmd_rows = command.chars().count().div_ceil(term_w.max(1)).max(1);
+        // blank, header, rule, command, rule, footer, blank
+        let band_h = cmd_rows + 6;
+        let mut row = (term_h.saturating_sub(band_h) / 2) as u16;
+
+        // Clear a band row so the underlying screen doesn't show through.
+        let clear = ClearType::CurrentLine;
+        queue!(out, BeginSynchronizedUpdate)?;
+
+        // A cleared margin row above, so the band reads as a floating pop-up.
+        queue!(out, cursor::MoveTo(0, row), terminal::Clear(clear))?;
+        row += 1;
+
+        // Header: title + copied confirmation.
+        queue!(
+            out,
+            cursor::MoveTo(0, row),
+            terminal::Clear(clear),
+            SetForegroundColor(palette::KEY),
+            SetAttribute(Attribute::Bold)
+        )?;
+        write!(out, "CLI command")?;
+        queue!(
+            out,
+            SetAttribute(Attribute::Reset),
+            SetForegroundColor(palette::SUCCESS)
+        )?;
+        write!(out, "   ✓ copied to the clipboard")?;
+        queue!(out, ResetColor)?;
+        row += 1;
+
+        // Opening rule.
+        queue!(
+            out,
+            cursor::MoveTo(0, row),
+            terminal::Clear(clear),
+            SetForegroundColor(palette::ACCENT)
+        )?;
+        write!(out, "{rule}")?;
+        queue!(out, ResetColor)?;
+        row += 1;
+
+        // The command: blank its rows first, then write it at column 0 so it
+        // soft-wraps cleanly with nothing flanking it.
+        for r in 0..cmd_rows as u16 {
+            queue!(out, cursor::MoveTo(0, row + r), terminal::Clear(clear))?;
+        }
+        queue!(out, cursor::MoveTo(0, row))?;
+        write!(out, "{command}")?;
+        row += cmd_rows as u16;
+
+        // Closing rule.
+        queue!(
+            out,
+            cursor::MoveTo(0, row),
+            terminal::Clear(clear),
+            SetForegroundColor(palette::ACCENT)
+        )?;
+        write!(out, "{rule}")?;
+        queue!(out, ResetColor)?;
+        row += 1;
+
+        // Footer hint.
+        queue!(
+            out,
+            cursor::MoveTo(0, row),
+            terminal::Clear(clear),
+            SetForegroundColor(palette::DIM)
+        )?;
+        write!(
+            out,
+            "select the command above to copy it by hand · any key to dismiss"
+        )?;
+        queue!(out, ResetColor)?;
+        row += 1;
+
+        // A cleared margin row below.
+        queue!(out, cursor::MoveTo(0, row), terminal::Clear(clear))?;
+
+        queue!(out, EndSynchronizedUpdate)?;
+        out.flush()?;
+        Ok(())
+    }
+
     /// Draw a full-screen warning panel summarising checkpoint health issues,
     /// shown once at startup. Each category is capped so the panel stays small.
     pub fn draw_health_warning(reports: &[HealthReport]) -> Result<()> {
@@ -1705,6 +1814,8 @@ fn write_view_footer(
     }
     // Copy the screen's text to the clipboard.
     items.push(("c", "copy"));
+    // Show and copy the CLI command that reopens this view.
+    items.push(("y", "copy cmd"));
     // Open the legend for this view's glyphs.
     items.push(("l", "legend"));
     // Step back / forward through the screen history.
