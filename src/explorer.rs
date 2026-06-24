@@ -2874,11 +2874,34 @@ impl Explorer {
         }
     }
 
+    /// The path argument(s) that reopen this checkpoint the way it was launched:
+    /// a single file as-is, or — when every loaded file lives in one directory (a
+    /// sharded checkpoint opened as a folder) — that directory, so the command
+    /// references the checkpoint rather than an arbitrary shard; otherwise the
+    /// individual files.
+    fn checkpoint_path_parts(&self) -> Vec<String> {
+        let quote = |p: &Path| shell_quote(&p.to_string_lossy());
+        match self.files.as_slice() {
+            [] => Vec::new(),
+            [one] => vec![quote(one)],
+            many => {
+                let set: BTreeSet<String> = many
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                match common_dir(&set) {
+                    Some(dir) => vec![shell_quote(&dir)],
+                    None => many.iter().map(|p| quote(p)).collect(),
+                }
+            }
+        }
+    }
+
     /// The command that reopens the current tree: the program and the file/dir
     /// arguments it was launched with.
     fn command_for_tree(&self) -> String {
         let mut parts = vec![PROGRAM.to_string()];
-        parts.extend(self.files.iter().map(|p| shell_quote(&p.to_string_lossy())));
+        parts.extend(self.checkpoint_path_parts());
         parts.join(" ")
     }
 
@@ -2898,15 +2921,15 @@ impl Explorer {
         }
     }
 
-    /// `checkpoint-explorer <file> --tensor <name>`, plus the active dtype and
-    /// shape overrides — the shared prefix for the detail and data-view commands.
+    /// `checkpoint-explorer <file-or-dir> --tensor <name>`, plus the active dtype
+    /// and shape overrides — the shared prefix for the detail and data-view
+    /// commands. Uses the checkpoint's launch path(s), not the tensor's specific
+    /// shard, so a directory checkpoint reopens whole.
     fn command_base(&self, tensor: &TensorInfo) -> Vec<String> {
-        let mut parts = vec![
-            PROGRAM.to_string(),
-            shell_quote(&tensor.source_path),
-            "--tensor".to_string(),
-            shell_quote(&tensor.name),
-        ];
+        let mut parts = vec![PROGRAM.to_string()];
+        parts.extend(self.checkpoint_path_parts());
+        parts.push("--tensor".to_string());
+        parts.push(shell_quote(&tensor.name));
         if let Some(dt) = self.dtype_overrides.borrow().get(&tensor.name)
             && let Some(value) = dt.cli_value()
         {
