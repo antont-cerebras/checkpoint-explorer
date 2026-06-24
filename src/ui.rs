@@ -204,7 +204,10 @@ impl UI {
             queue!(out, ResetColor)?;
             input_box(&mut *out, config.search_query, 16)?;
             write!(out, "  ")?;
-            hint_line(&mut *out, &[("Enter", "view"), ("Esc/q", "exit")])?;
+            hint_line(
+                &mut *out,
+                &[("Enter", "view"), ("Tab", "in tree"), ("Esc/q", "exit")],
+            )?;
             write!(out, "\r\n")?;
         } else {
             let mut hints: Vec<(&str, &str)> = vec![
