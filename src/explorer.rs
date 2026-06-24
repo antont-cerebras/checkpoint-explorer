@@ -70,6 +70,10 @@ pub struct OpenRequest {
     /// checkpoint has exactly one (so a single-tensor file — always the case for
     /// `.npy` — needs no `--tensor`); ambiguous otherwise.
     pub tensor: Option<String>,
+    /// Exact metadata entry name to reveal in the tree (`--metadata`). Mutually
+    /// exclusive with `tensor`; when set, the tree opens with that entry
+    /// selected (metadata lives only in the tree, so there's no separate view).
+    pub metadata: Option<String>,
     /// Which screen to show.
     pub view: OpenView,
     /// Optional dtype reinterpretation to apply first.
@@ -818,6 +822,13 @@ impl Explorer {
     fn load_hdf5_file(&mut self, file_path: &std::path::Path) -> Result<()> {
         let tensors = crate::hdf5::read_tensors(file_path)?;
         self.tensors.extend(tensors);
+        // Root attributes carry the checkpoint's free-form metadata (version,
+        // per-tensor and config `__metadata__`); surface them in the tree.
+        match crate::hdf5::read_metadata(file_path) {
+            Ok(metadata) => self.metadata.extend(metadata),
+            // Metadata is supplementary — a read failure shouldn't sink the file.
+            Err(e) => eprintln!("Warning: failed to read HDF5 metadata: {e}"),
+        }
         Ok(())
     }
 
@@ -873,10 +884,10 @@ impl Explorer {
         self.update_filtered_tree();
     }
 
-    /// Move the tree cursor onto the tensor named `name`, expanding any
-    /// collapsed groups so it's visible. Used when returning to the tree from a
-    /// tensor's detail/data view (and when the app was opened with `--tensor`),
-    /// so you land back on the tensor you were looking at.
+    /// Move the tree cursor onto the leaf named `name` — a tensor or a metadata
+    /// entry — expanding any collapsed groups so it's visible. Used when
+    /// returning to the tree from a detail/data view, and when the app was
+    /// opened with `--tensor`/`--metadata`, so you land back on that row.
     fn reveal_tensor(&mut self, name: &str) {
         if !self.search_mode {
             TreeBuilder::expand_to_tensor(&mut self.tree, name);
@@ -1613,6 +1624,24 @@ impl Explorer {
     /// or return the [`Screen`] to seed the navigator with. Returns `None` when
     /// the tensor isn't found, the slice is invalid, or it was a one-shot render.
     fn open_requested(&mut self, req: OpenRequest) -> Option<Screen> {
+        // `--metadata`: metadata lives only in the tree, so reveal that entry and
+        // stay on the tree (this is what `y` on a metadata row reproduces).
+        if let Some(name) = &req.metadata {
+            if self.metadata.iter().any(|m| &m.name == name) {
+                self.reveal_tensor(name);
+            } else {
+                let _ = UI::draw_message(
+                    "Metadata not found",
+                    &format!(
+                        "No metadata entry named '{name}' in this checkpoint — opening the browser instead."
+                    ),
+                );
+                if !req.exit_after {
+                    let _ = event::read();
+                }
+            }
+            return None;
+        }
         // Resolve the target tensor: the named one, or — when `--tensor` is
         // omitted — the sole tensor if the checkpoint has exactly one (e.g. any
         // `.npy`, or a single-array `.npz`/HDF5/safetensors). Ambiguous otherwise.
@@ -3020,6 +3049,15 @@ impl Explorer {
         match self.flattened_tree.get(self.selected_idx) {
             Some((TreeNode::Tensor { info, .. }, _)) => {
                 let mut parts = self.command_base(info);
+                parts.push("--tree".to_string());
+                parts.join(" ")
+            }
+            // A metadata row reopens the tree with that entry revealed.
+            Some((TreeNode::Metadata { info }, _)) => {
+                let mut parts = vec![PROGRAM.to_string()];
+                parts.extend(self.checkpoint_path_parts());
+                parts.push("--metadata".to_string());
+                parts.push(shell_quote(&info.name));
                 parts.push("--tree".to_string());
                 parts.join(" ")
             }

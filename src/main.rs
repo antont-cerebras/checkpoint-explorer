@@ -74,6 +74,14 @@ struct ExploreArgs {
 
     #[arg(
         long,
+        value_name = "NAME",
+        conflicts_with = "tensor",
+        help = "Reveal a metadata entry on startup (exact name, e.g. model.norm.weight.__metadata__) — opens the tree with it selected"
+    )]
+    metadata: Option<String>,
+
+    #[arg(
+        long,
         value_name = "DTYPE",
         value_parser = sample::parse_view_dtype,
         help = "Reinterpret the opened tensor's dtype: u4-packed, u4-lo, u4-hi, i4-packed, i4-lo, i4-hi, f16, bf16, i16, u16, f32, i32, u32, f64, i64, u64, i8, u8, stored"
@@ -287,6 +295,7 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
     // Seed an open request when a tensor is named *or* any view/override flag is
     // given — the latter targets the sole tensor when the checkpoint has one.
     let wants_open = args.tensor.is_some()
+        || args.metadata.is_some()
         || args.values
         || args.heatmap
         || args.tree
@@ -302,6 +311,7 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         || args.exit;
     let open = wants_open.then_some(OpenRequest {
         tensor: args.tensor,
+        metadata: args.metadata,
         view,
         dtype: args.dtype,
         layout,

@@ -22,7 +22,10 @@ An interactive terminal-based explorer for [`safetensors`](https://huggingface.c
   reinterpretation; no extra system dependencies (pure-Rust deflate)
 - 🧊 **HDF5 checkpoint support** (opt-in `--features hdf5`) - read Cerebras-style
   `.h5`/`.hdf5` checkpoints, showing compression status and both the logical and
-  on-disk (compressed) sizes
+  on-disk (compressed) sizes, plus their root-attribute metadata (`__version__`,
+  per-tensor and config `__metadata__` such as `codebook_packing_schema`) — each
+  tensor's `__metadata__` (marked `†`) shown beside it in the tree, with
+  standalone config in a top-level Metadata group
 
 ## Installation
 
@@ -134,6 +137,7 @@ without `--tensor` is reported as ambiguous.
 | Flag | Effect |
 |------|--------|
 | `--tensor <NAME>` | Open this tensor (exact name); optional for single-tensor checkpoints |
+| `--metadata <NAME>` | Reveal a metadata entry in the tree (exact name, e.g. `model.norm.weight.__metadata__`) |
 | `--values` / `--heatmap` | Open the numeric grid / the heatmap (default: the detail screen) |
 | `--tree` | Reveal the tensor highlighted in the tree browser, without opening a view |
 | `--dtype <DTYPE>` | Reinterpret the dtype: `u4-packed`, `u4-lo`, `u4-hi`, `i4-packed`, `i4-lo`, `i4-hi`, or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
@@ -162,7 +166,7 @@ keep exploring.
 | `l` | Show a legend explaining the symbols on the current screen (works on every screen) |
 | `c` | Copy the current screen's text to the clipboard (works on every screen) |
 | `f` | Copy the selected row's File path (tensor file, or a group/root's file or directory) |
-| `y` | Show and copy the CLI command that reopens this exact screen — file, tensor, dtype/shape overrides, view, layout, zebra, base, slice (works on every screen) |
+| `y` | Show and copy the CLI command that reopens this exact screen — file, tensor (or metadata entry), dtype/shape overrides, view, layout, zebra, base, slice (works on every screen) |
 | `h` | Show the checkpoint health report (when there is a mismatch) |
 | `R` | Repack the current HDF5 checkpoint into a new file (HDF5 only) |
 | `Backspace` / `\` | Step **back** / **forward** through the screens you've visited (browser-style history) — e.g. reopen a view you just left |
