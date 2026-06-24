@@ -74,9 +74,12 @@ pub struct DrawConfig<'a> {
     /// is a success message (the copy confirmation) for accent colouring.
     pub status_icon: &'a str,
     pub status_ok: bool,
-    /// Bottom status line: source file(s)/directory of the selected row, or a
-    /// copy confirmation.
+    /// Bottom status line: a tensor's full name, a group's source
+    /// file(s)/directory, or a copy confirmation.
     pub status_bar: &'a str,
+    /// Second status line, below `status_bar`: a tensor's source file (empty for
+    /// groups and the copy confirmation).
+    pub status_secondary: &'a str,
     /// Whether a checkpoint health issue was detected (shows a header hint to
     /// press `h` for the report).
     pub health_warning: bool,
@@ -169,9 +172,10 @@ impl UI {
     pub fn draw_screen(out: &mut impl Write, config: &DrawConfig) -> Result<usize> {
         let (terminal_width, terminal_height) = terminal::size()?;
         let header_height = 3;
-        // One bottom line for the status bar (the per-checkpoint totals now live
-        // in the tree root instead of a footer).
-        let footer_height = 1;
+        // Two bottom lines for the status bar: the selected tensor's full name on
+        // the first, its source file on the second (the per-checkpoint totals now
+        // live in the tree root instead of a footer).
+        let footer_height = 2;
         let available_height =
             (terminal_height as usize).saturating_sub(header_height + footer_height);
 
@@ -213,6 +217,7 @@ impl UI {
                 ("l", "legend"),
                 ("c", "copy screen"),
                 ("f", "copy file"),
+                ("n", "copy name"),
                 ("y", "copy command"),
                 ("⌫/\\", "back/fwd"),
             ];
@@ -269,10 +274,13 @@ impl UI {
         // Wipe any rows left over from a previous, taller frame.
         queue!(out, terminal::Clear(ClearType::FromCursorDown))?;
 
-        // Status bar pinned to the bottom line (no trailing newline, to avoid
-        // scrolling): the source file(s)/directory of the selected row, or the
-        // empty-search message. Truncate keeping the tail so names stay visible.
-        queue!(out, cursor::MoveTo(0, terminal_height.saturating_sub(1)))?;
+        // Two-line status bar pinned to the bottom (no trailing newline on the
+        // last, to avoid scrolling). First line: the selected row's primary text
+        // (tensor name / group files / copy confirmation) as a coloured chip;
+        // second line: the tensor's source file, dimmed and aligned under the
+        // chip text. Both truncate tail-first so the meaningful end stays visible.
+        let max_text = (terminal_width as usize).saturating_sub(6);
+        queue!(out, cursor::MoveTo(0, terminal_height.saturating_sub(2)))?;
         if config.search_mode && config.tree.is_empty() {
             write!(
                 out,
@@ -290,12 +298,21 @@ impl UI {
             } else {
                 (palette::STATUS_BG, palette::STATUS_FG)
             };
-            let text = truncate_keep_end(
-                config.status_bar,
-                (terminal_width as usize).saturating_sub(6),
-            );
+            let text = truncate_keep_end(config.status_bar, max_text);
             queue!(out, SetBackgroundColor(bg), SetForegroundColor(fg))?;
             write!(out, " {} {text} ", config.status_icon)?;
+            queue!(out, ResetColor)?;
+        }
+        // Second line: the source file, dimmed, indented under the chip's text.
+        queue!(
+            out,
+            cursor::MoveTo(0, terminal_height.saturating_sub(1)),
+            terminal::Clear(ClearType::CurrentLine)
+        )?;
+        if !config.status_secondary.is_empty() {
+            let text = truncate_keep_end(config.status_secondary, max_text);
+            queue!(out, SetForegroundColor(palette::DIM))?;
+            write!(out, "   {text}")?;
             queue!(out, ResetColor)?;
         }
 

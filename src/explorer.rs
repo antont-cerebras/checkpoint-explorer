@@ -1054,7 +1054,7 @@ impl Explorer {
         } else {
             &self.flattened_tree
         };
-        let (status_icon, status_ok, status_bar) = self.status_bar();
+        let (status_icon, status_ok, status_bar, status_secondary) = self.status_bar();
         let config = DrawConfig {
             tree: tree_to_display,
             current_file: &title,
@@ -1067,6 +1067,7 @@ impl Explorer {
             status_icon,
             status_ok,
             status_bar: &status_bar,
+            status_secondary: &status_secondary,
             health_warning: !self.health_reports.is_empty(),
             can_repack: self.repack_input().is_some(),
             unindexed: &self.unindexed,
@@ -1120,6 +1121,12 @@ impl Explorer {
                         code: KeyCode::Char('f'),
                         ..
                     } if !self.search_mode => self.copy_selected_path(),
+                    // `n` copies the selected tensor's full name (shown in the
+                    // status bar; the tree row may abbreviate it).
+                    KeyEvent {
+                        code: KeyCode::Char('n'),
+                        ..
+                    } if !self.search_mode => self.copy_selected_name(),
                     // `y` shows and copies the CLI command that reopens this view
                     // — the highlighted tensor if one is selected, else the files.
                     KeyEvent {
@@ -1251,12 +1258,15 @@ impl Explorer {
         }
     }
 
-    /// Status bar contents for the row under the cursor: a leading glyph, an
-    /// "is this a success message" flag (the copy confirmation), and the text —
-    /// the source file(s)/directory, or the transient copy confirmation.
-    fn status_bar(&self) -> (&'static str, bool, String) {
+    /// Two-line status bar for the row under the cursor: a leading glyph, an
+    /// "is this a success message" flag (the copy confirmation), a primary line
+    /// and a secondary line. For a tensor the primary is its full name (which the
+    /// tree row may abbreviate) and the secondary is its source file; for a group
+    /// the primary is its source file(s)/directory and the secondary is blank;
+    /// the copy confirmation occupies the primary line alone.
+    fn status_bar(&self) -> (&'static str, bool, String, String) {
         if let Some(flash) = &self.copied_flash {
-            return ("✓", true, format!("Copied: {flash}"));
+            return ("✓", true, format!("Copied: {flash}"), String::new());
         }
 
         let tree = if self.search_mode {
@@ -1265,34 +1275,36 @@ impl Explorer {
             &self.flattened_tree
         };
         let Some((node, _)) = tree.get(self.selected_idx) else {
-            return ("", false, String::new());
+            return ("", false, String::new(), String::new());
         };
 
         match node {
-            TreeNode::Tensor { info, .. } => ("▪", false, info.source_path.clone()),
+            // The full name on the first line (the tree row often abbreviates it —
+            // last segment or a compacted path), the source file on the second.
+            // `n` copies the name, `f` the file.
+            TreeNode::Tensor { info, .. } => {
+                ("▪", false, info.name.clone(), info.source_path.clone())
+            }
             TreeNode::Group { .. } => {
                 let mut files = BTreeSet::new();
                 collect_source_paths(node, &mut files);
-                match files.len() {
-                    0 => ("", false, String::new()),
-                    1 => ("▪", false, files.into_iter().next().unwrap()),
+                let primary = match files.len() {
+                    0 => return ("", false, String::new(), String::new()),
+                    1 => ("▪", files.into_iter().next().unwrap()),
                     n => match common_dir(&files) {
                         // When the files share a directory, show that instead of
                         // a long list — most checkpoints live in one folder.
-                        Some(dir) => ("▸", false, format!("{n} files in {dir}")),
+                        Some(dir) => ("▸", format!("{n} files in {dir}")),
                         None => {
                             let first = file_name(files.iter().next().unwrap());
                             let last = file_name(files.iter().next_back().unwrap());
-                            (
-                                "▸",
-                                false,
-                                format!("stored across {n} files: {first} … {last}"),
-                            )
+                            ("▸", format!("stored across {n} files: {first} … {last}"))
                         }
                     },
-                }
+                };
+                (primary.0, false, primary.1, String::new())
             }
-            TreeNode::Metadata { .. } => ("", false, String::new()),
+            TreeNode::Metadata { .. } => ("", false, String::new(), String::new()),
         }
     }
 
@@ -1319,6 +1331,20 @@ impl Explorer {
         if let Some(path) = path {
             copy_to_clipboard(&path);
             self.copied_flash = Some(path);
+        }
+    }
+
+    /// Copy the selected row's full name to the clipboard (the `n` shortcut): a
+    /// tensor's complete name (e.g. `model.layers.0.self_attn.k_norm.weight`,
+    /// which the tree may show abbreviated), or a group's path.
+    fn copy_selected_name(&mut self) {
+        let Some((node, _)) = self.flattened_tree.get(self.selected_idx) else {
+            return;
+        };
+        let name = node.name().to_string();
+        if !name.is_empty() {
+            copy_to_clipboard(&name);
+            self.copied_flash = Some(name);
         }
     }
 
