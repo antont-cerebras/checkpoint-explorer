@@ -305,6 +305,10 @@ pub struct Explorer {
     /// dominant cost on NFS), so the heatmap/numeric view opens fast; the scan is
     /// shown live on the detail screen's Statistics line. Off via `--no-preload`.
     preload: bool,
+    /// `source_path`s of files present on disk but not referenced by a
+    /// `model.safetensors.index.json` (derived from the health reports); their
+    /// tensors are flagged in the tree and detail screens.
+    unindexed: HashSet<String>,
 }
 
 impl Explorer {
@@ -314,6 +318,16 @@ impl Explorer {
         open: Option<OpenRequest>,
         preload: bool,
     ) -> Self {
+        // Files on disk but absent from the index (per the health reports),
+        // resolved to absolute paths so they match each tensor's `source_path`.
+        let mut unindexed = HashSet::new();
+        for report in &health_reports {
+            if let Some(dir) = Path::new(&report.index_path).parent() {
+                for file in &report.extra_files {
+                    unindexed.insert(absolute_path(&dir.join(file)));
+                }
+            }
+        }
         Self {
             files,
             tensors: Vec::new(),
@@ -345,6 +359,7 @@ impl Explorer {
             reader_cache: RefCell::new(None),
             sample_cache: RefCell::new(None),
             preload,
+            unindexed,
         }
     }
 
@@ -1053,6 +1068,7 @@ impl Explorer {
             status_bar: &status_bar,
             health_warning: !self.health_reports.is_empty(),
             can_repack: self.repack_input().is_some(),
+            unindexed: &self.unindexed,
         };
         UI::draw_screen(out, &config)
     }
@@ -1636,6 +1652,7 @@ impl Explorer {
                 .copied()
                 .unwrap_or(ViewDtype::Stored);
             let overridable = dtype_overridable(&tensor);
+            let unindexed = self.unindexed.contains(&tensor.source_path);
             let shape = self
                 .shape_overrides
                 .borrow()
@@ -1643,8 +1660,15 @@ impl Explorer {
                 .cloned()
                 .unwrap_or_else(|| tensor.shape.clone());
             self.compute_stats_animated(&tensor, view, |sv| {
-                let _ =
-                    UI::draw_tensor_detail(&mut live_out(), &tensor, &shape, view, overridable, sv);
+                let _ = UI::draw_tensor_detail(
+                    &mut live_out(),
+                    &tensor,
+                    &shape,
+                    view,
+                    overridable,
+                    unindexed,
+                    sv,
+                );
             });
         }
         Some(screen)
@@ -1666,6 +1690,7 @@ impl Explorer {
         };
         let tensor = &tensor;
         let overridable = dtype_overridable(tensor);
+        let unindexed = self.unindexed.contains(&tensor.source_path);
         // While this screen is up, compute the tensor's exact stats in the
         // background and show the scan live on the Statistics line (a spinner +
         // timer) rather than silently claiming "press s". The reduction streams
@@ -1708,6 +1733,7 @@ impl Explorer {
                         &shape,
                         view,
                         overridable,
+                        unindexed,
                         sv,
                     );
                 });
@@ -1761,6 +1787,7 @@ impl Explorer {
                 &shape,
                 view,
                 overridable,
+                unindexed,
                 stats_view,
             )
             .is_err()
@@ -1822,6 +1849,7 @@ impl Explorer {
                             &shape,
                             view,
                             overridable,
+                            unindexed,
                             sv,
                         );
                     });
@@ -1870,6 +1898,7 @@ impl Explorer {
                             &shape,
                             view,
                             overridable,
+                            unindexed,
                             stats_view,
                         );
                     });
@@ -2404,6 +2433,7 @@ impl Explorer {
                     &shape,
                     options[idx],
                     true,
+                    self.unindexed.contains(&tensor.source_path),
                     stats_view,
                 )
                 .is_ok(),
