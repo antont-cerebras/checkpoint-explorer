@@ -250,6 +250,8 @@ pub struct Explorer {
     flattened_tree: Vec<(TreeNode, usize)>,
     total_parameters: usize,
     search_query: String,
+    /// Caret position within `search_query`, as a character index in `0..=len`.
+    search_cursor: usize,
     search_mode: bool,
     filtered_tree: Vec<(TreeNode, usize)>,
     /// Transient "✓ Copied …" message shown after pressing `c`; cleared on the
@@ -338,6 +340,7 @@ impl Explorer {
             flattened_tree: Vec::new(),
             total_parameters: 0,
             search_query: String::new(),
+            search_cursor: 0,
             search_mode: false,
             filtered_tree: Vec::new(),
             copied_flash: None,
@@ -1064,6 +1067,7 @@ impl Explorer {
             scroll_offset: self.scroll_offset,
             search_mode: self.search_mode,
             search_query: &self.search_query,
+            search_cursor: self.search_cursor,
             status_icon,
             status_ok,
             status_bar: &status_bar,
@@ -1095,16 +1099,13 @@ impl Explorer {
                 // The copy confirmation only lasts until the next key press.
                 self.copied_flash = None;
                 match key_event {
+                    // `q` quits only outside search; while searching it is a
+                    // normal character (typed via the search Char(c) arm below),
+                    // so search is left with Esc.
                     KeyEvent {
                         code: KeyCode::Char('q'),
                         ..
-                    } => {
-                        if self.search_mode {
-                            self.exit_search_mode();
-                        } else {
-                            return Ok(Nav::Quit);
-                        }
-                    }
+                    } if !self.search_mode => return Ok(Nav::Quit),
                     KeyEvent {
                         code: KeyCode::Char('c'),
                         modifiers: KeyModifiers::CONTROL,
@@ -1189,6 +1190,30 @@ impl Explorer {
                         code: KeyCode::Down,
                         ..
                     } => self.move_selection(1),
+                    // While searching, ←/→ (and Home/End) move the text caret
+                    // within the query rather than navigating the tree.
+                    KeyEvent {
+                        code: KeyCode::Left,
+                        ..
+                    } if self.search_mode => {
+                        self.search_cursor = self.search_cursor.saturating_sub(1);
+                    }
+                    KeyEvent {
+                        code: KeyCode::Right,
+                        ..
+                    } if self.search_mode => {
+                        self.search_cursor =
+                            (self.search_cursor + 1).min(self.search_query.chars().count());
+                    }
+                    KeyEvent {
+                        code: KeyCode::Home,
+                        ..
+                    } if self.search_mode => self.search_cursor = 0,
+                    KeyEvent {
+                        code: KeyCode::End, ..
+                    } if self.search_mode => {
+                        self.search_cursor = self.search_query.chars().count();
+                    }
                     // ← jumps to the parent group; → enters the group (its
                     // first child), expanding it first if collapsed.
                     KeyEvent {
@@ -1233,12 +1258,7 @@ impl Explorer {
                     KeyEvent {
                         code: KeyCode::Backspace,
                         ..
-                    } if self.search_mode => {
-                        self.search_query.pop();
-                        self.update_filtered_tree();
-                        self.selected_idx = 0;
-                        self.scroll_offset = 0;
-                    }
+                    } if self.search_mode => self.search_backspace(),
                     KeyEvent {
                         code: KeyCode::Backspace,
                         ..
@@ -1251,12 +1271,7 @@ impl Explorer {
                     KeyEvent {
                         code: KeyCode::Char(c),
                         ..
-                    } if self.search_mode => {
-                        self.search_query.push(c);
-                        self.update_filtered_tree();
-                        self.selected_idx = 0;
-                        self.scroll_offset = 0;
-                    }
+                    } if self.search_mode => self.search_insert(c),
                     // Remove left/right file navigation since we're showing all files merged
                     _ => {}
                 }
@@ -1459,6 +1474,7 @@ impl Explorer {
     fn enter_search_mode(&mut self) {
         self.search_mode = true;
         self.search_query.clear();
+        self.search_cursor = 0;
         self.update_filtered_tree();
         self.selected_idx = 0;
         self.scroll_offset = 0;
@@ -1467,6 +1483,40 @@ impl Explorer {
     fn exit_search_mode(&mut self) {
         self.search_mode = false;
         self.search_query.clear();
+        self.search_cursor = 0;
+        self.update_filtered_tree();
+        self.selected_idx = 0;
+        self.scroll_offset = 0;
+    }
+
+    /// Insert a character into the query at the caret and advance past it.
+    fn search_insert(&mut self, c: char) {
+        let byte = self
+            .search_query
+            .char_indices()
+            .nth(self.search_cursor)
+            .map(|(b, _)| b)
+            .unwrap_or(self.search_query.len());
+        self.search_query.insert(byte, c);
+        self.search_cursor += 1;
+        self.update_filtered_tree();
+        self.selected_idx = 0;
+        self.scroll_offset = 0;
+    }
+
+    /// Delete the character before the caret (Backspace) and step the caret back.
+    fn search_backspace(&mut self) {
+        if self.search_cursor == 0 {
+            return;
+        }
+        let byte = self
+            .search_query
+            .char_indices()
+            .nth(self.search_cursor - 1)
+            .map(|(b, _)| b)
+            .unwrap_or(0);
+        self.search_query.remove(byte);
+        self.search_cursor -= 1;
         self.update_filtered_tree();
         self.selected_idx = 0;
         self.scroll_offset = 0;
