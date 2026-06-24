@@ -1199,6 +1199,12 @@ impl Explorer {
                         code: KeyCode::Right,
                         ..
                     } => self.move_to_first_child(),
+                    // While searching, Tab jumps to the highlighted result's
+                    // place in the tree (leaving search), so you can see it in
+                    // context — Enter still opens its detail.
+                    KeyEvent {
+                        code: KeyCode::Tab, ..
+                    } if self.search_mode => self.reveal_search_result(),
                     // Enter acts on the highlighted row in both modes: expand a
                     // group, or open a tensor detail (returned to the navigator).
                     KeyEvent {
@@ -1464,6 +1470,18 @@ impl Explorer {
         self.update_filtered_tree();
         self.selected_idx = 0;
         self.scroll_offset = 0;
+    }
+
+    /// Jump from the highlighted search result to that tensor's place in the
+    /// tree: leave search mode, then expand to and select it so it's shown in
+    /// context (a no-op if the highlighted result isn't a tensor).
+    fn reveal_search_result(&mut self) {
+        let name = match self.filtered_tree.get(self.selected_idx) {
+            Some((TreeNode::Tensor { info, .. }, _)) => info.name.clone(),
+            _ => return,
+        };
+        self.exit_search_mode();
+        self.reveal_tensor(&name);
     }
 
     /// Act on the highlighted tree row. Returns `Some(Screen::Detail)` when a
