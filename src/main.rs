@@ -477,17 +477,20 @@ fn collect_safetensors_files(
                     }
                 }
 
-                // Scan the directory when there is no index, or when the index
-                // is stale and pointed at files that no longer exist.
-                if !found_from_index {
-                    scan_directory(&expanded_path, recursive, &mut files)?;
-                }
+                // Always scan the directory as well, so files present on disk
+                // but missing from the index — a partially-stale index, e.g.
+                // extra `codebooks`/`qscales` shards — still show up, alongside
+                // the no-index and fully-stale cases. Duplicates (a shard listed
+                // in the index *and* found by the scan) are removed below.
+                scan_directory(&expanded_path, recursive, &mut files)?;
             }
         }
     }
 
-    // Sort files for consistent ordering
+    // Sort for consistent ordering and drop duplicates — the same file can be
+    // collected both from the index and the directory scan (identical paths).
     files.sort();
+    files.dedup();
     Ok((files, health_reports))
 }
 
@@ -538,4 +541,52 @@ fn parse_safetensors_index(index_path: &PathBuf) -> Result<Vec<String>> {
 
     files.sort();
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// A directory whose index lists only some of the `.safetensors` on disk (a
+    /// partially-stale index) must still surface the extra files — the bug where
+    /// `codebooks`/`qscales` shards were silently dropped.
+    #[test]
+    fn collects_extra_files_absent_from_a_stale_index() {
+        let dir = std::env::temp_dir().join("ckpt_explorer_stale_index_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Three shards on disk; the index references only the first.
+        fs::write(dir.join("model.safetensors"), b"x").unwrap();
+        fs::write(dir.join("codebooks.safetensors"), b"x").unwrap();
+        fs::write(dir.join("qscales.safetensors"), b"x").unwrap();
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            br#"{"weight_map": {"w": "model.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let (files, _) =
+            collect_safetensors_files(std::slice::from_ref(&dir), false, true).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        for want in [
+            "model.safetensors",
+            "codebooks.safetensors",
+            "qscales.safetensors",
+        ] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "{want} should be collected; got {names:?}"
+            );
+        }
+        // The shard listed in the index *and* found by the scan must appear once.
+        let unique: std::collections::HashSet<_> = files.iter().collect();
+        assert_eq!(files.len(), unique.len(), "duplicate paths: {names:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

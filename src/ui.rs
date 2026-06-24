@@ -4,6 +4,7 @@ use crossterm::{
     style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{self, BeginSynchronizedUpdate, ClearType, EndSynchronizedUpdate},
 };
+use std::collections::HashSet;
 use std::io::{self, BufWriter, Write};
 use std::time::Duration;
 
@@ -41,6 +42,9 @@ mod palette {
     pub const OK_FG: Color = Color::Black;
     /// A success accent used as a *foreground* (e.g. the "✓ copied" confirmation).
     pub const SUCCESS: Color = Color::Green;
+    /// Marks a tensor present on disk but missing from the index — a vivid red
+    /// that stands out clearly against the tree's default and dimmed text.
+    pub const UNINDEXED: Color = Color::AnsiValue(196);
     /// Group names and expand arrows in the tree — the primary accent (a bright
     /// sky-cyan), so the structure stands out from the leaf tensors.
     pub const ACCENT: Color = Color::AnsiValue(81);
@@ -52,6 +56,10 @@ mod palette {
     pub const STRIPE_DARK: Color = Color::AnsiValue(234);
     pub const STRIPE_LITE: Color = Color::AnsiValue(237);
 }
+
+/// Marks a tensor that's on disk but not listed in the index (an "extra"),
+/// shown in [`palette::UNINDEXED`] in the tree, detail screen and legends.
+const UNINDEXED_MARK: &str = "✚";
 
 pub struct DrawConfig<'a> {
     pub tree: &'a [(TreeNode, usize)],
@@ -75,6 +83,9 @@ pub struct DrawConfig<'a> {
     /// Whether the loaded checkpoint can be repacked (a single HDF5 file), which
     /// gates the `R` hint.
     pub can_repack: bool,
+    /// `source_path`s of tensors present on disk but not listed in the index
+    /// (a stale `model.safetensors.index.json`), flagged in the tree.
+    pub unindexed: &'a HashSet<String>,
 }
 
 /// How a screen should render the statistics area: not computed yet, a scan in
@@ -248,7 +259,7 @@ impl UI {
                 )?;
             }
 
-            Self::draw_node(node, *depth, is_selected, &mut *out)?;
+            Self::draw_node(node, *depth, is_selected, config.unindexed, &mut *out)?;
 
             if is_selected {
                 queue!(out, ResetColor)?;
@@ -301,6 +312,7 @@ impl UI {
         node: &TreeNode,
         depth: usize,
         selected: bool,
+        unindexed: &HashSet<String>,
         out: &mut impl Write,
     ) -> Result<()> {
         let indent = "  ".repeat(depth);
@@ -363,9 +375,15 @@ impl UI {
                 };
                 // The name, shape and size read at full strength; only the leaf
                 // marker and the storage tag (codec / "raw") are dimmed, and the
-                // dtype is tinted. `⇩` marks a compressed tensor.
+                // dtype is tinted. `⇩` marks a compressed tensor. A tensor on disk
+                // but absent from the index gets a red `✚` (an "extra") instead of
+                // the dot.
                 write!(out, "{indent}  ")?;
-                paint(out, selected, palette::DIM, "·")?;
+                if unindexed.contains(&info.source_path) {
+                    paint(out, selected, palette::UNINDEXED, UNINDEXED_MARK)?;
+                } else {
+                    paint(out, selected, palette::DIM, "·")?;
+                }
                 write!(out, " {display_name} [")?;
                 paint(out, selected, palette::DTYPE, &info.dtype)?;
                 write!(out, ", {}, ", format_shape(&info.shape))?;
@@ -421,6 +439,7 @@ impl UI {
         shape: &[usize],
         view: ViewDtype,
         overridable: bool,
+        unindexed: bool,
         stats: StatsView,
     ) -> Result<()> {
         queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
@@ -527,6 +546,16 @@ impl UI {
         paint(&mut *out, false, palette::DIM, "File: ")?;
         write!(out, "{}", tensor.source_path)?;
         line_end(&mut *out)?;
+        // Flag a tensor that's on disk but absent from the index.
+        if unindexed {
+            queue!(out, SetForegroundColor(palette::UNINDEXED))?;
+            write!(
+                out,
+                "{UNINDEXED_MARK} on disk but not listed in model.safetensors.index.json"
+            )?;
+            queue!(out, ResetColor)?;
+            line_end(&mut *out)?;
+        }
         line_end(&mut *out)?;
 
         // Exact whole-tensor statistics: shown once computed, else a hint.
@@ -1441,6 +1470,11 @@ impl UI {
                         "a group, expanded / collapsed (Enter or Space toggles it)",
                     ),
                     (Some(palette::DIM), "·", "a tensor (a stored array)"),
+                    (
+                        Some(palette::UNINDEXED),
+                        UNINDEXED_MARK,
+                        "an extra tensor on disk but not listed in the index (model.safetensors.index.json)",
+                    ),
                     (Some(palette::DIM), "≡", "a metadata entry"),
                     (
                         None,
@@ -1494,6 +1528,11 @@ impl UI {
                         "a byte range within the file (the tensor's data offsets)",
                     ),
                     (Some(palette::DIM), "·", "separates fields on a line"),
+                    (
+                        Some(palette::UNINDEXED),
+                        UNINDEXED_MARK,
+                        "this tensor is an extra: on disk but not listed in the index (model.safetensors.index.json)",
+                    ),
                     (
                         Some(palette::KEY),
                         "⠋",
