@@ -82,6 +82,10 @@ pub enum TreeNode {
     },
     Tensor {
         info: TensorInfo,
+        /// Compacted display label: when a chain of single-child groups collapses
+        /// down to this lone tensor, the merged path (e.g. `self_attn.k_norm.weight`)
+        /// is shown on one row. `None` renders the plain last segment of `name`.
+        label: Option<String>,
     },
     Metadata {
         info: MetadataInfo,
@@ -92,10 +96,17 @@ impl TreeNode {
     pub fn name(&self) -> &str {
         match self {
             TreeNode::Group { name, .. } => name,
-            TreeNode::Tensor { info } => &info.name,
+            TreeNode::Tensor { info, .. } => &info.name,
             TreeNode::Metadata { info } => &info.name,
         }
     }
+}
+
+/// The last path segment of a tensor name, treating `.` and `__` as separators
+/// (so `…_down_proj_weight__variant` yields `variant`). Used for the leaf label.
+pub fn last_segment(name: &str) -> &str {
+    let after = name.rsplit("__").next().unwrap_or(name);
+    after.rsplit('.').next().unwrap_or(after)
 }
 
 pub fn natural_sort_key(name: &str) -> Vec<NaturalSortItem> {
@@ -201,7 +212,10 @@ impl TreeBuilder {
         for (prefix, mut tensors) in root_map {
             if prefix == "_root" {
                 for tensor in tensors {
-                    tree.push(TreeNode::Tensor { info: tensor });
+                    tree.push(TreeNode::Tensor {
+                        info: tensor,
+                        label: None,
+                    });
                 }
             } else {
                 tensors.sort_by_key(|a| natural_sort_key(&a.name));
@@ -225,7 +239,9 @@ impl TreeBuilder {
         }
 
         tree.sort_by_key(|a| natural_sort_key(a.name()));
-        tree
+        // IDE-style "compact folders": collapse chains of single-child groups,
+        // so a lone deeply-nested tensor shows as one `a.b.c.weight` row.
+        compact_nodes(tree)
     }
 
     fn build_subtree(tensors: &[TensorInfo], prefix: &str) -> Vec<TreeNode> {
@@ -250,7 +266,10 @@ impl TreeBuilder {
         let mut result = Vec::new();
 
         for tensor in direct_tensors {
-            result.push(TreeNode::Tensor { info: tensor });
+            result.push(TreeNode::Tensor {
+                info: tensor,
+                label: None,
+            });
         }
 
         for (group_name, group_tensors) in groups {
@@ -280,7 +299,7 @@ impl TreeBuilder {
     /// visible (selectable) in the flattened tree. Returns whether it was found.
     pub fn expand_to_tensor(nodes: &mut [TreeNode], name: &str) -> bool {
         for node in nodes.iter_mut() {
-            if let TreeNode::Tensor { info } = node
+            if let TreeNode::Tensor { info, .. } = node
                 && info.name == name
             {
                 return true;
@@ -370,6 +389,73 @@ impl TreeBuilder {
     }
 }
 
+/// IDE-style "compact folders": collapse chains of single-child groups so a lone
+/// deeply-nested tensor (or middle package) shows on one row. Children are
+/// compacted first, then a group with exactly one child is folded:
+/// - a single sub-group merges its name in (`a` + `b` → `a.b`, keeping `b`'s
+///   children);
+/// - a single tensor is absorbed into the leaf, whose label becomes the joined
+///   path (e.g. `self_attn.k_norm.weight`).
+fn compact_nodes(nodes: Vec<TreeNode>) -> Vec<TreeNode> {
+    nodes.into_iter().map(compact_node).collect()
+}
+
+fn compact_node(node: TreeNode) -> TreeNode {
+    let TreeNode::Group {
+        name,
+        children,
+        expanded,
+        tensor_count,
+        params,
+        total_size,
+        stored_size,
+    } = node
+    else {
+        return node; // tensors / metadata are leaves
+    };
+    let mut children = compact_nodes(children);
+    if children.len() == 1 {
+        match children.pop().unwrap() {
+            // Single sub-group: merge names, adopt its (already-compacted)
+            // children. The aggregates match (the parent had only this child).
+            TreeNode::Group {
+                name: child_name,
+                children: grandchildren,
+                ..
+            } => {
+                return TreeNode::Group {
+                    name: format!("{name}.{child_name}"),
+                    children: grandchildren,
+                    expanded,
+                    tensor_count,
+                    params,
+                    total_size,
+                    stored_size,
+                };
+            }
+            // Single tensor: absorb the group into the leaf's display label.
+            TreeNode::Tensor { info, label } => {
+                let seg = label.unwrap_or_else(|| last_segment(&info.name).to_string());
+                return TreeNode::Tensor {
+                    info,
+                    label: Some(format!("{name}.{seg}")),
+                };
+            }
+            // Anything else (metadata): leave the group intact.
+            other => children.push(other),
+        }
+    }
+    TreeNode::Group {
+        name,
+        children,
+        expanded,
+        tensor_count,
+        params,
+        total_size,
+        stored_size,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,7 +495,7 @@ mod tests {
         nodes
             .iter()
             .filter_map(|n| match n {
-                TreeNode::Tensor { info } => Some(info.name.as_str()),
+                TreeNode::Tensor { info, .. } => Some(info.name.as_str()),
                 _ => None,
             })
             .collect()
@@ -445,12 +531,46 @@ mod tests {
             tensor("model.layers.0.weight"),
             tensor("model.layers.0.bias"),
         ]);
-        // model -> layers -> 0 -> {weight, bias} (the `__` change is additive).
-        let layers = group(&tree, "model");
-        let zero = group(layers, "layers");
-        let leaves = group(zero, "0");
-        let mut names = leaf_names(leaves);
+        // The single-child chain model→layers→0 compacts into one group holding
+        // both leaves.
+        let zero = group(&tree, "model.layers.0");
+        let mut names = leaf_names(zero);
         names.sort();
         assert_eq!(names, vec!["model.layers.0.bias", "model.layers.0.weight"]);
+    }
+
+    #[test]
+    fn compacts_a_single_child_chain_into_one_leaf() {
+        let tree = TreeBuilder::build_tree(&[tensor("model.layers.0.self_attn.k_norm.weight")]);
+        // A lone deeply-nested tensor becomes a single labelled leaf row.
+        assert_eq!(tree.len(), 1);
+        match &tree[0] {
+            TreeNode::Tensor { info, label } => {
+                assert_eq!(info.name, "model.layers.0.self_attn.k_norm.weight");
+                assert_eq!(
+                    label.as_deref(),
+                    Some("model.layers.0.self_attn.k_norm.weight")
+                );
+            }
+            other => panic!("expected one compacted leaf, got group {:?}", other.name()),
+        }
+    }
+
+    #[test]
+    fn compacts_lone_tensors_but_keeps_shared_folders() {
+        let tree =
+            TreeBuilder::build_tree(&[tensor("enc.a.w"), tensor("enc.b.x"), tensor("enc.b.y")]);
+        // `enc` stays (two children). `a` (one tensor) compacts to a leaf
+        // labelled `a.w`; `b` (two tensors) stays a group with leaves `x`/`y`.
+        let enc = group(&tree, "enc");
+        let aw_label = enc.iter().find_map(|n| match n {
+            TreeNode::Tensor { info, label } if info.name == "enc.a.w" => Some(label.clone()),
+            _ => None,
+        });
+        assert_eq!(aw_label, Some(Some("a.w".to_string())));
+        let b = group(enc, "b");
+        let mut names = leaf_names(b);
+        names.sort();
+        assert_eq!(names, vec!["enc.b.x", "enc.b.y"]);
     }
 }
