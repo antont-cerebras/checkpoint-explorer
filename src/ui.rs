@@ -70,6 +70,8 @@ pub struct DrawConfig<'a> {
     pub scroll_offset: usize,
     pub search_mode: bool,
     pub search_query: &'a str,
+    /// Caret position within `search_query`, as a character index in `0..=len`.
+    pub search_cursor: usize,
     /// Leading glyph for the status bar (e.g. `▪`, `▸`, `✓`), and whether it
     /// is a success message (the copy confirmation) for accent colouring.
     pub status_icon: &'a str,
@@ -202,11 +204,11 @@ impl UI {
             queue!(out, SetForegroundColor(palette::DIM))?;
             write!(out, "Search ")?;
             queue!(out, ResetColor)?;
-            input_box(&mut *out, config.search_query, 16)?;
+            input_box(&mut *out, config.search_query, config.search_cursor, 16)?;
             write!(out, "  ")?;
             hint_line(
                 &mut *out,
-                &[("Enter", "view"), ("Tab", "in tree"), ("Esc/q", "exit")],
+                &[("Enter", "view"), ("Tab", "in tree"), ("Esc", "exit")],
             )?;
             write!(out, "\r\n")?;
         } else {
@@ -1074,7 +1076,7 @@ impl UI {
         write!(out, "(0-{} or 0-100%)", slices.saturating_sub(1))?;
         queue!(out, ResetColor)?;
         write!(out, "  ")?;
-        input_box(&mut out, input, 5)?;
+        input_box(&mut out, input, input.chars().count(), 5)?;
         write!(out, "  ")?;
         key_hint(&mut out, "Enter")?;
         queue!(out, SetForegroundColor(palette::DIM))?;
@@ -1127,7 +1129,7 @@ impl UI {
         )?;
         queue!(out, ResetColor)?;
         write!(out, "  ")?;
-        input_box(&mut out, input, 16)?;
+        input_box(&mut out, input, input.chars().count(), 16)?;
         write!(out, "  ")?;
         key_hint(&mut out, "Enter")?;
         queue!(out, SetForegroundColor(palette::DIM))?;
@@ -1209,7 +1211,7 @@ impl UI {
         )?;
         write!(out, "{label} ")?;
         queue!(out, ResetColor)?;
-        input_box(&mut out, input, 24)?;
+        input_box(&mut out, input, input.chars().count(), 24)?;
         write!(out, "  ")?;
         key_hint(&mut out, "Enter")?;
         queue!(out, SetForegroundColor(palette::DIM))?;
@@ -1940,15 +1942,40 @@ fn edge_desc(idx: &[usize], total: usize) -> String {
 
 /// Render a text-input field: the typed `text` plus a block cursor, on the
 /// input palette colours, padded to at least `min_chars` characters wide. Used
-/// by the search bar and the slice-jump prompt so every input box matches.
-fn input_box(out: &mut impl Write, text: &str, min_chars: usize) -> Result<()> {
+/// by the search bar and the slice-jump prompt so every input box matches. The
+/// block cursor sits at character index `cursor` (in `0..=len`): inside the text
+/// it inverts the character under it, at the end it is a trailing block.
+fn input_box(out: &mut impl Write, text: &str, cursor: usize, min_chars: usize) -> Result<()> {
     queue!(
         out,
         SetBackgroundColor(palette::INPUT_BG),
         SetForegroundColor(palette::INPUT_FG)
     )?;
-    write!(out, " {text}█")?;
-    for _ in text.chars().count()..min_chars {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    write!(out, " ")?;
+    for (i, ch) in chars.iter().enumerate() {
+        if i == cursor {
+            // Invert the input colours to draw the caret over this character.
+            queue!(
+                out,
+                SetBackgroundColor(palette::INPUT_FG),
+                SetForegroundColor(palette::INPUT_BG)
+            )?;
+            write!(out, "{ch}")?;
+            queue!(
+                out,
+                SetBackgroundColor(palette::INPUT_BG),
+                SetForegroundColor(palette::INPUT_FG)
+            )?;
+        } else {
+            write!(out, "{ch}")?;
+        }
+    }
+    if cursor >= chars.len() {
+        write!(out, "█")?;
+    }
+    for _ in chars.len()..min_chars {
         write!(out, " ")?;
     }
     write!(out, " ")?;
