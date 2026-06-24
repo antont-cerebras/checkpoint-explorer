@@ -1365,7 +1365,12 @@ impl Explorer {
                 };
                 (primary.0, false, primary.1, String::new())
             }
-            TreeNode::Metadata { .. } => ("", false, String::new(), String::new()),
+            // The full metadata path on the first line (the tree row shows only
+            // the short `…__metadata__` label); the value preview on the second.
+            TreeNode::Metadata { info } => {
+                let value = info.value.split_whitespace().collect::<Vec<_>>().join(" ");
+                ("†", false, info.name.clone(), value)
+            }
         }
     }
 
