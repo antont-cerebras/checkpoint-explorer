@@ -219,7 +219,17 @@ impl UI {
             write!(out, "Search ")?;
             queue!(out, ResetColor)?;
             input_box(&mut *out, config.search_query, config.search_cursor, 16)?;
-            write!(out, "  ")?;
+            // The running match count, between the query box and the hints. Only
+            // shown once something is typed — with an empty query the list is the
+            // whole tree, not a set of matches.
+            if config.search_query.is_empty() {
+                write!(out, "  ")?;
+            } else {
+                let n = config.tree.len();
+                queue!(out, SetForegroundColor(palette::DIM))?;
+                write!(out, "  {n} {}  ", if n == 1 { "match" } else { "matches" })?;
+                queue!(out, ResetColor)?;
+            }
             hint_line(
                 &mut *out,
                 &[("Enter", "view"), ("Tab", "in tree"), ("Esc", "exit")],
