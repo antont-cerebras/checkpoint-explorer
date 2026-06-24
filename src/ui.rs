@@ -500,7 +500,9 @@ impl UI {
                 // dtype is tinted. `⇩` marks a compressed tensor. A tensor on disk
                 // but absent from the index gets a red `✚` (an "extra") instead of
                 // the dot.
-                write!(out, "{indent}  ")?;
+                // Align the leaf marker with sibling group markers at this depth
+                // (the depth already accounts for nesting — no extra indent).
+                write!(out, "{indent}")?;
                 if unindexed.contains(&info.source_path) {
                     paint(out, selected, palette::UNINDEXED, UNINDEXED_MARK)?;
                 } else {
@@ -542,7 +544,9 @@ impl UI {
                 } else {
                     flat
                 };
-                write!(out, "{indent}  ")?;
+                // Align the leaf marker with sibling group markers at this depth
+                // (the depth already accounts for nesting — no extra indent).
+                write!(out, "{indent}")?;
                 // Muted symbol + name so the whole row reads as a side note.
                 paint(out, selected, palette::META, "†")?;
                 write!(out, " ")?;
