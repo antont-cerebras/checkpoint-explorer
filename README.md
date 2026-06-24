@@ -140,6 +140,7 @@ without `--tensor` is reported as ambiguous.
 | `--shape <DIMS>` | Reinterpret the shape (same element count): `10,100` / `10x100`; one dim may be `-1`/`*`/`_` to infer |
 | `--edge[=RFRAC,CFRAC]` (alias `--edges`) / `--overview` / `--window[=ROW,COL]` | Force the edges submode (optional head/tail split fractions `0..1`) / the overview / the contiguous window (optional top-left `ROW,COL`) |
 | `--zebra <rows\|cols\|off>` | Zebra-stripe the numeric grid by rows, columns, or off |
+| `--base <dec\|hex\|oct\|bin>` | Numeral base for the numeric grid; non-decimal shows each element's raw stored bits |
 | `--slice <INDEX>` | Starting slice for a 3D tensor: an index (`12`) or a percentage (`50%`) |
 | `--compute-stats` | Start the statistics scan immediately on the detail view (data views always compute them) |
 | `--exit` | Render the requested view once and exit, without entering interactive navigation |
@@ -161,7 +162,7 @@ keep exploring.
 | `l` | Show a legend explaining the symbols on the current screen (works on every screen) |
 | `c` | Copy the current screen's text to the clipboard (works on every screen) |
 | `f` | Copy the selected row's File path (tensor file, or a group/root's file or directory) |
-| `y` | Show and copy the CLI command that reopens this exact screen — file, tensor, dtype/shape overrides, view, layout, zebra, slice (works on every screen) |
+| `y` | Show and copy the CLI command that reopens this exact screen — file, tensor, dtype/shape overrides, view, layout, zebra, base, slice (works on every screen) |
 | `h` | Show the checkpoint health report (when there is a mismatch) |
 | `R` | Repack the current HDF5 checkpoint into a new file (HDF5 only) |
 | `Backspace` / `\` | Step **back** / **forward** through the screens you've visited (browser-style history) — e.g. reopen a view you just left |
@@ -186,8 +187,8 @@ file or the checkpoint directory).
 its precise settings: the file and `--tensor`, any active `--dtype` / `--shape`
 override, the view (`--values` / `--heatmap`), the layout *and its position* (the
 window's top-left corner via `--window=ROW,COL`, or the edges head/tail split via
-`--edge=RFRAC,CFRAC`), the `--zebra` mode and the `--slice`. So a panned window or
-a re-balanced edges view round-trips exactly. On the tree it reproduces the
+`--edge=RFRAC,CFRAC`), the `--zebra` mode, the `--base`, and the `--slice`. So a
+panned window or a re-balanced edges view round-trips exactly. On the tree it reproduces the
 *highlighted tensor* — `--tensor … --tree`, which reopens the tree with that
 tensor revealed (e.g. after backing out of its view) rather than opening it.
 Paste it to share or revisit an exact view; append `--exit` to render it once
@@ -224,7 +225,11 @@ those, so a tensor stored as e.g. `(128, 3088, 1, 748)` previews as the 3D
   thinned so the ones shown don't collide. To make the grid easier on the eyes
   the indices are dimmed and the cells get a subtle alternating "zebra"
   background (a constant-width band per row or column); `z` cycles the striping
-  between rows, columns, and off.
+  between rows, columns, and off. `b` cycles the **numeral base** — decimal
+  (the default), hex, octal, or binary; the non-decimal bases print each
+  element's raw stored bit pattern, zero-padded to the dtype's width (e.g. an
+  `F32` as 8 hex digits, a `BF16` as 4), which is handy for inspecting exact
+  bits, NaN/inf patterns, or quantized payloads.
 
 Both views open in the **edges view** by default — the first *and* last rows and
 columns (as many as fit), with a dotted `⋯` / `⋮` separator marking the skipped

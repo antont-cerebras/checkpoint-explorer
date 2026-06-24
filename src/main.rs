@@ -133,6 +133,14 @@ struct ExploreArgs {
 
     #[arg(
         long,
+        value_name = "BASE",
+        value_parser = ui::parse_num_base,
+        help = "Numeral base for the numeric grid: dec, hex, oct, or bin (non-decimal shows raw stored bits)"
+    )]
+    base: Option<ui::NumBase>,
+
+    #[arg(
+        long,
         value_name = "INDEX",
         help = "Starting slice for a 3D tensor: an index (e.g. 12) or a percentage (e.g. 50%)"
     )]
@@ -287,6 +295,7 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         || args.overview
         || args.window.is_some()
         || args.zebra.is_some()
+        || args.base.is_some()
         || args.slice.is_some()
         || args.shape.is_some()
         || args.compute_stats
@@ -299,6 +308,7 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         window_at,
         edge_split,
         zebra: args.zebra,
+        base: args.base,
         slice: args.slice,
         shape: args.shape,
         compute_stats: args.compute_stats,

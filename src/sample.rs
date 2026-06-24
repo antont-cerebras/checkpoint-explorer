@@ -125,6 +125,17 @@ impl ViewDtype {
         }
     }
 
+    /// Bit width of one element under this view — 4 for the packed/nibble views,
+    /// otherwise the byte width of the (possibly reinterpreted) dtype. Used to
+    /// size and zero-pad hex/octal/binary cells, and matches [`RawBits::width`].
+    pub fn bit_width(self, stored: &str) -> u32 {
+        match self {
+            ViewDtype::Stored => item_size(stored).unwrap_or(4) as u32 * 8,
+            ViewDtype::As(dt) => item_size(dt).unwrap_or(4) as u32 * 8,
+            _ => 4, // all 4-bit views
+        }
+    }
+
     /// Display width (chars, incl. a 1-col gap) for one value cell in the
     /// numeric grid. Floats use a fixed scientific-notation width. Integer
     /// views size to the *actual* values: given the exact whole-tensor `range`
@@ -263,6 +274,17 @@ pub fn parse_view_dtype(s: &str) -> Result<ViewDtype, String> {
 }
 
 /// A downsampled grid of tensor values plus the original indices it came from.
+/// The raw stored bit pattern of one sampled element, for non-decimal numeral
+/// display. `bits` is the little-endian integer value of the element's bytes (a
+/// single nibble for the 4-bit views); `width` is its bit count (e.g. 32 for an
+/// `F32`, 8 for an `I8`, 4 for a packed-4-bit view). Decimal display ignores
+/// this and uses the decoded [`f64`] in `values`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawBits {
+    pub bits: u64,
+    pub width: u8,
+}
+
 pub struct Sample {
     /// Original row indices that were sampled (logical rows).
     pub rows: Vec<usize>,
@@ -270,6 +292,9 @@ pub struct Sample {
     pub cols: Vec<usize>,
     /// Sampled values, `values[i][j]` for `(rows[i], cols[j])`.
     pub values: Vec<Vec<f64>>,
+    /// Raw stored bits of each sampled element, parallel to `values`, for
+    /// hex/octal/binary display.
+    pub raw: Vec<Vec<RawBits>>,
     pub min: f64,
     pub max: f64,
     /// Logical dimensions of the sampled matrix (1D is treated as `1 x n`; for
@@ -426,7 +451,7 @@ pub(crate) fn sample_tensor_with(
         ),
     };
 
-    let values = read_sampled(reader, t, total_cols, base, &rows, &cols, view)?;
+    let (values, raw) = read_sampled(reader, t, total_cols, base, &rows, &cols, view)?;
 
     let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
     for row in &values {
@@ -446,6 +471,7 @@ pub(crate) fn sample_tensor_with(
         rows,
         cols,
         values,
+        raw,
         min,
         max,
         total_rows,
@@ -618,6 +644,35 @@ fn decode_view(view: ViewDtype, dtype: &str, bytes: &[u8], sub: usize) -> f64 {
         (nibble - 16) as f64
     } else {
         nibble as f64
+    }
+}
+
+/// The raw stored bit pattern of sub-element `sub` of container `bytes` under
+/// `view`, for hex/octal/binary display. For `Stored`/`As` it is the whole
+/// little-endian container (the byte reinterpretation `As` applies doesn't
+/// change the bits); for the 4-bit views it is the selected nibble (the raw
+/// two's-complement pattern, *not* sign-extended).
+fn raw_bits(view: ViewDtype, bytes: &[u8], sub: usize) -> RawBits {
+    let mut container: u64 = 0;
+    for (i, &b) in bytes.iter().take(8).enumerate() {
+        container |= (b as u64) << (8 * i);
+    }
+    match view {
+        ViewDtype::Stored | ViewDtype::As(_) => RawBits {
+            bits: container,
+            width: (bytes.len().min(8) * 8) as u8,
+        },
+        _ => {
+            let nib_index = match view {
+                ViewDtype::U4Packed | ViewDtype::I4Packed => sub,
+                ViewDtype::U4Hi | ViewDtype::I4Hi => bytes.len() * 2 - 1,
+                _ => 0,
+            };
+            RawBits {
+                bits: (container >> (nib_index * 4)) & 0xF,
+                width: 4,
+            }
+        }
     }
 }
 
@@ -1050,6 +1105,10 @@ pub fn tensor_stats(
     Ok(stats)
 }
 
+/// Decoded values and the parallel raw stored bits for a sampled grid, each
+/// indexed `[row][col]`.
+type SampledGrid = (Vec<Vec<f64>>, Vec<Vec<RawBits>>);
+
 /// Sample the grid of `rows × cols` logical values from `reader`, decoding under
 /// `view`. Indices are logical: under a packed view a logical element `flat`
 /// lives in container `flat / packing` at nibble `flat % packing`. Reads only
@@ -1063,7 +1122,7 @@ fn read_sampled(
     rows: &[usize],
     cols: &[usize],
     view: ViewDtype,
-) -> Result<Vec<Vec<f64>>, String> {
+) -> Result<SampledGrid, String> {
     let dtype = t.dtype.as_str();
     let item = item_size(dtype).ok_or_else(|| format!("unsupported dtype: {dtype}"))?;
     let shape = reader.shape().to_vec();
@@ -1105,24 +1164,31 @@ fn read_sampled(
     }
     let bufs = reader.read_regions(&regions)?;
 
-    let out = rows
-        .iter()
-        .zip(&starts)
-        .zip(bufs)
-        .map(|((&r, &start), buf)| {
-            let row_base = base + r * total_cols;
-            cols.iter()
-                .map(|&c| {
-                    let flat = row_base + c;
-                    let off = (flat / packing - start) * item;
-                    buf.get(off..off + item)
-                        .map(|cont| decode_view(view, dtype, cont, flat % packing))
-                        .unwrap_or(f64::NAN)
-                })
-                .collect()
-        })
-        .collect();
-    Ok(out)
+    let width = view.bit_width(dtype) as u8;
+    let mut values = Vec::with_capacity(rows.len());
+    let mut raws = Vec::with_capacity(rows.len());
+    for ((&r, &start), buf) in rows.iter().zip(&starts).zip(bufs) {
+        let row_base = base + r * total_cols;
+        let mut vrow = Vec::with_capacity(cols.len());
+        let mut rrow = Vec::with_capacity(cols.len());
+        for &c in cols {
+            let flat = row_base + c;
+            let off = (flat / packing - start) * item;
+            match buf.get(off..off + item) {
+                Some(cont) => {
+                    vrow.push(decode_view(view, dtype, cont, flat % packing));
+                    rrow.push(raw_bits(view, cont, flat % packing));
+                }
+                None => {
+                    vrow.push(f64::NAN);
+                    rrow.push(RawBits { bits: 0, width });
+                }
+            }
+        }
+        values.push(vrow);
+        raws.push(rrow);
+    }
+    Ok((values, raws))
 }
 
 /// Memory-mapped reader for a safetensors tensor.
@@ -2198,6 +2264,54 @@ mod tests {
         let s = sample_tensor(&t, 10, 10, 0, ViewDtype::I4Packed, SampleMode::Grid).unwrap();
         assert_eq!(s.values[0], vec![4.0, 3.0, 2.0, 1.0, -5.0, -6.0, 0.0, 0.0]);
 
+        // Packed raw bits are the individual nibbles, 4 bits wide.
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Packed, SampleMode::Grid).unwrap();
+        let bits: Vec<u64> = s.raw[0].iter().map(|r| r.bits).collect();
+        assert_eq!(bits, vec![0x4, 0x3, 0x2, 0x1, 0xB, 0xA, 0x0, 0x0]);
+        assert!(s.raw[0].iter().all(|r| r.width == 4));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn raw_bits_capture_the_stored_pattern() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_explorer_sample_rawbits");
+        let _ = std::fs::create_dir_all(&dir);
+
+        // F32 [1,3] = 1.0, 2.0, -1.0 → IEEE-754 bits 0x3f800000 / 0x40000000 /
+        // 0xbf800000, each 32 bits wide.
+        let path = dir.join("f32.safetensors");
+        let header = br#"{"w":{"dtype":"F32","shape":[1,3],"data_offsets":[0,12]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for v in [1.0f32, 2.0, -1.0] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        drop(f);
+        let t = fixture(&path, "w", &[1, 3], (0, 12));
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        let bits: Vec<u64> = s.raw[0].iter().map(|r| r.bits).collect();
+        assert_eq!(bits, vec![0x3f80_0000, 0x4000_0000, 0xbf80_0000]);
+        assert!(s.raw[0].iter().all(|r| r.width == 32));
+        let _ = std::fs::remove_file(&path);
+
+        // I8 [1,3] = 1, -1, -128 → raw two's-complement bytes 0x01 / 0xFF / 0x80,
+        // 8 bits wide, while the decoded values stay signed.
+        let path = dir.join("i8.safetensors");
+        let header = br#"{"w":{"dtype":"I8","shape":[1,3],"data_offsets":[0,3]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        f.write_all(&[0x01, 0xFF, 0x80]).unwrap();
+        drop(f);
+        let t = fixture_dtype(&path, "w", "I8", &[1, 3], (0, 3));
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        let bits: Vec<u64> = s.raw[0].iter().map(|r| r.bits).collect();
+        assert_eq!(bits, vec![0x01, 0xFF, 0x80]);
+        assert!(s.raw[0].iter().all(|r| r.width == 8));
+        assert_eq!(s.values[0], vec![1.0, -1.0, -128.0]);
         let _ = std::fs::remove_file(&path);
     }
 }

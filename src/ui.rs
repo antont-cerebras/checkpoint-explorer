@@ -152,6 +152,77 @@ pub fn parse_stripe_mode(s: &str) -> Result<StripeMode, String> {
     }
 }
 
+/// The numeral base the numeric grid prints values in. `Decimal` is the normal
+/// human-readable form (floats in scientific notation, integers as signed
+/// decimals); the other bases show each element's raw stored bit pattern,
+/// zero-padded to the dtype's width. Cycled with `b`.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum NumBase {
+    #[default]
+    Decimal,
+    Hex,
+    Octal,
+    Binary,
+}
+
+impl NumBase {
+    /// The next base in the `b` cycle: dec → hex → oct → bin → dec.
+    pub fn next(self) -> Self {
+        match self {
+            NumBase::Decimal => NumBase::Hex,
+            NumBase::Hex => NumBase::Octal,
+            NumBase::Octal => NumBase::Binary,
+            NumBase::Binary => NumBase::Decimal,
+        }
+    }
+
+    /// Short label for the footer/command (`dec`, `hex`, `oct`, `bin`).
+    pub fn label(self) -> &'static str {
+        match self {
+            NumBase::Decimal => "dec",
+            NumBase::Hex => "hex",
+            NumBase::Octal => "oct",
+            NumBase::Binary => "bin",
+        }
+    }
+
+    /// Number of digits needed to print `width` bits in this base (raw-bit
+    /// bases only; `Decimal` returns 0 since it sizes cells differently).
+    fn digits(self, width: u32) -> usize {
+        match self {
+            NumBase::Decimal => 0,
+            NumBase::Hex => width.div_ceil(4) as usize,
+            NumBase::Octal => width.div_ceil(3) as usize,
+            NumBase::Binary => width as usize,
+        }
+    }
+
+    /// Display width (chars, incl. a 1-col gap) of one numeric-grid cell under
+    /// this base, for the given `view`/`dtype`. Decimal sizes to the actual
+    /// value `range` (small ints pack tighter); the raw-bit bases use the
+    /// dtype's fixed digit count. Both the sampler (how many columns to fetch)
+    /// and the renderer call this, so they can't disagree on the width.
+    pub fn cell_width(self, view: ViewDtype, dtype: &str, range: Option<(f64, f64)>) -> usize {
+        match self {
+            NumBase::Decimal => view.cell_width(dtype, range),
+            _ => self.digits(view.bit_width(dtype)) + 1,
+        }
+    }
+}
+
+/// Parse a CLI `--base` value into a [`NumBase`].
+pub fn parse_num_base(s: &str) -> Result<NumBase, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "dec" | "decimal" | "10" => Ok(NumBase::Decimal),
+        "hex" | "hexadecimal" | "16" => Ok(NumBase::Hex),
+        "oct" | "octal" | "8" => Ok(NumBase::Octal),
+        "bin" | "binary" | "2" => Ok(NumBase::Binary),
+        _ => Err(format!(
+            "unknown base '{s}'; expected dec, hex, oct, or bin"
+        )),
+    }
+}
+
 /// Which screen a legend explains. The legend (`l`) is context-sensitive — it
 /// lists only the glyphs and colour cues that appear on the screen it was opened
 /// from.
@@ -793,7 +864,7 @@ impl UI {
         line_end(&mut *out)?;
 
         line_end(&mut *out)?;
-        write_view_footer(&mut *out, sample, true, StripeMode::Off)?;
+        write_view_footer(&mut *out, sample, true, StripeMode::Off, NumBase::Decimal)?;
 
         // Clear the footer's tail and everything below (no trailing newline),
         // then end the synchronized frame.
@@ -814,11 +885,13 @@ impl UI {
         sample: &Sample,
         stats: StatsView,
         stripe: StripeMode,
+        base: NumBase,
     ) -> Result<()> {
         // Cell width adapts to the data: floats need room for scientific
         // notation, while small integers (incl. sparse values in a wide dtype)
-        // are 1-3 digits, so we pack many narrow columns onto the screen.
-        let cw = sample.view.cell_width(&tensor.dtype, stats.value_range());
+        // are 1-3 digits, so we pack many narrow columns onto the screen. The
+        // raw-bit bases reserve a fixed width: the dtype's digit count + a gap.
+        let cw = base.cell_width(sample.view, &tensor.dtype, stats.value_range());
         // Synchronized, in-place overwrite (see `draw_heatmap`) to avoid flicker.
         queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
 
@@ -984,10 +1057,21 @@ impl UI {
             queue!(out, SetForegroundColor(Color::Reset))?;
             let mut vcol = 0usize; // visual column ordinal (counts the gap cell)
             for (j, &v) in row.iter().enumerate() {
-                let s = if integer {
-                    format!("{:>cw$}", v as i64)
-                } else {
-                    format!("{v:>cw$.3e}")
+                let s = match base {
+                    NumBase::Decimal if integer => format!("{:>cw$}", v as i64),
+                    NumBase::Decimal => format!("{v:>cw$.3e}"),
+                    // The raw stored bits, zero-padded to the dtype's width.
+                    _ => {
+                        let rb = sample.raw[i][j];
+                        let d = base.digits(rb.width as u32);
+                        let body = match base {
+                            NumBase::Hex => format!("{:0d$x}", rb.bits),
+                            NumBase::Octal => format!("{:0d$o}", rb.bits),
+                            NumBase::Binary => format!("{:0d$b}", rb.bits),
+                            NumBase::Decimal => unreachable!(),
+                        };
+                        format!("{body:>cw$}")
+                    }
                 };
                 let bg = (stripe == StripeMode::Cols).then(|| band(vcol));
                 write_grid_cell(&mut *out, &s, bg, false)?;
@@ -1016,7 +1100,7 @@ impl UI {
         }
 
         line_end(&mut *out)?;
-        write_view_footer(&mut *out, sample, false, stripe)?;
+        write_view_footer(&mut *out, sample, false, stripe, base)?;
 
         queue!(
             out,
@@ -1659,6 +1743,11 @@ impl UI {
                         "1.2e-3",
                         "floats use scientific notation; integers print plain",
                     ),
+                    (
+                        None,
+                        "3f800000",
+                        "press b to cycle the base: dec / hex / oct / bin (raw stored bits)",
+                    ),
                 ];
                 // Reserve room for the wider zebra swatch row drawn below.
                 let col = legend_desc_col(&rows, 8);
@@ -1846,6 +1935,7 @@ fn write_view_footer(
     sample: &Sample,
     heatmap: bool,
     stripe: StripeMode,
+    base: NumBase,
 ) -> Result<()> {
     let switch = if heatmap {
         ("v", "numeric values")
@@ -1896,6 +1986,13 @@ fn write_view_footer(
             StripeMode::Rows => ("z", "zebra: rows"),
             StripeMode::Cols => ("z", "zebra: cols"),
             StripeMode::Off => ("z", "zebra: off"),
+        });
+        // Cycle the numeral base dec → hex → oct → bin (numeric grid only).
+        items.push(match base {
+            NumBase::Decimal => ("b", "base: dec"),
+            NumBase::Hex => ("b", "base: hex"),
+            NumBase::Octal => ("b", "base: oct"),
+            NumBase::Binary => ("b", "base: bin"),
         });
     }
     // Copy the screen's text to the clipboard.
@@ -2241,4 +2338,49 @@ fn with_thousands(n: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn num_base_parses_aliases() {
+        assert_eq!(parse_num_base("dec"), Ok(NumBase::Decimal));
+        assert_eq!(parse_num_base("DECIMAL"), Ok(NumBase::Decimal));
+        assert_eq!(parse_num_base("hex"), Ok(NumBase::Hex));
+        assert_eq!(parse_num_base("16"), Ok(NumBase::Hex));
+        assert_eq!(parse_num_base(" Oct "), Ok(NumBase::Octal));
+        assert_eq!(parse_num_base("bin"), Ok(NumBase::Binary));
+        assert!(parse_num_base("base64").is_err());
+    }
+
+    #[test]
+    fn num_base_cycles_and_round_trips_its_label() {
+        // dec → hex → oct → bin → dec
+        assert_eq!(NumBase::Decimal.next(), NumBase::Hex);
+        assert_eq!(NumBase::Hex.next(), NumBase::Octal);
+        assert_eq!(NumBase::Octal.next(), NumBase::Binary);
+        assert_eq!(NumBase::Binary.next(), NumBase::Decimal);
+        for b in [
+            NumBase::Decimal,
+            NumBase::Hex,
+            NumBase::Octal,
+            NumBase::Binary,
+        ] {
+            assert_eq!(parse_num_base(b.label()), Ok(b));
+        }
+    }
+
+    #[test]
+    fn num_base_digit_widths_match_bit_count() {
+        // 32-bit element (e.g. F32/I32): 8 hex, 11 octal, 32 binary digits.
+        assert_eq!(NumBase::Hex.digits(32), 8);
+        assert_eq!(NumBase::Octal.digits(32), 11);
+        assert_eq!(NumBase::Binary.digits(32), 32);
+        // 8-bit and 4-bit elements.
+        assert_eq!(NumBase::Hex.digits(8), 2);
+        assert_eq!(NumBase::Hex.digits(4), 1);
+        assert_eq!(NumBase::Octal.digits(8), 3);
+    }
 }

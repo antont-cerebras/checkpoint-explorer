@@ -23,7 +23,7 @@ use crate::sample::{SampleMode, Stats, ViewDtype};
 use crate::tree::{
     Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key,
 };
-use crate::ui::{DrawConfig, Legend, StatsView, StripeMode, UI};
+use crate::ui::{DrawConfig, Legend, NumBase, StatsView, StripeMode, UI};
 use crate::utils::base64_encode;
 
 /// Whether the data views show the evenly-spaced overview or the first/last
@@ -84,6 +84,8 @@ pub struct OpenRequest {
     pub edge_split: Option<(f32, f32)>,
     /// Optional zebra-striping mode to apply (numeric grid).
     pub zebra: Option<StripeMode>,
+    /// Optional numeral base for the numeric grid (`--base dec/hex/oct/bin`).
+    pub base: Option<NumBase>,
     /// Optional starting slice (3D tensors), as a raw `N` or `N%` string
     /// resolved against the tensor's slice count.
     pub slice: Option<String>,
@@ -293,6 +295,9 @@ pub struct Explorer {
     /// The numeric grid's zebra striping (rows / columns / off). Session-
     /// remembered; cycled with `z`.
     data_view_stripe: Cell<StripeMode>,
+    /// The numeric grid's numeral base (dec / hex / oct / bin). Session-
+    /// remembered; cycled with `b`.
+    data_view_base: Cell<NumBase>,
     /// A tensor/view to jump straight to on startup (from CLI flags); consumed
     /// once after loading, then normal browsing resumes.
     open: Option<OpenRequest>,
@@ -358,6 +363,7 @@ impl Explorer {
             win_page_rows: Cell::new(1),
             win_page_cols: Cell::new(1),
             data_view_stripe: Cell::new(StripeMode::default()),
+            data_view_base: Cell::new(NumBase::default()),
             open,
             reader_cache: RefCell::new(None),
             sample_cache: RefCell::new(None),
@@ -1688,6 +1694,9 @@ impl Explorer {
         if let Some(zebra) = req.zebra {
             self.data_view_stripe.set(zebra);
         }
+        if let Some(base) = req.base {
+            self.data_view_base.set(base);
+        }
         // Resolve the starting slice against this tensor's slice count — the
         // leading dimension of the (possibly overridden) squeezed shape (so an
         // (N, M, 1, K) tensor pages through N slices, matching the data view);
@@ -2273,6 +2282,11 @@ impl Explorer {
                             KeyCode::Char('z') | KeyCode::Char('Z') => self
                                 .data_view_stripe
                                 .set(self.data_view_stripe.get().next()),
+                            // Cycle the numeral base dec → hex → oct → bin
+                            // (numeric grid); remembered for the session.
+                            KeyCode::Char('b') | KeyCode::Char('B') => {
+                                self.data_view_base.set(self.data_view_base.get().next())
+                            }
                             // In the edges view the arrows move the divider between
                             // the first and last blocks (Shift pushes it fully to one
                             // end): e.g. `→` slides the column divider right, growing
@@ -2446,11 +2460,16 @@ impl Explorer {
             // The heatmap packs two data rows per text line (half blocks), so it
             // can sample twice as many rows as there are lines.
             Representation::Heatmap => (text_rows * 2, (cols as usize).saturating_sub(1).max(1)),
-            // Numeric cell width depends on the actual values (small ints — even
-            // in a wide dtype — pack many columns); plus a 7-char row-index
-            // column. The exact range comes from stats once computed.
+            // Numeric cell width depends on the base (hex/oct/bin are fixed,
+            // wider) and, for decimal, the actual values (small ints — even in a
+            // wide dtype — pack many columns); plus a 7-char row-index column.
+            // The exact range comes from stats once computed. Must match the
+            // width `draw_values` renders with, or the grid overflows the line.
             Representation::Values => {
-                let cell = view.cell_width(&tensor.dtype, stats.value_range());
+                let cell =
+                    self.data_view_base
+                        .get()
+                        .cell_width(view, &tensor.dtype, stats.value_range());
                 (text_rows, ((cols as usize).saturating_sub(7) / cell).max(1))
             }
         };
@@ -2516,8 +2535,15 @@ impl Explorer {
                 UI::draw_heatmap(out, tensor, sample, stats).map_err(|e| e.to_string())?;
             }
             Representation::Values => {
-                UI::draw_values(out, tensor, sample, stats, self.data_view_stripe.get())
-                    .map_err(|e| e.to_string())?;
+                UI::draw_values(
+                    out,
+                    tensor,
+                    sample,
+                    stats,
+                    self.data_view_stripe.get(),
+                    self.data_view_base.get(),
+                )
+                .map_err(|e| e.to_string())?;
             }
         }
         Ok(info)
@@ -3079,6 +3105,13 @@ impl Explorer {
             if let Some(mode) = zebra {
                 parts.push("--zebra".to_string());
                 parts.push(mode.to_string());
+            }
+            // Base applies only to the numeric grid; emit it only when it differs
+            // from the default (decimal).
+            let base = self.data_view_base.get();
+            if base != NumBase::Decimal {
+                parts.push("--base".to_string());
+                parts.push(base.label().to_string());
             }
         }
         // Slice 0 is the default, so only name a non-zero starting slice.
