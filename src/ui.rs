@@ -363,15 +363,16 @@ impl UI {
                 };
                 write!(out, "{meta}\r\n")?;
             }
-            TreeNode::Tensor { info } => {
-                // In search mode (depth 0), show full name; otherwise short name.
+            TreeNode::Tensor { info, label } => {
+                // In search mode (depth 0), show the full name; otherwise the
+                // compacted label if this leaf absorbed a single-child folder
+                // chain (e.g. `self_attn.k_norm.weight`), else the last segment.
                 let display_name = if depth == 0 {
-                    &info.name
+                    info.name.as_str()
+                } else if let Some(label) = label {
+                    label.as_str()
                 } else {
-                    // The last path component, treating `.` and `__` as separators
-                    // (so `…_down_proj_weight__variant` shows just `variant`).
-                    let after = info.name.rsplit("__").next().unwrap_or(&info.name);
-                    after.rsplit('.').next().unwrap_or(after)
+                    crate::tree::last_segment(&info.name)
                 };
                 // The name, shape and size read at full strength; only the leaf
                 // marker and the storage tag (codec / "raw") are dimmed, and the

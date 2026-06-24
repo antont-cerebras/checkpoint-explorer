@@ -905,6 +905,7 @@ impl Explorer {
                     scored_results.push((
                         TreeNode::Tensor {
                             info: tensor.clone(),
+                            label: None,
                         },
                         score,
                     ));
@@ -1268,7 +1269,7 @@ impl Explorer {
         };
 
         match node {
-            TreeNode::Tensor { info } => ("▪", false, info.source_path.clone()),
+            TreeNode::Tensor { info, .. } => ("▪", false, info.source_path.clone()),
             TreeNode::Group { .. } => {
                 let mut files = BTreeSet::new();
                 collect_source_paths(node, &mut files);
@@ -1303,7 +1304,7 @@ impl Explorer {
             return;
         };
         let path = match node {
-            TreeNode::Tensor { info } => Some(info.source_path.clone()),
+            TreeNode::Tensor { info, .. } => Some(info.source_path.clone()),
             TreeNode::Group { .. } => {
                 let mut files = BTreeSet::new();
                 collect_source_paths(node, &mut files);
@@ -1463,7 +1464,7 @@ impl Explorer {
                         self.flatten_tree();
                     }
                 }
-                TreeNode::Tensor { info } => {
+                TreeNode::Tensor { info, .. } => {
                     return Some(Screen::Detail {
                         tensor: info.name.clone(),
                         slice: 0,
@@ -2844,7 +2845,7 @@ impl Explorer {
     /// row, the plain file list.
     fn command_for_tree_selection(&self) -> String {
         match self.flattened_tree.get(self.selected_idx) {
-            Some((TreeNode::Tensor { info }, _)) => {
+            Some((TreeNode::Tensor { info, .. }, _)) => {
                 let mut parts = self.command_base(info);
                 parts.push("--tree".to_string());
                 parts.join(" ")
@@ -3118,7 +3119,7 @@ fn file_name(path: &str) -> String {
 /// Collect the distinct source files of every tensor under `node`.
 fn collect_source_paths(node: &TreeNode, out: &mut BTreeSet<String>) {
     match node {
-        TreeNode::Tensor { info } => {
+        TreeNode::Tensor { info, .. } => {
             out.insert(info.source_path.clone());
         }
         TreeNode::Group { children, .. } => {
