@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::health::HealthReport;
 use crate::sample::{Sample, SampleMode, Stats, ViewDtype};
-use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo, TreeNode};
+use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo, TreeNode, metadata_short};
 use crate::utils::{format_parameters, format_shape, format_size};
 
 /// The app's colour palette — the single source of truth for how each kind of
@@ -50,6 +50,10 @@ mod palette {
     pub const ACCENT: Color = Color::AnsiValue(81);
     /// A tensor's data type (warm amber, so the type pops).
     pub const DTYPE: Color = Color::AnsiValue(215);
+    /// Metadata entries (the `†` marker and the entry name) — a muted slate
+    /// violet, distinct from the cyan groups and amber dtypes but quiet enough
+    /// that metadata reads as a side note rather than competing with tensors.
+    pub const META: Color = Color::AnsiValue(103);
     /// Zebra striping for the numeric grid — two subtle dark backgrounds (one
     /// "dark", one "less dark") that alternate to guide the eye along the rows
     /// or columns, like a dim highlighter.
@@ -527,14 +531,22 @@ impl UI {
                 write!(out, "]\r\n")?;
             }
             TreeNode::Metadata { info } => {
-                let truncated_value = if info.value.len() > 50 {
-                    format!("{}...", &info.value[..47])
+                // Collapse the value (which may be multi-line pretty-printed
+                // JSON) into a compact one-line preview — otherwise its newlines
+                // cascade across the tree. The full value shows in the detail
+                // view. Truncate by chars so we never split a UTF-8 boundary.
+                let flat = info.value.split_whitespace().collect::<Vec<_>>().join(" ");
+                let truncated_value = if flat.chars().count() > 50 {
+                    let head: String = flat.chars().take(47).collect();
+                    format!("{head}...")
                 } else {
-                    info.value.clone()
+                    flat
                 };
                 write!(out, "{indent}  ")?;
-                paint(out, selected, palette::DIM, "≡")?;
-                write!(out, " {}", info.name)?;
+                // Muted symbol + name so the whole row reads as a side note.
+                paint(out, selected, palette::META, "†")?;
+                write!(out, " ")?;
+                paint(out, selected, palette::META, &metadata_short(&info.name))?;
                 paint(
                     out,
                     selected,
@@ -759,11 +771,18 @@ impl UI {
         writeln!(stdout, "Type: {}\r", metadata.value_type)?;
         writeln!(stdout, "Value:\r")?;
 
-        // Handle multi-line values or long values
-        let lines = metadata.value.lines();
-        for line in lines.take(20) {
-            // Limit to 20 lines
+        // Show as many value lines as fit the terminal (the lines above plus a
+        // short footer below), noting how many were elided rather than cutting
+        // silently — metadata values like a quant config run dozens of lines.
+        let rows = terminal::size().map(|(_, h)| h as usize).unwrap_or(40);
+        let budget = rows.saturating_sub(8).max(1);
+        let all: Vec<&str> = metadata.value.lines().collect();
+        let shown = all.len().min(budget);
+        for line in &all[..shown] {
             writeln!(stdout, "  {line}\r")?;
+        }
+        if all.len() > shown {
+            writeln!(stdout, "  … ({} more lines)\r", all.len() - shown)?;
         }
 
         writeln!(stdout, "\r")?;
@@ -1606,7 +1625,11 @@ impl UI {
                         UNINDEXED_MARK,
                         "an extra tensor on disk but not listed in the index (model.safetensors.index.json)",
                     ),
-                    (Some(palette::DIM), "≡", "a metadata entry"),
+                    (
+                        Some(palette::META),
+                        "†",
+                        "a metadata entry (shown beside its tensor, or in the Metadata group)",
+                    ),
                     (
                         None,
                         "☰ N",

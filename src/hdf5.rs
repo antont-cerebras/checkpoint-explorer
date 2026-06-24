@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use hdf5_metno::filters::Filter;
 use hdf5_metno::types::TypeDescriptor;
 
-use crate::tree::{Layout, Storage, TensorInfo};
+use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo};
 
 /// Read tensor metadata (name, dtype, shape, logical + on-disk size) from an
 /// HDF5 checkpoint.
@@ -96,6 +96,82 @@ pub fn read_tensors(path: &std::path::Path) -> Result<Vec<TensorInfo>> {
     }
 
     Ok(tensors)
+}
+
+/// Read root-level HDF5 attributes as checkpoint metadata. Cerebras checkpoints
+/// store free-form metadata in root attributes — scalars like `__version__` /
+/// `__SUCCESS__`, the layout `__spec__`, and one `<object>.__metadata__` JSON
+/// attribute per tensor and per config object (e.g. `inference_version`,
+/// `codebook_packing_schema`). Each `__metadata__` attribute wraps the real
+/// payload (torch-serialization plumbing: `__spec__` / `__objects__` / the
+/// payload under the attribute's own name), so we unwrap it to the useful part.
+pub fn read_metadata(path: &std::path::Path) -> Result<Vec<MetadataInfo>> {
+    let file = hdf5_metno::File::open(path)
+        .with_context(|| format!("Failed to open HDF5 file: {}", path.display()))?;
+    let names = file.attr_names().unwrap_or_default();
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let Some((raw, value_type)) = read_attr_value(&file, &name) else {
+            continue;
+        };
+        // Unwrap the `<object>.__metadata__` serialization wrapper to the payload
+        // it carries; everything else (scalars, `__spec__`) is shown verbatim.
+        let (value, value_type) = unwrap_metadata_value(&name, &raw).unwrap_or((raw, value_type));
+        out.push(MetadataInfo {
+            name,
+            value,
+            value_type,
+        });
+    }
+    Ok(out)
+}
+
+/// Read a single attribute as a `(value, type-label)` string pair, trying the
+/// scalar types Cerebras checkpoints use (a variable-length string, else a
+/// boolean / float / integer). `None` for an attribute we can't read as any.
+fn read_attr_value(loc: &hdf5_metno::Location, name: &str) -> Option<(String, String)> {
+    use hdf5_metno::types::{VarLenAscii, VarLenUnicode};
+    let attr = loc.attr(name).ok()?;
+    if let Ok(s) = attr.read_scalar::<VarLenUnicode>() {
+        return Some((s.as_str().to_string(), "string".to_string()));
+    }
+    if let Ok(s) = attr.read_scalar::<VarLenAscii>() {
+        return Some((s.as_str().to_string(), "string".to_string()));
+    }
+    if let Ok(b) = attr.read_scalar::<bool>() {
+        return Some((b.to_string(), "bool".to_string()));
+    }
+    if let Ok(v) = attr.read_scalar::<f64>() {
+        return Some((v.to_string(), "float".to_string()));
+    }
+    if let Ok(v) = attr.read_scalar::<i64>() {
+        return Some((v.to_string(), "int".to_string()));
+    }
+    None
+}
+
+/// Unwrap a `<object>.__metadata__` attribute's JSON to the payload it carries.
+/// The payload lives under a key equal to the attribute name; a `string_value`
+/// (the `StringSerializer` case, e.g. `inference_version` → `"1.5"`, or a config
+/// object stored as a JSON string) is returned as that string (pretty-printed if
+/// it is itself JSON), otherwise the payload object is pretty-printed. Returns
+/// `None` for non-`__metadata__` attributes or anything that doesn't parse, so
+/// the caller falls back to the raw value.
+fn unwrap_metadata_value(attr_name: &str, raw: &str) -> Option<(String, String)> {
+    if !attr_name.ends_with(".__metadata__") {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let payload = json.get(attr_name)?;
+    if let Some(sv) = payload.get("string_value").and_then(|v| v.as_str()) {
+        let value = serde_json::from_str::<serde_json::Value>(sv)
+            .ok()
+            .and_then(|inner| serde_json::to_string_pretty(&inner).ok())
+            .unwrap_or_else(|| sv.to_string());
+        return Some((value, "string".to_string()));
+    }
+    let value = serde_json::to_string_pretty(payload).unwrap_or_else(|_| raw.to_string());
+    Some((value, "json".to_string()))
 }
 
 /// Name the size-reducing compressor in an HDF5 filter, if any. Shuffle and
@@ -287,6 +363,94 @@ mod tests {
         }
         // The compressed dataset is chunked, so its layout is reported.
         assert!(matches!(comp.layout, crate::tree::Layout::Chunked { .. }));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unwraps_string_serializer_metadata() {
+        // `inference_version`: a plain string payload under `string_value`.
+        let raw = r#"{"__spec__":[{"inference_version":"*"}],"__objects__":["inference_version"],
+            "inference_version.__metadata__":{"string_value":"1.5","__TYPE__":"StringSerializer"}}"#;
+        let (val, ty) = unwrap_metadata_value("inference_version.__metadata__", raw).unwrap();
+        assert_eq!(val, "1.5");
+        assert_eq!(ty, "string");
+    }
+
+    #[test]
+    fn unwraps_json_string_value_pretty() {
+        // `codebook_packing_schema`: `string_value` is itself JSON → pretty-print.
+        let raw = r#"{"__objects__":["codebook_packing_schema"],
+            "codebook_packing_schema.__metadata__":{"string_value":"{\"down_proj\": {\"quant_mode\": \"3bit\"}}","__TYPE__":"StringSerializer"}}"#;
+        let (val, ty) = unwrap_metadata_value("codebook_packing_schema.__metadata__", raw).unwrap();
+        assert_eq!(ty, "string");
+        assert!(val.contains("\"down_proj\""));
+        assert!(val.contains("\"quant_mode\": \"3bit\""));
+        assert!(val.contains('\n'), "should be pretty-printed: {val}");
+    }
+
+    #[test]
+    fn unwraps_non_string_payload_as_pretty_json() {
+        // A torch-tensor payload has no `string_value`; show the dict itself.
+        let raw =
+            r#"{"lm_head.weight.__metadata__":{"__TORCH__":true,"dtypes":["torch.float16"]}}"#;
+        let (val, ty) = unwrap_metadata_value("lm_head.weight.__metadata__", raw).unwrap();
+        assert_eq!(ty, "json");
+        assert!(val.contains("__TORCH__"));
+        assert!(val.contains("torch.float16"));
+    }
+
+    #[test]
+    fn leaves_non_metadata_and_malformed_attrs_to_the_caller() {
+        // Non-`__metadata__` names are shown verbatim by the caller.
+        assert!(unwrap_metadata_value("__spec__", "[1,2,3]").is_none());
+        assert!(unwrap_metadata_value("__version__", "0.5").is_none());
+        // Unparseable JSON or a missing payload key falls back to the raw value.
+        assert!(unwrap_metadata_value("x.__metadata__", "not json").is_none());
+        assert!(unwrap_metadata_value("x.__metadata__", r#"{"other":1}"#).is_none());
+    }
+
+    #[test]
+    fn reads_root_attributes_as_metadata() {
+        use hdf5_metno::types::VarLenUnicode;
+        use std::str::FromStr;
+
+        let dir = std::env::temp_dir().join("safetensors_explorer_hdf5_attrs");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("attrs.h5");
+        let _ = std::fs::remove_file(&path);
+        {
+            let file = hdf5_metno::File::create(&path).unwrap();
+            file.new_dataset::<f32>().shape([2]).create("w").unwrap();
+            // A Cerebras-style string `__metadata__` attribute.
+            let json = r#"{"__objects__":["inference_version"],"inference_version.__metadata__":{"string_value":"1.5","__TYPE__":"StringSerializer"}}"#;
+            let v = VarLenUnicode::from_str(json).unwrap();
+            file.new_attr::<VarLenUnicode>()
+                .create("inference_version.__metadata__")
+                .unwrap()
+                .write_scalar(&v)
+                .unwrap();
+            // Scalar attributes (a bool and a float).
+            file.new_attr::<bool>()
+                .create("__SUCCESS__")
+                .unwrap()
+                .write_scalar(&true)
+                .unwrap();
+            file.new_attr::<f64>()
+                .create("__version__")
+                .unwrap()
+                .write_scalar(&0.5f64)
+                .unwrap();
+        }
+
+        let meta = read_metadata(&path).unwrap();
+        let find = |n: &str| meta.iter().find(|m| m.name == n).unwrap();
+        let iv = find("inference_version.__metadata__");
+        assert_eq!(iv.value, "1.5");
+        assert_eq!(iv.value_type, "string");
+        assert_eq!(find("__SUCCESS__").value, "true");
+        assert_eq!(find("__SUCCESS__").value_type, "bool");
+        assert_eq!(find("__version__").value_type, "float");
 
         let _ = std::fs::remove_file(&path);
     }

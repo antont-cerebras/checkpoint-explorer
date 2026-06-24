@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// How a tensor is stored on disk, for formats (like HDF5) that may compress.
 // `Raw`/`Compressed` are only constructed by the HDF5 reader; without that
@@ -109,6 +109,18 @@ pub fn last_segment(name: &str) -> &str {
     after.rsplit('.').next().unwrap_or(after)
 }
 
+/// Short label for a metadata entry shown in the tree: the last path segment
+/// with the `.__metadata__` suffix kept (so `a.b.qscale.__metadata__` reads as
+/// `qscale.__metadata__`, beside its `qscale` tensor). Names without that suffix
+/// (`__version__`, `inference_version.__metadata__` at the root) are returned as
+/// their final dotted segment.
+pub fn metadata_short(name: &str) -> String {
+    match name.strip_suffix(".__metadata__") {
+        Some(stem) => format!("{}.__metadata__", stem.rsplit('.').next().unwrap_or(stem)),
+        None => name.rsplit('.').next().unwrap_or(name).to_string(),
+    }
+}
+
 pub fn natural_sort_key(name: &str) -> Vec<NaturalSortItem> {
     let mut result = Vec::new();
     let mut current_number = String::new();
@@ -157,36 +169,65 @@ pub enum NaturalSortItem {
 pub struct TreeBuilder;
 
 impl TreeBuilder {
+    /// Build the tree from tensors plus metadata. Per-tensor metadata (a
+    /// `<tensor>.__metadata__` entry whose `<tensor>` is in the file) is placed
+    /// in-place, right beside its tensor, so it's seen while walking the tree;
+    /// the remaining standalone/config metadata (e.g. `inference_version`,
+    /// `codebook_packing_schema`, `__version__`) stays in a top-level group.
     pub fn build_tree_mixed(tensors: &[TensorInfo], metadata: &[MetadataInfo]) -> Vec<TreeNode> {
-        let mut tree = Vec::new();
+        let tensor_names: HashSet<&str> = tensors.iter().map(|t| t.name.as_str()).collect();
+        let stem_of = |m: &MetadataInfo| -> Option<String> {
+            let stem = m.name.strip_suffix(".__metadata__")?;
+            tensor_names.contains(stem).then(|| stem.to_string())
+        };
 
-        // Add metadata as a separate group
-        if !metadata.is_empty() {
-            let mut metadata_children = Vec::new();
-            for meta in metadata {
-                metadata_children.push(TreeNode::Metadata { info: meta.clone() });
+        // Build the tensor tree uncompacted, weave each per-tensor metadata in
+        // beside its tensor, then compact — so a lone tensor and its metadata
+        // collapse together rather than the metadata blocking compaction above.
+        let mut raw = Self::build_tree_raw(tensors);
+        for meta in metadata {
+            if let Some(stem) = stem_of(meta) {
+                // Parent path = the tensor's path minus its own leaf segment.
+                let parts: Vec<&str> = stem.split('.').collect();
+                let parent = &parts[..parts.len() - 1];
+                insert_metadata(&mut raw, parent, meta.clone());
             }
-            metadata_children.sort_by_key(|a| natural_sort_key(a.name()));
-
-            tree.push(TreeNode::Group {
-                name: "🔧 Metadata".to_string(),
-                children: metadata_children,
-                expanded: false,
-                tensor_count: 0,
-                params: 0,
-                total_size: 0,
-                stored_size: 0,
-            });
         }
+        let mut tree = compact_nodes(raw);
 
-        // Build tensor tree
-        let tensor_tree = Self::build_tree(tensors);
-        tree.extend(tensor_tree);
+        // Standalone metadata (no matching tensor) keeps its own group on top.
+        let standalone: Vec<TreeNode> = metadata
+            .iter()
+            .filter(|m| stem_of(m).is_none())
+            .map(|m| TreeNode::Metadata { info: m.clone() })
+            .collect();
+        if !standalone.is_empty() {
+            let mut children = standalone;
+            children.sort_by_key(|a| natural_sort_key(a.name()));
+            tree.insert(
+                0,
+                TreeNode::Group {
+                    name: "🔧 Metadata".to_string(),
+                    children,
+                    expanded: false,
+                    tensor_count: 0,
+                    params: 0,
+                    total_size: 0,
+                    stored_size: 0,
+                },
+            );
+        }
 
         tree
     }
 
     pub fn build_tree(tensors: &[TensorInfo]) -> Vec<TreeNode> {
+        compact_nodes(Self::build_tree_raw(tensors))
+    }
+
+    /// The tensor tree before "compact folders" runs. Kept separate so
+    /// [`build_tree_mixed`] can weave metadata leaves in before compaction.
+    fn build_tree_raw(tensors: &[TensorInfo]) -> Vec<TreeNode> {
         let mut root_map: HashMap<String, Vec<TensorInfo>> = HashMap::new();
 
         for tensor in tensors {
@@ -239,9 +280,7 @@ impl TreeBuilder {
         }
 
         tree.sort_by_key(|a| natural_sort_key(a.name()));
-        // IDE-style "compact folders": collapse chains of single-child groups,
-        // so a lone deeply-nested tensor shows as one `a.b.c.weight` row.
-        compact_nodes(tree)
+        tree
     }
 
     fn build_subtree(tensors: &[TensorInfo], prefix: &str) -> Vec<TreeNode> {
@@ -295,21 +334,30 @@ impl TreeBuilder {
         result
     }
 
-    /// Expand every group on the path to the tensor named `name`, so it becomes
-    /// visible (selectable) in the flattened tree. Returns whether it was found.
+    /// Expand every group on the path to the leaf named `name` — a tensor or a
+    /// metadata entry — so it becomes visible (selectable) in the flattened
+    /// tree. Returns whether it was found.
     pub fn expand_to_tensor(nodes: &mut [TreeNode], name: &str) -> bool {
         for node in nodes.iter_mut() {
-            if let TreeNode::Tensor { info, .. } = node
-                && info.name == name
-            {
-                return true;
-            } else if let TreeNode::Group {
-                children, expanded, ..
-            } = node
-                && Self::expand_to_tensor(children, name)
-            {
-                *expanded = true;
-                return true;
+            match node {
+                TreeNode::Tensor { info, .. } => {
+                    if info.name == name {
+                        return true;
+                    }
+                }
+                TreeNode::Metadata { info } => {
+                    if info.name == name {
+                        return true;
+                    }
+                }
+                TreeNode::Group {
+                    children, expanded, ..
+                } => {
+                    if Self::expand_to_tensor(children, name) {
+                        *expanded = true;
+                        return true;
+                    }
+                }
             }
         }
         false
@@ -456,6 +504,25 @@ fn compact_node(node: TreeNode) -> TreeNode {
     }
 }
 
+/// Insert a metadata leaf beside its tensor: descend the (uncompacted) group
+/// chain named by `parent`, then add the node to that group's children and
+/// re-sort so it lands next to its tensor. Falls back to the current level if
+/// the parent path isn't found, so the entry is never dropped.
+fn insert_metadata(nodes: &mut Vec<TreeNode>, parent: &[&str], meta: MetadataInfo) {
+    if let Some((head, rest)) = parent.split_first() {
+        for node in nodes.iter_mut() {
+            if let TreeNode::Group { name, children, .. } = node
+                && name == head
+            {
+                insert_metadata(children, rest, meta);
+                return;
+            }
+        }
+    }
+    nodes.push(TreeNode::Metadata { info: meta });
+    nodes.sort_by_key(|a| natural_sort_key(a.name()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +639,84 @@ mod tests {
         let mut names = leaf_names(b);
         names.sort();
         assert_eq!(names, vec!["enc.b.x", "enc.b.y"]);
+    }
+
+    fn meta(name: &str) -> MetadataInfo {
+        MetadataInfo {
+            name: name.to_string(),
+            value: "v".to_string(),
+            value_type: "string".to_string(),
+        }
+    }
+
+    fn meta_names(nodes: &[TreeNode]) -> Vec<&str> {
+        nodes
+            .iter()
+            .filter_map(|n| match n {
+                TreeNode::Metadata { info } => Some(info.name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn places_per_tensor_metadata_beside_its_tensor() {
+        let tree = TreeBuilder::build_tree_mixed(
+            &[tensor("a.b.weight"), tensor("a.b.qscale")],
+            &[
+                meta("a.b.qscale.__metadata__"),        // per-tensor → in place
+                meta("inference_version.__metadata__"), // standalone → group
+                meta("__version__"),                    // standalone → group
+            ],
+        );
+
+        // The per-tensor metadata sits beside its tensor (the `a`→`b` chain
+        // compacts to one `a.b` group holding both tensors and the metadata).
+        let ab = group(&tree, "a.b");
+        let mut names: Vec<&str> = ab.iter().map(|n| n.name()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["a.b.qscale", "a.b.qscale.__metadata__", "a.b.weight"]
+        );
+        assert_eq!(meta_names(ab), vec!["a.b.qscale.__metadata__"]);
+
+        // Standalone metadata (no matching tensor) stays in the top-level group.
+        let md = group(&tree, "🔧 Metadata");
+        let mut standalone = meta_names(md);
+        standalone.sort();
+        assert_eq!(
+            standalone,
+            vec!["__version__", "inference_version.__metadata__"]
+        );
+    }
+
+    #[test]
+    fn expand_to_tensor_also_reveals_metadata_nodes() {
+        let mut tree = TreeBuilder::build_tree_mixed(
+            &[tensor("a.b.qscale")],
+            &[meta("a.b.qscale.__metadata__")],
+        );
+        assert!(TreeBuilder::expand_to_tensor(
+            &mut tree,
+            "a.b.qscale.__metadata__"
+        ));
+        assert!(!TreeBuilder::expand_to_tensor(
+            &mut tree,
+            "a.b.nope.__metadata__"
+        ));
+    }
+
+    #[test]
+    fn metadata_short_keeps_the_suffix_on_the_last_segment() {
+        assert_eq!(
+            metadata_short("a.b.qscale.__metadata__"),
+            "qscale.__metadata__"
+        );
+        assert_eq!(
+            metadata_short("inference_version.__metadata__"),
+            "inference_version.__metadata__"
+        );
+        assert_eq!(metadata_short("__version__"), "__version__");
     }
 }
