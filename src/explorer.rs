@@ -1190,8 +1190,21 @@ impl Explorer {
                         code: KeyCode::Down,
                         ..
                     } => self.move_selection(1),
-                    // While searching, ←/→ (and Home/End) move the text caret
-                    // within the query rather than navigating the tree.
+                    // While searching, the arrows edit the query: Shift+←/→ jump
+                    // the text caret to the start/end, plain ←/→ move it one
+                    // character at a time.
+                    KeyEvent {
+                        code: KeyCode::Left,
+                        modifiers: KeyModifiers::SHIFT,
+                        ..
+                    } if self.search_mode => self.search_cursor = 0,
+                    KeyEvent {
+                        code: KeyCode::Right,
+                        modifiers: KeyModifiers::SHIFT,
+                        ..
+                    } if self.search_mode => {
+                        self.search_cursor = self.search_query.chars().count();
+                    }
                     KeyEvent {
                         code: KeyCode::Left,
                         ..
@@ -1205,15 +1218,25 @@ impl Explorer {
                         self.search_cursor =
                             (self.search_cursor + 1).min(self.search_query.chars().count());
                     }
+                    // In the results list Home/End jump to the first/last match
+                    // and PageUp/PageDown move by one screenful.
                     KeyEvent {
                         code: KeyCode::Home,
                         ..
-                    } if self.search_mode => self.search_cursor = 0,
+                    } if self.search_mode => self.selected_idx = 0,
                     KeyEvent {
                         code: KeyCode::End, ..
                     } if self.search_mode => {
-                        self.search_cursor = self.search_query.chars().count();
+                        self.selected_idx = self.filtered_tree.len().saturating_sub(1);
                     }
+                    KeyEvent {
+                        code: KeyCode::PageUp,
+                        ..
+                    } if self.search_mode => self.move_selection(-(self.page_rows() as i32)),
+                    KeyEvent {
+                        code: KeyCode::PageDown,
+                        ..
+                    } if self.search_mode => self.move_selection(self.page_rows() as i32),
                     // ← jumps to the parent group; → enters the group (its
                     // first child), expanding it first if collapsed.
                     KeyEvent {
@@ -1367,6 +1390,13 @@ impl Explorer {
             copy_to_clipboard(&name);
             self.copied_flash = Some(name);
         }
+    }
+
+    /// One screenful of tree rows, used to size a PageUp/PageDown jump so it
+    /// matches what's currently visible.
+    fn page_rows(&self) -> usize {
+        let height = terminal::size().map(|(_, h)| h).unwrap_or(40);
+        UI::visible_tree_rows(height)
     }
 
     fn move_selection(&mut self, delta: i32) {

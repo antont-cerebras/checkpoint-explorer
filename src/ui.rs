@@ -163,9 +163,23 @@ pub enum Legend {
     Values,
 }
 
+/// Rows of chrome above the tree list: the title, the search/hint line, and the
+/// separator rule.
+const TREE_HEADER_HEIGHT: usize = 3;
+/// Rows of chrome below the tree list: the two-line status bar.
+const TREE_FOOTER_HEIGHT: usize = 2;
+
 pub struct UI;
 
 impl UI {
+    /// How many tree rows are visible at once (one screenful), used to size a
+    /// PageUp/PageDown jump. `terminal_height` is the full terminal height.
+    pub fn visible_tree_rows(terminal_height: u16) -> usize {
+        (terminal_height as usize)
+            .saturating_sub(TREE_HEADER_HEIGHT + TREE_FOOTER_HEIGHT)
+            .max(1)
+    }
+
     /// Render the tree browser into `out` (a buffered stdout for the live
     /// screen, or an in-memory buffer when capturing the screen for copy).
     /// Writing the whole frame at once and flushing once — combined with
@@ -173,11 +187,11 @@ impl UI {
     /// front) — removes the flicker a per-frame `Clear(All)` produced.
     pub fn draw_screen(out: &mut impl Write, config: &DrawConfig) -> Result<usize> {
         let (terminal_width, terminal_height) = terminal::size()?;
-        let header_height = 3;
+        let header_height = TREE_HEADER_HEIGHT;
         // Two bottom lines for the status bar: the selected tensor's full name on
         // the first, its source file on the second (the per-checkpoint totals now
         // live in the tree root instead of a footer).
-        let footer_height = 2;
+        let footer_height = TREE_FOOTER_HEIGHT;
         let available_height =
             (terminal_height as usize).saturating_sub(header_height + footer_height);
 
