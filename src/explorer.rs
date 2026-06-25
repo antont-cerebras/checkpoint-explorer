@@ -18,7 +18,7 @@ use std::{
 };
 
 use crate::gguf::GGUFFile;
-use crate::sample::{SampleMode, Stats, ViewDtype};
+use crate::sample::{HistShared, Histogram, SampleMode, Stats, ViewDtype};
 
 use crate::tree::{
     Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key,
@@ -76,6 +76,11 @@ pub struct OpenRequest {
     pub metadata: Option<String>,
     /// Which screen to show.
     pub view: OpenView,
+    /// Show the value histogram on the detail screen (the `h` key's result).
+    pub histogram: bool,
+    /// Requested histogram bucket count (`--bins N`, the `b` key's result);
+    /// `None` leaves the count automatic. Implies showing the histogram.
+    pub bins: Option<usize>,
     /// Optional dtype reinterpretation to apply first.
     pub dtype: Option<ViewDtype>,
     /// Which data-view layout to force (`--edge`/`--overview`/`--window`);
@@ -190,6 +195,16 @@ enum ReshapeChoice {
     Cancel,
 }
 
+/// The outcome of the histogram bin-count prompt (`b`).
+enum BinsChoice {
+    /// Use this bucket count.
+    Set(usize),
+    /// Go back to the automatic count (entered empty).
+    Clear,
+    /// Leave the count unchanged (`Esc`).
+    Cancel,
+}
+
 /// The last sample a data view rendered, reused when nothing that affects it
 /// changed. This keeps the spinner-frame redraws during a stats scan from
 /// re-reading (and, for HDF5, re-decompressing) the tensor every frame — those
@@ -214,6 +229,11 @@ type SampleKey = (
     usize,          // max_cols
     Vec<usize>,     // effective shape (stored, or a shape override)
 );
+
+/// Cache key for a computed histogram: tensor name, view (dtype reinterpretation)
+/// and the requested bucket count (`None` = automatic) — a different count caches
+/// separately rather than reusing a stale layout.
+type HistKey = (String, ViewDtype, Option<usize>);
 
 /// Whether a screen waits for keys or renders once and returns (`--exit`).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -293,6 +313,13 @@ pub struct Explorer {
     /// Exact whole-tensor statistics, cached per (tensor name, view) since the
     /// scan is expensive. Session-scoped.
     stats_cache: RefCell<HashMap<(String, ViewDtype), Stats>>,
+    /// Cached whole-tensor histograms, keyed like the stats cache plus the
+    /// requested bucket count (so a different `--bins` / `b` count caches and
+    /// redraws separately rather than reusing a stale layout).
+    histogram_cache: RefCell<HashMap<HistKey, Histogram>>,
+    /// Requested histogram bucket count (the `b` key / `--bins`); `None` lets the
+    /// layout pick automatically. Session-wide, like the other view toggles.
+    histogram_bins: Cell<Option<usize>>,
     /// Which layout the data views use (overview / edges / window). Session-
     /// scoped: remembered as you move between tensors and in/out of the preview.
     data_view_layout: Cell<DataLayout>,
@@ -376,6 +403,8 @@ impl Explorer {
             dtype_overrides: RefCell::new(HashMap::new()),
             shape_overrides: RefCell::new(HashMap::new()),
             stats_cache: RefCell::new(HashMap::new()),
+            histogram_cache: RefCell::new(HashMap::new()),
+            histogram_bins: Cell::new(None),
             data_view_layout: Cell::new(DataLayout::default()),
             data_view_row_tail: Cell::new(0.5),
             data_view_col_tail: Cell::new(0.5),
@@ -1808,6 +1837,38 @@ impl Explorer {
             }
         };
 
+        // `--histogram` / `--bins`: pre-compute the value histogram so the detail
+        // screen shows it on first render — this is what makes `y`'s `--histogram`
+        // (and `--bins N`) round-trip restore the view. A bucket count implies
+        // showing the histogram. Done before the one-shot below so `--exit`
+        // captures it too.
+        if let Some(n) = req.bins {
+            self.histogram_bins.set(Some(n));
+        }
+        if (req.histogram || req.bins.is_some())
+            && let Screen::Detail { .. } = screen
+        {
+            let view = self
+                .dtype_overrides
+                .borrow()
+                .get(&tensor.name)
+                .copied()
+                .unwrap_or(ViewDtype::Stored);
+            let shape = self
+                .shape_overrides
+                .borrow()
+                .get(&tensor.name)
+                .cloned()
+                .unwrap_or_else(|| tensor.shape.clone());
+            self.ensure_detail_histogram(
+                &tensor,
+                view,
+                &shape,
+                dtype_overridable(&tensor),
+                self.unindexed.contains(&tensor.source_path),
+            );
+        }
+
         // One-shot (`--exit`): render the requested screen once and return None
         // (the navigator is never entered).
         if req.exit_after {
@@ -1855,6 +1916,8 @@ impl Explorer {
                     overridable,
                     unindexed,
                     sv,
+                    None,
+                    None,
                 );
             });
         }
@@ -1925,6 +1988,8 @@ impl Explorer {
                         overridable,
                         unindexed,
                         sv,
+                        None,
+                        None,
                     );
                 });
             }
@@ -1971,6 +2036,12 @@ impl Explorer {
                 }
                 None => StatsView::Pending,
             };
+            // Show the value histogram below the stats once it's been computed.
+            let hist = self
+                .histogram_cache
+                .borrow()
+                .get(&(tensor.name.clone(), view, self.histogram_bins.get()))
+                .cloned();
             if UI::draw_tensor_detail(
                 &mut live_out(),
                 tensor,
@@ -1979,6 +2050,8 @@ impl Explorer {
                 overridable,
                 unindexed,
                 stats_view,
+                hist.as_ref(),
+                None,
             )
             .is_err()
             {
@@ -2043,6 +2116,34 @@ impl Explorer {
                         slice: start_slice,
                     });
                 }
+                // Compute the whole-tensor value histogram, animating the bars
+                // filling in below the statistics.
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Char('h'),
+                    ..
+                })) => {
+                    self.ensure_detail_histogram(tensor, view, &shape, overridable, unindexed);
+                }
+                // Set the histogram's bucket count (then (re)compute and show it).
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Char('b') | KeyCode::Char('B'),
+                    ..
+                })) => {
+                    let changed = match self.prompt_bins(self.histogram_bins.get()) {
+                        BinsChoice::Set(n) => {
+                            self.histogram_bins.set(Some(n));
+                            true
+                        }
+                        BinsChoice::Clear => {
+                            self.histogram_bins.set(None);
+                            true
+                        }
+                        BinsChoice::Cancel => false,
+                    };
+                    if changed {
+                        self.ensure_detail_histogram(tensor, view, &shape, overridable, unindexed);
+                    }
+                }
                 // Compute exact whole-tensor statistics on demand, animating the
                 // spinner in the detail screen's Statistics line.
                 Ok(Event::Key(KeyEvent {
@@ -2058,6 +2159,8 @@ impl Explorer {
                             overridable,
                             unindexed,
                             sv,
+                            None,
+                            None,
                         );
                     });
                 }
@@ -2098,6 +2201,11 @@ impl Explorer {
                     code: KeyCode::Char('c'),
                     ..
                 })) => {
+                    let hist = self
+                        .histogram_cache
+                        .borrow()
+                        .get(&(tensor.name.clone(), view, self.histogram_bins.get()))
+                        .cloned();
                     let text = screen_text(|buf| {
                         let _ = UI::draw_tensor_detail(
                             buf,
@@ -2107,6 +2215,8 @@ impl Explorer {
                             overridable,
                             unindexed,
                             stats_view,
+                            hist.as_ref(),
+                            None,
                         );
                     });
                     copy_to_clipboard(&text);
@@ -2537,6 +2647,142 @@ impl Explorer {
         }
     }
 
+    /// Compute and show the detail screen's value histogram (animating the bars
+    /// filling in below the statistics). Floats / wide integers need the value
+    /// range, so stats are computed first when the bin layout can't be decided
+    /// without them. Shared by the `h` key and the `--histogram` startup restore,
+    /// so both produce the same result and `y` round-trips it.
+    fn ensure_detail_histogram(
+        &self,
+        tensor: &TensorInfo,
+        view: ViewDtype,
+        shape: &[usize],
+        overridable: bool,
+        unindexed: bool,
+    ) {
+        let need_stats =
+            crate::sample::histogram_bins(view, &tensor.dtype, None, self.histogram_bins.get())
+                .is_none()
+                && self.cached_stats(tensor, view).is_none();
+        let ready = !need_stats
+            || matches!(
+                self.compute_stats_animated(tensor, view, |sv| {
+                    let _ = UI::draw_tensor_detail(
+                        &mut live_out(),
+                        tensor,
+                        shape,
+                        view,
+                        overridable,
+                        unindexed,
+                        sv,
+                        None,
+                        None,
+                    );
+                }),
+                ScanOutcome::Completed
+            );
+        if ready {
+            self.scan_histogram(tensor, view, |snap, scanning| {
+                let stats = self.cached_stats(tensor, view);
+                let sv = match &stats {
+                    Some(s) => StatsView::Ready(s),
+                    None => StatsView::Pending,
+                };
+                let _ = UI::draw_tensor_detail(
+                    &mut live_out(),
+                    tensor,
+                    shape,
+                    view,
+                    overridable,
+                    unindexed,
+                    sv,
+                    Some(snap),
+                    scanning,
+                );
+            });
+        }
+    }
+
+    /// Compute the whole-tensor value histogram for `(tensor, view)` into the
+    /// cache, calling `redraw` with the running snapshot (and a spinner / elapsed
+    /// / fraction) each frame so the caller can animate the bins filling in on
+    /// its own screen. A no-op if already cached. Any key cancels (nothing is
+    /// cached, so it recomputes next time); Ctrl-C quits. The bin layout needs
+    /// the value range for floats / wide integers, taken from cached stats — the
+    /// caller computes those first when required (the 4-bit views don't need them).
+    fn scan_histogram(
+        &self,
+        tensor: &TensorInfo,
+        view: ViewDtype,
+        mut redraw: impl FnMut(&Histogram, Option<crate::ui::ScanProgress>),
+    ) {
+        let count = self.histogram_bins.get();
+        let key = (tensor.name.clone(), view, count);
+        if self.histogram_cache.borrow().contains_key(&key) {
+            return;
+        }
+        let range = self.cached_stats(tensor, view).map(|s| (s.min, s.max));
+        let Some((bins, n)) = crate::sample::histogram_bins(view, &tensor.dtype, range, count)
+        else {
+            return; // a range is required but stats aren't available
+        };
+
+        // Scan on a worker, accumulating into shared atomics so the bars can be
+        // redrawn filling in.
+        let shared = Arc::new(HistShared::new(n));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicUsize::new(0));
+        let total = tensor.size_bytes;
+        let owned = tensor.clone();
+        let (wsh, wc, wp, wd) = (
+            Arc::clone(&shared),
+            Arc::clone(&cancel),
+            Arc::clone(&pause),
+            Arc::clone(&done),
+        );
+        let handle = std::thread::spawn(move || {
+            crate::sample::tensor_histogram_into(&owned, view, bins, n, &wsh, &wc, &wp, Some(&*wd))
+        });
+
+        let started = std::time::Instant::now();
+        let mut frame = 0usize;
+        while !handle.is_finished() {
+            let progress =
+                (total > 0).then(|| (done.load(Ordering::Relaxed) as f64 / total as f64).min(1.0));
+            redraw(
+                &shared.snapshot(bins),
+                Some((
+                    STATS_SPINNER[frame % STATS_SPINNER.len()],
+                    started.elapsed(),
+                    progress,
+                )),
+            );
+            frame += 1;
+            if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false)
+                && let Ok(Event::Key(key)) = event::read()
+            {
+                if is_ctrl_c(&key) {
+                    quit_immediately();
+                }
+                cancel.store(true, Ordering::Relaxed);
+                return; // cancelled — leave it uncached so `g` recomputes
+            }
+        }
+        match handle.join() {
+            Ok(Ok(())) => {
+                self.histogram_cache
+                    .borrow_mut()
+                    .insert(key, shared.snapshot(bins));
+            }
+            Ok(Err(msg)) => {
+                let _ = UI::draw_message("Histogram unavailable", &msg);
+                let _ = event::read();
+            }
+            Err(_) => {}
+        }
+    }
+
     /// Sample and draw the heatmap or numeric grid for `(slice, view)`, sized to
     /// the terminal. Returns `(slices, overridable, clamped_slice)` on success,
     /// or an error message for the caller to show. Shared by the data-view loop
@@ -2718,6 +2964,8 @@ impl Explorer {
                     true,
                     self.unindexed.contains(&tensor.source_path),
                     stats_view,
+                    None,
+                    None,
                 )
                 .is_ok(),
                 DtypePreview::Data { repr, slice, mode } => self
@@ -2963,6 +3211,55 @@ impl Explorer {
 
     /// Prompt for the streaming buffer size (e.g. `256M`, `1G`), pre-filled with
     /// a default. Returns the size in bytes, or `None` if cancelled.
+    /// Prompt for the histogram bucket count, pre-filled with the current count.
+    /// An empty entry returns to the automatic count; `Esc` leaves it unchanged.
+    fn prompt_bins(&self, current: Option<usize>) -> BinsChoice {
+        let mut input = current.map(|n| n.to_string()).unwrap_or_default();
+        let mut error: Option<String> = None;
+        loop {
+            if UI::draw_text_prompt(
+                "Histogram bin count (1–512, empty for automatic)",
+                &input,
+                error.as_deref(),
+            )
+            .is_err()
+            {
+                return BinsChoice::Cancel;
+            }
+            match event::read() {
+                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+                Ok(Event::Key(KeyEvent { code, .. })) => match code {
+                    KeyCode::Enter => {
+                        let t = input.trim();
+                        if t.is_empty() {
+                            return BinsChoice::Clear;
+                        }
+                        match t.parse::<usize>() {
+                            Ok(n) if (1..=512).contains(&n) => return BinsChoice::Set(n),
+                            Ok(_) => error = Some("Enter a count between 1 and 512.".to_string()),
+                            Err(_) => {
+                                error =
+                                    Some("Enter a whole number (empty = automatic).".to_string())
+                            }
+                        }
+                    }
+                    KeyCode::Esc => return BinsChoice::Cancel,
+                    KeyCode::Backspace => {
+                        input.pop();
+                        error = None;
+                    }
+                    KeyCode::Char(c) => {
+                        input.push(c);
+                        error = None;
+                    }
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(_) => return BinsChoice::Cancel,
+            }
+        }
+    }
+
     fn prompt_buffer(&self) -> Option<usize> {
         let mut input = "256M".to_string();
         let mut error: Option<String> = None;
@@ -3198,7 +3495,28 @@ impl Explorer {
 
     /// The command that reopens this tensor's detail screen.
     fn command_for_detail(&self, tensor: &TensorInfo) -> String {
-        self.command_base(tensor).join(" ")
+        let mut parts = self.command_base(tensor);
+        // Reopen with the histogram showing when it's been computed for this view.
+        let view = self
+            .dtype_overrides
+            .borrow()
+            .get(&tensor.name)
+            .copied()
+            .unwrap_or(ViewDtype::Stored);
+        let bins = self.histogram_bins.get();
+        if self
+            .histogram_cache
+            .borrow()
+            .contains_key(&(tensor.name.clone(), view, bins))
+        {
+            parts.push("--histogram".to_string());
+            // Carry a custom bucket count so the histogram round-trips exactly.
+            if let Some(n) = bins {
+                parts.push("--bins".to_string());
+                parts.push(n.to_string());
+            }
+        }
+        parts.join(" ")
     }
 
     /// The command that reopens this data view with its current representation,

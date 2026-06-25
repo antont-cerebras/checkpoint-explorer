@@ -100,6 +100,22 @@ struct ExploreArgs {
 
     #[arg(
         long,
+        conflicts_with_all = ["values", "heatmap", "tree"],
+        help = "Show the opened tensor's value histogram on its detail screen"
+    )]
+    histogram: bool,
+
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = parse_bins,
+        conflicts_with_all = ["values", "heatmap", "tree"],
+        help = "Histogram bucket count (1–512); implies --histogram"
+    )]
+    bins: Option<usize>,
+
+    #[arg(
+        long,
         conflicts_with_all = ["values", "heatmap"],
         help = "Reveal the tensor highlighted in the tree browser instead of opening a view"
     )]
@@ -217,6 +233,15 @@ fn main() -> Result<()> {
 }
 
 /// Parse a `ROW,COL` pair of non-negative integers (the `--window` top-left).
+/// Parse and bound the `--bins` histogram bucket count to `1..=512`.
+fn parse_bins(s: &str) -> std::result::Result<usize, String> {
+    match s.trim().parse::<usize>() {
+        Ok(n) if (1..=512).contains(&n) => Ok(n),
+        Ok(_) => Err("must be between 1 and 512".to_string()),
+        Err(_) => Err(format!("expected a whole number, got '{s}'")),
+    }
+}
+
 fn parse_offset_pair(s: &str) -> Result<(usize, usize)> {
     let (r, c) = s
         .split_once(',')
@@ -308,11 +333,15 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         || args.slice.is_some()
         || args.shape.is_some()
         || args.compute_stats
+        || args.histogram
+        || args.bins.is_some()
         || args.exit;
     let open = wants_open.then_some(OpenRequest {
         tensor: args.tensor,
         metadata: args.metadata,
         view,
+        histogram: args.histogram,
+        bins: args.bins,
         dtype: args.dtype,
         layout,
         window_at,

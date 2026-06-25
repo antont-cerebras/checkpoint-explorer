@@ -9,9 +9,13 @@ use std::io::{self, BufWriter, Write};
 use std::time::Duration;
 
 use crate::health::HealthReport;
-use crate::sample::{Sample, SampleMode, Stats, ViewDtype};
+use crate::sample::{HistBins, Histogram, Sample, SampleMode, Stats, ViewDtype};
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo, TreeNode, metadata_short};
 use crate::utils::{format_parameters, format_shape, format_size};
+
+/// A still-forming scan's progress indicator: a spinner glyph, the elapsed time,
+/// and an optional completed fraction (`None` when the total isn't known).
+pub type ScanProgress = (char, std::time::Duration, Option<f64>);
 
 /// The app's colour palette — the single source of truth for how each kind of
 /// thing is styled, so the same role looks the same on every screen. Change a
@@ -565,8 +569,10 @@ impl UI {
 
     /// Draw the tensor detail screen. `view` is the active dtype reinterpretation
     /// (which changes the shown dtype, shape and parameter count); `overridable`
-    /// gates the `d` hint. Rendered flicker-free so it can also serve as the
-    /// live preview while choosing a dtype in the menu.
+    /// gates the `d` hint. `histogram` adds the value-histogram section below the
+    /// stats. Rendered flicker-free so it can also serve as the live preview
+    /// while choosing a dtype in the menu.
+    #[allow(clippy::too_many_arguments)] // a screen renderer; the params are all distinct
     pub fn draw_tensor_detail(
         out: &mut impl Write,
         tensor: &TensorInfo,
@@ -575,24 +581,30 @@ impl UI {
         overridable: bool,
         unindexed: bool,
         stats: StatsView,
+        histogram: Option<&Histogram>,
+        hist_scanning: Option<ScanProgress>,
     ) -> Result<()> {
         queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
 
-        queue!(out, SetForegroundColor(palette::ACCENT))?;
-        write!(out, "Tensor Details")?;
-        queue!(out, ResetColor, SetForegroundColor(palette::DIM))?;
-        line_end(&mut *out)?;
-        write!(out, "{}", "─".repeat(14))?;
-        queue!(out, ResetColor)?;
-        line_end(&mut *out)?;
-        paint(&mut *out, false, palette::DIM, "Name: ")?;
-        write!(out, "{}", tensor.name)?;
-        line_end(&mut *out)?;
+        // The header (title, fields, statistics) is rendered into a buffer so
+        // its exact wrapped height can be measured; the histogram below is then
+        // sized to the rows that remain, leaving no gap and never scrolling.
+        let mut body: Vec<u8> = Vec::new();
+        queue!(body, SetForegroundColor(palette::ACCENT))?;
+        write!(body, "Tensor Details")?;
+        queue!(body, ResetColor, SetForegroundColor(palette::DIM))?;
+        line_end(&mut body)?;
+        write!(body, "{}", "─".repeat(14))?;
+        queue!(body, ResetColor)?;
+        line_end(&mut body)?;
+        paint(&mut body, false, palette::DIM, "Name: ")?;
+        write!(body, "{}", tensor.name)?;
+        line_end(&mut body)?;
 
         // Data type, with the active reinterpretation highlighted.
-        paint(&mut *out, false, palette::DIM, "Data Type: ")?;
-        write_view_dtype(&mut *out, &tensor.dtype, view)?;
-        line_end(&mut *out)?;
+        paint(&mut body, false, palette::DIM, "Data Type: ")?;
+        write_view_dtype(&mut body, &tensor.dtype, view)?;
+        line_end(&mut body)?;
 
         // Shape and parameter count reflect the overrides: `shape` is the
         // effective (possibly reshaped) shape, and a packed dtype view unpacks
@@ -600,21 +612,21 @@ impl UI {
         // `stored as reinterpreted` just like the dtype line above.
         let logical = view.logical_shape(shape, &tensor.dtype);
         let num_elements: usize = logical.iter().product();
-        paint(&mut *out, false, palette::DIM, "Shape: ")?;
-        write_view_shape(&mut *out, &tensor.shape, &logical)?;
-        line_end(&mut *out)?;
-        paint(&mut *out, false, palette::DIM, "Parameters: ")?;
-        write!(out, "{} ", format_parameters(num_elements))?;
+        paint(&mut body, false, palette::DIM, "Shape: ")?;
+        write_view_shape(&mut body, &tensor.shape, &logical)?;
+        line_end(&mut body)?;
+        paint(&mut body, false, palette::DIM, "Parameters: ")?;
+        write!(body, "{} ", format_parameters(num_elements))?;
         paint(
-            &mut *out,
+            &mut body,
             false,
             palette::DIM,
             &format!("({})", with_thousands(num_elements)),
         )?;
-        line_end(&mut *out)?;
+        line_end(&mut body)?;
 
-        paint(&mut *out, false, palette::DIM, "Size: ")?;
-        write!(out, "{}", format_size(tensor.size_bytes))?;
+        paint(&mut body, false, palette::DIM, "Size: ")?;
+        write!(body, "{}", format_size(tensor.size_bytes))?;
         // On-disk size + codec on the same line, for formats that track
         // compression (HDF5); safetensors leaves it off entirely.
         match &tensor.storage {
@@ -626,9 +638,9 @@ impl UI {
                 // explicit (e.g. 4-bit weights in 16-bit words only reach ~2×
                 // under byte-oriented LZ4).
                 let ratio = tensor.size_bytes as f64 / (*stored_bytes).max(1) as f64;
-                write!(out, " · on disk: {} ", format_size(*stored_bytes))?;
+                write!(body, " · on disk: {} ", format_size(*stored_bytes))?;
                 paint(
-                    &mut *out,
+                    &mut body,
                     false,
                     palette::DIM,
                     &format!("(⇩ {codec}, {ratio:.1}×)"),
@@ -636,61 +648,61 @@ impl UI {
             }
             Storage::Raw => {
                 write!(
-                    out,
+                    body,
                     " · on disk: {} (uncompressed)",
                     format_size(tensor.size_bytes)
                 )?;
             }
             Storage::Unknown => {}
         }
-        line_end(&mut *out)?;
+        line_end(&mut body)?;
         // Where the data lives within the file.
         match &tensor.layout {
             Layout::ByteRange { start, end } => {
-                paint(&mut *out, false, palette::DIM, "Data offsets: ")?;
+                paint(&mut body, false, palette::DIM, "Data offsets: ")?;
                 write!(
-                    out,
+                    body,
                     "{} – {}  (within file data)",
                     with_thousands(*start as usize),
                     with_thousands(*end as usize)
                 )?;
-                line_end(&mut *out)?;
+                line_end(&mut body)?;
             }
             Layout::Offset(offset) => {
-                paint(&mut *out, false, palette::DIM, "Data offset: ")?;
+                paint(&mut body, false, palette::DIM, "Data offset: ")?;
                 write!(
-                    out,
+                    body,
                     "{}  (within tensor data)",
                     with_thousands(*offset as usize)
                 )?;
-                line_end(&mut *out)?;
+                line_end(&mut body)?;
             }
             Layout::Chunked { chunk, num_chunks } => {
-                paint(&mut *out, false, palette::DIM, "Chunks: ")?;
+                paint(&mut body, false, palette::DIM, "Chunks: ")?;
                 write!(
-                    out,
+                    body,
                     "{} × {}",
                     format_shape(chunk),
                     with_thousands(*num_chunks)
                 )?;
-                line_end(&mut *out)?;
+                line_end(&mut body)?;
             }
             Layout::None => {}
         }
-        paint(&mut *out, false, palette::DIM, "File: ")?;
-        write!(out, "{}", tensor.source_path)?;
-        line_end(&mut *out)?;
+        paint(&mut body, false, palette::DIM, "File: ")?;
+        write!(body, "{}", tensor.source_path)?;
+        line_end(&mut body)?;
         // Flag a tensor that's on disk but absent from the index.
         if unindexed {
-            queue!(out, SetForegroundColor(palette::UNINDEXED))?;
+            queue!(body, SetForegroundColor(palette::UNINDEXED))?;
             write!(
-                out,
+                body,
                 "{UNINDEXED_MARK} on disk but not listed in model.safetensors.index.json"
             )?;
-            queue!(out, ResetColor)?;
-            line_end(&mut *out)?;
+            queue!(body, ResetColor)?;
+            line_end(&mut body)?;
         }
-        line_end(&mut *out)?;
+        line_end(&mut body)?;
 
         // Exact whole-tensor statistics: shown once computed, else a hint.
         match stats {
@@ -698,58 +710,86 @@ impl UI {
                 // min/max are exact integers for integer dtypes — show them as
                 // such (no `.0000`).
                 let integer = view.is_integer(&tensor.dtype);
-                paint(&mut *out, false, palette::DIM, "Statistics: ")?;
+                paint(&mut body, false, palette::DIM, "Statistics: ")?;
                 write!(
-                    out,
+                    body,
                     "min {} · max {} · ",
                     fmt_value(s.min, integer),
                     fmt_value(s.max, integer)
                 )?;
-                write_stats_line(&mut *out, s)?;
+                write_stats_line(&mut body, s)?;
             }
             StatsView::Computing {
                 spinner,
                 elapsed,
                 progress,
             } => {
-                paint(&mut *out, false, palette::DIM, "Statistics: ")?;
-                write_computing(&mut *out, spinner, elapsed, progress)?;
+                paint(&mut body, false, palette::DIM, "Statistics: ")?;
+                write_computing(&mut body, spinner, elapsed, progress)?;
             }
             StatsView::Pending => {
-                queue!(out, SetForegroundColor(palette::DIM))?;
-                write!(out, "Statistics: press ")?;
-                queue!(out, ResetColor)?;
-                key_hint(&mut *out, "s")?;
-                queue!(out, SetForegroundColor(palette::DIM))?;
-                write!(out, " to scan the full tensor")?;
-                queue!(out, ResetColor)?;
+                queue!(body, SetForegroundColor(palette::DIM))?;
+                write!(body, "Statistics: press ")?;
+                queue!(body, ResetColor)?;
+                key_hint(&mut body, "s")?;
+                queue!(body, SetForegroundColor(palette::DIM))?;
+                write!(body, " to scan the full tensor")?;
+                queue!(body, ResetColor)?;
             }
         }
-        line_end(&mut *out)?;
-        line_end(&mut *out)?;
+        line_end(&mut body)?;
+        line_end(&mut body)?;
 
-        // Footer hints (keys highlighted).
-        write!(out, "Press ")?;
-        key_hint(&mut *out, "m")?;
-        write!(out, " for a heatmap, ")?;
-        key_hint(&mut *out, "v")?;
-        write!(out, " for numeric values, ")?;
+        // Footer hints (keys highlighted) — built into a buffer first so its
+        // wrapped height can be measured and the histogram sized to fit exactly.
+        let mut footer: Vec<u8> = Vec::new();
+        write!(footer, "Press ")?;
+        key_hint(&mut footer, "m")?;
+        write!(footer, " for a heatmap, ")?;
+        key_hint(&mut footer, "v")?;
+        write!(footer, " for numeric values, ")?;
+        key_hint(&mut footer, "h")?;
+        write!(footer, " for a histogram, ")?;
+        key_hint(&mut footer, "b")?;
+        write!(footer, " to set its bin count, ")?;
         if overridable {
-            key_hint(&mut *out, "d")?;
-            write!(out, " to reinterpret the dtype, ")?;
-            key_hint(&mut *out, "r")?;
-            write!(out, " to reshape, ")?;
+            key_hint(&mut footer, "d")?;
+            write!(footer, " to reinterpret the dtype, ")?;
+            key_hint(&mut footer, "r")?;
+            write!(footer, " to reshape, ")?;
         }
-        key_hint(&mut *out, "c")?;
-        write!(out, " to copy, ")?;
-        key_hint(&mut *out, "y")?;
-        write!(out, " to copy the command, ")?;
-        key_hint(&mut *out, "l")?;
-        write!(out, " for the legend, ")?;
-        key_hint(&mut *out, "⌫")?;
-        write!(out, " / ")?;
-        key_hint(&mut *out, "\\")?;
-        write!(out, " to step back / forward, any other key to return...")?;
+        key_hint(&mut footer, "c")?;
+        write!(footer, " to copy, ")?;
+        key_hint(&mut footer, "y")?;
+        write!(footer, " to copy the command, ")?;
+        key_hint(&mut footer, "l")?;
+        write!(footer, " for the legend, ")?;
+        key_hint(&mut footer, "⌫")?;
+        write!(footer, " / ")?;
+        key_hint(&mut footer, "\\")?;
+        write!(
+            footer,
+            " to step back / forward, any other key to return..."
+        )?;
+
+        out.write_all(&body)?;
+
+        // The whole-tensor value histogram, below the statistics (when computed
+        // or being computed), sized to exactly the rows left between the header
+        // and the footer — so it fills the screen with no blank line above the
+        // footer and never scrolls. Both heights are measured from the rendered
+        // bytes (the blank line above the histogram already sets it off from the
+        // statistics, so no extra spacer is reserved below it).
+        if let Some(hist) = histogram {
+            let (term_w, term_h) = terminal::size().unwrap_or((100, 40));
+            let (tw, th) = (term_w as usize, term_h as usize);
+            let body_rows = count_physical_lines(&body, tw);
+            let footer_rows = count_physical_lines(&footer, tw);
+            let section = th.saturating_sub(body_rows + footer_rows).max(2);
+            write_histogram_section(&mut *out, hist, hist_scanning, tw, section)?;
+        }
+
+        out.write_all(&footer)?;
 
         // No trailing newline (avoids scrolling); clear anything below.
         queue!(
@@ -2455,6 +2495,201 @@ fn with_thousands(n: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+/// A horizontal bar `width` cells wide filled to `frac` of `[0, 1]`. Uses the
+/// lower three-quarters block `▆` (rather than a full `█`) so its top sits below
+/// the cell ceiling, leaving a thin gap between stacked bars; any non-zero bar
+/// shows at least one cell so tiny bins stay visible.
+fn bar(frac: f64, width: usize) -> String {
+    let frac = frac.clamp(0.0, 1.0);
+    let mut cells = (frac * width as f64).round() as usize;
+    if frac > 0.0 {
+        cells = cells.max(1);
+    }
+    let cells = cells.min(width);
+    if cells == 0 {
+        // An empty (zero-count) bin still occupies the one-cell baseline so its
+        // count lines up with the smallest non-zero bars rather than shifting
+        // a column to the left.
+        " ".to_string()
+    } else {
+        "▆".repeat(cells)
+    }
+}
+
+/// Render the value histogram as horizontal bars — one per bin, with its label,
+/// absolute count, and percentage of the finite values — for embedding in the
+/// detail screen below the statistics. The whole section (heading + bars + an
+/// "N more" note when clipped) fits within `max_rows`, so it never pushes the
+/// footer off a short screen. `scanning` (spinner, elapsed, fraction) marks a
+/// still-forming scan so the bars animate as they fill in.
+fn write_histogram_section(
+    out: &mut impl Write,
+    hist: &Histogram,
+    scanning: Option<ScanProgress>,
+    term_w: usize,
+    max_rows: usize,
+) -> Result<()> {
+    // Heading: how many values, any non-finite, and the scan indicator. Built
+    // into a buffer so its own wrapped height is known (the scan line can be
+    // long), leaving the rest of the budget for bars.
+    let mut head: Vec<u8> = Vec::new();
+    paint(&mut head, false, palette::DIM, "Histogram: ")?;
+    write!(head, "{} values", with_thousands(hist.total as usize))?;
+    if hist.nonfinite > 0 {
+        paint(
+            &mut head,
+            false,
+            palette::DIM,
+            &format!(
+                "  ·  {} non-finite",
+                with_thousands(hist.nonfinite as usize)
+            ),
+        )?;
+    }
+    if let Some((spinner, elapsed, progress)) = scanning {
+        queue!(head, SetForegroundColor(palette::ACCENT))?;
+        write!(head, "   {spinner} scanning")?;
+        if let Some(p) = progress {
+            write!(head, " {:.0}%", p * 100.0)?;
+        }
+        write!(head, " ({:.1}s)", elapsed.as_secs_f64())?;
+        queue!(head, ResetColor)?;
+    }
+    line_end(&mut head)?;
+    let heading_rows = count_physical_lines(&head, term_w);
+    out.write_all(&head)?;
+
+    let n = hist.counts.len();
+    // Bin labels: the integer value, or the bin's lower edge for range bins.
+    let labels: Vec<String> = (0..n)
+        .map(|i| match hist.bins {
+            HistBins::IntBins { start, step } => (start + i as i64 * step).to_string(),
+            HistBins::Range { lo, hi } => fmt_hist_edge(lo + (hi - lo) * i as f64 / n as f64),
+        })
+        .collect();
+    let label_w = labels.iter().map(|l| l.chars().count()).max().unwrap_or(1);
+    let counts: Vec<String> = hist
+        .counts
+        .iter()
+        .map(|c| with_thousands(*c as usize))
+        .collect();
+    let count_w = counts.iter().map(|s| s.chars().count()).max().unwrap_or(1);
+    let max_count = hist.counts.iter().copied().max().unwrap_or(0).max(1);
+    let total = hist.total.max(1);
+    // Percentages: a non-empty bin with a tiny share would round to a misleading
+    // `0.0%`, so show its magnitude in scientific notation instead (matching the
+    // stats line's zero-fraction). Empty bins stay a plain `0.0%`.
+    let pcts: Vec<String> = hist
+        .counts
+        .iter()
+        .map(|&c| {
+            let pct = c as f64 / total as f64 * 100.0;
+            if c == 0 {
+                "0.0%".to_string()
+            } else if pct < 0.1 {
+                format!("{pct:.1e}%")
+            } else {
+                format!("{pct:.1}%")
+            }
+        })
+        .collect();
+    let pct_w = pcts.iter().map(|s| s.chars().count()).max().unwrap_or(4);
+
+    // The bar gets whatever width is left after `label │ … count (pct)`.
+    let fixed = label_w + 3 + 1 + count_w + pct_w + 3;
+    let bar_w = term_w.saturating_sub(fixed).clamp(1, 100);
+    // `max_rows` bounds the whole section; the heading took `heading_rows`, so
+    // the rest is for bars — and when clipping, one more is left for the note.
+    let bar_rows = max_rows.saturating_sub(heading_rows).max(1);
+    let shown = if n <= bar_rows {
+        n
+    } else {
+        bar_rows.saturating_sub(1).max(1)
+    };
+
+    for i in 0..shown {
+        let frac = hist.counts[i] as f64 / max_count as f64;
+        // The bin value (left) and the count (right) are the data, so both read
+        // at full strength; only the `│` separator and the percentage's
+        // parentheses are dimmed as chrome.
+        write!(out, "{:>label_w$} ", labels[i])?;
+        paint(out, false, palette::DIM, "│")?;
+        queue!(out, SetForegroundColor(palette::ACCENT))?;
+        write!(out, "{}", bar(frac, bar_w))?;
+        queue!(out, ResetColor)?;
+        queue!(out, SetAttribute(Attribute::Bold))?;
+        write!(out, " {:>count_w$} ", counts[i])?;
+        queue!(out, SetAttribute(Attribute::Reset))?;
+        paint(out, false, palette::DIM, "(")?;
+        write!(out, "{}", pcts[i])?;
+        paint(out, false, palette::DIM, ")")?;
+        line_end(out)?;
+    }
+    if n > shown {
+        paint(
+            out,
+            false,
+            palette::DIM,
+            &format!("… {} more bins (enlarge the terminal)", n - shown),
+        )?;
+        line_end(out)?;
+    }
+    Ok(())
+}
+
+/// Visible (printable) character count of a rendered byte buffer — ANSI escape
+/// sequences and carriage returns excluded. Used to measure how wide a styled
+/// line is so its wrapped height can be computed.
+fn visible_len(buf: &[u8]) -> usize {
+    let text = String::from_utf8_lossy(buf);
+    let mut chars = text.chars().peekable();
+    let mut len = 0;
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip a CSI sequence: `ESC [ … <final letter>`.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                while let Some(&d) = chars.peek() {
+                    chars.next();
+                    if d.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        } else if c != '\r' && c != '\n' {
+            len += 1;
+        }
+    }
+    len
+}
+
+/// Number of terminal rows a rendered buffer occupies at the given width:
+/// every `\n`-terminated line wraps to `ceil(visible / width)` rows (at least
+/// one), so the height accounts for both explicit line breaks and autowrap.
+fn count_physical_lines(buf: &[u8], width: usize) -> usize {
+    let text = String::from_utf8_lossy(buf);
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    // A trailing newline leaves an empty final segment that isn't its own row.
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    lines
+        .iter()
+        .map(|line| visible_len(line.as_bytes()).div_ceil(width.max(1)).max(1))
+        .sum()
+}
+
+/// Compact label for a range-histogram bin's lower edge.
+fn fmt_hist_edge(x: f64) -> String {
+    if x == 0.0 {
+        "0".to_string()
+    } else if x.abs() >= 1e5 || x.abs() < 1e-3 {
+        format!("{x:.2e}")
+    } else {
+        format!("{x:.4}")
+    }
 }
 
 #[cfg(test)]
