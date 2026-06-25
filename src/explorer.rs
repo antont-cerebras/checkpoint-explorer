@@ -142,6 +142,10 @@ const HDR_GRID_GAP_ROW: usize = 1;
 /// The column-index row (the numeric grid only; the heatmap has none).
 const HDR_COLINDEX_ROW: usize = 1;
 
+/// How long the "✓ Copied …" confirmation stays on screen after `c` before it
+/// auto-dismisses (it also clears on the next key press).
+const COPY_FLASH: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A statistics scan running on a worker thread for a data view's current
 /// `(tensor, view)`. The view stays fully interactive while it runs; the main
 /// loop polls [`Self::handle`], caches the result when it lands, and animates the
@@ -1893,6 +1897,9 @@ impl Explorer {
         let mut scan: Option<ScanJob> = None;
         let mut spin_frame = 0usize;
         let mut first = true;
+        // Set right after `c` copies the screen; confirmed on the bottom line
+        // until the next key or `COPY_FLASH` elapses.
+        let mut copied_since: Option<std::time::Instant> = None;
         loop {
             let view = self
                 .dtype_overrides
@@ -1977,6 +1984,11 @@ impl Explorer {
             {
                 return Nav::Quit;
             }
+            // Confirm a screen copy on the bottom line while the flash is still
+            // within its window (dismissed by the next key or the timed poll).
+            if copied_since.is_some_and(|t| t.elapsed() < COPY_FLASH) {
+                let _ = UI::draw_copied_flash("screen contents");
+            }
             // One-shot mode: leave this frame up and exit without reading keys.
             if first && interaction == Interaction::OneShot {
                 return Nav::Quit;
@@ -1994,9 +2006,21 @@ impl Explorer {
                     job.pause.store(false, Ordering::Relaxed);
                     continue;
                 }
+            } else if let Some(t) = copied_since {
+                // A copy confirmation is up: wake when it expires so it can be
+                // cleared without a key press.
+                let remaining = COPY_FLASH.saturating_sub(t.elapsed());
+                if !remaining.is_zero() && event::poll(remaining).unwrap_or(false) {
+                    event::read()
+                } else {
+                    copied_since = None;
+                    continue; // flash window elapsed — redraw without it
+                }
             } else {
                 event::read()
             };
+            // Any key dismisses a lingering copy confirmation; `c` sets it again.
+            copied_since = None;
             match ev {
                 Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
                 Ok(Event::Key(KeyEvent {
@@ -2086,6 +2110,7 @@ impl Explorer {
                         );
                     });
                     copy_to_clipboard(&text);
+                    copied_since = Some(std::time::Instant::now());
                 }
                 // `y` shows and copies the CLI command that reopens this screen.
                 Ok(Event::Key(KeyEvent {
@@ -2143,6 +2168,9 @@ impl Explorer {
         // once the stats are cached. `spin_frame` advances the spinner.
         let mut scan: Option<ScanJob> = None;
         let mut spin_frame = 0usize;
+        // Set right after `c` copies the screen; shows a confirmation on the
+        // bottom line until the next key or `COPY_FLASH` elapses.
+        let mut copied_since: Option<std::time::Instant> = None;
         loop {
             // The data-view layout is a session-remembered preference, so it
             // sticks as you move between tensors and in/out of the preview.
@@ -2248,6 +2276,13 @@ impl Explorer {
                 }
             };
 
+            // Confirm a screen copy on the bottom line, over the footer, while
+            // the flash is still within its window (it's dismissed by the next
+            // key or by the timed poll below).
+            if copied_since.is_some_and(|t| t.elapsed() < COPY_FLASH) {
+                let _ = UI::draw_copied_flash("screen contents");
+            }
+
             // One-shot mode (`--exit`): stats are computed above and the final
             // frame is now drawn, so leave it up and exit without reading keys.
             if interaction == Interaction::OneShot {
@@ -2275,6 +2310,16 @@ impl Explorer {
                     job.pause.store(false, Ordering::Relaxed);
                     continue; // idle — let the scan run; spinner reuses the cache
                 }
+            } else if let Some(t) = copied_since {
+                // A copy confirmation is up: wake when it expires so it can be
+                // cleared without a key press.
+                let remaining = COPY_FLASH.saturating_sub(t.elapsed());
+                if !remaining.is_zero() && event::poll(remaining).unwrap_or(false) {
+                    event::read()
+                } else {
+                    copied_since = None;
+                    continue; // flash window elapsed — redraw without it
+                }
             } else {
                 event::read()
             };
@@ -2284,6 +2329,9 @@ impl Explorer {
                     Ok(Event::Key(KeyEvent {
                         code, modifiers, ..
                     })) => {
+                        // Any key dismisses a lingering copy confirmation; `c`
+                        // sets it again below.
+                        copied_since = None;
                         let shift = modifiers.contains(KeyModifiers::SHIFT);
                         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
                         let edges = matches!(mode, SampleMode::Edges { .. });
@@ -2446,6 +2494,7 @@ impl Explorer {
                                     );
                                 });
                                 copy_to_clipboard(&text);
+                                copied_since = Some(std::time::Instant::now());
                             }
                             // `y` shows and copies the CLI command that reopens
                             // this exact view.

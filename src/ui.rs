@@ -1433,6 +1433,26 @@ impl UI {
     /// OSC-52 clipboard copy doesn't reach the terminal and it must be copied by
     /// hand. The terminal soft-wraps a long command, but it stays one logical
     /// line, so the selection still yields the whole command.
+    /// Flash a "✓ Copied … to the clipboard" confirmation on the bottom line —
+    /// the status-line position — over whatever the view drew there, until the
+    /// next redraw clears it. Gives the data/detail views the copy feedback the
+    /// tree shows in its status chip. `what` names what was copied.
+    pub fn draw_copied_flash(what: &str) -> Result<()> {
+        let mut out = io::stdout();
+        let (_, term_h) = terminal::size()?;
+        queue!(
+            out,
+            cursor::MoveTo(0, term_h.saturating_sub(1)),
+            terminal::Clear(ClearType::CurrentLine),
+            SetForegroundColor(palette::SUCCESS),
+            SetAttribute(Attribute::Bold)
+        )?;
+        write!(out, "✓ Copied {what} to the clipboard")?;
+        queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
+        out.flush()?;
+        Ok(())
+    }
+
     pub fn draw_command(command: &str) -> Result<()> {
         let mut out = io::stdout();
         let (term_w, term_h) = terminal::size()?;
