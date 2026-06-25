@@ -147,7 +147,7 @@ without `--tensor` is reported as ambiguous.
 | `--histogram` | Show the value histogram on the detail screen |
 | `--bins <N>` | Histogram bucket count (1–512); implies `--histogram` |
 | `--tree` | Reveal the tensor highlighted in the tree browser, without opening a view |
-| `--dtype <DTYPE>` | Reinterpret the dtype: `u4`, `i4`, or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
+| `--dtype <DTYPE>` | Reinterpret the dtype: `u4`, `i4`, `unpacked` (fused-codebook unmerge; needs a packing schema), or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
 | `--shape <DIMS>` | Reinterpret the shape (same element count): `10,100` / `10x100`; one dim may be `-1`/`*`/`_` to infer |
 | `--edge[=RFRAC,CFRAC]` (alias `--edges`) / `--overview` / `--window[=ROW,COL]` | Force the edges submode (optional head/tail split fractions `0..1`) / the overview / the contiguous window (optional top-left `ROW,COL`) |
 | `--zebra <rows\|cols\|off>` | Zebra-stripe the numeric grid by rows, columns, or off |
@@ -356,8 +356,19 @@ quit. Options for a 16-bit tensor:
 - **`u4`/`i4`** — quantized 4-bit weights stored inside a wider container, with
   every nibble unpacked densely, so each 16-bit slot yields four values and the
   last dimension grows ×4 (`i4` sign-extends two's-complement nibbles).
+- **`unpacked`** — a fused-MoE codebook weight whose `U16` words pack several
+  experts' sub-byte indices, described by a per-tensor **quantization schema**
+  (`bit_widths`, e.g. `[4,4,4,4]` or `[3,3,3,3,3]`, even non-uniform). The view
+  *unmerges* the schema along the **first (expert) dimension** — each logical
+  expert is one field shifted out of the word — so the expert count grows by
+  `lenP` (e.g. `(26, 2057, 770)` → `(130, 2057, 770)` for `u3×5`) and each expert
+  reads as a correct 2D slice. Stepping the slice (`[`/`]`, `←`/`→`) walks the
+  experts. This option appears, and is applied by default, only for tensors that
+  carry a schema (read from the per-tensor `…__metadata__` or a top-level
+  `codebook_packing_schema`); `d` / `--dtype stored` switches back to the raw `U16`.
 
-The header shows the active reinterpretation (e.g. `BF16 as u4`).
+The header shows the active reinterpretation (e.g. `BF16 as u4`, or
+`U16 as u3×5 (unpacked)` with a `Packing:` line listing the bit widths).
 
 #### Shape override
 

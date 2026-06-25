@@ -9,7 +9,7 @@ use std::io::{self, BufWriter, Write};
 use std::time::Duration;
 
 use crate::health::HealthReport;
-use crate::sample::{HistBins, Histogram, Sample, SampleMode, Stats, ViewDtype};
+use crate::sample::{HistBins, Histogram, PackingSchema, Sample, SampleMode, Stats, ViewDtype};
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo, TreeNode, metadata_short};
 use crate::utils::{format_parameters, format_shape, format_size};
 
@@ -669,6 +669,7 @@ impl UI {
         stats: StatsView,
         histogram: Option<&Histogram>,
         hist_scanning: Option<ScanProgress>,
+        schema: Option<&PackingSchema>,
     ) -> Result<()> {
         queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
 
@@ -688,15 +689,16 @@ impl UI {
         line_end(&mut body)?;
 
         // Data type, with the active reinterpretation highlighted.
+        let unpacked_label = schema.map(PackingSchema::label);
         paint(&mut body, false, palette::DIM, "Data Type: ")?;
-        write_view_dtype(&mut body, &tensor.dtype, view)?;
+        write_view_dtype(&mut body, &tensor.dtype, view, unpacked_label.as_deref())?;
         line_end(&mut body)?;
 
         // Shape and parameter count reflect the overrides: `shape` is the
         // effective (possibly reshaped) shape, and a packed dtype view unpacks
-        // several values per stored element, growing the last dimension. Show
-        // `stored as reinterpreted` just like the dtype line above.
-        let logical = view.logical_shape(shape, &tensor.dtype);
+        // several values per stored element (the codebook unmerge grows the first
+        // dimension, the 4-bit views the last). Show `stored as reinterpreted`.
+        let logical = view.logical_shape_with(shape, &tensor.dtype, schema);
         let num_elements: usize = logical.iter().product();
         paint(&mut body, false, palette::DIM, "Shape: ")?;
         write_view_shape(&mut body, &tensor.shape, &logical)?;
@@ -710,6 +712,37 @@ impl UI {
             &format!("({})", with_thousands(num_elements)),
         )?;
         line_end(&mut body)?;
+
+        // Codebook packing schema disclosure (only for tensors that carry one).
+        if let Some(s) = schema {
+            paint(&mut body, false, palette::DIM, "Packing: ")?;
+            write!(body, "{} ", s.label())?;
+            let widths = s
+                .bit_widths()
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mode = s
+                .quant_mode()
+                .map(|m| format!(" · {m}"))
+                .unwrap_or_default();
+            let uniform = if s.uniform_width().is_some() {
+                "uniform"
+            } else {
+                "non-uniform"
+            };
+            paint(
+                &mut body,
+                false,
+                palette::DIM,
+                &format!(
+                    "(bit widths [{widths}] · {} experts/word · {uniform}{mode})",
+                    s.len_p()
+                ),
+            )?;
+            line_end(&mut body)?;
+        }
 
         paint(&mut body, false, palette::DIM, "Size: ")?;
         write!(body, "{}", format_size(tensor.size_bytes))?;
@@ -955,7 +988,12 @@ impl UI {
         } else {
             " (sampled)"
         };
-        write_view_dtype(&mut *out, &tensor.dtype, sample.view)?;
+        write_view_dtype(
+            &mut *out,
+            &tensor.dtype,
+            sample.view,
+            sample.schema_label.as_deref(),
+        )?;
         write!(out, " ")?;
         write_view_shape(&mut *out, &tensor.shape, &sample.display_shape)?;
         let what = match sample.mode {
@@ -1044,7 +1082,12 @@ impl UI {
         queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
 
         write_data_view_title(&mut *out, "Values", tensor)?;
-        write_view_dtype(&mut *out, &tensor.dtype, sample.view)?;
+        write_view_dtype(
+            &mut *out,
+            &tensor.dtype,
+            sample.view,
+            sample.schema_label.as_deref(),
+        )?;
         write!(out, " ")?;
         write_view_shape(&mut *out, &tensor.shape, &sample.display_shape)?;
         // Describe the layout: a contiguous window, the first/last edges (for
@@ -2086,11 +2129,20 @@ fn line_end(out: &mut impl Write) -> Result<()> {
 /// shown and how to change it (keys highlighted, no trailing newline — the
 /// caller ends the line). Only called when `sample.slices > 1`.
 fn write_slice_header(out: &mut impl Write, sample: &Sample) -> Result<()> {
-    write!(
-        out,
-        "slice {} of {} (fixed leading index) — ",
-        sample.slice, sample.slices
-    )?;
+    match sample.unpacked_field {
+        // The codebook unmerge: each logical expert is a field unmerged from a
+        // stored word, so spell out the mapping rather than "fixed leading index".
+        Some(f) => write!(
+            out,
+            "expert {} of {} — stored word {}, field {}/{} ({}-bit) — ",
+            sample.slice, sample.slices, f.stored_slice, f.field, f.len_p, f.field_bits,
+        )?,
+        None => write!(
+            out,
+            "slice {} of {} (fixed leading index) — ",
+            sample.slice, sample.slices
+        )?,
+    }
     // The overview frees the arrows for slice stepping; the edges and window
     // layouts claim them (divider / pan), so slices move on `[` / `]` there.
     if matches!(sample.mode, SampleMode::Grid) {
@@ -2443,8 +2495,19 @@ fn fmt_value(v: f64, integer: bool) -> String {
 /// Write the dtype shown in a data-view header. With no override this is just
 /// the stored dtype; when overridden it fades the original dtype and highlights
 /// the active reinterpretation, e.g. a dimmed `BF16 as` then a bold `u4`.
-fn write_view_dtype(out: &mut impl Write, stored: &str, view: ViewDtype) -> Result<()> {
-    match view.label() {
+fn write_view_dtype(
+    out: &mut impl Write,
+    stored: &str,
+    view: ViewDtype,
+    unpacked_label: Option<&str>,
+) -> Result<()> {
+    // The codebook unmerge shows the schema-derived label (e.g. `u3×5`) instead
+    // of the generic `unpacked`.
+    let label: Option<String> = match (view, unpacked_label) {
+        (ViewDtype::Unpacked, Some(l)) => Some(format!("{l} (unpacked)")),
+        _ => view.label().map(str::to_string),
+    };
+    match label.as_deref() {
         Some(label) => {
             queue!(out, SetForegroundColor(palette::DIM))?;
             write!(out, "{stored} as ")?;

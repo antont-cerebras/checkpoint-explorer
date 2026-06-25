@@ -18,7 +18,7 @@ use std::{
 };
 
 use crate::gguf::GGUFFile;
-use crate::sample::{HistShared, Histogram, SampleMode, Stats, ViewDtype};
+use crate::sample::{HistShared, Histogram, PackingSchema, SampleMode, Stats, ViewDtype};
 
 use crate::tree::{
     Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key,
@@ -307,6 +307,9 @@ pub struct Explorer {
     /// Per-tensor dtype reinterpretation chosen in the data views, keyed by
     /// tensor name. Session-scoped: remembered until the app exits.
     dtype_overrides: RefCell<HashMap<String, ViewDtype>>,
+    /// Per-tensor fused-codebook packing schema parsed from metadata at load.
+    /// A tensor with a schema defaults to the [`ViewDtype::Unpacked`] view.
+    packing_schemas: HashMap<String, PackingSchema>,
     /// Per-tensor shape override (a reshape with the same element count) chosen
     /// in the data views with `r`, keyed by tensor name. Session-scoped.
     shape_overrides: RefCell<HashMap<String, Vec<usize>>>,
@@ -401,6 +404,7 @@ impl Explorer {
             copied_flash: None,
             health_reports,
             dtype_overrides: RefCell::new(HashMap::new()),
+            packing_schemas: HashMap::new(),
             shape_overrides: RefCell::new(HashMap::new()),
             stats_cache: RefCell::new(HashMap::new()),
             histogram_cache: RefCell::new(HashMap::new()),
@@ -468,6 +472,7 @@ impl Explorer {
         let pause = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicUsize::new(0));
         let owned = tensor.clone();
+        let schema = self.schema_for(&tensor.name).cloned();
         let worker_cancel = Arc::clone(&cancel);
         let worker_pause = Arc::clone(&pause);
         let worker_done = Arc::clone(&done);
@@ -475,6 +480,7 @@ impl Explorer {
             crate::sample::tensor_stats(
                 &owned,
                 view,
+                schema.as_ref(),
                 &worker_cancel,
                 &worker_pause,
                 Some(&*worker_done),
@@ -517,6 +523,7 @@ impl Explorer {
         let done = Arc::new(AtomicUsize::new(0));
         let total = tensor.size_bytes;
         let owned = tensor.clone();
+        let schema = self.schema_for(&tensor.name).cloned();
         let worker_cancel = Arc::clone(&cancel);
         let worker_pause = Arc::clone(&pause);
         let worker_done = Arc::clone(&done);
@@ -524,6 +531,7 @@ impl Explorer {
             crate::sample::tensor_stats(
                 &owned,
                 view,
+                schema.as_ref(),
                 &worker_cancel,
                 &worker_pause,
                 Some(&*worker_done),
@@ -633,8 +641,47 @@ impl Explorer {
 
         self.tensors.sort_by_key(|a| natural_sort_key(&a.name));
         self.total_parameters = self.tensors.iter().map(|t| t.num_elements).sum::<usize>();
+        self.packing_schemas = crate::sample::parse_packing_schemas(&self.tensors, &self.metadata);
         self.build_tree();
         Ok(())
+    }
+
+    /// The fused-codebook packing schema for `name`, if the checkpoint declared one.
+    fn schema_for(&self, name: &str) -> Option<&PackingSchema> {
+        self.packing_schemas.get(name)
+    }
+
+    /// The view a tensor opens in with no explicit override: the codebook
+    /// [`ViewDtype::Unpacked`] when it carries a packing schema, else `Stored`.
+    fn default_view(&self, name: &str) -> ViewDtype {
+        if self.packing_schemas.contains_key(name) {
+            ViewDtype::Unpacked
+        } else {
+            ViewDtype::Stored
+        }
+    }
+
+    /// The active view for a tensor: an explicit `d`/`--dtype` override if set,
+    /// otherwise its [`default_view`].
+    fn active_view(&self, name: &str) -> ViewDtype {
+        self.dtype_overrides
+            .borrow()
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| self.default_view(name))
+    }
+
+    /// The value range to bin the histogram over: the intrinsic codebook span
+    /// `0..=2^max_width-1` for the unmerged view (so every index gets a bar, even
+    /// absent ones — like the 4-bit views show all 16), otherwise the tensor's
+    /// exact min/max once a stats scan has cached it.
+    fn histogram_range(&self, tensor: &TensorInfo, view: ViewDtype) -> Option<(f64, f64)> {
+        if view == ViewDtype::Unpacked
+            && let Some(s) = self.schema_for(&tensor.name)
+        {
+            return Some((0.0, ((1u64 << s.max_width()) - 1) as f64));
+        }
+        self.cached_stats(tensor, view).map(|s| (s.min, s.max))
     }
 
     fn read_safetensors_file(file_path: &Path) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
@@ -1789,8 +1836,18 @@ impl Explorer {
         if let Some(dt) = req.dtype
             && dtype_overridable(&tensor)
         {
+            let def = self.default_view(&tensor.name);
+            // `--dtype unpacked` only applies to a tensor that carries a packing
+            // schema; otherwise keep its default view.
+            let dt = if dt == ViewDtype::Unpacked && self.schema_for(&tensor.name).is_none() {
+                def
+            } else {
+                dt
+            };
             let mut overrides = self.dtype_overrides.borrow_mut();
-            if dt == ViewDtype::Stored {
+            // Record only an explicit non-default choice, so an unset tensor falls
+            // back to its default (Unpacked for schema tensors) and `y` round-trips.
+            if dt == def {
                 overrides.remove(&tensor.name);
             } else {
                 overrides.insert(tensor.name.clone(), dt);
@@ -1902,12 +1959,7 @@ impl Explorer {
         if (req.histogram || req.bins.is_some())
             && let Screen::Detail { .. } = screen
         {
-            let view = self
-                .dtype_overrides
-                .borrow()
-                .get(&tensor.name)
-                .copied()
-                .unwrap_or(ViewDtype::Stored);
+            let view = self.active_view(&tensor.name);
             let shape = self
                 .shape_overrides
                 .borrow()
@@ -1947,12 +1999,7 @@ impl Explorer {
         if stats_start == StatsStart::Auto
             && let Screen::Detail { .. } = screen
         {
-            let view = self
-                .dtype_overrides
-                .borrow()
-                .get(&tensor.name)
-                .copied()
-                .unwrap_or(ViewDtype::Stored);
+            let view = self.active_view(&tensor.name);
             let overridable = dtype_overridable(&tensor);
             let unindexed = self.unindexed.contains(&tensor.source_path);
             let shape = self
@@ -1972,6 +2019,7 @@ impl Explorer {
                     sv,
                     None,
                     None,
+                    self.schema_for(&tensor.name),
                 );
             });
         }
@@ -2018,12 +2066,7 @@ impl Explorer {
         // until the next key or `COPY_FLASH` elapses.
         let mut copied_since: Option<std::time::Instant> = None;
         loop {
-            let view = self
-                .dtype_overrides
-                .borrow()
-                .get(&tensor.name)
-                .copied()
-                .unwrap_or(ViewDtype::Stored);
+            let view = self.active_view(&tensor.name);
             let shape = self
                 .shape_overrides
                 .borrow()
@@ -2044,6 +2087,7 @@ impl Explorer {
                         sv,
                         None,
                         None,
+                        self.schema_for(&tensor.name),
                     );
                 });
             }
@@ -2106,6 +2150,7 @@ impl Explorer {
                 stats_view,
                 hist.as_ref(),
                 None,
+                self.schema_for(&tensor.name),
             )
             .is_err()
             {
@@ -2215,6 +2260,7 @@ impl Explorer {
                             sv,
                             None,
                             None,
+                            self.schema_for(&tensor.name),
                         );
                     });
                 }
@@ -2224,8 +2270,9 @@ impl Explorer {
                     ..
                 })) if overridable => {
                     if let Some(chosen) = self.prompt_dtype(tensor, DtypePreview::Detail) {
+                        let def = self.default_view(&tensor.name);
                         let mut overrides = self.dtype_overrides.borrow_mut();
-                        if chosen == ViewDtype::Stored {
+                        if chosen == def {
                             overrides.remove(&tensor.name);
                         } else {
                             overrides.insert(tensor.name.clone(), chosen);
@@ -2271,6 +2318,7 @@ impl Explorer {
                             stats_view,
                             hist.as_ref(),
                             None,
+                            self.schema_for(&tensor.name),
                         );
                     });
                     copy_to_clipboard(&text);
@@ -2350,12 +2398,7 @@ impl Explorer {
                 },
             };
             // The dtype reinterpretation remembered for this tensor, if any.
-            let view = self
-                .dtype_overrides
-                .borrow()
-                .get(&tensor.name)
-                .copied()
-                .unwrap_or(ViewDtype::Stored);
+            let view = self.active_view(&tensor.name);
 
             // Exact stats power the value range, heatmap scale and stats line, but
             // the scan can take a while on a big tensor. Run it on a worker thread
@@ -2601,8 +2644,9 @@ impl Explorer {
                                 if let Some(chosen) = self
                                     .prompt_dtype(tensor, DtypePreview::Data { repr, slice, mode })
                                 {
+                                    let def = self.default_view(&tensor.name);
                                     let mut overrides = self.dtype_overrides.borrow_mut();
-                                    if chosen == ViewDtype::Stored {
+                                    if chosen == def {
                                         overrides.remove(&tensor.name);
                                     } else {
                                         overrides.insert(tensor.name.clone(), chosen);
@@ -2714,8 +2758,9 @@ impl Explorer {
         overridable: bool,
         unindexed: bool,
     ) {
+        let range = self.histogram_range(tensor, view);
         let need_stats =
-            crate::sample::histogram_bins(view, &tensor.dtype, None, self.histogram_bins.get())
+            crate::sample::histogram_bins(view, &tensor.dtype, range, self.histogram_bins.get())
                 .is_none()
                 && self.cached_stats(tensor, view).is_none();
         let ready = !need_stats
@@ -2731,6 +2776,7 @@ impl Explorer {
                         sv,
                         None,
                         None,
+                        self.schema_for(&tensor.name),
                     );
                 }),
                 ScanOutcome::Completed
@@ -2752,6 +2798,7 @@ impl Explorer {
                     sv,
                     Some(snap),
                     scanning,
+                    self.schema_for(&tensor.name),
                 );
             });
         }
@@ -2775,7 +2822,7 @@ impl Explorer {
         if self.histogram_cache.borrow().contains_key(&key) {
             return;
         }
-        let range = self.cached_stats(tensor, view).map(|s| (s.min, s.max));
+        let range = self.histogram_range(tensor, view);
         let Some((bins, n)) = crate::sample::histogram_bins(view, &tensor.dtype, range, count)
         else {
             return; // a range is required but stats aren't available
@@ -2789,6 +2836,7 @@ impl Explorer {
         let done = Arc::new(AtomicUsize::new(0));
         let total = tensor.size_bytes;
         let owned = tensor.clone();
+        let schema = self.schema_for(&tensor.name).cloned();
         let (wsh, wc, wp, wd) = (
             Arc::clone(&shared),
             Arc::clone(&cancel),
@@ -2796,7 +2844,17 @@ impl Explorer {
             Arc::clone(&done),
         );
         let handle = std::thread::spawn(move || {
-            crate::sample::tensor_histogram_into(&owned, view, bins, n, &wsh, &wc, &wp, Some(&*wd))
+            crate::sample::tensor_histogram_into(
+                &owned,
+                view,
+                schema.as_ref(),
+                bins,
+                n,
+                &wsh,
+                &wc,
+                &wp,
+                Some(&*wd),
+            )
         });
 
         let started = std::time::Instant::now();
@@ -2863,9 +2921,14 @@ impl Explorer {
                 .get(&tensor.name)
                 .cloned()
                 .unwrap_or_else(|| tensor.shape.clone());
-            match crate::sample::squeezed_shape(&eff).as_slice() {
+            let stored = match crate::sample::squeezed_shape(&eff).as_slice() {
                 [d0, _, _] => *d0,
                 _ => 1,
+            };
+            // The codebook unmerge turns each stored expert into `lenP` slices.
+            match (view, self.schema_for(&tensor.name)) {
+                (ViewDtype::Unpacked, Some(s)) => stored * s.len_p(),
+                _ => stored,
             }
         };
         // Size the grid to leave the header (tensor name + file path, dtype/
@@ -2941,9 +3004,10 @@ impl Explorer {
             .as_ref()
             .is_some_and(|c| c.key == key);
         if !hit {
+            let schema = self.schema_for(&tensor.name);
             let sample = self.with_reader(tensor, |reader| {
                 crate::sample::sample_tensor_with(
-                    reader, tensor, &eff_shape, max_rows, max_cols, slice, view, mode,
+                    reader, tensor, &eff_shape, max_rows, max_cols, slice, view, mode, schema,
                 )
             })?;
             // In the window layout, read the clamped top-left corner and the
@@ -2986,16 +3050,12 @@ impl Explorer {
     /// horizontal); Enter applies, Esc cancels. Ctrl-C quits the app. The
     /// preview re-renders whichever screen the menu was opened from.
     fn prompt_dtype(&self, tensor: &TensorInfo, preview: DtypePreview) -> Option<ViewDtype> {
-        let options = crate::sample::view_options(&tensor.dtype);
+        let options =
+            crate::sample::view_options_for(&tensor.dtype, self.schema_for(&tensor.name).is_some());
         if options.is_empty() {
             return None;
         }
-        let current = self
-            .dtype_overrides
-            .borrow()
-            .get(&tensor.name)
-            .copied()
-            .unwrap_or(ViewDtype::Stored);
+        let current = self.active_view(&tensor.name);
         let mut idx = options.iter().position(|v| *v == current).unwrap_or(0);
         // The shape override (if any) is fixed while the dtype menu is open.
         let shape = self
@@ -3020,6 +3080,7 @@ impl Explorer {
                     stats_view,
                     None,
                     None,
+                    self.schema_for(&tensor.name),
                 )
                 .is_ok(),
                 DtypePreview::Data { repr, slice, mode } => self
@@ -3551,12 +3612,7 @@ impl Explorer {
     fn command_for_detail(&self, tensor: &TensorInfo) -> String {
         let mut parts = self.command_base(tensor);
         // Reopen with the histogram showing when it's been computed for this view.
-        let view = self
-            .dtype_overrides
-            .borrow()
-            .get(&tensor.name)
-            .copied()
-            .unwrap_or(ViewDtype::Stored);
+        let view = self.active_view(&tensor.name);
         let bins = self.histogram_bins.get();
         if self
             .histogram_cache
