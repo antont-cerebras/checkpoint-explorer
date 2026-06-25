@@ -69,6 +69,18 @@ mod palette {
 /// shown in [`palette::UNINDEXED`] in the tree, detail screen and legends.
 const UNINDEXED_MARK: &str = "✚";
 
+/// Storage tag for a tensor stored uncompressed on disk. Shared by the tree row,
+/// the detail screen and the legend so the wording stays consistent.
+const UNCOMPRESSED_TAG: &str = "(uncompressed)";
+
+/// On-disk compression codec marker, e.g. `⇩ lz4`. Shared by the tree row, the
+/// detail screen and the legend so the glyph stays consistent.
+const COMPRESSED_MARK: &str = "⇩";
+
+/// Separator between a tensor's logical size and its (smaller) on-disk size,
+/// e.g. `593 MiB → 588 MiB`. Shared by the tree rows and the legend.
+const SIZE_ARROW: &str = "→";
+
 pub struct DrawConfig<'a> {
     pub tree: &'a [(TreeNode, usize)],
     pub current_file: &'a str,
@@ -465,7 +477,7 @@ impl UI {
                 };
                 let size_field = if stored_size != total_size {
                     format!(
-                        "{} → {}",
+                        "{} {SIZE_ARROW} {}",
                         format_size(*total_size),
                         format_size(*stored_size)
                     )
@@ -500,7 +512,7 @@ impl UI {
                     crate::tree::last_segment(&info.name)
                 };
                 // The name, shape and size read at full strength; only the leaf
-                // marker and the storage tag (codec / "raw") are dimmed, and the
+                // marker and the storage tag (codec / "uncompressed") are dimmed, and the
                 // dtype is tinted. `⇩` marks a compressed tensor. A tensor on disk
                 // but absent from the index gets a red `✚` (an "extra") instead of
                 // the dot.
@@ -522,15 +534,20 @@ impl UI {
                     } => {
                         write!(
                             out,
-                            "{} → {} ",
+                            "{} {SIZE_ARROW} {} ",
                             format_size(info.size_bytes),
                             format_size(*stored_bytes)
                         )?;
-                        paint(out, selected, palette::DIM, &format!("(⇩ {codec})"))?;
+                        paint(
+                            out,
+                            selected,
+                            palette::DIM,
+                            &format!("({COMPRESSED_MARK} {codec})"),
+                        )?;
                     }
                     Storage::Raw => {
                         write!(out, "{} ", format_size(info.size_bytes))?;
-                        paint(out, selected, palette::DIM, "(raw)")?;
+                        paint(out, selected, palette::DIM, UNCOMPRESSED_TAG)?;
                     }
                     Storage::Unknown => write!(out, "{}", format_size(info.size_bytes))?,
                 }
@@ -643,13 +660,13 @@ impl UI {
                     &mut body,
                     false,
                     palette::DIM,
-                    &format!("(⇩ {codec}, {ratio:.1}×)"),
+                    &format!("({COMPRESSED_MARK} {codec}, {ratio:.1}×)"),
                 )?;
             }
             Storage::Raw => {
                 write!(
                     body,
-                    " · on disk: {} (uncompressed)",
+                    " · on disk: {} {UNCOMPRESSED_TAG}",
                     format_size(tensor.size_bytes)
                 )?;
             }
@@ -1675,6 +1692,10 @@ impl UI {
 
         match legend {
             Legend::Tree => {
+                // Example symbols built from the shared glyph constants so the
+                // legend matches what the tree actually renders.
+                let size_example = format!("A {SIZE_ARROW} B");
+                let codec_example = format!("{COMPRESSED_MARK} lz4");
                 let rows = [
                     (
                         Some(palette::ACCENT),
@@ -1700,15 +1721,19 @@ impl UI {
                     (None, "▦ N", "number of tensors in the group / checkpoint"),
                     (
                         None,
-                        "A → B",
+                        size_example.as_str(),
                         "logical size → on-disk size (shown only when they differ)",
                     ),
                     (
                         Some(palette::DIM),
-                        "⇩ lz4",
+                        codec_example.as_str(),
                         "compressed on disk; the codec is named after the glyph",
                     ),
-                    (Some(palette::DIM), "(raw)", "stored uncompressed on disk"),
+                    (
+                        Some(palette::DIM),
+                        UNCOMPRESSED_TAG,
+                        "stored uncompressed on disk",
+                    ),
                     (None, "", ""),
                     (
                         Some(palette::DTYPE),
@@ -1727,10 +1752,11 @@ impl UI {
                 }
             }
             Legend::Detail => {
+                let codec_example = format!("{COMPRESSED_MARK} lz4");
                 let rows = [
                     (
                         Some(palette::DIM),
-                        "⇩ lz4",
+                        codec_example.as_str(),
                         "on-disk compression codec; the N× beside it is the ratio (logical ÷ stored)",
                     ),
                     (
