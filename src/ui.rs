@@ -814,8 +814,7 @@ impl UI {
         // newline (which could scroll the screen and flash).
         queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
 
-        write!(out, "Heatmap: {}", tensor.name)?;
-        line_end(&mut *out)?;
+        write_data_view_title(&mut *out, "Heatmap", tensor)?;
         let integer = sample.view.is_integer(&tensor.dtype);
         // Use the exact whole-tensor range (and color scale) once stats are
         // ready; otherwise fall back to the sampled range, flagged as such.
@@ -918,8 +917,7 @@ impl UI {
         // Synchronized, in-place overwrite (see `draw_heatmap`) to avoid flicker.
         queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
 
-        write!(out, "Values: {}", tensor.name)?;
-        line_end(&mut *out)?;
+        write_data_view_title(&mut *out, "Values", tensor)?;
         write_view_dtype(&mut *out, &tensor.dtype, sample.view)?;
         write!(out, " ")?;
         write_view_shape(&mut *out, &tensor.shape, &sample.display_shape)?;
@@ -1957,21 +1955,26 @@ fn write_slice_header(out: &mut impl Write, sample: &Sample) -> Result<()> {
 /// Footer for the data views: offers the other representation (`m`/`v` switch
 /// in place, no trip back to the detail screen) and mentions slice navigation
 /// only when there is more than one slice to move between. Keys highlighted.
-fn write_view_footer(
-    out: &mut impl Write,
-    sample: &Sample,
+/// The footer hint items for a data view — shared by the renderer and the
+/// height calculation so the two can't drift. Depends only on values known
+/// before sampling (layout mode, slice count, whether the dtype is overridable,
+/// the representation, and the zebra/base toggles).
+fn view_footer_items(
+    mode: SampleMode,
+    slices: usize,
+    overridable: bool,
     heatmap: bool,
     stripe: StripeMode,
     base: NumBase,
-) -> Result<()> {
+) -> Vec<(&'static str, &'static str)> {
     let switch = if heatmap {
         ("v", "numeric values")
     } else {
         ("m", "heatmap")
     };
     let mut items = vec![switch];
-    let edges = matches!(sample.mode, SampleMode::Edges { .. });
-    let window = matches!(sample.mode, SampleMode::Window { .. });
+    let edges = matches!(mode, SampleMode::Edges { .. });
+    let window = matches!(mode, SampleMode::Window { .. });
     // In the edges view the arrows rebalance first vs. last (Shift snaps to one
     // end); in the window view they pan the block (Shift a screenful, Ctrl to an
     // edge). Either way slice stepping moves to `[`/`]` so the arrows are free.
@@ -1986,7 +1989,7 @@ fn write_view_footer(
         items.push(("Home/End", "col edge"));
         items.push(("PgUp/Dn", "row edge"));
     }
-    if sample.slices > 1 {
+    if slices > 1 {
         if edges || window {
             items.push(("[ ]", "slice"));
         } else {
@@ -1995,26 +1998,24 @@ fn write_view_footer(
         }
         items.push(("/", "index or %"));
     }
-    if sample.overridable {
+    if overridable {
         items.push(("d", "dtype"));
         items.push(("r", "reshape"));
     }
     // Cycle the layout overview → edges → window → overview; the label names the
     // layout `e` switches to next.
-    items.push(match sample.mode {
+    items.push(match mode {
         SampleMode::Grid => ("e", "edges"),
         SampleMode::Edges { .. } => ("e", "window"),
         SampleMode::Window { .. } => ("e", "overview"),
     });
-    // Cycle the zebra striping rows → cols → off (numeric grid only); the label
-    // shows the current mode.
+    // Cycle the zebra striping / numeral base (numeric grid only).
     if !heatmap {
         items.push(match stripe {
             StripeMode::Rows => ("z", "zebra: rows"),
             StripeMode::Cols => ("z", "zebra: cols"),
             StripeMode::Off => ("z", "zebra: off"),
         });
-        // Cycle the numeral base dec → hex → oct → bin (numeric grid only).
         items.push(match base {
             NumBase::Decimal => ("b", "base: dec"),
             NumBase::Hex => ("b", "base: hex"),
@@ -2022,16 +2023,62 @@ fn write_view_footer(
             NumBase::Binary => ("b", "base: bin"),
         });
     }
-    // Copy the screen's text to the clipboard.
     items.push(("c", "copy"));
-    // Show and copy the CLI command that reopens this view.
     items.push(("y", "copy cmd"));
-    // Open the legend for this view's glyphs.
     items.push(("l", "legend"));
-    // Step back / forward through the screen history.
     items.push(("⌫", "back"));
     items.push(("\\", "fwd"));
     items.push(("", "any other key to return..."));
+    items
+}
+
+/// Physical lines the data view footer occupies at `width`: the blank spacer
+/// line above it plus the hint line (one logical line the terminal auto-wraps).
+/// Used to size the grid so the header (tensor name + file) never scrolls off.
+pub fn data_view_footer_lines(
+    mode: SampleMode,
+    slices: usize,
+    overridable: bool,
+    heatmap: bool,
+    stripe: StripeMode,
+    base: NumBase,
+    width: usize,
+) -> usize {
+    let items = view_footer_items(mode, slices, overridable, heatmap, stripe, base);
+    // Visible width: each item is `key`, `label`, or `key label`, joined by " · ".
+    let len: usize = items
+        .iter()
+        .enumerate()
+        .map(|(i, (k, l))| {
+            let sep = usize::from(i > 0) * 3;
+            let body = if k.is_empty() {
+                l.chars().count()
+            } else if l.is_empty() {
+                k.chars().count()
+            } else {
+                k.chars().count() + 1 + l.chars().count()
+            };
+            sep + body
+        })
+        .sum();
+    1 + len.div_ceil(width.max(1)).max(1)
+}
+
+fn write_view_footer(
+    out: &mut impl Write,
+    sample: &Sample,
+    heatmap: bool,
+    stripe: StripeMode,
+    base: NumBase,
+) -> Result<()> {
+    let items = view_footer_items(
+        sample.mode,
+        sample.slices,
+        sample.overridable,
+        heatmap,
+        stripe,
+        base,
+    );
     hint_line(out, &items)
 }
 
@@ -2341,6 +2388,29 @@ fn truncate_keep_end(s: &str, width: usize) -> String {
     }
     let tail: String = s.chars().skip(count - (width - 1)).collect();
     format!("…{tail}")
+}
+
+/// Write a data view's title block — the tensor name and its source file — each
+/// kept to a single line (truncated tail-first, so the distinguishing end stays)
+/// so both remain on screen above a grid of any size. `kind` is the view label
+/// (`Values` / `Heatmap`).
+fn write_data_view_title(out: &mut impl Write, kind: &str, tensor: &TensorInfo) -> Result<()> {
+    let width = terminal::size().map(|(w, _)| w as usize).unwrap_or(100);
+    write!(out, "{kind}: ")?;
+    write!(
+        out,
+        "{}",
+        truncate_keep_end(&tensor.name, width.saturating_sub(kind.len() + 2))
+    )?;
+    line_end(&mut *out)?;
+    paint(&mut *out, false, palette::DIM, "File: ")?;
+    write!(
+        out,
+        "{}",
+        truncate_keep_end(&tensor.source_path, width.saturating_sub(6))
+    )?;
+    line_end(&mut *out)?;
+    Ok(())
 }
 
 /// Map a normalized value in `[0, 1]` to a blue→green→red 256-color ramp

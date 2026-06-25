@@ -127,6 +127,21 @@ const STATS_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '�
 /// The program name used when building the copyable CLI commands (`y`).
 const PROGRAM: &str = "checkpoint-explorer";
 
+// Data-view header rows above the grid. Summed to size the grid so the header
+// (tensor name + file path) and the footer always stay on screen.
+/// Tensor name line + source file line.
+const HDR_TITLE_ROWS: usize = 2;
+/// The dtype / shape / layout line.
+const HDR_DTYPE_ROW: usize = 1;
+/// The statistics line.
+const HDR_STATS_ROW: usize = 1;
+/// The slice line (3D tensors only).
+const HDR_SLICE_ROW: usize = 1;
+/// The blank spacer between the header and the grid.
+const HDR_GRID_GAP_ROW: usize = 1;
+/// The column-index row (the numeric grid only; the heatmap has none).
+const HDR_COLINDEX_ROW: usize = 1;
+
 /// A statistics scan running on a worker thread for a data view's current
 /// `(tensor, view)`. The view stays fully interactive while it runs; the main
 /// loop polls [`Self::handle`], caches the result when it lands, and animates the
@@ -2489,7 +2504,41 @@ impl Explorer {
         stats: StatsView,
     ) -> Result<(usize, bool, usize), String> {
         let (cols, rows) = terminal::size().unwrap_or((100, 40));
-        let text_rows = (rows as usize).saturating_sub(8).max(1);
+        let width = cols as usize;
+        let heatmap = matches!(repr, Representation::Heatmap);
+        // Leading-index count of the (possibly reshaped) tensor — drives whether
+        // a slice line appears in the header.
+        let slices = {
+            let overrides = self.shape_overrides.borrow();
+            let eff = overrides
+                .get(&tensor.name)
+                .cloned()
+                .unwrap_or_else(|| tensor.shape.clone());
+            match crate::sample::squeezed_shape(&eff).as_slice() {
+                [d0, _, _] => *d0,
+                _ => 1,
+            }
+        };
+        // Size the grid to leave the header (tensor name + file path, dtype/
+        // shape/layout, stats, a slice line for 3D, the blank spacer, and the
+        // column-index row for the numeric grid) and the footer (blank + the
+        // auto-wrapped hint line) on screen — so neither scrolls off the top.
+        let header = HDR_TITLE_ROWS
+            + HDR_DTYPE_ROW
+            + HDR_STATS_ROW
+            + HDR_GRID_GAP_ROW
+            + if slices > 1 { HDR_SLICE_ROW } else { 0 }
+            + if heatmap { 0 } else { HDR_COLINDEX_ROW };
+        let footer = crate::ui::data_view_footer_lines(
+            mode,
+            slices,
+            dtype_overridable(tensor),
+            heatmap,
+            self.data_view_stripe.get(),
+            self.data_view_base.get(),
+            width,
+        );
+        let text_rows = (rows as usize).saturating_sub(header + footer).max(1);
         let (max_rows, max_cols) = match repr {
             // The heatmap packs two data rows per text line (half blocks), so it
             // can sample twice as many rows as there are lines.
