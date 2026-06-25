@@ -9,7 +9,7 @@
 //! shards, is just another implementation).
 
 use std::ops::{ControlFlow, Range};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
@@ -1103,6 +1103,229 @@ pub fn tensor_stats(
     let mut stats = acc.finish();
     stats.elapsed = started.elapsed();
     Ok(stats)
+}
+
+/// How a value histogram's bins are laid out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HistBins {
+    /// Integer bins: bin `i` covers the `step` integers starting at
+    /// `start + i * step`. `step == 1` gives one bin per value; a larger step
+    /// groups a wide integer range into whole-number buckets (never fractional).
+    IntBins { start: i64, step: i64 },
+    /// Equal-width bins spanning `[lo, hi]` (the last bin includes `hi`).
+    Range { lo: f64, hi: f64 },
+}
+
+/// A whole-tensor value histogram (a snapshot of the running scan, or final).
+#[derive(Clone, Debug)]
+pub struct Histogram {
+    pub bins: HistBins,
+    /// One count per bin.
+    pub counts: Vec<u64>,
+    /// Finite elements binned so far.
+    pub total: u64,
+    /// Non-finite elements (NaN / ±Inf), not binned.
+    pub nonfinite: u64,
+}
+
+/// Live bin counts shared between the scan worker and the UI, so the histogram
+/// can be drawn filling in as it forms. The bin layout is fixed up front.
+pub struct HistShared {
+    pub counts: Vec<AtomicU64>,
+    pub total: AtomicU64,
+    pub nonfinite: AtomicU64,
+}
+
+impl HistShared {
+    pub fn new(n: usize) -> Self {
+        HistShared {
+            counts: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            total: AtomicU64::new(0),
+            nonfinite: AtomicU64::new(0),
+        }
+    }
+
+    /// A consistent-enough snapshot of the running counts for one rendered frame.
+    pub fn snapshot(&self, bins: HistBins) -> Histogram {
+        Histogram {
+            bins,
+            counts: self
+                .counts
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .collect(),
+            total: self.total.load(Ordering::Relaxed),
+            nonfinite: self.nonfinite.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl ViewDtype {
+    /// The full inclusive integer value range when it is small and intrinsic to
+    /// the view (the 4-bit views), so the histogram shows every possible value —
+    /// including ones absent from the data. `None` otherwise (use the data range).
+    fn small_int_span(self) -> Option<(i64, i64)> {
+        match self {
+            ViewDtype::U4Lo | ViewDtype::U4Hi | ViewDtype::U4Packed => Some((0, 15)),
+            ViewDtype::I4Lo | ViewDtype::I4Hi | ViewDtype::I4Packed => Some((-8, 7)),
+            _ => None,
+        }
+    }
+}
+
+/// Max distinct integer values shown as one bin each; above this the histogram
+/// uses equal-width range bins instead.
+const MAX_VALUE_BINS: usize = 64;
+/// Number of equal-width bins for a range histogram (floats / wide integers).
+const RANGE_BINS: usize = 40;
+
+/// Decide a histogram's bin layout for `(view, dtype)`. `range` is the tensor's
+/// `(min, max)` from its stats — needed for range bins and data-range integer
+/// bins, but not for the 4-bit views (whose range is intrinsic). `bins` requests
+/// a specific bucket count (the `b` key / `--bins`); `None` uses the defaults.
+/// Returns the layout and bin count, or `None` when a range is required but not
+/// yet known.
+pub fn histogram_bins(
+    view: ViewDtype,
+    dtype: &str,
+    range: Option<(f64, f64)>,
+    bins: Option<usize>,
+) -> Option<(HistBins, usize)> {
+    // A requested bucket count overrides the defaults: it sets the float bin
+    // count and the wide-integer grouping target, and also caps the per-value
+    // threshold (you can't show more buckets than there are distinct values).
+    let target = bins.unwrap_or(RANGE_BINS).max(1) as u64;
+    if view.is_integer(dtype) {
+        // 4-bit views: every possible value, even absent ones — no range needed,
+        // and the count is intrinsic, so a requested count doesn't apply.
+        if let Some((lo, hi)) = view.small_int_span() {
+            return Some((
+                HistBins::IntBins { start: lo, step: 1 },
+                (hi - lo + 1) as usize,
+            ));
+        }
+        let (min, max) = range?;
+        let (lo, hi) = (min.floor() as i64, max.ceil() as i64);
+        if hi < lo {
+            return Some((HistBins::IntBins { start: lo, step: 1 }, 1));
+        }
+        let distinct = (hi - lo + 1) as u64;
+        // One bin per value when few enough — capped by any requested count.
+        let per_value_cap = bins.unwrap_or(MAX_VALUE_BINS).max(1) as u64;
+        if distinct <= per_value_cap {
+            return Some((HistBins::IntBins { start: lo, step: 1 }, distinct as usize));
+        }
+        // Otherwise group into ~`target` whole-number-width buckets, so the
+        // edges stay integers rather than the fractional ones a float range
+        // would produce.
+        let step = distinct.div_ceil(target) as i64;
+        let n = distinct.div_ceil(step as u64) as usize;
+        return Some((HistBins::IntBins { start: lo, step }, n));
+    }
+    match range? {
+        (min, max) if min < max => Some((HistBins::Range { lo: min, hi: max }, target as usize)),
+        (min, max) => Some((HistBins::Range { lo: min, hi: max }, 1)), // all-equal: one bin
+    }
+}
+
+/// The bin a value falls in (clamped to the end bins for out-of-range values).
+fn bin_index(bins: HistBins, n: usize, v: f64) -> usize {
+    let last = n.saturating_sub(1) as i64;
+    match bins {
+        HistBins::IntBins { start, step } => {
+            ((v.round() as i64 - start).div_euclid(step.max(1))).clamp(0, last) as usize
+        }
+        HistBins::Range { lo, hi } => {
+            if hi <= lo {
+                return 0;
+            }
+            let frac = (v - lo) / (hi - lo);
+            ((frac * n as f64).floor() as i64).clamp(0, last) as usize
+        }
+    }
+}
+
+/// Reduce a flat byte buffer into per-bin counts (plus finite/non-finite totals)
+/// under `view`, in parallel. Mirrors [`reduce_view_bytes`] but bins instead of
+/// folding moments.
+fn reduce_view_hist(
+    bytes: &[u8],
+    item: usize,
+    view: ViewDtype,
+    dtype: &str,
+    bins: HistBins,
+    n: usize,
+) -> (Vec<u64>, u64, u64) {
+    let packing = view.packing(item);
+    let decode = view_decoder(view, dtype);
+    bytes
+        .par_chunks(item * STATS_CHUNK)
+        .map(|chunk| {
+            let mut counts = vec![0u64; n];
+            let (mut total, mut nonfinite) = (0u64, 0u64);
+            for container in chunk.chunks_exact(item) {
+                for sub in 0..packing {
+                    let v = decode(container, sub);
+                    if v.is_finite() {
+                        counts[bin_index(bins, n, v)] += 1;
+                        total += 1;
+                    } else {
+                        nonfinite += 1;
+                    }
+                }
+            }
+            (counts, total, nonfinite)
+        })
+        .reduce(
+            || (vec![0u64; n], 0, 0),
+            |mut a, b| {
+                for (x, y) in a.0.iter_mut().zip(&b.0) {
+                    *x += *y;
+                }
+                (a.0, a.1 + b.1, a.2 + b.2)
+            },
+        )
+}
+
+/// Scan the whole tensor and accumulate its value histogram into `shared` (whose
+/// bin count must match `n`), so the UI can draw the bins filling in as the scan
+/// runs. `bins` is the fixed layout. Honours `pause`/`cancel` like [`tensor_stats`].
+#[allow(clippy::too_many_arguments)] // a scan driver; the params are all distinct
+pub fn tensor_histogram_into(
+    t: &TensorInfo,
+    view: ViewDtype,
+    bins: HistBins,
+    n: usize,
+    shared: &HistShared,
+    cancel: &AtomicBool,
+    pause: &AtomicBool,
+    progress: Option<&AtomicUsize>,
+) -> Result<(), String> {
+    let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
+    let reader = open_reader(t)?;
+    reader.fold_blocks(&mut |bytes| {
+        let (counts, total, nonfinite) = reduce_view_hist(bytes, item, view, &t.dtype, bins, n);
+        for (slot, c) in shared.counts.iter().zip(&counts) {
+            slot.fetch_add(*c, Ordering::Relaxed);
+        }
+        shared.total.fetch_add(total, Ordering::Relaxed);
+        shared.nonfinite.fetch_add(nonfinite, Ordering::Relaxed);
+        if let Some(p) = progress {
+            p.fetch_add(bytes.len(), Ordering::Relaxed);
+        }
+        while pause.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+        if cancel.load(Ordering::Relaxed) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled".to_string());
+    }
+    Ok(())
 }
 
 /// Decoded values and the parallel raw stored bits for a sampled grid, each
@@ -2313,6 +2536,96 @@ mod tests {
         assert!(s.raw[0].iter().all(|r| r.width == 8));
         assert_eq!(s.values[0], vec![1.0, -1.0, -128.0]);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn histogram_bins_per_value_for_4bit_views() {
+        // The 4-bit views bin every possible value with no range needed.
+        assert_eq!(
+            histogram_bins(ViewDtype::U4Packed, "I16", None, None),
+            Some((HistBins::IntBins { start: 0, step: 1 }, 16))
+        );
+        assert_eq!(
+            histogram_bins(ViewDtype::I4Packed, "I16", None, None),
+            Some((HistBins::IntBins { start: -8, step: 1 }, 16))
+        );
+    }
+
+    #[test]
+    fn histogram_bins_use_range_for_floats_and_wide_ints() {
+        // Floats need the range; without it, undecidable.
+        assert_eq!(histogram_bins(ViewDtype::Stored, "F32", None, None), None);
+        let (bins, n) = histogram_bins(ViewDtype::Stored, "F32", Some((-1.0, 1.0)), None).unwrap();
+        assert!(matches!(bins, HistBins::Range { .. }));
+        assert_eq!(n, RANGE_BINS);
+        // A small integer data span bins per value.
+        assert_eq!(
+            histogram_bins(ViewDtype::Stored, "I8", Some((0.0, 5.0)), None),
+            Some((HistBins::IntBins { start: 0, step: 1 }, 6))
+        );
+    }
+
+    #[test]
+    fn histogram_bins_keep_integer_edges_for_wide_int_spans() {
+        // A wide integer span must use whole-number-width bins, not a float
+        // range — the bucket edges stay integers (start + i*step).
+        let (bins, n) =
+            histogram_bins(ViewDtype::Stored, "U16", Some((0.0, 65_535.0)), None).unwrap();
+        let HistBins::IntBins { start, step } = bins else {
+            panic!("wide integer span should produce integer bins, got {bins:?}");
+        };
+        assert_eq!(start, 0);
+        assert!(step > 1, "wide span should group multiple integers per bin");
+        assert!(n <= RANGE_BINS, "no more than {RANGE_BINS} bins");
+        // The bins must cover the whole span.
+        assert!(start + (n as i64) * step > 65_535);
+    }
+
+    #[test]
+    fn histogram_bins_honour_a_requested_count() {
+        // Floats: the requested count is the bin count exactly.
+        let (_, n) = histogram_bins(ViewDtype::Stored, "F32", Some((-1.0, 1.0)), Some(12)).unwrap();
+        assert_eq!(n, 12);
+        // Wide integers: grouped into about the requested number of whole-number
+        // buckets (never more, since the step is a whole number).
+        let (bins, n) =
+            histogram_bins(ViewDtype::Stored, "U16", Some((0.0, 65_535.0)), Some(16)).unwrap();
+        assert!(matches!(bins, HistBins::IntBins { step, .. } if step > 1));
+        assert!(n <= 16, "grouped to at most the requested count, got {n}");
+        // A count larger than the distinct integer span still shows one bin per
+        // value (you can't have more buckets than values).
+        assert_eq!(
+            histogram_bins(ViewDtype::Stored, "I8", Some((0.0, 5.0)), Some(40)),
+            Some((HistBins::IntBins { start: 0, step: 1 }, 6))
+        );
+        // A small count groups an otherwise per-value integer span.
+        let (bins, n) =
+            histogram_bins(ViewDtype::Stored, "I16", Some((0.0, 19.0)), Some(5)).unwrap();
+        assert!(matches!(bins, HistBins::IntBins { step, .. } if step > 1));
+        assert!(n <= 5);
+    }
+
+    #[test]
+    fn bin_index_maps_and_clamps() {
+        let pv = HistBins::IntBins { start: -8, step: 1 };
+        assert_eq!(bin_index(pv, 16, -8.0), 0);
+        assert_eq!(bin_index(pv, 16, 7.0), 15);
+        assert_eq!(bin_index(pv, 16, 99.0), 15); // clamped to the last bin
+        // Stepped integer bins: each bin spans `step` values.
+        let iv = HistBins::IntBins {
+            start: 0,
+            step: 100,
+        };
+        assert_eq!(bin_index(iv, 10, 0.0), 0);
+        assert_eq!(bin_index(iv, 10, 99.0), 0);
+        assert_eq!(bin_index(iv, 10, 100.0), 1);
+        assert_eq!(bin_index(iv, 10, 250.0), 2);
+        assert_eq!(bin_index(iv, 10, 9_999.0), 9); // clamped to the last bin
+        let rg = HistBins::Range { lo: 0.0, hi: 10.0 };
+        assert_eq!(bin_index(rg, 10, 0.0), 0);
+        assert_eq!(bin_index(rg, 10, 9.999), 9);
+        assert_eq!(bin_index(rg, 10, 10.0), 9); // the max lands in the last bin
+        assert_eq!(bin_index(rg, 10, -5.0), 0); // clamped
     }
 }
 

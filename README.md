@@ -11,6 +11,11 @@ An interactive terminal-based explorer for [`safetensors`](https://huggingface.c
 - 🔎 **Fuzzy search** - instantly filter tensors with fuzzy matching using `/` key
 - 🔢 **Smart numeric sorting** for layer numbers (e.g., layer.0, layer.1, layer.2, ..., layer.10)
 - 📊 **Tensor details** including shape, data type, and size
+- 📈 **Value histogram** (`h`) - on the detail screen, a whole-tensor ASCII bar
+  chart shown below the stats, with absolute counts and percentages, formed live
+  as the scan runs; one bar per value for small-integer encodings (e.g. all 16
+  values of a `u4` view), whole-number-width bins for wider integers, and
+  equal-width range bins for floats
 - 🔗 **Multi-file support** - automatically merges multiple files into a unified view
 - 📂 **Directory support** - explore entire model directories with automatic `safetensors` index detection
 - 🌟 **Glob pattern support** - use wildcards to select multiple files (e.g., `*.safetensors`, `model-*.gguf`)
@@ -139,6 +144,8 @@ without `--tensor` is reported as ambiguous.
 | `--tensor <NAME>` | Open this tensor (exact name); optional for single-tensor checkpoints |
 | `--metadata <NAME>` | Reveal a metadata entry in the tree (exact name, e.g. `model.norm.weight.__metadata__`) |
 | `--values` / `--heatmap` | Open the numeric grid / the heatmap (default: the detail screen) |
+| `--histogram` | Show the value histogram on the detail screen |
+| `--bins <N>` | Histogram bucket count (1–512); implies `--histogram` |
 | `--tree` | Reveal the tensor highlighted in the tree browser, without opening a view |
 | `--dtype <DTYPE>` | Reinterpret the dtype: `u4-packed`, `u4-lo`, `u4-hi`, `i4-packed`, `i4-lo`, `i4-hi`, or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
 | `--shape <DIMS>` | Reinterpret the shape (same element count): `10,100` / `10x100`; one dim may be `-1`/`*`/`_` to infer |
@@ -268,6 +275,25 @@ there slices step with `[` / `]` — `/` still works.)
 Within either view, `m` and `v` switch between the heatmap and numeric
 representations in place, `e` cycles the layout (overview → edges → window), and
 `Ctrl+C` quits the app from anywhere.
+
+#### Value histogram (`h`)
+
+On the **detail screen**, `h` computes a whole-tensor **value histogram** and
+shows it inline below the statistics — a horizontal ASCII bar chart, one bar per
+bin, each with its absolute count and percentage of the finite values. The bars
+fill in live as the tensor is scanned (any key cancels). Small-integer encodings
+get one bar per possible value — e.g. a `u4` view shows all 16 values `0..15`,
+including ones absent from the data. Integers with a wider range are grouped into
+whole-number-width bins (the bucket edges stay integers, never fractional), and
+floats use equal-width range bins across the value range. It respects the active
+`--dtype` reinterpretation, so a `u4-packed` view histograms the unpacked 4-bit
+values.
+
+Press `b` (or pass `--bins N`, 1–512) to set the bucket count — it applies to the
+float and wide-integer cases (the small-integer encodings are intrinsically one
+bar per value); an empty entry returns to the automatic count. Results are
+cached, and `y` includes `--histogram` (and `--bins N` when set) so the view
+round-trips.
 
 #### Statistics
 
