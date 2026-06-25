@@ -1017,9 +1017,16 @@ impl Explorer {
         // Leave the last rendered frame on screen — don't clear it — and drop the
         // shell prompt onto a fresh line just below it. This keeps whatever you
         // were looking at visible after you quit (and lets `--exit` output be
-        // read / captured). The newline lands the prompt at the bottom left;
-        // disabling raw mode first so its `\n` becomes a CR+LF (column 0).
-        execute!(stdout, cursor::Show)?;
+        // read / captured). Clear from the cursor down first so no frame content
+        // lingers *below* the prompt — e.g. the grid rows beneath a mid-screen
+        // overlay such as the `y` command pop-up, which the draw didn't wipe. The
+        // newline then lands the prompt at the bottom left; disabling raw mode
+        // first so its `\n` becomes a CR+LF (column 0).
+        execute!(
+            stdout,
+            terminal::Clear(ClearType::FromCursorDown),
+            cursor::Show
+        )?;
         terminal::disable_raw_mode()?;
         println!();
 
@@ -3731,9 +3738,15 @@ fn is_ctrl_c(key: &KeyEvent) -> bool {
 /// instead of stepping back one screen.
 fn quit_immediately() -> ! {
     let mut stdout = io::stdout();
-    let _ = execute!(stdout, cursor::Show);
+    // Clear below the cursor so no frame content lingers under the prompt (e.g.
+    // the rows beneath a mid-screen overlay like the `y` command pop-up), then
+    // drop the prompt onto a fresh line below the preserved frame.
+    let _ = execute!(
+        stdout,
+        terminal::Clear(ClearType::FromCursorDown),
+        cursor::Show
+    );
     let _ = terminal::disable_raw_mode();
-    // Drop the prompt onto a fresh line below the preserved frame.
     println!();
     std::process::exit(0);
 }
