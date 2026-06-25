@@ -169,25 +169,50 @@ pub enum NaturalSortItem {
 pub struct TreeBuilder;
 
 impl TreeBuilder {
-    /// Build the tree from tensors plus metadata. Per-tensor metadata (a
-    /// `<tensor>.__metadata__` entry whose `<tensor>` is in the file) is placed
-    /// in-place, right beside its tensor, so it's seen while walking the tree;
-    /// the remaining standalone/config metadata (e.g. `inference_version`,
-    /// `codebook_packing_schema`, `__version__`) stays in a top-level group.
+    /// Build the tree from tensors plus metadata. Metadata that belongs to the
+    /// tensor tree is placed in-place so it's seen while walking the tree —
+    /// beside its tensor (`<tensor>.__metadata__`), inside a module's group
+    /// (`<group>.…__metadata__`, e.g. a per-experts `quantization_schema` with
+    /// no tensor of its own), or beside the tensor it annotates when nested under
+    /// one (`<tensor>.quantization_schema.__metadata__`). The remaining
+    /// standalone/config metadata (e.g. `inference_version`, `__version__`) stays
+    /// in a top-level group.
     pub fn build_tree_mixed(tensors: &[TensorInfo], metadata: &[MetadataInfo]) -> Vec<TreeNode> {
         let tensor_names: HashSet<&str> = tensors.iter().map(|t| t.name.as_str()).collect();
-        let stem_of = |m: &MetadataInfo| -> Option<String> {
+        // Whether `path` (dotted) names a group in the tensor tree — i.e. it is a
+        // strict prefix of some tensor's dotted path.
+        let names_group = |path: &str| -> bool {
+            !path.is_empty()
+                && tensors.iter().any(|t| {
+                    t.name
+                        .strip_prefix(path)
+                        .is_some_and(|rest| rest.starts_with('.'))
+                })
+        };
+        // The stem a `<stem>.__metadata__` entry attaches to when it belongs in
+        // the tree: it is path-scoped within the tensor tree, i.e. its root
+        // segment names a tensor or a group. That covers per-tensor metadata
+        // (`<tensor>.__metadata__`), per-module metadata (`<group>.…__metadata__`),
+        // and metadata nested under a tensor (`<tensor>.quantization_schema.…`);
+        // `insert_metadata` then places it at the deepest matching group, beside
+        // the tensor / module it annotates. Config-style metadata whose root
+        // isn't in the tree (e.g. `inference_version`, `__version__`) returns
+        // `None` and stays in the standalone group.
+        let attached_stem = |m: &MetadataInfo| -> Option<String> {
             let stem = m.name.strip_suffix(".__metadata__")?;
-            tensor_names.contains(stem).then(|| stem.to_string())
+            let root = stem.split('.').next().unwrap_or(stem);
+            (tensor_names.contains(root) || names_group(root)).then(|| stem.to_string())
         };
 
-        // Build the tensor tree uncompacted, weave each per-tensor metadata in
-        // beside its tensor, then compact — so a lone tensor and its metadata
-        // collapse together rather than the metadata blocking compaction above.
+        // Build the tensor tree uncompacted, weave each attached metadata in
+        // beside its tensor / inside its group, then compact — so a lone tensor
+        // and its metadata collapse together rather than the metadata blocking
+        // compaction above.
         let mut raw = Self::build_tree_raw(tensors);
         for meta in metadata {
-            if let Some(stem) = stem_of(meta) {
-                // Parent path = the tensor's path minus its own leaf segment.
+            if let Some(stem) = attached_stem(meta) {
+                // Parent path = the stem minus its own leaf segment (empty for a
+                // top-level stem, which inserts at the tree root).
                 let parts: Vec<&str> = stem.split('.').collect();
                 let parent = &parts[..parts.len() - 1];
                 insert_metadata(&mut raw, parent, meta.clone());
@@ -195,10 +220,10 @@ impl TreeBuilder {
         }
         let mut tree = compact_nodes(raw);
 
-        // Standalone metadata (no matching tensor) keeps its own group on top.
+        // Metadata with no place in the tensor tree keeps its own group on top.
         let standalone: Vec<TreeNode> = metadata
             .iter()
-            .filter(|m| stem_of(m).is_none())
+            .filter(|m| attached_stem(m).is_none())
             .map(|m| TreeNode::Metadata { info: m.clone() })
             .collect();
         if !standalone.is_empty() {
@@ -689,6 +714,71 @@ mod tests {
             standalone,
             vec!["__version__", "inference_version.__metadata__"]
         );
+    }
+
+    #[test]
+    fn places_group_metadata_inside_its_group() {
+        // A `<group>.quantization_schema.__metadata__` whose stem is not a tensor
+        // but whose parent (`…experts`) is a real group: it should sit inside
+        // that group beside the sibling tensors, not in a standalone group.
+        let tree = TreeBuilder::build_tree_mixed(
+            &[
+                tensor("model.experts.down_proj.weight"),
+                tensor("model.experts.gate_up_proj.weight"),
+            ],
+            &[meta("model.experts.quantization_schema.__metadata__")],
+        );
+
+        let experts = group(&tree, "model.experts");
+        assert_eq!(
+            meta_names(experts),
+            vec!["model.experts.quantization_schema.__metadata__"]
+        );
+        // It is woven into the tree, so there is no standalone metadata group.
+        assert!(
+            tree.iter().all(|n| n.name() != "🔧 Metadata"),
+            "group-attached metadata should not also appear in a standalone group"
+        );
+    }
+
+    #[test]
+    fn places_metadata_nested_under_a_tensor() {
+        // `<tensor>.quantization_schema.__metadata__`: the stem's parent is the
+        // tensor itself (a leaf, not a group), so it falls back to the tensor's
+        // group and sits beside it — not in the standalone group.
+        let tree = TreeBuilder::build_tree_mixed(
+            &[
+                tensor("model.experts.down_proj.weight"),
+                tensor("model.experts.down_proj.qscale"),
+            ],
+            &[meta(
+                "model.experts.down_proj.weight.quantization_schema.__metadata__",
+            )],
+        );
+
+        let dp = group(&tree, "model.experts.down_proj");
+        assert_eq!(
+            meta_names(dp),
+            vec!["model.experts.down_proj.weight.quantization_schema.__metadata__"]
+        );
+        assert!(
+            tree.iter().all(|n| n.name() != "🔧 Metadata"),
+            "tensor-attached metadata should not also appear in a standalone group"
+        );
+    }
+
+    #[test]
+    fn keeps_config_metadata_standalone() {
+        // Metadata whose root segment is not in the tensor tree stays in the
+        // standalone group, never woven into the tree.
+        let tree = TreeBuilder::build_tree_mixed(
+            &[tensor("model.experts.down_proj.weight")],
+            &[meta("inference_version.__metadata__"), meta("__version__")],
+        );
+        let md = group(&tree, "🔧 Metadata");
+        let mut names = meta_names(md);
+        names.sort();
+        assert_eq!(names, vec!["__version__", "inference_version.__metadata__"]);
     }
 
     #[test]
