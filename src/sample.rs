@@ -2578,7 +2578,7 @@ mod hdf5_tests {
     fn hdf5_stats_timing() {
         let path = std::env::var("BENCH_FILE").expect("set BENCH_FILE");
         let name = std::env::var("BENCH_TENSOR").expect("set BENCH_TENSOR");
-        let tensors = crate::hdf5::read_tensors(std::path::Path::new(&path)).unwrap();
+        let (tensors, _metadata) = crate::hdf5::read(std::path::Path::new(&path)).unwrap();
         let t = tensors
             .into_iter()
             .find(|t| t.name == name)

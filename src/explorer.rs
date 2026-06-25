@@ -582,37 +582,49 @@ impl Explorer {
         self.tensors.clear();
         self.metadata.clear();
 
+        // Read the checkpoint structure on a worker thread so the UI stays
+        // responsive: a cold file (e.g. a large HDF5 over the network) can take
+        // seconds to enumerate, and we'd otherwise show an empty screen. Animate
+        // a loading frame — the same header/footer chrome as the tree, with a
+        // spinner in place of the rows — until the worker finishes.
         let files = self.files.clone();
-        for file_path in &files {
-            let extension = file_path.extension().and_then(|s| s.to_str());
+        let handle = std::thread::spawn(move || Self::gather_checkpoint(&files));
 
-            match extension {
-                Some("safetensors") => {
-                    self.load_safetensors_file(file_path)?;
-                }
-                Some("gguf") => {
-                    self.load_gguf_file(file_path)?;
-                }
-                Some("npy") => {
-                    self.load_numpy_file(file_path)?;
-                }
-                Some("npz") => {
-                    self.load_npz_file(file_path)?;
-                }
-                Some("h5") | Some("hdf5") => {
-                    #[cfg(feature = "hdf5")]
-                    self.load_hdf5_file(file_path)?;
-                    #[cfg(not(feature = "hdf5"))]
-                    eprintln!(
-                        "Warning: HDF5 support is not compiled in; rebuild with `--features hdf5` to read {}",
-                        file_path.display()
-                    );
-                }
-                _ => {
-                    eprintln!("Warning: Unsupported file format: {}", file_path.display());
-                }
+        let label = self
+            .files
+            .first()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let total = self.files.len();
+        let started = std::time::Instant::now();
+        let mut frame = 0usize;
+        loop {
+            // Wait one ~12 fps tick — also catches `q` / Ctrl-C to abort. Polling
+            // *before* drawing means a fast (cached) load finishes within the
+            // first tick and never flashes the spinner; only a slow load reaches
+            // the draw below.
+            if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false)
+                && let Ok(Event::Key(key)) = event::read()
+                && (is_ctrl_c(&key) || matches!(key.code, KeyCode::Char('q')))
+            {
+                quit_immediately();
             }
+            if handle.is_finished() {
+                break;
+            }
+            let _ = UI::draw_loading(
+                &label,
+                total,
+                STATS_SPINNER[frame % STATS_SPINNER.len()],
+                started.elapsed(),
+            );
+            frame += 1;
         }
+        let (tensors, metadata) = handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("checkpoint loader thread panicked"))??;
+        self.tensors = tensors;
+        self.metadata = metadata;
 
         // Deduplicate tensors by name
         let mut seen_names = HashSet::new();
@@ -625,7 +637,9 @@ impl Explorer {
         Ok(())
     }
 
-    fn load_safetensors_file(&mut self, file_path: &PathBuf) -> Result<()> {
+    fn read_safetensors_file(file_path: &Path) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+        let mut tensors: Vec<TensorInfo> = Vec::new();
+        let mut metadata: Vec<MetadataInfo> = Vec::new();
         let source_path = absolute_path(file_path);
         let mut file = File::open(file_path)
             .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
@@ -669,7 +683,7 @@ impl Explorer {
             if key == "__metadata__" {
                 if let Some(meta_obj) = value.as_object() {
                     for (meta_key, meta_value) in meta_obj {
-                        self.metadata.push(MetadataInfo {
+                        metadata.push(MetadataInfo {
                             name: meta_key.clone(),
                             value: match meta_value.as_str() {
                                 Some(s) => s.to_string(),
@@ -711,7 +725,7 @@ impl Explorer {
             };
             let num_elements = shape.iter().product::<usize>();
 
-            self.tensors.push(TensorInfo {
+            tensors.push(TensorInfo {
                 name: key.clone(),
                 dtype,
                 shape,
@@ -723,13 +737,13 @@ impl Explorer {
             });
         }
 
-        Ok(())
+        Ok((tensors, metadata))
     }
 
     /// Load a NumPy `.npy` file: one array behind a small header, then raw
     /// row-major little-endian data running to EOF. The byte range is absolute
     /// (the data follows the header), and the tensor is named after the file.
-    fn load_numpy_file(&mut self, file_path: &PathBuf) -> Result<()> {
+    fn read_numpy_file(file_path: &Path) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
         let source_path = absolute_path(file_path);
         let mut file = File::open(file_path)
             .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
@@ -742,7 +756,7 @@ impl Explorer {
             .unwrap_or("array")
             .to_string();
         let num_elements = header.shape.iter().product::<usize>();
-        self.tensors.push(TensorInfo {
+        let tensor = TensorInfo {
             name,
             dtype: header.dtype,
             shape: header.shape,
@@ -754,14 +768,15 @@ impl Explorer {
                 start: header.data_offset as u64,
                 end: file_len,
             },
-        });
-        Ok(())
+        };
+        Ok((vec![tensor], Vec::new()))
     }
 
     /// Load a NumPy `.npz` archive: a ZIP whose `<name>.npy` entries are each a
     /// `.npy` array. We read each entry's header (decompressing only that much)
     /// to list the tensors; the reader decompresses the full entry on demand.
-    fn load_npz_file(&mut self, file_path: &PathBuf) -> Result<()> {
+    fn read_npz_file(file_path: &Path) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+        let mut tensors: Vec<TensorInfo> = Vec::new();
         let source_path = absolute_path(file_path);
         let file = File::open(file_path)
             .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
@@ -789,7 +804,7 @@ impl Explorer {
             } else {
                 Storage::Raw
             };
-            self.tensors.push(TensorInfo {
+            tensors.push(TensorInfo {
                 name: name.to_string(),
                 dtype: header.dtype,
                 shape: header.shape,
@@ -801,10 +816,12 @@ impl Explorer {
                 layout: Layout::None,
             });
         }
-        Ok(())
+        Ok((tensors, Vec::new()))
     }
 
-    fn load_gguf_file(&mut self, file_path: &PathBuf) -> Result<()> {
+    fn read_gguf_file(file_path: &Path) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+        let mut tensors: Vec<TensorInfo> = Vec::new();
+        let mut metadata: Vec<MetadataInfo> = Vec::new();
         let source_path = absolute_path(file_path);
         let mut file = File::open(file_path)
             .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
@@ -834,7 +851,7 @@ impl Explorer {
                 crate::gguf::GGUFValue::Array(_) => "array",
             };
 
-            self.metadata.push(MetadataInfo {
+            metadata.push(MetadataInfo {
                 name: key.clone(),
                 value: value.to_string(),
                 value_type: value_type.to_string(),
@@ -851,7 +868,7 @@ impl Explorer {
             let size_bytes =
                 (num_elements as f32 * tensor.tensor_type.element_size_bytes()) as usize;
 
-            self.tensors.push(TensorInfo {
+            tensors.push(TensorInfo {
                 name: tensor.name.clone(),
                 dtype,
                 shape,
@@ -863,21 +880,51 @@ impl Explorer {
             });
         }
 
-        Ok(())
+        Ok((tensors, metadata))
     }
 
     #[cfg(feature = "hdf5")]
-    fn load_hdf5_file(&mut self, file_path: &std::path::Path) -> Result<()> {
-        let tensors = crate::hdf5::read_tensors(file_path)?;
-        self.tensors.extend(tensors);
-        // Root attributes carry the checkpoint's free-form metadata (version,
-        // per-tensor and config `__metadata__`); surface them in the tree.
-        match crate::hdf5::read_metadata(file_path) {
-            Ok(metadata) => self.metadata.extend(metadata),
-            // Metadata is supplementary — a read failure shouldn't sink the file.
-            Err(e) => eprintln!("Warning: failed to read HDF5 metadata: {e}"),
+    fn read_hdf5_file(file_path: &Path) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+        // Tensors plus root-attribute metadata (version, per-tensor and config
+        // `__metadata__`) from a single file open.
+        crate::hdf5::read(file_path)
+    }
+
+    /// Read every file's top-level structure (tensors + metadata) into owned
+    /// vectors. A free function (no `&self`) so it can run on a worker thread
+    /// while the UI animates a loading spinner.
+    fn gather_checkpoint(files: &[PathBuf]) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+        let mut tensors: Vec<TensorInfo> = Vec::new();
+        let mut metadata: Vec<MetadataInfo> = Vec::new();
+        for file_path in files {
+            let (t, m) = match file_path.extension().and_then(|s| s.to_str()) {
+                Some("safetensors") => Self::read_safetensors_file(file_path)?,
+                Some("gguf") => Self::read_gguf_file(file_path)?,
+                Some("npy") => Self::read_numpy_file(file_path)?,
+                Some("npz") => Self::read_npz_file(file_path)?,
+                Some("h5") | Some("hdf5") => {
+                    #[cfg(feature = "hdf5")]
+                    {
+                        Self::read_hdf5_file(file_path)?
+                    }
+                    #[cfg(not(feature = "hdf5"))]
+                    {
+                        eprintln!(
+                            "Warning: HDF5 support is not compiled in; rebuild with `--features hdf5` to read {}",
+                            file_path.display()
+                        );
+                        (Vec::new(), Vec::new())
+                    }
+                }
+                _ => {
+                    eprintln!("Warning: Unsupported file format: {}", file_path.display());
+                    (Vec::new(), Vec::new())
+                }
+            };
+            tensors.extend(t);
+            metadata.extend(m);
         }
-        Ok(())
+        Ok((tensors, metadata))
     }
 
     fn build_tree(&mut self) {
