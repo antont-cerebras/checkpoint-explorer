@@ -584,6 +584,75 @@ impl UI {
         Ok(())
     }
 
+    /// A loading screen shown while the checkpoint structure is read: the same
+    /// title line + rule as the tree browser, a spinner where the rows will land,
+    /// and a hint pinned to the bottom — so the header/footer are up immediately
+    /// and the tree fills into the same frame once the read finishes.
+    pub fn draw_loading(
+        file: &str,
+        total_files: usize,
+        spinner: char,
+        elapsed: std::time::Duration,
+    ) -> Result<()> {
+        let mut out = io::stdout();
+        let (w, h) = terminal::size()?;
+        let (w, h) = (w as usize, h as usize);
+        queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
+
+        // Each element is positioned with an explicit `MoveTo` so the layout is
+        // exact regardless of how the terminal handles the full-width rule's
+        // wrap. Header: title line (row 0), full-width rule (row 1).
+        queue!(out, terminal::Clear(ClearType::CurrentLine))?;
+        write!(out, "Checkpoint Explorer - {file}")?;
+        if total_files > 1 {
+            queue!(out, SetForegroundColor(palette::DIM))?;
+            write!(out, "  (+{} more)", total_files - 1)?;
+            queue!(out, ResetColor)?;
+        }
+        queue!(
+            out,
+            cursor::MoveTo(0, 1),
+            terminal::Clear(ClearType::CurrentLine),
+            SetForegroundColor(palette::DIM)
+        )?;
+        write!(out, "{}", "─".repeat(w))?;
+        queue!(out, ResetColor)?;
+
+        // Wipe everything below the header, then the spinner just under it — on
+        // the row where the tree's first node will land, so it reads as content
+        // loading in place rather than floating mid-screen.
+        let spinner_row = 3u16.min(h.saturating_sub(2) as u16);
+        queue!(
+            out,
+            cursor::MoveTo(0, 2),
+            terminal::Clear(ClearType::FromCursorDown),
+            cursor::MoveTo(2, spinner_row),
+            SetForegroundColor(palette::ACCENT)
+        )?;
+        write!(out, "{spinner} reading checkpoint structure")?;
+        queue!(out, ResetColor, SetForegroundColor(palette::DIM))?;
+        write!(out, "  ({:.1}s)", elapsed.as_secs_f64())?;
+        queue!(out, ResetColor)?;
+
+        // Footer hint pinned to the bottom (no trailing newline → no scroll).
+        queue!(
+            out,
+            cursor::MoveTo(0, h.saturating_sub(1) as u16),
+            terminal::Clear(ClearType::CurrentLine),
+            SetForegroundColor(palette::DIM)
+        )?;
+        write!(out, "Press ")?;
+        queue!(out, ResetColor)?;
+        key_hint(&mut out, "q")?;
+        queue!(out, SetForegroundColor(palette::DIM))?;
+        write!(out, " to cancel")?;
+        queue!(out, ResetColor)?;
+
+        queue!(out, EndSynchronizedUpdate)?;
+        out.flush()?;
+        Ok(())
+    }
+
     /// Draw the tensor detail screen. `view` is the active dtype reinterpretation
     /// (which changes the shown dtype, shape and parameter count); `overridable`
     /// gates the `d` hint. `histogram` adds the value-histogram section below the

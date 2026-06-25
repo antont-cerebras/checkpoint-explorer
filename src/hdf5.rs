@@ -13,17 +13,27 @@ use hdf5_metno::types::TypeDescriptor;
 
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo};
 
-/// Read tensor metadata (name, dtype, shape, logical + on-disk size) from an
-/// HDF5 checkpoint.
-pub fn read_tensors(path: &std::path::Path) -> Result<Vec<TensorInfo>> {
+/// Read a checkpoint's top-level structure — tensor metadata and root-attribute
+/// metadata — from a single file open. Opening an HDF5 file twice repeats the
+/// superblock / root-group traversal, which is slow on a cold network file, so
+/// the tensors and the metadata are read from one handle.
+pub fn read(path: &std::path::Path) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
     let file = hdf5_metno::File::open(path)
         .with_context(|| format!("Failed to open HDF5 file: {}", path.display()))?;
 
-    // libhdf5 is now initialised; teach it the LZ4 filter so compressed datasets
-    // (stats/preview) are readable later in the session.
+    // libhdf5 is now initialised; teach it the LZ4 / Zstd filters so compressed
+    // datasets (stats/preview) are readable later in the session.
     crate::hdf5_lz4::register();
     crate::hdf5_zstd::register();
 
+    let tensors = read_tensors(&file, path)?;
+    let metadata = read_metadata(&file);
+    Ok((tensors, metadata))
+}
+
+/// Read tensor metadata (name, dtype, shape, logical + on-disk size) from an
+/// already-open HDF5 file.
+fn read_tensors(file: &hdf5_metno::File, path: &std::path::Path) -> Result<Vec<TensorInfo>> {
     let members = file
         .member_names()
         .with_context(|| format!("Failed to list members of: {}", path.display()))?;
@@ -105,13 +115,11 @@ pub fn read_tensors(path: &std::path::Path) -> Result<Vec<TensorInfo>> {
 /// `codebook_packing_schema`). Each `__metadata__` attribute wraps the real
 /// payload (torch-serialization plumbing: `__spec__` / `__objects__` / the
 /// payload under the attribute's own name), so we unwrap it to the useful part.
-pub fn read_metadata(path: &std::path::Path) -> Result<Vec<MetadataInfo>> {
-    let file = hdf5_metno::File::open(path)
-        .with_context(|| format!("Failed to open HDF5 file: {}", path.display()))?;
+fn read_metadata(file: &hdf5_metno::File) -> Vec<MetadataInfo> {
     let names = file.attr_names().unwrap_or_default();
     let mut out = Vec::with_capacity(names.len());
     for name in names {
-        let Some((raw, value_type)) = read_attr_value(&file, &name) else {
+        let Some((raw, value_type)) = read_attr_value(file, &name) else {
             continue;
         };
         // Unwrap the `<object>.__metadata__` serialization wrapper to the payload
@@ -123,7 +131,7 @@ pub fn read_metadata(path: &std::path::Path) -> Result<Vec<MetadataInfo>> {
             value_type,
         });
     }
-    Ok(out)
+    out
 }
 
 /// Read a single attribute as a `(value, type-label)` string pair, trying the
@@ -332,7 +340,7 @@ mod tests {
             ds.write_raw(&vec![0f32; 64 * 64]).unwrap();
         }
 
-        let tensors = read_tensors(&path).unwrap();
+        let (tensors, _metadata) = read(&path).unwrap();
         let by_name = |n: &str| tensors.iter().find(|t| t.name == n).unwrap();
 
         let weight = by_name("model.layers.0.weight");
@@ -443,7 +451,7 @@ mod tests {
                 .unwrap();
         }
 
-        let meta = read_metadata(&path).unwrap();
+        let (_tensors, meta) = read(&path).unwrap();
         let find = |n: &str| meta.iter().find(|m| m.name == n).unwrap();
         let iv = find("inference_version.__metadata__");
         assert_eq!(iv.value, "1.5");
