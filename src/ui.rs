@@ -1736,7 +1736,7 @@ impl UI {
                     (
                         Some(palette::KEY),
                         "as",
-                        "the active dtype reinterpretation (press d), e.g. 'BF16 as u4 (packed)'",
+                        "the active dtype reinterpretation (press d), e.g. 'BF16 as u4'",
                     ),
                     (
                         None,
@@ -2347,7 +2347,7 @@ fn fmt_value(v: f64, integer: bool) -> String {
 
 /// Write the dtype shown in a data-view header. With no override this is just
 /// the stored dtype; when overridden it fades the original dtype and highlights
-/// the active reinterpretation, e.g. a dimmed `BF16 as` then a bold `u4 (packed)`.
+/// the active reinterpretation, e.g. a dimmed `BF16 as` then a bold `u4`.
 fn write_view_dtype(out: &mut impl Write, stored: &str, view: ViewDtype) -> Result<()> {
     match view.label() {
         Some(label) => {

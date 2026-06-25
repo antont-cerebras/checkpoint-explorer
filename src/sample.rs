@@ -23,11 +23,10 @@ use crate::tree::{Layout, TensorInfo};
 /// * [`ViewDtype::As`] decodes each stored container as a *different same-width*
 ///   dtype — e.g. show a `BF16`-tagged tensor as `F16` (both 16-bit). No shape
 ///   change.
-/// * The 4-bit views handle quantized weights stored inside a wider container
-///   (e.g. gpt-oss MoE: 4-bit values in a `bf16`/`f16` slot). `*Lo`/`*Hi` take
-///   a single value from the low / high nibble of each container (formats
-///   differ on which nibble carries the data); `*Packed` unpacks every nibble
-///   densely (a 16-bit slot yields four values, expanding the last dimension).
+/// * The 4-bit views ([`ViewDtype::U4`] / [`ViewDtype::I4`]) handle quantized
+///   weights stored inside a wider container (e.g. gpt-oss MoE: 4-bit values in
+///   a `bf16`/`f16` slot). They unpack every nibble densely (a 16-bit slot
+///   yields four values, expanding the last dimension).
 ///
 /// Overrides apply wherever we read the raw stored bytes — both safetensors and
 /// HDF5.
@@ -38,18 +37,10 @@ pub enum ViewDtype {
     Stored,
     /// Reinterpret each container as this (same byte width) dtype, e.g. `"F16"`.
     As(&'static str),
-    /// Unsigned 4-bit, low nibble of each stored container.
-    U4Lo,
-    /// Unsigned 4-bit, high nibble of each stored container.
-    U4Hi,
-    /// Unsigned 4-bit, all nibbles packed densely (last dim ×(bytes·2)).
-    U4Packed,
-    /// Signed 4-bit (two's complement), low nibble of each stored container.
-    I4Lo,
-    /// Signed 4-bit, high nibble of each stored container.
-    I4Hi,
-    /// Signed 4-bit, all nibbles packed densely.
-    I4Packed,
+    /// Unsigned 4-bit: every nibble unpacked densely (last dim ×(bytes·2)).
+    U4,
+    /// Signed 4-bit (two's complement): every nibble unpacked densely.
+    I4,
 }
 
 impl ViewDtype {
@@ -58,60 +49,45 @@ impl ViewDtype {
         match self {
             ViewDtype::Stored => None,
             ViewDtype::As(dt) => Some(dt),
-            ViewDtype::U4Lo => Some("u4 (low nibble)"),
-            ViewDtype::U4Hi => Some("u4 (high nibble)"),
-            ViewDtype::U4Packed => Some("u4 (packed)"),
-            ViewDtype::I4Lo => Some("i4 (low nibble)"),
-            ViewDtype::I4Hi => Some("i4 (high nibble)"),
-            ViewDtype::I4Packed => Some("i4 (packed)"),
+            ViewDtype::U4 => Some("u4"),
+            ViewDtype::I4 => Some("i4"),
         }
     }
 
-    /// The `--dtype` CLI value that re-selects this view (e.g. `f16`, `u4-packed`),
-    /// or `None` for the stored dtype (no flag needed). Inverse of
+    /// The `--dtype` CLI value that re-selects this view (e.g. `f16`, `u4`), or
+    /// `None` for the stored dtype (no flag needed). Inverse of
     /// [`parse_view_dtype`].
     pub fn cli_value(self) -> Option<String> {
         Some(match self {
             ViewDtype::Stored => return None,
             ViewDtype::As(dt) => dt.to_ascii_lowercase(),
-            ViewDtype::U4Lo => "u4-lo".to_string(),
-            ViewDtype::U4Hi => "u4-hi".to_string(),
-            ViewDtype::U4Packed => "u4-packed".to_string(),
-            ViewDtype::I4Lo => "i4-lo".to_string(),
-            ViewDtype::I4Hi => "i4-hi".to_string(),
-            ViewDtype::I4Packed => "i4-packed".to_string(),
+            ViewDtype::U4 => "u4".to_string(),
+            ViewDtype::I4 => "i4".to_string(),
         })
     }
 
-    /// A compact label for the selection menu (e.g. `stored`, `F16`, `u4·hi`).
+    /// A compact label for the selection menu (e.g. `stored`, `F16`, `u4`).
     pub fn menu_label(self) -> &'static str {
         match self {
             ViewDtype::Stored => "stored",
             ViewDtype::As(dt) => dt,
-            ViewDtype::U4Lo => "u4·lo",
-            ViewDtype::U4Hi => "u4·hi",
-            ViewDtype::U4Packed => "u4·packed",
-            ViewDtype::I4Lo => "i4·lo",
-            ViewDtype::I4Hi => "i4·hi",
-            ViewDtype::I4Packed => "i4·packed",
+            ViewDtype::U4 => "u4",
+            ViewDtype::I4 => "i4",
         }
     }
 
     /// How many logical 4-bit values are unpacked from each stored container of
-    /// `item_bytes` bytes. `1` for everything except the packed 4-bit views,
-    /// which yield `item_bytes * 2` nibbles per container.
+    /// `item_bytes` bytes. `1` for everything except the 4-bit views, which
+    /// unpack `item_bytes * 2` nibbles per container.
     fn packing(self, item_bytes: usize) -> usize {
         match self {
-            ViewDtype::U4Packed | ViewDtype::I4Packed => item_bytes * 2,
+            ViewDtype::U4 | ViewDtype::I4 => item_bytes * 2,
             _ => 1,
         }
     }
 
     fn is_signed(self) -> bool {
-        matches!(
-            self,
-            ViewDtype::I4Lo | ViewDtype::I4Hi | ViewDtype::I4Packed
-        )
+        matches!(self, ViewDtype::I4)
     }
 
     /// Whether the decoded values are integers (so they should be shown without
@@ -161,8 +137,8 @@ impl ViewDtype {
     /// produce, used to size cells before the exact value range is known.
     fn int_max_digits(self, stored: &str) -> usize {
         let dt = match self {
-            ViewDtype::U4Lo | ViewDtype::U4Hi | ViewDtype::U4Packed => return 2, // 0..=15
-            ViewDtype::I4Lo | ViewDtype::I4Hi | ViewDtype::I4Packed => return 2, // -8..=7
+            ViewDtype::U4 => return 2, // 0..=15
+            ViewDtype::I4 => return 2, // -8..=7
             ViewDtype::As(dt) => dt,
             ViewDtype::Stored => stored,
         };
@@ -227,30 +203,19 @@ pub fn view_options(stored: &str) -> Vec<ViewDtype> {
             .filter(|&dt| dt != stored)
             .map(ViewDtype::As),
     );
-    opts.extend([
-        ViewDtype::U4Lo,
-        ViewDtype::U4Hi,
-        ViewDtype::U4Packed,
-        ViewDtype::I4Lo,
-        ViewDtype::I4Hi,
-        ViewDtype::I4Packed,
-    ]);
+    opts.extend([ViewDtype::U4, ViewDtype::I4]);
     opts
 }
 
-/// Parse a CLI dtype-override string (e.g. `u4-packed`, `i4-lo`, `f16`,
-/// `stored`) into a [`ViewDtype`]. Case-insensitive; `-` and `_` are
-/// interchangeable. Used by the `--dtype` flag.
+/// Parse a CLI dtype-override string (e.g. `u4`, `i4`, `f16`, `stored`) into a
+/// [`ViewDtype`]. Case-insensitive; `-` and `_` are interchangeable. Used by the
+/// `--dtype` flag.
 pub fn parse_view_dtype(s: &str) -> Result<ViewDtype, String> {
     let norm = s.trim().to_ascii_lowercase().replace('_', "-");
     Ok(match norm.as_str() {
         "stored" => ViewDtype::Stored,
-        "u4" | "u4-packed" => ViewDtype::U4Packed,
-        "u4-lo" => ViewDtype::U4Lo,
-        "u4-hi" => ViewDtype::U4Hi,
-        "i4" | "i4-packed" => ViewDtype::I4Packed,
-        "i4-lo" => ViewDtype::I4Lo,
-        "i4-hi" => ViewDtype::I4Hi,
+        "u4" => ViewDtype::U4,
+        "i4" => ViewDtype::I4,
         "f16" => ViewDtype::As("F16"),
         "bf16" => ViewDtype::As("BF16"),
         "f32" => ViewDtype::As("F32"),
@@ -266,8 +231,8 @@ pub fn parse_view_dtype(s: &str) -> Result<ViewDtype, String> {
         "bool" => ViewDtype::As("BOOL"),
         _ => {
             return Err(format!(
-                "unknown dtype view '{s}'; expected one of: stored, u4-lo, u4-hi, u4-packed, \
-                 i4-lo, i4-hi, i4-packed, f16, bf16, f32, f64, i8, u8, i16, u16, i32, u32, i64, u64"
+                "unknown dtype view '{s}'; expected one of: stored, u4, i4, f16, bf16, f32, f64, \
+                 i8, u8, i16, u16, i32, u32, i64, u64, bool"
             ));
         }
     })
@@ -619,9 +584,8 @@ fn decode(dtype: &str, b: &[u8]) -> f64 {
 
 /// Decode sub-element `sub` of a stored container `bytes` under `view`. For
 /// `Stored`/`As` this decodes the whole container; for the 4-bit views it
-/// extracts one nibble of the little-endian container, sign-extending for the
-/// signed views. The packed views read nibble `sub`; the low/high views always
-/// read the least/most significant nibble (so `sub` is ignored).
+/// extracts nibble `sub` of the little-endian container, sign-extending for the
+/// signed view.
 fn decode_view(view: ViewDtype, dtype: &str, bytes: &[u8], sub: usize) -> f64 {
     match view {
         ViewDtype::Stored => return decode(dtype, bytes),
@@ -634,12 +598,7 @@ fn decode_view(view: ViewDtype, dtype: &str, bytes: &[u8], sub: usize) -> f64 {
     for (i, &b) in bytes.iter().take(8).enumerate() {
         container |= (b as u64) << (8 * i);
     }
-    let nib_index = match view {
-        ViewDtype::U4Packed | ViewDtype::I4Packed => sub,
-        ViewDtype::U4Hi | ViewDtype::I4Hi => bytes.len() * 2 - 1,
-        _ => 0, // low-nibble views
-    };
-    let nibble = ((container >> (nib_index * 4)) & 0xF) as i64;
+    let nibble = ((container >> (sub * 4)) & 0xF) as i64;
     if view.is_signed() && nibble >= 8 {
         (nibble - 16) as f64
     } else {
@@ -650,7 +609,7 @@ fn decode_view(view: ViewDtype, dtype: &str, bytes: &[u8], sub: usize) -> f64 {
 /// The raw stored bit pattern of sub-element `sub` of container `bytes` under
 /// `view`, for hex/octal/binary display. For `Stored`/`As` it is the whole
 /// little-endian container (the byte reinterpretation `As` applies doesn't
-/// change the bits); for the 4-bit views it is the selected nibble (the raw
+/// change the bits); for the 4-bit views it is nibble `sub` (the raw
 /// two's-complement pattern, *not* sign-extended).
 fn raw_bits(view: ViewDtype, bytes: &[u8], sub: usize) -> RawBits {
     let mut container: u64 = 0;
@@ -662,17 +621,10 @@ fn raw_bits(view: ViewDtype, bytes: &[u8], sub: usize) -> RawBits {
             bits: container,
             width: (bytes.len().min(8) * 8) as u8,
         },
-        _ => {
-            let nib_index = match view {
-                ViewDtype::U4Packed | ViewDtype::I4Packed => sub,
-                ViewDtype::U4Hi | ViewDtype::I4Hi => bytes.len() * 2 - 1,
-                _ => 0,
-            };
-            RawBits {
-                bits: (container >> (nib_index * 4)) & 0xF,
-                width: 4,
-            }
-        }
+        _ => RawBits {
+            bits: (container >> (sub * 4)) & 0xF,
+            width: 4,
+        },
     }
 }
 
@@ -824,17 +776,12 @@ fn view_decoder(view: ViewDtype, dtype: &str) -> impl Fn(&[u8], usize) -> f64 {
     move |bytes: &[u8], sub: usize| match view {
         ViewDtype::Stored | ViewDtype::As(_) => prim.map_or(f64::NAN, |p| decode_prim(p, bytes)),
         _ => {
-            // 4-bit nibble views: pull one nibble from the little-endian container.
+            // 4-bit views: pull nibble `sub` from the little-endian container.
             let mut container: u64 = 0;
             for (i, &b) in bytes.iter().take(8).enumerate() {
                 container |= (b as u64) << (8 * i);
             }
-            let nib_index = match view {
-                ViewDtype::U4Packed | ViewDtype::I4Packed => sub,
-                ViewDtype::U4Hi | ViewDtype::I4Hi => bytes.len() * 2 - 1,
-                _ => 0, // low-nibble views
-            };
-            let nibble = ((container >> (nib_index * 4)) & 0xF) as i64;
+            let nibble = ((container >> (sub * 4)) & 0xF) as i64;
             if signed && nibble >= 8 {
                 (nibble - 16) as f64
             } else {
@@ -1166,8 +1113,8 @@ impl ViewDtype {
     /// including ones absent from the data. `None` otherwise (use the data range).
     fn small_int_span(self) -> Option<(i64, i64)> {
         match self {
-            ViewDtype::U4Lo | ViewDtype::U4Hi | ViewDtype::U4Packed => Some((0, 15)),
-            ViewDtype::I4Lo | ViewDtype::I4Hi | ViewDtype::I4Packed => Some((-8, 7)),
+            ViewDtype::U4 => Some((0, 15)),
+            ViewDtype::I4 => Some((-8, 7)),
             _ => None,
         }
     }
@@ -2467,28 +2414,18 @@ mod tests {
 
         let t = fixture_dtype(&path, "w", "F16", &[2], (0, 4));
 
-        // Low nibble of each container -> [0x4, 0xB]. Shape unchanged.
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Lo, SampleMode::Grid).unwrap();
-        assert_eq!(s.total_cols, 2);
-        assert_eq!(s.values[0], vec![4.0, 11.0]);
-
-        // High nibble (bits 12-15) of each container -> 0x1234->0x1, 0x00AB->0x0.
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Hi, SampleMode::Grid).unwrap();
-        assert_eq!(s.total_cols, 2);
-        assert_eq!(s.values[0], vec![1.0, 0.0]);
-
-        // Packed: four nibbles per 16-bit container, last dim ×4 -> 8 values.
+        // u4: four nibbles per 16-bit container, last dim ×4 -> 8 values.
         // 0x1234 -> [4,3,2,1]; 0x00AB -> [11,10,0,0].
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Packed, SampleMode::Grid).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4, SampleMode::Grid).unwrap();
         assert_eq!(s.total_cols, 8);
         assert_eq!(s.values[0], vec![4.0, 3.0, 2.0, 1.0, 11.0, 10.0, 0.0, 0.0]);
 
-        // Signed packed: nibbles >= 8 are negative (0xB->-5, 0xA->-6).
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::I4Packed, SampleMode::Grid).unwrap();
+        // Signed: nibbles >= 8 are negative (0xB->-5, 0xA->-6).
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::I4, SampleMode::Grid).unwrap();
         assert_eq!(s.values[0], vec![4.0, 3.0, 2.0, 1.0, -5.0, -6.0, 0.0, 0.0]);
 
-        // Packed raw bits are the individual nibbles, 4 bits wide.
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Packed, SampleMode::Grid).unwrap();
+        // Raw bits are the individual nibbles, 4 bits wide.
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4, SampleMode::Grid).unwrap();
         let bits: Vec<u64> = s.raw[0].iter().map(|r| r.bits).collect();
         assert_eq!(bits, vec![0x4, 0x3, 0x2, 0x1, 0xB, 0xA, 0x0, 0x0]);
         assert!(s.raw[0].iter().all(|r| r.width == 4));
@@ -2542,11 +2479,11 @@ mod tests {
     fn histogram_bins_per_value_for_4bit_views() {
         // The 4-bit views bin every possible value with no range needed.
         assert_eq!(
-            histogram_bins(ViewDtype::U4Packed, "I16", None, None),
+            histogram_bins(ViewDtype::U4, "I16", None, None),
             Some((HistBins::IntBins { start: 0, step: 1 }, 16))
         );
         assert_eq!(
-            histogram_bins(ViewDtype::I4Packed, "I16", None, None),
+            histogram_bins(ViewDtype::I4, "I16", None, None),
             Some((HistBins::IntBins { start: -8, step: 1 }, 16))
         );
     }
@@ -2745,14 +2682,14 @@ mod hdf5_tests {
         assert_eq!(s.values[0], vec![0x21 as f64, 0x43 as f64]);
 
         // Packed u4: each 16-bit slot yields four nibbles, last dim ×4.
-        let p = sample_tensor(&t, 10, 10, 0, ViewDtype::U4Packed, SampleMode::Grid).unwrap();
+        let p = sample_tensor(&t, 10, 10, 0, ViewDtype::U4, SampleMode::Grid).unwrap();
         assert_eq!(p.total_cols, 8);
         assert_eq!(p.values[0], vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0]);
 
         // Stats under the packed view see all eight unpacked nibbles.
         let st = tensor_stats(
             &t,
-            ViewDtype::U4Packed,
+            ViewDtype::U4,
             &AtomicBool::new(false),
             &AtomicBool::new(false),
             None,

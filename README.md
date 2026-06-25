@@ -128,11 +128,11 @@ checkpoint-explorer model.hdf5 --tensor model.layers.0.mlp.down_proj.weight
 # in the first/last edges submode
 checkpoint-explorer model.hdf5 \
   --tensor model.layers.0.block_sparse_moe.experts.down_proj.weight \
-  --dtype u4-packed --values --edge
+  --dtype u4 --values --edge
 
 # --tensor is optional when the checkpoint holds a single tensor (always so for
 # a .npy): reshape a flat dump and view it as packed 4-bit, no name needed
-checkpoint-explorer weights.npy --shape 128,3088,2992 --dtype u4-packed --values
+checkpoint-explorer weights.npy --shape 128,3088,2992 --dtype u4 --values
 ```
 The flags below act on the opened tensor. `--tensor` names it (exact name), but
 is **optional when the checkpoint has only one tensor** — always the case for a
@@ -147,7 +147,7 @@ without `--tensor` is reported as ambiguous.
 | `--histogram` | Show the value histogram on the detail screen |
 | `--bins <N>` | Histogram bucket count (1–512); implies `--histogram` |
 | `--tree` | Reveal the tensor highlighted in the tree browser, without opening a view |
-| `--dtype <DTYPE>` | Reinterpret the dtype: `u4-packed`, `u4-lo`, `u4-hi`, `i4-packed`, `i4-lo`, `i4-hi`, or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
+| `--dtype <DTYPE>` | Reinterpret the dtype: `u4`, `i4`, or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
 | `--shape <DIMS>` | Reinterpret the shape (same element count): `10,100` / `10x100`; one dim may be `-1`/`*`/`_` to infer |
 | `--edge[=RFRAC,CFRAC]` (alias `--edges`) / `--overview` / `--window[=ROW,COL]` | Force the edges submode (optional head/tail split fractions `0..1`) / the overview / the contiguous window (optional top-left `ROW,COL`) |
 | `--zebra <rows\|cols\|off>` | Zebra-stripe the numeric grid by rows, columns, or off |
@@ -286,8 +286,7 @@ get one bar per possible value — e.g. a `u4` view shows all 16 values `0..15`,
 including ones absent from the data. Integers with a wider range are grouped into
 whole-number-width bins (the bucket edges stay integers, never fractional), and
 floats use equal-width range bins across the value range. It respects the active
-`--dtype` reinterpretation, so a `u4-packed` view histograms the unpacked 4-bit
-values.
+`--dtype` reinterpretation, so a `u4` view histograms the unpacked 4-bit values.
 
 Press `b` (or pass `--bins N`, 1–512) to set the bucket count — it applies to the
 float and wide-integer cases (the small-integer encodings are intrinsically one
@@ -354,12 +353,11 @@ previews each option live as you move through it (`←`/`→` or `d`/`D` to move
 quit. Options for a 16-bit tensor:
 
 - another **same-width** dtype, e.g. view a `BF16` tensor as `F16` / `I16` / `U16`;
-- **`u4`/`i4` (low nibble)** or **(high nibble)** — one 4-bit value from the
-  low / high nibble of each slot (formats differ on which nibble holds the data);
-- **`u4`/`i4` (packed)** — every nibble unpacked densely, so each 16-bit slot
-  yields four values and the last dimension grows ×4.
+- **`u4`/`i4`** — quantized 4-bit weights stored inside a wider container, with
+  every nibble unpacked densely, so each 16-bit slot yields four values and the
+  last dimension grows ×4 (`i4` sign-extends two's-complement nibbles).
 
-The header shows the active reinterpretation (e.g. `BF16 as u4 (packed)`).
+The header shows the active reinterpretation (e.g. `BF16 as u4`).
 
 #### Shape override
 
