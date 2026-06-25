@@ -84,7 +84,7 @@ struct ExploreArgs {
         long,
         value_name = "DTYPE",
         value_parser = sample::parse_view_dtype,
-        help = "Reinterpret the opened tensor's dtype: u4, i4, f16, bf16, i16, u16, f32, i32, u32, f64, i64, u64, i8, u8, stored"
+        help = "Reinterpret the opened tensor's dtype: u4, i4, unpacked (fused codebook, needs a packing schema), f16, bf16, i16, u16, f32, i32, u32, f64, i64, u64, i8, u8, stored"
     )]
     dtype: Option<sample::ViewDtype>,
 

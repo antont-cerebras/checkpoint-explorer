@@ -8,12 +8,104 @@
 //! once and work the same regardless of format (and a new one, e.g. remote/S3
 //! shards, is just another implementation).
 
+use std::collections::{HashMap, HashSet};
 use std::ops::{ControlFlow, Range};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use rayon::prelude::*;
 
-use crate::tree::{Layout, TensorInfo};
+use crate::tree::{Layout, MetadataInfo, TensorInfo};
+
+/// How a fused-MoE codebook weight is bit-packed: a list of per-expert bit
+/// widths, least-significant-field first. Each `U16` word packs `len_p()`
+/// experts — expert `k` occupies bits `[offset(k), offset(k)+bit_widths[k])` —
+/// so unpacking it ("unmerging") shifts the word right by the field's offset and
+/// masks off the higher bits. Invariants (per the conversion spec): non-empty,
+/// every width > 0, and `sum(bit_widths) <= 16`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackingSchema {
+    bit_widths: Vec<u32>,
+    /// The declared mode label (e.g. `"3bit"`), for display only.
+    quant_mode: Option<String>,
+}
+
+impl PackingSchema {
+    /// Build a schema, validating the spec invariants.
+    pub fn new(bit_widths: Vec<u32>, quant_mode: Option<String>) -> Result<Self, String> {
+        if bit_widths.is_empty() {
+            return Err("empty bit_widths".to_string());
+        }
+        if bit_widths.contains(&0) {
+            return Err("a bit width is zero".to_string());
+        }
+        let total: u32 = bit_widths.iter().sum();
+        if total > 16 {
+            return Err(format!(
+                "bit widths sum to {total} (> 16, exceeds the U16 word)"
+            ));
+        }
+        Ok(PackingSchema {
+            bit_widths,
+            quant_mode,
+        })
+    }
+
+    /// Experts packed per stored word (`lenP`).
+    pub fn len_p(&self) -> usize {
+        self.bit_widths.len()
+    }
+
+    /// Bit offset of field `k` (sum of the preceding widths).
+    pub fn offset(&self, k: usize) -> u32 {
+        self.bit_widths[..k].iter().sum()
+    }
+
+    /// Bit width of field `k`.
+    pub fn width(&self, k: usize) -> u32 {
+        self.bit_widths[k]
+    }
+
+    /// Unmerge field `k` from a stored word: shift right past the lower fields,
+    /// then mask to the field's width (unsigned codebook index).
+    pub fn extract(&self, word: u64, k: usize) -> u64 {
+        let mask = (1u64 << self.width(k)) - 1;
+        (word >> self.offset(k)) & mask
+    }
+
+    /// The single width when all fields share it (e.g. `[3,3,3,3,3]` → 3).
+    pub fn uniform_width(&self) -> Option<u32> {
+        let first = *self.bit_widths.first()?;
+        self.bit_widths.iter().all(|&w| w == first).then_some(first)
+    }
+
+    /// The widest field — the intrinsic value range is `0..=2^max_width-1`.
+    pub fn max_width(&self) -> u32 {
+        self.bit_widths.iter().copied().max().unwrap_or(0)
+    }
+
+    /// Display label: `u3×5` when uniform, else the explicit width list.
+    pub fn label(&self) -> String {
+        match self.uniform_width() {
+            Some(w) => format!("u{w}×{}", self.len_p()),
+            None => format!(
+                "[{}]",
+                self.bit_widths
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        }
+    }
+
+    pub fn bit_widths(&self) -> &[u32] {
+        &self.bit_widths
+    }
+
+    pub fn quant_mode(&self) -> Option<&str> {
+        self.quant_mode.as_deref()
+    }
+}
 
 /// A user override for how a tensor's bytes are decoded, for visualization.
 ///
@@ -27,6 +119,11 @@ use crate::tree::{Layout, TensorInfo};
 ///   weights stored inside a wider container (e.g. gpt-oss MoE: 4-bit values in
 ///   a `bf16`/`f16` slot). They unpack every nibble densely (a 16-bit slot
 ///   yields four values, expanding the last dimension).
+/// * [`ViewDtype::Unpacked`] applies a fused-MoE codebook [`PackingSchema`] (read
+///   from metadata, stored per-tensor): each `U16` word is "unmerged" along the
+///   *first* (expert) dimension, expanding it by `lenP` so each logical expert is
+///   a correct 2D slice. Unlike `U4`, the widths can differ per field and the
+///   expansion is on dim 0, not the last.
 ///
 /// Overrides apply wherever we read the raw stored bytes — both safetensors and
 /// HDF5.
@@ -41,6 +138,9 @@ pub enum ViewDtype {
     U4,
     /// Signed 4-bit (two's complement): every nibble unpacked densely.
     I4,
+    /// Unmerge a fused codebook [`PackingSchema`] along the first dimension. The
+    /// per-tensor widths live outside the (Copy) enum and are passed alongside.
+    Unpacked,
 }
 
 impl ViewDtype {
@@ -51,6 +151,7 @@ impl ViewDtype {
             ViewDtype::As(dt) => Some(dt),
             ViewDtype::U4 => Some("u4"),
             ViewDtype::I4 => Some("i4"),
+            ViewDtype::Unpacked => Some("unpacked"),
         }
     }
 
@@ -63,6 +164,7 @@ impl ViewDtype {
             ViewDtype::As(dt) => dt.to_ascii_lowercase(),
             ViewDtype::U4 => "u4".to_string(),
             ViewDtype::I4 => "i4".to_string(),
+            ViewDtype::Unpacked => "unpacked".to_string(),
         })
     }
 
@@ -73,6 +175,7 @@ impl ViewDtype {
             ViewDtype::As(dt) => dt,
             ViewDtype::U4 => "u4",
             ViewDtype::I4 => "i4",
+            ViewDtype::Unpacked => "unpacked",
         }
     }
 
@@ -108,7 +211,11 @@ impl ViewDtype {
         match self {
             ViewDtype::Stored => item_size(stored).unwrap_or(4) as u32 * 8,
             ViewDtype::As(dt) => item_size(dt).unwrap_or(4) as u32 * 8,
-            _ => 4, // all 4-bit views
+            // The unmerged value is a sub-field of the U16 word; the exact field
+            // width is known only with the schema (see `raw_bits_field`), so this
+            // fallback is the container width.
+            ViewDtype::Unpacked => 16,
+            ViewDtype::U4 | ViewDtype::I4 => 4,
         }
     }
 
@@ -137,8 +244,9 @@ impl ViewDtype {
     /// produce, used to size cells before the exact value range is known.
     fn int_max_digits(self, stored: &str) -> usize {
         let dt = match self {
-            ViewDtype::U4 => return 2, // 0..=15
-            ViewDtype::I4 => return 2, // -8..=7
+            ViewDtype::U4 => return 2,       // 0..=15
+            ViewDtype::I4 => return 2,       // -8..=7
+            ViewDtype::Unpacked => return 5, // up to a 16-bit field (65535); range shrinks it
             ViewDtype::As(dt) => dt,
             ViewDtype::Stored => stored,
         };
@@ -172,6 +280,26 @@ impl ViewDtype {
             *last *= packing;
         }
         shape
+    }
+
+    /// Logical shape including the codebook unmerge: for [`ViewDtype::Unpacked`]
+    /// with a schema the *first* dimension grows by `lenP` (each stored expert
+    /// unpacks into `lenP` logical experts); otherwise defers to [`logical_shape`].
+    pub fn logical_shape_with(
+        self,
+        shape: &[usize],
+        stored_dtype: &str,
+        schema: Option<&PackingSchema>,
+    ) -> Vec<usize> {
+        if let (ViewDtype::Unpacked, Some(s)) = (self, schema) {
+            let mut shape = shape.to_vec();
+            match shape.first_mut() {
+                Some(first) => *first *= s.len_p(),
+                None => shape = vec![s.len_p()],
+            }
+            return shape;
+        }
+        self.logical_shape(shape, stored_dtype)
     }
 }
 
@@ -207,6 +335,16 @@ pub fn view_options(stored: &str) -> Vec<ViewDtype> {
     opts
 }
 
+/// [`view_options`] plus the codebook [`ViewDtype::Unpacked`] view, offered only
+/// when the tensor actually carries a packing schema.
+pub fn view_options_for(stored: &str, has_schema: bool) -> Vec<ViewDtype> {
+    let mut opts = view_options(stored);
+    if has_schema {
+        opts.push(ViewDtype::Unpacked);
+    }
+    opts
+}
+
 /// Parse a CLI dtype-override string (e.g. `u4`, `i4`, `f16`, `stored`) into a
 /// [`ViewDtype`]. Case-insensitive; `-` and `_` are interchangeable. Used by the
 /// `--dtype` flag.
@@ -216,6 +354,7 @@ pub fn parse_view_dtype(s: &str) -> Result<ViewDtype, String> {
         "stored" => ViewDtype::Stored,
         "u4" => ViewDtype::U4,
         "i4" => ViewDtype::I4,
+        "unpacked" => ViewDtype::Unpacked,
         "f16" => ViewDtype::As("F16"),
         "bf16" => ViewDtype::As("BF16"),
         "f32" => ViewDtype::As("F32"),
@@ -231,11 +370,102 @@ pub fn parse_view_dtype(s: &str) -> Result<ViewDtype, String> {
         "bool" => ViewDtype::As("BOOL"),
         _ => {
             return Err(format!(
-                "unknown dtype view '{s}'; expected one of: stored, u4, i4, f16, bf16, f32, f64, \
-                 i8, u8, i16, u16, i32, u32, i64, u64, bool"
+                "unknown dtype view '{s}'; expected one of: stored, u4, i4, unpacked, f16, bf16, \
+                 f32, f64, i8, u8, i16, u16, i32, u32, i64, u64, bool"
             ));
         }
     })
+}
+
+/// Pull a [`PackingSchema`] out of a metadata JSON value, unwrapping the known
+/// nestings: a torch `json_value` payload, or a per-tensor blob carrying a
+/// `quantization_schema`. The leaf must have a `bit_widths` array; `quant_mode`
+/// is optional. Returns `None` on anything that doesn't match or fails validation.
+fn parse_schema_json(v: &serde_json::Value) -> Option<PackingSchema> {
+    if let Some(inner) = v.get("json_value")
+        && let Some(s) = parse_schema_json(inner)
+    {
+        return Some(s);
+    }
+    if let Some(inner) = v.get("quantization_schema")
+        && let Some(s) = parse_schema_json(inner)
+    {
+        return Some(s);
+    }
+    let bit_widths: Vec<u32> = v
+        .get("bit_widths")?
+        .as_array()?
+        .iter()
+        .map(|x| x.as_u64().map(|n| n as u32))
+        .collect::<Option<Vec<_>>>()?;
+    let quant_mode = v
+        .get("quant_mode")
+        .and_then(|m| m.as_str())
+        .map(String::from);
+    PackingSchema::new(bit_widths, quant_mode).ok()
+}
+
+/// Match tensors to their fused-codebook [`PackingSchema`] from checkpoint
+/// metadata. Two storage shapes are supported, per-tensor preferred:
+/// 1. per-tensor `<tensor>.__metadata__` (or `.quantization_schema[.__metadata__]`)
+///    carrying a `quantization_schema` / `bit_widths`;
+/// 2. a top-level `codebook_packing_schema` keyed by projection segment
+///    (`down_proj` / `gate_up_proj`).
+///
+/// Only `U16` tensors (the fused-codebook storage) are matched.
+pub fn parse_packing_schemas(
+    tensors: &[TensorInfo],
+    metadata: &[MetadataInfo],
+) -> HashMap<String, PackingSchema> {
+    let mut out: HashMap<String, PackingSchema> = HashMap::new();
+    let is_u16: HashSet<&str> = tensors
+        .iter()
+        .filter(|t| t.dtype == "U16")
+        .map(|t| t.name.as_str())
+        .collect();
+
+    // (1) Per-tensor metadata (preferred).
+    for m in metadata {
+        let Some(stem) = m
+            .name
+            .strip_suffix(".quantization_schema.__metadata__")
+            .or_else(|| m.name.strip_suffix(".quantization_schema"))
+            .or_else(|| m.name.strip_suffix(".__metadata__"))
+        else {
+            continue;
+        };
+        if !is_u16.contains(stem) || out.contains_key(stem) {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&m.value)
+            && let Some(schema) = parse_schema_json(&v)
+        {
+            out.insert(stem.to_string(), schema);
+        }
+    }
+
+    // (2) Top-level `codebook_packing_schema`, keyed by projection; per-tensor wins.
+    if let Some(m) = metadata.iter().find(|m| {
+        m.name == "codebook_packing_schema" || m.name == "codebook_packing_schema.__metadata__"
+    }) && let Ok(v) = serde_json::from_str::<serde_json::Value>(&m.value)
+        && let Some(obj) = v.as_object()
+    {
+        for (proj, schema_json) in obj {
+            let Some(schema) = parse_schema_json(schema_json) else {
+                continue;
+            };
+            for t in tensors {
+                if t.dtype != "U16" || out.contains_key(&t.name) {
+                    continue;
+                }
+                // Match the projection as a path segment (`.`/`__`-separated).
+                if t.name.replace("__", ".").split('.').any(|seg| seg == proj) {
+                    out.insert(t.name.clone(), schema.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A downsampled grid of tensor values plus the original indices it came from.
@@ -280,6 +510,22 @@ pub struct Sample {
     /// overridden) shape with the dtype packing applied to its last dimension.
     /// The header shows it against the stored shape.
     pub display_shape: Vec<usize>,
+    /// For the codebook [`ViewDtype::Unpacked`] view: which expert field this
+    /// slice unmerges (`(stored_slice, field, len_p, field_bits)`), so the slice
+    /// header can spell out the mapping. `None` for every other view.
+    pub unpacked_field: Option<UnpackedField>,
+    /// The schema-derived dtype label (e.g. `u3×5`) for the unmerged view, so the
+    /// data-view header can show it without re-deriving from the schema.
+    pub schema_label: Option<String>,
+}
+
+/// Describes the field a single unpacked slice shows (see [`Sample::unpacked_field`]).
+#[derive(Clone, Copy, Debug)]
+pub struct UnpackedField {
+    pub stored_slice: usize,
+    pub field: usize,
+    pub len_p: usize,
+    pub field_bits: u32,
 }
 
 /// How [`sample_tensor`] chooses which rows/columns to show.
@@ -327,6 +573,7 @@ pub fn sample_tensor(
     slice: usize,
     view: ViewDtype,
     mode: SampleMode,
+    schema: Option<&PackingSchema>,
 ) -> Result<Sample, String> {
     let reader = open_reader(t)?;
     sample_tensor_with(
@@ -338,6 +585,7 @@ pub fn sample_tensor(
         slice,
         view,
         mode,
+        schema,
     )
 }
 
@@ -361,6 +609,7 @@ pub(crate) fn sample_tensor_with(
     slice: usize,
     view: ViewDtype,
     mode: SampleMode,
+    schema: Option<&PackingSchema>,
 ) -> Result<Sample, String> {
     let ext = std::path::Path::new(&t.source_path)
         .extension()
@@ -371,9 +620,13 @@ pub(crate) fn sample_tensor_with(
     // back to the stored dtype so the header never mislabels what's shown.
     let overridable = matches!(ext, "safetensors" | "h5" | "hdf5" | "npy" | "npz");
     let view = if overridable { view } else { ViewDtype::Stored };
+    // The codebook unmerge needs both the view and the per-tensor schema.
+    let unpack = (view == ViewDtype::Unpacked).then_some(schema).flatten();
 
     // A packed override unpacks several 4-bit values from each stored element,
-    // expanding the innermost (last) dimension by that factor.
+    // expanding the innermost (last) dimension by that factor. The codebook
+    // unmerge instead expands the *first* (expert) dimension, so it keeps
+    // `packing == 1` (one value per word) and grows the slice count below.
     let item = item_size(&t.dtype);
     let packing = item.map(|bytes| view.packing(bytes)).unwrap_or(1);
 
@@ -381,7 +634,7 @@ pub(crate) fn sample_tensor_with(
     // from the squeezed shape (region reads below still use the real shape — flat
     // indices are layout-invariant under squeezing, and under any reshape with a
     // matching element count).
-    let (total_rows, stored_cols, slices) = match squeezed_shape(shape).as_slice() {
+    let (total_rows, stored_cols, stored_slices) = match squeezed_shape(shape).as_slice() {
         [] => (1usize, 1usize, 1usize),
         [n] => (1usize, *n, 1usize),
         [r, c] => (*r, *c, 1usize),
@@ -394,12 +647,24 @@ pub(crate) fn sample_tensor_with(
         }
     };
     let total_cols = stored_cols * packing;
-    if total_rows == 0 || total_cols == 0 || slices == 0 {
+    if total_rows == 0 || total_cols == 0 || stored_slices == 0 {
         return Err("tensor has no elements".to_string());
     }
+
+    // For the unmerge, each stored expert unpacks into `lenP` logical experts
+    // (slices); the requested slice picks a stored expert and a field within it.
+    let len_p = unpack.map_or(1, PackingSchema::len_p);
+    let slices = stored_slices * len_p;
     let slice = slice.min(slices - 1);
-    // Logical elements to skip to reach the chosen slice (0 for 1D/2D).
-    let base = slice * total_rows * total_cols;
+    let (stored_slice, field) = (slice / len_p, slice % len_p);
+    let unpacked_field = unpack.map(|s| UnpackedField {
+        stored_slice,
+        field,
+        len_p,
+        field_bits: s.width(field),
+    });
+    // Logical elements to skip to reach the chosen stored slice (0 for 1D/2D).
+    let base = stored_slice * total_rows * total_cols;
 
     let (rows, cols) = match mode {
         SampleMode::Grid => (
@@ -416,7 +681,9 @@ pub(crate) fn sample_tensor_with(
         ),
     };
 
-    let (values, raw) = read_sampled(reader, t, total_cols, base, &rows, &cols, view)?;
+    let (values, raw) = read_sampled(
+        reader, t, total_cols, base, &rows, &cols, view, unpack, field,
+    )?;
 
     let (mut min, mut max) = (f64::INFINITY, f64::NEG_INFINITY);
     for row in &values {
@@ -446,7 +713,9 @@ pub(crate) fn sample_tensor_with(
         view,
         overridable,
         mode,
-        display_shape: view.logical_shape(shape, &t.dtype),
+        display_shape: view.logical_shape_with(shape, &t.dtype, unpack),
+        unpacked_field,
+        schema_label: unpack.map(PackingSchema::label),
     })
 }
 
@@ -628,6 +897,29 @@ fn raw_bits(view: ViewDtype, bytes: &[u8], sub: usize) -> RawBits {
     }
 }
 
+/// Little-endian integer value of a stored container (up to 8 bytes).
+#[inline]
+fn container_word(bytes: &[u8]) -> u64 {
+    let mut word: u64 = 0;
+    for (i, &b) in bytes.iter().take(8).enumerate() {
+        word |= (b as u64) << (8 * i);
+    }
+    word
+}
+
+/// Unmerge codebook field `k` from a stored word as an `f64` (unsigned index).
+fn decode_field(bytes: &[u8], schema: &PackingSchema, k: usize) -> f64 {
+    schema.extract(container_word(bytes), k) as f64
+}
+
+/// The raw stored bits of codebook field `k` (zero-padded to the field width).
+fn raw_bits_field(bytes: &[u8], schema: &PackingSchema, k: usize) -> RawBits {
+    RawBits {
+        bits: schema.extract(container_word(bytes), k),
+        width: schema.width(k) as u8,
+    }
+}
+
 /// Exact whole-tensor statistics (under a given [`ViewDtype`]), computed by
 /// scanning every element once.
 #[derive(Clone, Copy, Debug)]
@@ -795,7 +1087,33 @@ fn view_decoder(view: ViewDtype, dtype: &str) -> impl Fn(&[u8], usize) -> f64 {
 /// [`Acc`] under `view`, decoding every logical value (a packed view yields
 /// several per container). Parallel over chunks; shared by the safetensors and
 /// HDF5 scanners so a dtype reinterpretation means the same thing in both.
-fn reduce_view_bytes(bytes: &[u8], item: usize, view: ViewDtype, dtype: &str) -> Acc {
+fn reduce_view_bytes(
+    bytes: &[u8],
+    item: usize,
+    view: ViewDtype,
+    dtype: &str,
+    schema: Option<&PackingSchema>,
+) -> Acc {
+    // Codebook unmerge: each word yields `lenP` field values (their multiset is
+    // exactly the u4-equivalent distribution — order is irrelevant for stats).
+    if view == ViewDtype::Unpacked
+        && let Some(s) = schema
+    {
+        let lenp = s.len_p();
+        return bytes
+            .par_chunks(item * STATS_CHUNK)
+            .map(|chunk| {
+                let mut a = Acc::ID;
+                for container in chunk.chunks_exact(item) {
+                    let word = container_word(container);
+                    for k in 0..lenp {
+                        a.push(s.extract(word, k) as f64);
+                    }
+                }
+                a
+            })
+            .reduce(|| Acc::ID, Acc::merge);
+    }
     let packing = view.packing(item);
     let decode = view_decoder(view, dtype);
     bytes
@@ -1011,9 +1329,11 @@ fn gather_region(
 /// Compute exact statistics over the whole tensor under `view`, scanning every
 /// element once and decoding in parallel. Works the same for any backing format
 /// via [`TensorReader`]; a non-`Stored` view reinterprets the raw stored bytes.
+#[allow(clippy::too_many_arguments)] // distinct scan parameters
 pub fn tensor_stats(
     t: &TensorInfo,
     view: ViewDtype,
+    schema: Option<&PackingSchema>,
     cancel: &AtomicBool,
     pause: &AtomicBool,
     progress: Option<&AtomicUsize>,
@@ -1023,7 +1343,7 @@ pub fn tensor_stats(
     let reader = open_reader(t)?;
     let mut acc = Acc::ID;
     reader.fold_blocks(&mut |bytes| {
-        acc = Acc::merge(acc, reduce_view_bytes(bytes, item, view, &t.dtype));
+        acc = Acc::merge(acc, reduce_view_bytes(bytes, item, view, &t.dtype, schema));
         // Report bytes scanned so the caller can show a progress bar. Summed over
         // every block this equals the tensor's stored byte size (`size_bytes`).
         if let Some(p) = progress {
@@ -1195,15 +1515,20 @@ fn bin_index(bins: HistBins, n: usize, v: f64) -> usize {
 /// Reduce a flat byte buffer into per-bin counts (plus finite/non-finite totals)
 /// under `view`, in parallel. Mirrors [`reduce_view_bytes`] but bins instead of
 /// folding moments.
+#[allow(clippy::too_many_arguments)] // distinct scan parameters
 fn reduce_view_hist(
     bytes: &[u8],
     item: usize,
     view: ViewDtype,
     dtype: &str,
+    schema: Option<&PackingSchema>,
     bins: HistBins,
     n: usize,
 ) -> (Vec<u64>, u64, u64) {
-    let packing = view.packing(item);
+    // Codebook unmerge: bin every field of every word (the u4-equivalent value
+    // multiset). A closure resolves the decode once so the hot loop stays tight.
+    let unpack = (view == ViewDtype::Unpacked).then_some(schema).flatten();
+    let packing = unpack.map_or_else(|| view.packing(item), PackingSchema::len_p);
     let decode = view_decoder(view, dtype);
     bytes
         .par_chunks(item * STATS_CHUNK)
@@ -1212,7 +1537,10 @@ fn reduce_view_hist(
             let (mut total, mut nonfinite) = (0u64, 0u64);
             for container in chunk.chunks_exact(item) {
                 for sub in 0..packing {
-                    let v = decode(container, sub);
+                    let v = match unpack {
+                        Some(s) => s.extract(container_word(container), sub) as f64,
+                        None => decode(container, sub),
+                    };
                     if v.is_finite() {
                         counts[bin_index(bins, n, v)] += 1;
                         total += 1;
@@ -1241,6 +1569,7 @@ fn reduce_view_hist(
 pub fn tensor_histogram_into(
     t: &TensorInfo,
     view: ViewDtype,
+    schema: Option<&PackingSchema>,
     bins: HistBins,
     n: usize,
     shared: &HistShared,
@@ -1251,7 +1580,8 @@ pub fn tensor_histogram_into(
     let item = item_size(&t.dtype).ok_or_else(|| format!("unsupported dtype: {}", t.dtype))?;
     let reader = open_reader(t)?;
     reader.fold_blocks(&mut |bytes| {
-        let (counts, total, nonfinite) = reduce_view_hist(bytes, item, view, &t.dtype, bins, n);
+        let (counts, total, nonfinite) =
+            reduce_view_hist(bytes, item, view, &t.dtype, schema, bins, n);
         for (slot, c) in shared.counts.iter().zip(&counts) {
             slot.fetch_add(*c, Ordering::Relaxed);
         }
@@ -1284,6 +1614,7 @@ type SampledGrid = (Vec<Vec<f64>>, Vec<Vec<RawBits>>);
 /// lives in container `flat / packing` at nibble `flat % packing`. Reads only
 /// each sampled row's column span (never the whole tensor), so it scales to any
 /// size and any format.
+#[allow(clippy::too_many_arguments)] // distinct read parameters
 fn read_sampled(
     reader: &dyn TensorReader,
     t: &TensorInfo,
@@ -1292,6 +1623,8 @@ fn read_sampled(
     rows: &[usize],
     cols: &[usize],
     view: ViewDtype,
+    unpack: Option<&PackingSchema>,
+    field: usize,
 ) -> Result<SampledGrid, String> {
     let dtype = t.dtype.as_str();
     let item = item_size(dtype).ok_or_else(|| format!("unsupported dtype: {dtype}"))?;
@@ -1334,7 +1667,12 @@ fn read_sampled(
     }
     let bufs = reader.read_regions(&regions)?;
 
-    let width = view.bit_width(dtype) as u8;
+    // The unmerge decodes a single fixed field per container; its width sizes the
+    // raw-bit fallback. Otherwise the view's own element width applies.
+    let width = match unpack {
+        Some(s) => s.width(field) as u8,
+        None => view.bit_width(dtype) as u8,
+    };
     let mut values = Vec::with_capacity(rows.len());
     let mut raws = Vec::with_capacity(rows.len());
     for ((&r, &start), buf) in rows.iter().zip(&starts).zip(bufs) {
@@ -1345,10 +1683,16 @@ fn read_sampled(
             let flat = row_base + c;
             let off = (flat / packing - start) * item;
             match buf.get(off..off + item) {
-                Some(cont) => {
-                    vrow.push(decode_view(view, dtype, cont, flat % packing));
-                    rrow.push(raw_bits(view, cont, flat % packing));
-                }
+                Some(cont) => match unpack {
+                    Some(s) => {
+                        vrow.push(decode_field(cont, s, field));
+                        rrow.push(raw_bits_field(cont, s, field));
+                    }
+                    None => {
+                        vrow.push(decode_view(view, dtype, cont, flat % packing));
+                        rrow.push(raw_bits(view, cont, flat % packing));
+                    }
+                },
                 None => {
                     vrow.push(f64::NAN);
                     rrow.push(RawBits { bits: 0, width });
@@ -1838,6 +2182,7 @@ mod tests {
                     row_off: i,
                     col_off: 0,
                 },
+                None,
             )
             .unwrap();
         }
@@ -1958,7 +2303,7 @@ mod tests {
             row_off: 2,
             col_off: 1,
         };
-        let s = sample_tensor(&t, 3, 3, 0, ViewDtype::Stored, mode).unwrap();
+        let s = sample_tensor(&t, 3, 3, 0, ViewDtype::Stored, mode, None).unwrap();
         assert_eq!(s.rows, vec![2, 3, 4]);
         assert_eq!(s.cols, vec![1, 2, 3]);
         for (i, &r) in s.rows.iter().enumerate() {
@@ -1978,6 +2323,7 @@ mod tests {
                 row_off: 99,
                 col_off: 99,
             },
+            None,
         )
         .unwrap();
         assert_eq!(clamped.rows, vec![3, 4, 5]);
@@ -2043,7 +2389,7 @@ mod tests {
         drop(f);
 
         let t = fixture(&path, "w", &[4, 5], (0, 80));
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
         assert_eq!((s.total_rows, s.total_cols), (4, 5));
         assert_eq!((s.slices, s.slice), (1, 0));
         assert!(s.overridable && s.view == ViewDtype::Stored);
@@ -2099,7 +2445,7 @@ mod tests {
                 end: bytes.len() as u64,
             },
         };
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
         assert_eq!((s.total_rows, s.total_cols), (3, 4));
         for (i, &r) in s.rows.iter().enumerate() {
             for (j, &c) in s.cols.iter().enumerate() {
@@ -2110,6 +2456,7 @@ mod tests {
         let st = tensor_stats(
             &t,
             ViewDtype::Stored,
+            None,
             &AtomicBool::new(false),
             &AtomicBool::new(false),
             None,
@@ -2147,7 +2494,7 @@ mod tests {
             source_path: path.to_string_lossy().into_owned(),
             layout: Layout::None,
         };
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
         assert_eq!((s.total_rows, s.total_cols), (2, 3));
         for (i, &r) in s.rows.iter().enumerate() {
             for (j, &c) in s.cols.iter().enumerate() {
@@ -2185,6 +2532,7 @@ mod tests {
             0,
             ViewDtype::Stored,
             SampleMode::Grid,
+            None,
         )
         .unwrap();
         assert_eq!((s.total_rows, s.total_cols), (5, 4));
@@ -2281,6 +2629,7 @@ mod tests {
         let s = tensor_stats(
             &t,
             ViewDtype::Stored,
+            None,
             &AtomicBool::new(false),
             &AtomicBool::new(false),
             None,
@@ -2314,7 +2663,7 @@ mod tests {
 
         let t = fixture(&path, "w", &[2, 3, 4], (0, 96));
         // Slice 1 is the matrix [[12..16],[16..20],[20..24]].
-        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
         assert_eq!((s.total_rows, s.total_cols), (3, 4));
         assert_eq!((s.slices, s.slice), (2, 1));
         for (i, &r) in s.rows.iter().enumerate() {
@@ -2324,7 +2673,7 @@ mod tests {
         }
         // An out-of-range slice clamps to the last one.
         assert_eq!(
-            sample_tensor(&t, 10, 10, 99, ViewDtype::Stored, SampleMode::Grid)
+            sample_tensor(&t, 10, 10, 99, ViewDtype::Stored, SampleMode::Grid, None)
                 .unwrap()
                 .slice,
             1
@@ -2363,7 +2712,7 @@ mod tests {
         // [[12..16],[16..20],[20..24]] — identical to the plain 3D case, proving
         // the reads are layout-correct (not just the row/col/slice counts).
         let t = fixture(&path, "w", &[2, 1, 3, 4], (0, 96));
-        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
         assert_eq!((s.total_rows, s.total_cols), (3, 4));
         assert_eq!((s.slices, s.slice), (2, 1));
         for (i, &r) in s.rows.iter().enumerate() {
@@ -2391,7 +2740,7 @@ mod tests {
         drop(f);
 
         let t = fixture(&path, "w", &[1, 5], (0, 20));
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
         assert_eq!((s.total_rows, s.total_cols, s.slices), (1, 5, 1));
         assert_eq!(s.values[0], vec![0.0, 1.0, 2.0, 3.0, 4.0]);
         let _ = std::fs::remove_file(&path);
@@ -2416,16 +2765,16 @@ mod tests {
 
         // u4: four nibbles per 16-bit container, last dim ×4 -> 8 values.
         // 0x1234 -> [4,3,2,1]; 0x00AB -> [11,10,0,0].
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4, SampleMode::Grid).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4, SampleMode::Grid, None).unwrap();
         assert_eq!(s.total_cols, 8);
         assert_eq!(s.values[0], vec![4.0, 3.0, 2.0, 1.0, 11.0, 10.0, 0.0, 0.0]);
 
         // Signed: nibbles >= 8 are negative (0xB->-5, 0xA->-6).
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::I4, SampleMode::Grid).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::I4, SampleMode::Grid, None).unwrap();
         assert_eq!(s.values[0], vec![4.0, 3.0, 2.0, 1.0, -5.0, -6.0, 0.0, 0.0]);
 
         // Raw bits are the individual nibbles, 4 bits wide.
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4, SampleMode::Grid).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::U4, SampleMode::Grid, None).unwrap();
         let bits: Vec<u64> = s.raw[0].iter().map(|r| r.bits).collect();
         assert_eq!(bits, vec![0x4, 0x3, 0x2, 0x1, 0xB, 0xA, 0x0, 0x0]);
         assert!(s.raw[0].iter().all(|r| r.width == 4));
@@ -2451,7 +2800,7 @@ mod tests {
         }
         drop(f);
         let t = fixture(&path, "w", &[1, 3], (0, 12));
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
         let bits: Vec<u64> = s.raw[0].iter().map(|r| r.bits).collect();
         assert_eq!(bits, vec![0x3f80_0000, 0x4000_0000, 0xbf80_0000]);
         assert!(s.raw[0].iter().all(|r| r.width == 32));
@@ -2467,11 +2816,202 @@ mod tests {
         f.write_all(&[0x01, 0xFF, 0x80]).unwrap();
         drop(f);
         let t = fixture_dtype(&path, "w", "I8", &[1, 3], (0, 3));
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
         let bits: Vec<u64> = s.raw[0].iter().map(|r| r.bits).collect();
         assert_eq!(bits, vec![0x01, 0xFF, 0x80]);
         assert!(s.raw[0].iter().all(|r| r.width == 8));
         assert_eq!(s.values[0], vec![1.0, -1.0, -128.0]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn packing_schema_bit_math_and_validation() {
+        let u = PackingSchema::new(vec![4, 4, 4, 4], None).unwrap();
+        assert_eq!(u.len_p(), 4);
+        assert_eq!(
+            (u.offset(0), u.offset(1), u.offset(2), u.offset(3)),
+            (0, 4, 8, 12)
+        );
+        // 0xDCBA → fields A, B, C, D (least-significant first).
+        let w = 0xDCBA;
+        assert_eq!(
+            [
+                u.extract(w, 0),
+                u.extract(w, 1),
+                u.extract(w, 2),
+                u.extract(w, 3)
+            ],
+            [0xA, 0xB, 0xC, 0xD]
+        );
+
+        // Non-uniform [4,3,3,6]: offsets 0,4,7,10; fields 10, 5, 3, 42.
+        let nu = PackingSchema::new(vec![4, 3, 3, 6], None).unwrap();
+        assert_eq!(
+            (nu.offset(0), nu.offset(1), nu.offset(2), nu.offset(3)),
+            (0, 4, 7, 10)
+        );
+        let word = 0xA | (5 << 4) | (3 << 7) | (42 << 10);
+        assert_eq!(
+            [
+                nu.extract(word, 0),
+                nu.extract(word, 1),
+                nu.extract(word, 2),
+                nu.extract(word, 3)
+            ],
+            [10, 5, 3, 42]
+        );
+
+        // Validation: non-empty, every width > 0, sum ≤ 16.
+        assert!(PackingSchema::new(vec![], None).is_err());
+        assert!(PackingSchema::new(vec![4, 0, 4], None).is_err());
+        assert!(PackingSchema::new(vec![8, 9], None).is_err()); // sum 17
+        assert!(PackingSchema::new(vec![8, 8], None).is_ok()); // sum 16
+        assert!(PackingSchema::new(vec![3, 3, 3, 3, 3], None).is_ok()); // sum 15
+    }
+
+    #[test]
+    fn packing_schema_uniform_and_label() {
+        let uni = PackingSchema::new(vec![3, 3, 3, 3, 3], None).unwrap();
+        assert_eq!(uni.uniform_width(), Some(3));
+        assert_eq!(uni.max_width(), 3);
+        assert_eq!(uni.label(), "u3×5");
+        let nu = PackingSchema::new(vec![4, 3, 3, 6], None).unwrap();
+        assert_eq!(nu.uniform_width(), None);
+        assert_eq!(nu.max_width(), 6);
+        assert_eq!(nu.label(), "[4,3,3,6]");
+    }
+
+    #[test]
+    fn parse_packing_schemas_per_tensor_and_top_level() {
+        let p = std::path::Path::new("/x");
+        let tensors = vec![
+            fixture_dtype(p, "m.experts.down_proj.weight", "U16", &[4, 4, 4], (0, 0)),
+            fixture_dtype(
+                p,
+                "m.experts.gate_up_proj.weight",
+                "U16",
+                &[4, 4, 4],
+                (0, 0),
+            ),
+            // A matching name but non-U16 dtype must be skipped.
+            fixture_dtype(p, "m.experts.down_proj.qscale", "F16", &[4, 4], (0, 0)),
+        ];
+        let meta = vec![
+            // Per-tensor (preferred), nested `json_value` wrapper.
+            MetadataInfo {
+                name: "m.experts.down_proj.weight.quantization_schema.__metadata__".to_string(),
+                value: r#"{"json_value":{"bit_widths":[4,4,4,4],"quant_mode":"4bit"}}"#.to_string(),
+                value_type: "json".to_string(),
+            },
+            // Top-level, projection-keyed.
+            MetadataInfo {
+                name: "codebook_packing_schema.__metadata__".to_string(),
+                value: r#"{"gate_up_proj":{"bit_widths":[3,3,3,3,3],"quant_mode":"3bit"},
+                          "down_proj":{"bit_widths":[9,9,9],"quant_mode":"x"}}"#
+                    .to_string(),
+                value_type: "string".to_string(),
+            },
+        ];
+        let map = parse_packing_schemas(&tensors, &meta);
+        // Per-tensor wins for down_proj (4-bit, not the bogus top-level 9-bit).
+        assert_eq!(
+            map["m.experts.down_proj.weight"].bit_widths(),
+            &[4, 4, 4, 4]
+        );
+        // gate_up_proj matched by the top-level projection key.
+        assert_eq!(
+            map["m.experts.gate_up_proj.weight"].bit_widths(),
+            &[3, 3, 3, 3, 3]
+        );
+        // The non-U16 qscale is never attached.
+        assert!(!map.contains_key("m.experts.down_proj.qscale"));
+    }
+
+    #[test]
+    fn logical_shape_unmerges_first_dim() {
+        let s = PackingSchema::new(vec![3, 3, 3, 3, 3], None).unwrap();
+        let v = ViewDtype::Unpacked;
+        assert_eq!(
+            v.logical_shape_with(&[26, 2057, 770], "U16", Some(&s)),
+            vec![130, 2057, 770]
+        );
+        assert_eq!(
+            v.logical_shape_with(&[64, 2880], "U16", Some(&s)),
+            vec![320, 2880]
+        );
+        assert_eq!(v.logical_shape_with(&[100], "U16", Some(&s)), vec![500]);
+        // Without a schema it is unchanged.
+        assert_eq!(
+            ViewDtype::Stored.logical_shape_with(&[26, 2057, 770], "U16", None),
+            vec![26, 2057, 770]
+        );
+    }
+
+    #[test]
+    fn parse_view_dtype_round_trips_unpacked() {
+        assert_eq!(parse_view_dtype("unpacked").unwrap(), ViewDtype::Unpacked);
+        assert_eq!(
+            ViewDtype::Unpacked.cli_value(),
+            Some("unpacked".to_string())
+        );
+        assert_eq!(ViewDtype::Unpacked.label(), Some("unpacked"));
+    }
+
+    #[test]
+    fn unpacked_unmerges_fields_along_first_dim() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("checkpoint_explorer_unpacked");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("w.safetensors");
+        // U16 [2,2,2]: word at flat index f packs field0=f (low nibble) and
+        // field1=f+8 (high nibble), so all 16 codebook values 0..15 appear once.
+        let header = br#"{"w":{"dtype":"U16","shape":[2,2,2],"data_offsets":[0,16]}}"#;
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(header).unwrap();
+        for flat in 0u16..8 {
+            let word = flat | ((flat + 8) << 4);
+            f.write_all(&word.to_le_bytes()).unwrap();
+        }
+        drop(f);
+        let t = fixture_dtype(&path, "w", "U16", &[2, 2, 2], (0, 16));
+        let schema = PackingSchema::new(vec![4, 4], None).unwrap();
+        let get = |slice| {
+            sample_tensor(
+                &t,
+                10,
+                10,
+                slice,
+                ViewDtype::Unpacked,
+                SampleMode::Grid,
+                Some(&schema),
+            )
+            .unwrap()
+        };
+
+        let s0 = get(0);
+        assert_eq!(s0.slices, 4); // 2 stored experts × lenP 2
+        assert_eq!(s0.total_cols, 2); // columns are NOT expanded
+        assert_eq!(s0.display_shape, vec![4, 2, 2]); // first dim × lenP
+        assert!(s0.raw[0].iter().all(|r| r.width == 4)); // field-width raw bits
+        // slice s → (stored s/lenP, field s%lenP).
+        assert_eq!(get(0).values, vec![vec![0.0, 1.0], vec![2.0, 3.0]]); // expert0 field0
+        assert_eq!(get(1).values, vec![vec![8.0, 9.0], vec![10.0, 11.0]]); // expert0 field1
+        assert_eq!(get(2).values, vec![vec![4.0, 5.0], vec![6.0, 7.0]]); // expert1 field0
+        assert_eq!(get(3).values, vec![vec![12.0, 13.0], vec![14.0, 15.0]]); // expert1 field1
+
+        // Whole-tensor stats see every field (the u4-equivalent value multiset).
+        let st = tensor_stats(
+            &t,
+            ViewDtype::Unpacked,
+            Some(&schema),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        assert_eq!(st.count, 16); // 8 words × lenP 2
+        assert_eq!((st.min, st.max), (0.0, 15.0));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2588,6 +3128,7 @@ mod hdf5_tests {
         match tensor_stats(
             &t,
             ViewDtype::Stored,
+            None,
             &AtomicBool::new(false),
             &AtomicBool::new(false),
             None,
@@ -2621,7 +3162,7 @@ mod hdf5_tests {
             layout: Layout::None,
         };
         // Read the stored f32 bytes back, decoding under the stored view.
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
         assert_eq!((s.total_rows, s.total_cols), (4, 5));
         // HDF5 reads raw stored bytes now, so dtype overrides are available.
         assert!(s.overridable);
@@ -2636,6 +3177,7 @@ mod hdf5_tests {
         let st = tensor_stats(
             &t,
             ViewDtype::Stored,
+            None,
             &AtomicBool::new(false),
             &AtomicBool::new(false),
             None,
@@ -2678,11 +3220,11 @@ mod hdf5_tests {
         };
 
         // Stored view: the raw signed 16-bit values.
-        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        let s = sample_tensor(&t, 10, 10, 0, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
         assert_eq!(s.values[0], vec![0x21 as f64, 0x43 as f64]);
 
         // Packed u4: each 16-bit slot yields four nibbles, last dim ×4.
-        let p = sample_tensor(&t, 10, 10, 0, ViewDtype::U4, SampleMode::Grid).unwrap();
+        let p = sample_tensor(&t, 10, 10, 0, ViewDtype::U4, SampleMode::Grid, None).unwrap();
         assert_eq!(p.total_cols, 8);
         assert_eq!(p.values[0], vec![1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0]);
 
@@ -2690,6 +3232,7 @@ mod hdf5_tests {
         let st = tensor_stats(
             &t,
             ViewDtype::U4,
+            None,
             &AtomicBool::new(false),
             &AtomicBool::new(false),
             None,
@@ -2736,7 +3279,7 @@ mod hdf5_tests {
         };
 
         // Slice 1: every value should read as 100 + row*10 + col.
-        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored, SampleMode::Grid).unwrap();
+        let s = sample_tensor(&t, 10, 10, 1, ViewDtype::Stored, SampleMode::Grid, None).unwrap();
         assert_eq!((s.total_rows, s.total_cols, s.slices), (3, 4, 2));
         for (i, &r) in s.rows.iter().enumerate() {
             for (j, &c) in s.cols.iter().enumerate() {
