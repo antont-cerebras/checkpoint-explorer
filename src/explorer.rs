@@ -1185,9 +1185,18 @@ impl Explorer {
 
         self.load_quiet()?;
 
-        // Resolve the requested screen and apply its dtype/shape/slice overrides.
-        // Histogram is dropped here: its scan is interactive (it reads key events),
-        // which has no place in a headless render — `--plain` histograms come later.
+        // `--histogram`/`--bins` and `--compute-stats` are scanned synchronously
+        // below: their interactive scans read key events, which a headless render
+        // can't. Capture the intent and the bin count, then strip the histogram
+        // from the request so `open_requested` only applies the dtype/shape/slice
+        // overrides (and doesn't kick off the interactive scan).
+        let (want_hist, want_stats, bins) = match &self.open {
+            Some(r) => (r.histogram || r.bins.is_some(), r.compute_stats, r.bins),
+            None => (false, false, None),
+        };
+        if let Some(n) = bins {
+            self.histogram_bins.set(Some(n));
+        }
         let screen = match self.open.take() {
             Some(mut req) => {
                 req.histogram = false;
@@ -1203,10 +1212,15 @@ impl Explorer {
             Screen::Tree => {
                 self.draw_tree(&mut buf)?;
             }
-            // The data views still need a `--plain` path; for now show the tensor's
-            // detail so the command still produces something useful.
-            Screen::Detail { tensor, .. } | Screen::Data { tensor, .. } => {
-                self.draw_detail_plain(&mut buf, tensor)?;
+            Screen::Detail { tensor, .. } => {
+                self.draw_detail_plain(&mut buf, tensor, want_stats, want_hist)?;
+            }
+            Screen::Data {
+                tensor,
+                repr,
+                slice,
+            } => {
+                self.draw_data_plain(&mut buf, tensor, *repr, *slice)?;
             }
         }
 
@@ -1215,9 +1229,15 @@ impl Explorer {
     }
 
     /// Render a tensor's detail screen into `out` (raw ANSI) for [`Self::render_plain`].
-    /// Mirrors the live detail draw, but with no background scan: statistics show
-    /// their pending hint and the histogram only appears if already cached.
-    fn draw_detail_plain(&self, out: &mut impl Write, tensor_name: &str) -> Result<()> {
+    /// Mirrors the live detail draw; statistics and the histogram, when requested,
+    /// are scanned synchronously here rather than animated on a worker thread.
+    fn draw_detail_plain(
+        &self,
+        out: &mut impl Write,
+        tensor_name: &str,
+        want_stats: bool,
+        want_hist: bool,
+    ) -> Result<()> {
         let Some(tensor) = self.tensors.iter().find(|t| t.name == tensor_name).cloned() else {
             return Ok(());
         };
@@ -1228,16 +1248,23 @@ impl Explorer {
             .get(&tensor.name)
             .cloned()
             .unwrap_or_else(|| tensor.shape.clone());
-        let stats = self.cached_stats(&tensor, view);
+        // The histogram is computed first because (for floats / wide ints) it
+        // computes and caches the stats it needs for its range — which then
+        // surface on the statistics line, matching the interactive screen.
+        let hist = if want_hist {
+            self.compute_histogram_sync(&tensor, view)
+        } else {
+            None
+        };
+        let stats = if want_stats {
+            self.compute_stats_sync(&tensor, view)
+        } else {
+            self.cached_stats(&tensor, view)
+        };
         let stats_view = match &stats {
             Some(s) => StatsView::Ready(s),
             None => StatsView::Pending,
         };
-        let hist = self
-            .histogram_cache
-            .borrow()
-            .get(&(tensor.name.clone(), view, self.histogram_bins.get()))
-            .cloned();
         UI::draw_tensor_detail(
             out,
             &tensor,
@@ -1252,6 +1279,97 @@ impl Explorer {
             None,
         )?;
         Ok(())
+    }
+
+    /// Render a tensor's numeric / heatmap data view into `out` for
+    /// [`Self::render_plain`]. The layout (overview / edges / window) and position
+    /// come from the request's flags (applied by `open_requested`); statistics —
+    /// which set the value range and heatmap scale — are scanned synchronously.
+    fn draw_data_plain(
+        &self,
+        out: &mut impl Write,
+        tensor_name: &str,
+        repr: Representation,
+        slice: usize,
+    ) -> Result<()> {
+        let Some(tensor) = self.tensors.iter().find(|t| t.name == tensor_name).cloned() else {
+            return Ok(());
+        };
+        let view = self.active_view(&tensor.name);
+        let mode = match self.data_view_layout.get() {
+            DataLayout::Edges => SampleMode::Edges {
+                row_tail: self.data_view_row_tail.get(),
+                col_tail: self.data_view_col_tail.get(),
+            },
+            DataLayout::Overview => SampleMode::Grid,
+            DataLayout::Window => SampleMode::Window {
+                row_off: self.data_view_win_row.get(),
+                col_off: self.data_view_win_col.get(),
+            },
+        };
+        let stats = self.compute_stats_sync(&tensor, view);
+        let stats_view = match &stats {
+            Some(s) => StatsView::Ready(s),
+            None => StatsView::Pending,
+        };
+        if let Err(msg) = self.draw_data_view(out, &tensor, repr, slice, view, mode, stats_view) {
+            write!(out, "Data preview unavailable: {msg}")?;
+        }
+        Ok(())
+    }
+
+    /// Compute (and cache) exact statistics for `(tensor, view)` synchronously,
+    /// for the headless `--plain` render. `None` if the format can't be byte-read.
+    fn compute_stats_sync(&self, tensor: &TensorInfo, view: ViewDtype) -> Option<Stats> {
+        if let Some(s) = self.cached_stats(tensor, view) {
+            return Some(s);
+        }
+        let schema = self.schema_for(&tensor.name).cloned();
+        let (cancel, pause) = (AtomicBool::new(false), AtomicBool::new(false));
+        let s = crate::sample::tensor_stats(tensor, view, schema.as_ref(), &cancel, &pause, None)
+            .ok()?;
+        self.stats_cache
+            .borrow_mut()
+            .insert((tensor.name.clone(), view), s);
+        Some(s)
+    }
+
+    /// Compute (and cache) the value histogram for `(tensor, view)` synchronously,
+    /// for `--plain`. Mirrors [`Self::scan_histogram`] without the animation /
+    /// cancellation: floats and wide integers need stats for their bin range, so
+    /// those are computed first only when required.
+    fn compute_histogram_sync(&self, tensor: &TensorInfo, view: ViewDtype) -> Option<Histogram> {
+        let count = self.histogram_bins.get();
+        let key = (tensor.name.clone(), view, count);
+        if let Some(h) = self.histogram_cache.borrow().get(&key) {
+            return Some(h.clone());
+        }
+        let range = self.histogram_range(tensor, view);
+        if crate::sample::histogram_bins(view, &tensor.dtype, range, count).is_none() {
+            self.compute_stats_sync(tensor, view); // populate the range, then retry
+        }
+        let range = self.histogram_range(tensor, view);
+        let (bins, n) = crate::sample::histogram_bins(view, &tensor.dtype, range, count)?;
+        let shared = HistShared::new(n);
+        let (cancel, pause) = (AtomicBool::new(false), AtomicBool::new(false));
+        let schema = self.schema_for(&tensor.name).cloned();
+        let started = std::time::Instant::now();
+        crate::sample::tensor_histogram_into(
+            tensor,
+            view,
+            schema.as_ref(),
+            bins,
+            n,
+            &shared,
+            &cancel,
+            &pause,
+            None,
+        )
+        .ok()?;
+        let mut hist = shared.snapshot(bins);
+        hist.elapsed = started.elapsed();
+        self.histogram_cache.borrow_mut().insert(key, hist.clone());
+        Some(hist)
     }
 
     pub fn run(&mut self) -> Result<()> {
@@ -3169,7 +3287,7 @@ impl Explorer {
         mode: SampleMode,
         stats: StatsView,
     ) -> Result<(usize, bool, usize), String> {
-        let (cols, rows) = terminal::size().unwrap_or((100, 40));
+        let (cols, rows) = crate::plain::term_size();
         let width = cols as usize;
         let heatmap = matches!(repr, Representation::Heatmap);
         // Leading-index count of the (possibly reshaped) tensor — drives whether

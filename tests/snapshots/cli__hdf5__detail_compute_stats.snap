@@ -1,0 +1,19 @@
+---
+source: tests/cli.rs
+expression: "plain(&[\"--tensor\", &t, \"--compute-stats\"])"
+---
+Tensor Details
+──────────────
+Name: model.layers.0.block_sparse_moe.experts.down_proj.weight
+Data Type: U16 as u3×5 (unpacked)
+Shape: (6, 3, 4) as (30, 3, 4)
+Parameters: 360 (360)
+Packing: u3×5 (bit widths [3, 3, 3, 3, 3] · 5 experts/word · uniform)
+Size: 144 B · on disk: 134 B (⇩ gzip, 1.1×)
+Chunks: (2, 3, 4) × 3
+File: [FIXTURE]
+
+Statistics: min 0 · max 7 · mean 0.9667 · std 1.7854 · zeros 69.2%  (<time>)
+
+Press m for a heatmap, v for numeric values, h for a histogram, b to set its bin count, d to reinterpret the dtype, r to
+ reshape, c to copy, y to copy the command, l for the legend, ⌫ / \ to step back / forward, any other key to return...

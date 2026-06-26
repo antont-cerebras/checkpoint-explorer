@@ -1,0 +1,17 @@
+---
+source: tests/cli.rs
+expression: "plain(&[\"--tensor\", &t, \"--heatmap\"])"
+---
+Heatmap: model.layers.0.block_sparse_moe.experts.down_proj.weight
+File: [FIXTURE]
+U16 as u3×5 (unpacked) (6, 3, 4) as (30, 3, 4) → edges 3×4, value range [0, 7]
+mean 0.9667 · std 1.7854 · zeros 69.2%  (<time>)
+expert 0 of 30 — stored word 0, field 0/5 (3-bit) — [ ] step · / index or %
+
+▀▀▀▀
+▀▀▀▀
+
+0 low ████████████████████████ high 7
+
+v numeric values · ← → first/last cols · ↑ ↓ first/last rows · +Shift one end · [ ] slice · / index or % · d dtype · r r
+eshape · e window · c copy · y copy cmd · l legend · ⌫ back · \ fwd · any other key to return...

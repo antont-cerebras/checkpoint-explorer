@@ -122,6 +122,8 @@ fn plain(extra_args: &[&str]) -> String {
 fn settings() -> insta::Settings {
     let mut s = insta::Settings::clone_current();
     s.add_filter(r"\S*tiny\.(?:safetensors|hdf5)", "[FIXTURE]");
+    // The statistics / histogram scan duration (e.g. `(2ms)`, `(1.0s)`) is timing.
+    s.add_filter(r"\(\d+(?:\.\d+)?m?s\)", "(<time>)");
     s
 }
 
@@ -140,6 +142,28 @@ fn plain_detail_u16() {
 #[test]
 fn plain_detail_f16() {
     settings().bind(|| insta::assert_snapshot!(plain(&["--tensor", "model.embed_tokens.weight"])));
+}
+
+#[test]
+fn plain_values_u16() {
+    settings().bind(|| {
+        insta::assert_snapshot!(plain(&[
+            "--tensor",
+            "model.layers.0.mlp.down_proj.weight",
+            "--values"
+        ]))
+    });
+}
+
+#[test]
+fn plain_histogram_u16() {
+    settings().bind(|| {
+        insta::assert_snapshot!(plain(&[
+            "--tensor",
+            "model.layers.0.mlp.down_proj.weight",
+            "--histogram"
+        ]))
+    });
 }
 
 /// HDF5 fixture (`tests/fixtures/tiny.hdf5`, committed; regenerate with
@@ -185,5 +209,40 @@ mod hdf5 {
     #[test]
     fn detail_compressed_f16() {
         settings().bind(|| insta::assert_snapshot!(plain(&["--tensor", "lm_head.weight"])));
+    }
+
+    // Synchronously-scanned screens: the histogram (intrinsic 0..7 span for the
+    // unpacked codebook view), statistics, and the numeric / heatmap data views
+    // in each layout. The scan time is filtered out by `settings`.
+
+    #[test]
+    fn detail_histogram() {
+        let t = format!("{MOE}.down_proj.weight");
+        settings().bind(|| insta::assert_snapshot!(plain(&["--tensor", &t, "--histogram"])));
+    }
+
+    #[test]
+    fn detail_compute_stats() {
+        let t = format!("{MOE}.down_proj.weight");
+        settings().bind(|| insta::assert_snapshot!(plain(&["--tensor", &t, "--compute-stats"])));
+    }
+
+    #[test]
+    fn values_edges() {
+        let t = format!("{MOE}.down_proj.weight");
+        settings().bind(|| insta::assert_snapshot!(plain(&["--tensor", &t, "--values"])));
+    }
+
+    #[test]
+    fn values_overview() {
+        let t = format!("{MOE}.down_proj.weight");
+        settings()
+            .bind(|| insta::assert_snapshot!(plain(&["--tensor", &t, "--values", "--overview"])));
+    }
+
+    #[test]
+    fn heatmap() {
+        let t = format!("{MOE}.down_proj.weight");
+        settings().bind(|| insta::assert_snapshot!(plain(&["--tensor", &t, "--heatmap"])));
     }
 }
