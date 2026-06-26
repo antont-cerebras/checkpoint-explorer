@@ -1,0 +1,44 @@
+---
+source: tests/cli.rs
+expression: "plain(&[\"--search\", \"down_proj\"])"
+---
+Checkpoint Explorer - [FIXTURE] (1/1)
+Search  down_proj█          9 matches  Enter view · Tab in tree · Esc exit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+· model.layers.0.block_sparse_moe.experts.down_proj.weight [U16 as u3×5, (6, 3, 4) as (30, 3, 4), 144 B → 134 B (⇩ gzip)
+]
+· model.layers.0.block_sparse_moe.experts.down_proj.weight.codebook [F16, (4, 4, 2), 64 B → 27 B (⇩ gzip)]
+· model.layers.0.block_sparse_moe.experts.down_proj.weight.qscale [F16, (6, 4, 4), 192 B → 27 B (⇩ gzip)]
+· model.layers.1.block_sparse_moe.experts.down_proj.weight [U16 as u3×5, (6, 3, 4) as (30, 3, 4), 144 B → 134 B (⇩ gzip)
+]
+· model.layers.1.block_sparse_moe.experts.down_proj.weight.codebook [F16, (4, 4, 2), 64 B → 27 B (⇩ gzip)]
+· model.layers.1.block_sparse_moe.experts.down_proj.weight.qscale [F16, (6, 4, 4), 192 B → 27 B (⇩ gzip)]
+· model.layers.2.block_sparse_moe.experts.down_proj.weight [U16 as u3×5, (6, 3, 4) as (30, 3, 4), 144 B → 134 B (⇩ gzip)
+]
+· model.layers.2.block_sparse_moe.experts.down_proj.weight.codebook [F16, (4, 4, 2), 64 B → 27 B (⇩ gzip)]
+· model.layers.2.block_sparse_moe.experts.down_proj.weight.qscale [F16, (6, 4, 4), 192 B → 27 B (⇩ gzip)]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ ▪ model.layers.0.block_sparse_moe.experts.down_proj.weight
+   [FIXTURE]

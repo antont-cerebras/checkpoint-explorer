@@ -64,6 +64,35 @@ pub enum OpenView {
     Tree,
 }
 
+/// A bulk expansion state for the tree browser (`--tree-state`, the `E` / `C`
+/// keys). Absent leaves the natural default (root expanded, layers collapsed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeState {
+    Expanded,
+    Collapsed,
+}
+
+impl TreeState {
+    /// The `--tree-state` value that names this state.
+    pub fn label(self) -> &'static str {
+        match self {
+            TreeState::Expanded => "expanded",
+            TreeState::Collapsed => "collapsed",
+        }
+    }
+}
+
+/// Parse a `--tree-state` value.
+pub fn parse_tree_state(s: &str) -> Result<TreeState, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "expanded" => Ok(TreeState::Expanded),
+        "collapsed" => Ok(TreeState::Collapsed),
+        other => Err(format!(
+            "invalid tree state '{other}' (expected: expanded, collapsed)"
+        )),
+    }
+}
+
 /// A tensor + view to open on startup, from the CLI flags.
 pub struct OpenRequest {
     /// Exact tensor name to open. `None` targets the sole tensor when the
@@ -103,6 +132,15 @@ pub struct OpenRequest {
     pub shape: Option<String>,
     /// Start the statistics scan immediately on the detail view.
     pub compute_stats: bool,
+    /// Bulk tree expansion (`--tree-state`, the `E` / `C` keys); `None` keeps the
+    /// natural default.
+    pub tree_state: Option<TreeState>,
+    /// Open the tree in search mode with this query (`--search`, the `/` key).
+    pub search: Option<String>,
+    /// Overlay the requested screen's legend (`--legend`, the `l` key). A
+    /// render-time aid (for `--plain` / inspection); not part of `y`'s round-trip
+    /// since the legend is a transient overlay you dismiss.
+    pub legend: bool,
     /// Render the view once and exit without interactive navigation.
     pub exit_after: bool,
 }
@@ -1194,6 +1232,7 @@ impl Explorer {
             Some(r) => (r.histogram || r.bins.is_some(), r.compute_stats, r.bins),
             None => (false, false, None),
         };
+        let want_legend = self.open.as_ref().is_some_and(|r| r.legend);
         if let Some(n) = bins {
             self.histogram_bins.set(Some(n));
         }
@@ -1230,6 +1269,21 @@ impl Explorer {
             } => {
                 self.draw_data_plain(&mut buf, tensor, *repr, *slice)?;
             }
+        }
+
+        // `--legend`: composite the screen's context-sensitive legend on top (the
+        // band is absolute-positioned, so appending it overlays it on replay).
+        if want_legend {
+            let legend = match &screen {
+                Screen::Tree => Legend::Tree,
+                Screen::Detail { .. } => Legend::Detail,
+                Screen::Data {
+                    repr: Representation::Heatmap,
+                    ..
+                } => Legend::Heatmap,
+                Screen::Data { .. } => Legend::Values,
+            };
+            UI::write_legend_band(&mut buf, legend)?;
         }
 
         println!("{}", crate::plain::render(&buf, COLS, ROWS));
@@ -2017,6 +2071,17 @@ impl Explorer {
         self.scroll_offset = 0;
     }
 
+    /// Open the tree in search mode with a preset query (`--search`), cursor at
+    /// the end — as if the query had just been typed into the search bar.
+    fn open_search(&mut self, query: &str) {
+        self.search_mode = true;
+        self.search_query = query.to_string();
+        self.search_cursor = self.search_query.chars().count();
+        self.update_filtered_tree();
+        self.selected_idx = 0;
+        self.scroll_offset = 0;
+    }
+
     fn exit_search_mode(&mut self) {
         self.search_mode = false;
         self.search_query.clear();
@@ -2114,6 +2179,17 @@ impl Explorer {
     /// or return the [`Screen`] to seed the navigator with. Returns `None` when
     /// the tensor isn't found, the slice is invalid, or it was a one-shot render.
     fn open_requested(&mut self, req: OpenRequest) -> Option<Screen> {
+        // Tree-browser state applies whichever screen opens (and is what makes
+        // these reachable headlessly): bulk expansion, then a search filter.
+        match req.tree_state {
+            Some(TreeState::Expanded) => self.set_all_expanded(true),
+            Some(TreeState::Collapsed) => self.set_all_expanded(false),
+            None => {}
+        }
+        if let Some(query) = &req.search {
+            self.open_search(query);
+        }
+
         // `--metadata`: metadata lives only in the tree, so reveal that entry and
         // stay on the tree (this is what `y` on a metadata row reproduces).
         if let Some(name) = &req.metadata {
@@ -2130,6 +2206,12 @@ impl Explorer {
                     let _ = event::read();
                 }
             }
+            return None;
+        }
+        // A tree screen with no specific tensor (`--tree-state` / `--search` /
+        // `--legend` alone, or a bare launch routed to the tree): just show the
+        // browser in whatever state the flags above set — don't demand a tensor.
+        if req.view == OpenView::Tree && req.tensor.is_none() {
             return None;
         }
         // Resolve the target tensor: the named one, or — when `--tensor` is
@@ -3983,7 +4065,25 @@ impl Explorer {
     fn command_for_tree(&self) -> String {
         let mut parts = vec![PROGRAM.to_string()];
         parts.extend(self.checkpoint_path_parts());
+        parts.extend(self.tree_state_args());
         parts.join(" ")
+    }
+
+    /// `--tree-state` args reproducing the current bulk expansion (`expanded` /
+    /// `collapsed`), or nothing for the default / a mixed (per-group) state. The
+    /// shared tail for the tree's reopen commands so `E` / `C` round-trip.
+    fn tree_state_args(&self) -> Vec<String> {
+        let state = if TreeBuilder::all_groups(&self.tree, true) {
+            Some(TreeState::Expanded)
+        } else if TreeBuilder::all_groups(&self.tree, false) {
+            Some(TreeState::Collapsed)
+        } else {
+            None
+        };
+        match state {
+            Some(s) => vec!["--tree-state".to_string(), s.label().to_string()],
+            None => Vec::new(),
+        }
     }
 
     /// The command `y` copies from the tree: when a tensor row is highlighted
@@ -3996,6 +4096,7 @@ impl Explorer {
             Some((TreeNode::Tensor { info, .. }, _)) => {
                 let mut parts = self.command_base(info);
                 parts.push("--tree".to_string());
+                parts.extend(self.tree_state_args());
                 parts.join(" ")
             }
             // A metadata row reopens the tree with that entry revealed.
@@ -4005,6 +4106,7 @@ impl Explorer {
                 parts.push("--metadata".to_string());
                 parts.push(shell_quote(&info.name));
                 parts.push("--tree".to_string());
+                parts.extend(self.tree_state_args());
                 parts.join(" ")
             }
             _ => self.command_for_tree(),

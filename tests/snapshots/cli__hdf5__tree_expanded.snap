@@ -1,0 +1,43 @@
+---
+source: tests/cli.rs
+expression: "plain(&[\"--tree-state\", \"expanded\"])"
+---
+Checkpoint Explorer - [FIXTURE] (1/1)
+↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · Enter/Space expand · E/C all · / search · l legend · c copy screen
+ · f copy file · n copy name · y copy command · ⌫/\ back/fwd · R repack · q quit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+▾ [FIXTURE] (▦ 23, 988 params, 2.0 KiB → 1.2 KiB)
+  ▾ 🔧 Metadata (▦ 0, 0 B)
+    † __SUCCESS__ [bool]: true
+    † __version__ [float]: 0.5
+    † codebook_packing_schema [string]: {"down_proj":{"bit_widths":[3,3,3,3,3]},"gate_u...
+    † inference_version.__metadata__ [string]: 1.5
+  · lm_head.weight [F16, (10, 4), 80 B → 27 B (⇩ gzip)]
+  ▾ model (▦ 22, 2.0 KiB → 1.2 KiB)
+    · embed_tokens.weight [F16, (10, 4), 80 B → 27 B (⇩ gzip)]
+    ▾ layers (☰ 3, ▦ 19, 1.9 KiB → 1.2 KiB)
+      ▾ 0 (▦ 7, 664 B → 421 B)
+        ▾ block_sparse_moe.experts (▦ 4, 544 B → 322 B)
+          ▾ down_proj (▦ 3, 400 B → 188 B)
+            · weight [U16 as u3×5, (6, 3, 4) as (30, 3, 4), 144 B → 134 B (⇩ gzip)]
+            ▾ weight (▦ 2, 256 B → 54 B)
+              · codebook [F16, (4, 4, 2), 64 B → 27 B (⇩ gzip)]
+              · qscale [F16, (6, 4, 4), 192 B → 27 B (⇩ gzip)]
+          · gate_up_proj.weight [U16 as [4,3,3,6], (6, 3, 4) as (24, 3, 4), 144 B → 134 B (⇩ gzip)]
+        ▾ custom_proj (▦ 1, 40 B → 39 B)
+          · weight [U16 as u4×4, (4, 5) as (16, 5), 40 B → 39 B (⇩ gzip)]
+          † weight.__metadata__ [json]: { "quantization_schema": { "bit_widths": [ 4, 4...
+        · input_layernorm.weight [F32, (4), 16 B → 19 B (⇩ gzip)]
+        · self_attn.q_proj.weight [I32, (4, 4), 64 B → 41 B (⇩ gzip)]
+      ▾ 1 (▦ 6, 624 B → 382 B)
+        ▾ block_sparse_moe.experts (▦ 4, 544 B → 322 B)
+          ▾ down_proj (▦ 3, 400 B → 188 B)
+            · weight [U16 as u3×5, (6, 3, 4) as (30, 3, 4), 144 B → 134 B (⇩ gzip)]
+            ▾ weight (▦ 2, 256 B → 54 B)
+              · codebook [F16, (4, 4, 2), 64 B → 27 B (⇩ gzip)]
+              · qscale [F16, (6, 4, 4), 192 B → 27 B (⇩ gzip)]
+          · gate_up_proj.weight [U16 as [4,3,3,6], (6, 3, 4) as (24, 3, 4), 144 B → 134 B (⇩ gzip)]
+        · input_layernorm.weight [F32, (4), 16 B → 19 B (⇩ gzip)]
+        · self_attn.q_proj.weight [I32, (4, 4), 64 B → 41 B (⇩ gzip)]
+      ▾ 2 (▦ 6, 624 B → 382 B)
+ ▪ [FIXTURE]

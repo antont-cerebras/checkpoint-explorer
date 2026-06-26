@@ -211,11 +211,18 @@ fn plain_histogram_u16() {
 }
 
 #[test]
+fn plain_tree_expanded() {
+    settings().bind(|| insta::assert_snapshot!(plain(&["--tree-state", "expanded"])));
+}
+
+#[test]
 fn y_roundtrips() {
     ensure_fixture();
     let t = "model.layers.0.mlp.down_proj.weight";
     for extra in [
-        vec![],                             // tree
+        vec![],                             // tree (default expansion)
+        vec!["--tree-state", "expanded"],   // E
+        vec!["--tree-state", "collapsed"],  // C
         vec!["--tensor", t],                // detail
         vec!["--tensor", t, "--histogram"], // detail + histogram
         vec!["--tensor", t, "--values", "--slice", "1"],
@@ -306,14 +313,56 @@ mod hdf5 {
         settings().bind(|| insta::assert_snapshot!(plain(&["--tensor", &t, "--heatmap"])));
     }
 
+    // Main-screen keyboard shortcuts, reached via their flags: bulk expand /
+    // collapse (E / C), search (/), and the context-sensitive legend (l) over
+    // the tree, a detail, and a data view.
+
+    #[test]
+    fn tree_expanded() {
+        settings().bind(|| insta::assert_snapshot!(plain(&["--tree-state", "expanded"])));
+    }
+
+    #[test]
+    fn tree_collapsed() {
+        settings().bind(|| insta::assert_snapshot!(plain(&["--tree-state", "collapsed"])));
+    }
+
+    #[test]
+    fn tree_search() {
+        settings().bind(|| insta::assert_snapshot!(plain(&["--search", "down_proj"])));
+    }
+
+    #[test]
+    fn legend_tree() {
+        settings().bind(|| insta::assert_snapshot!(plain(&["--legend"])));
+    }
+
+    #[test]
+    fn legend_detail() {
+        let t = format!("{MOE}.down_proj.weight");
+        settings().bind(|| insta::assert_snapshot!(plain(&["--tensor", &t, "--legend"])));
+    }
+
+    #[test]
+    fn legend_values() {
+        let t = format!("{MOE}.down_proj.weight");
+        settings()
+            .bind(|| insta::assert_snapshot!(plain(&["--tensor", &t, "--values", "--legend"])));
+    }
+
     // The `y` round-trip meta-test: every state-bearing screen must reopen to
-    // itself from the command `y` copies. Covers the schema views and the full
-    // matrix of data-view state (layout + position, slice, zebra, base).
+    // itself from the command `y` copies. Covers the bulk tree expansion, the
+    // schema views, and the full matrix of data-view state (layout + position,
+    // slice, zebra, base). (Search / legend are transient overlays you can't `y`
+    // from, so they're cram-only above.)
     #[test]
     fn y_roundtrips() {
         let dp = format!("{MOE}.down_proj.weight");
         let cases: &[Vec<&str>] = &[
-            vec![],                                     // tree
+            vec![],                                     // tree (default expansion)
+            vec!["--tree-state", "expanded"],           // E
+            vec!["--tree-state", "collapsed"],          // C
+            vec!["--tensor", &dp, "--tree"],            // tree with a tensor revealed
             vec!["--tensor", &dp],                      // unpacked detail
             vec!["--tensor", &dp, "--dtype", "stored"], // raw U16 over a schema
             vec!["--tensor", &dp, "--histogram"],

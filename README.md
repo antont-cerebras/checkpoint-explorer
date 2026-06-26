@@ -147,6 +147,9 @@ without `--tensor` is reported as ambiguous.
 | `--histogram` | Show the value histogram on the detail screen |
 | `--bins <N>` | Histogram bucket count (1–512); implies `--histogram` |
 | `--tree` | Reveal the tensor highlighted in the tree browser, without opening a view |
+| `--tree-state <expanded\|collapsed>` | Open the tree fully expanded / collapsed (the `E` / `C` keys) |
+| `--search <QUERY>` | Open the tree in search mode filtered to QUERY (the `/` key) |
+| `--legend` | Overlay the opened screen's legend (the `l` key); most useful with `--plain` |
 | `--dtype <DTYPE>` | Reinterpret the dtype: `u4`, `i4`, `unpacked` (fused-codebook unmerge; needs a packing schema), or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
 | `--shape <DIMS>` | Reinterpret the shape (same element count): `10,100` / `10x100`; one dim may be `-1`/`*`/`_` to infer |
 | `--edge[=RFRAC,CFRAC]` (alias `--edges`) / `--overview` / `--window[=ROW,COL]` | Force the edges submode (optional head/tail split fractions `0..1`) / the overview / the contiguous window (optional top-left `ROW,COL`) |
