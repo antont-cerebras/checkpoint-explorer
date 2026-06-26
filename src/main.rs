@@ -11,6 +11,7 @@ mod hdf5_lz4;
 mod hdf5_zstd;
 mod health;
 mod npy;
+mod plain;
 mod sample;
 mod tree;
 mod ui;
@@ -188,6 +189,12 @@ struct ExploreArgs {
         help = "Render the requested view once and exit, without entering interactive navigation"
     )]
     exit: bool,
+
+    #[arg(
+        long,
+        help = "Render the requested view once as plain text (no colour, no cursor control) and exit — for piping, grep, and end-to-end tests"
+    )]
+    plain: bool,
 }
 
 #[derive(Subcommand)]
@@ -355,7 +362,11 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
     });
 
     let mut explorer = Explorer::new(files, health_reports, open, !args.no_preload);
-    explorer.run()
+    if args.plain {
+        explorer.render_plain()
+    } else {
+        explorer.run()
+    }
 }
 
 #[cfg(feature = "hdf5")]

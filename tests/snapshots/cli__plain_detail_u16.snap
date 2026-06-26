@@ -1,0 +1,18 @@
+---
+source: tests/cli.rs
+expression: "plain(&[\"--tensor\", \"model.layers.0.mlp.down_proj.weight\"])"
+---
+Tensor Details
+──────────────
+Name: model.layers.0.mlp.down_proj.weight
+Data Type: U16
+Shape: (3, 4, 5)
+Parameters: 60 (60)
+Size: 120 B
+Data offsets: 144 – 264  (within file data)
+File: [FIXTURE]
+
+Statistics: press s to scan the full tensor
+
+Press m for a heatmap, v for numeric values, h for a histogram, b to set its bin count, d to reinterpret the dtype, r to
+ reshape, c to copy, y to copy the command, l for the legend, ⌫ / \ to step back / forward, any other key to return...

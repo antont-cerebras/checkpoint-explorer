@@ -297,7 +297,7 @@ impl UI {
     /// overwriting in place (clearing each line rather than the whole screen up
     /// front) — removes the flicker a per-frame `Clear(All)` produced.
     pub fn draw_screen(out: &mut impl Write, config: &DrawConfig) -> Result<usize> {
-        let (terminal_width, terminal_height) = terminal::size()?;
+        let (terminal_width, terminal_height) = crate::plain::term_size();
         let header_height = TREE_HEADER_HEIGHT;
         // Two bottom lines for the status bar: the selected tensor's full name on
         // the first, its source file on the second (the per-checkpoint totals now
