@@ -1822,17 +1822,16 @@ impl UI {
     }
 
     /// Draw a context-sensitive legend explaining the glyphs (and a few colour
-    /// cues) on whichever screen the user opened it from (`l`). Full-screen and
-    /// flicker-free, like the detail view; the caller waits for a key, then
-    /// redraws its own screen over it.
+    /// cues) on whichever screen the user opened it from (`l`). A flicker-free
+    /// floating band centred over the current screen — not a full-screen
+    /// takeover — so the surrounding view stays visible; the caller waits for a
+    /// key, then redraws its own screen over it.
     pub fn draw_legend(legend: Legend) -> Result<()> {
-        let stdout = io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
-        queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
-        // Panel background for the whole screen: every `line_end` / `Clear` below
-        // (down to the closing `FromCursorDown`) erases to this surface, so the
-        // legend reads as a pop-up over the view it was opened from.
-        begin_panel(&mut out)?;
+        // Render the legend body into a buffer first so it can be centred as a
+        // floating band on replay. The body writes plain content — each line
+        // ending in a newline — while the panel background and positioning are
+        // applied to the real screen below.
+        let mut out: Vec<u8> = Vec::new();
 
         let title = match legend {
             Legend::Tree => "Legend — checkpoint tree",
@@ -2048,13 +2047,35 @@ impl UI {
         queue!(out, SetForegroundColor(palette::DIM))?;
         write!(out, "Press any key to close.")?;
         reset_fg(&mut out)?;
+        line_end(&mut out)?;
 
-        // Fill the rest of the screen with the panel surface (bg still set), then
-        // drop the colours so the panel doesn't bleed past the dismissed pop-up.
-        queue!(out, terminal::Clear(ClearType::FromCursorDown))?;
-        end_panel(&mut out)?;
-        queue!(out, EndSynchronizedUpdate)?;
-        out.flush()?;
+        // Replay the buffered legend as a floating band centred over the current
+        // screen: a panel-filled row per content line, framed by a blank margin
+        // row above and below, with the surrounding view left untouched. Every
+        // line ends in a newline, so the newline count is the content height.
+        let lines = out.iter().filter(|&&b| b == b'\n').count();
+        let (_w, h) = terminal::size()?;
+        let band_h = lines + 2;
+        let start = ((h as usize).saturating_sub(band_h) / 2) as u16;
+
+        let stdout = io::stdout();
+        let mut sink = BufWriter::new(stdout.lock());
+        queue!(sink, BeginSynchronizedUpdate)?;
+        begin_panel(&mut sink)?;
+        // Blank margin row above the content (cleared to the panel surface).
+        queue!(
+            sink,
+            cursor::MoveTo(0, start),
+            terminal::Clear(ClearType::CurrentLine)
+        )?;
+        // The content, then a blank margin row below it — the cursor lands there
+        // after the footer's trailing newline.
+        queue!(sink, cursor::MoveTo(0, start + 1))?;
+        sink.write_all(&out)?;
+        queue!(sink, terminal::Clear(ClearType::CurrentLine))?;
+        end_panel(&mut sink)?;
+        queue!(sink, EndSynchronizedUpdate)?;
+        sink.flush()?;
         Ok(())
     }
 }
