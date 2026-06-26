@@ -1,0 +1,30 @@
+---
+source: tests/cli.rs
+expression: "plain(&[\"--tensor\", &t, \"--legend\"])"
+---
+Tensor Details
+──────────────
+Name: model.layers.0.block_sparse_moe.experts.down_proj.weight
+Data Type: U16 as u3×5 (unpacked)
+Shape: (6, 3, 4) as (30, 3, 4)
+Parameters: 360 (360)
+Packing: u3×5 (bit widths [3, 3, 3, 3, 3] · 5 experts/word · uniform)
+Size: 144 B · on disk: 134 B (⇩ gzip, 1.1×)
+Chunks: (2, 3, 4) × 3
+File: [FIXTURE]
+
+Statistics: press s to scan the full tensor
+
+Legend — tensor details
+───────────────────────
+
+  ⇩ lz4   on-disk compression codec; the N× beside it is the ratio (logical ÷ stored)
+  as      the active dtype reinterpretation (press d), e.g. 'BF16 as u4'
+  A – B   a byte range within the file (the tensor's data offsets)
+  ·       separates fields on a line
+  ✚       this tensor is an extra: on disk but not listed in the index (model.safetensors.index.json)
+  ⠋       a statistics scan is running (press s to start; any key cancels)
+
+  Statistics:  zeros = fraction of exactly-zero values · non-finite = count of NaN/∞
+
+Press any key to close.

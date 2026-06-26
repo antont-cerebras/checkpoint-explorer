@@ -1865,8 +1865,9 @@ impl UI {
     /// synchronized update), centred vertically as a floating pop-up. Used both
     /// standalone (by [`Self::draw_legend`]) and as the overlay layer of
     /// [`Self::draw_tensor_detail`], drawn last over the live detail frame so the
-    /// screen behind keeps animating.
-    fn write_legend_band(dst: &mut impl Write, legend: Legend) -> Result<()> {
+    /// screen behind keeps animating; also appended after a `--plain` screen to
+    /// render `--legend`.
+    pub fn write_legend_band(dst: &mut impl Write, legend: Legend) -> Result<()> {
         // Render the legend body into a buffer first so it can be centred as a
         // floating band on replay. The body writes plain content — each line
         // ending in a newline — while the panel background and positioning are
@@ -2094,7 +2095,7 @@ impl UI {
         // row above and below, with the surrounding view left untouched. Every
         // line ends in a newline, so the newline count is the content height.
         let lines = out.iter().filter(|&&b| b == b'\n').count();
-        let (_w, h) = terminal::size()?;
+        let (_w, h) = crate::plain::term_size();
         let band_h = lines + 2;
         let start = ((h as usize).saturating_sub(band_h) / 2) as u16;
 

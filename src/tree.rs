@@ -403,6 +403,19 @@ impl TreeBuilder {
         }
     }
 
+    /// Whether every group in the tree is expanded (`true`) / collapsed (`false`)
+    /// — i.e. matches a `set_all_expanded(want)`. Lets the reopen command detect
+    /// the `--expand-all` / `--collapse-all` bulk states so `y` round-trips them.
+    /// A tree with no groups vacuously matches either.
+    pub fn all_groups(nodes: &[TreeNode], want: bool) -> bool {
+        nodes.iter().all(|node| match node {
+            TreeNode::Group {
+                expanded, children, ..
+            } => *expanded == want && Self::all_groups(children, want),
+            _ => true,
+        })
+    }
+
     pub fn flatten_tree(tree: &[TreeNode]) -> Vec<(TreeNode, usize)> {
         let mut flattened = Vec::new();
         for node in tree {

@@ -186,6 +186,27 @@ struct ExploreArgs {
 
     #[arg(
         long,
+        value_name = "STATE",
+        value_parser = explorer::parse_tree_state,
+        help = "Open the tree fully expanded or collapsed (the `E` / `C` keys): expanded or collapsed"
+    )]
+    tree_state: Option<explorer::TreeState>,
+
+    #[arg(
+        long,
+        value_name = "QUERY",
+        help = "Open the tree in search mode filtered to QUERY (the `/` key)"
+    )]
+    search: Option<String>,
+
+    #[arg(
+        long,
+        help = "Overlay the requested screen's legend (the `l` key) — useful with --plain"
+    )]
+    legend: bool,
+
+    #[arg(
+        long,
         help = "Render the requested view once and exit, without entering interactive navigation"
     )]
     exit: bool,
@@ -308,11 +329,16 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         std::process::exit(1);
     }
 
+    // Flags that target the tree browser rather than a tensor view: with no
+    // `--tensor` (and no data view), they make the tree the opened screen, so
+    // e.g. `--expand-all` or `--legend` alone don't demand a tensor.
+    let tree_oriented =
+        args.tree || args.tree_state.is_some() || args.search.is_some() || args.legend;
     let view = if args.values {
         OpenView::Values
     } else if args.heatmap {
         OpenView::Heatmap
-    } else if args.tree {
+    } else if args.tree || (tree_oriented && args.tensor.is_none()) {
         OpenView::Tree
     } else {
         OpenView::Detail
@@ -348,6 +374,9 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         || args.compute_stats
         || args.histogram
         || args.bins.is_some()
+        || args.tree_state.is_some()
+        || args.search.is_some()
+        || args.legend
         || args.exit;
     let open = wants_open.then_some(OpenRequest {
         tensor: args.tensor,
@@ -364,6 +393,9 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         slice: args.slice,
         shape: args.shape,
         compute_stats: args.compute_stats,
+        tree_state: args.tree_state,
+        search: args.search,
+        legend: args.legend,
         exit_after: args.exit,
     });
 
