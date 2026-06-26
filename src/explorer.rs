@@ -341,9 +341,11 @@ pub struct Explorer {
     search_cursor: usize,
     search_mode: bool,
     filtered_tree: Vec<(TreeNode, usize)>,
-    /// Transient "✓ Copied …" message shown after pressing `c`; cleared on the
-    /// next key press.
-    copied_flash: Option<String>,
+    /// Transient "✓ Copied …" confirmation shown after a copy shortcut
+    /// (`c`/`f`/`n`) as a bottom-line overlay — leaving the path/name in the
+    /// status bar intact — paired with the time it was set so it clears on its
+    /// own after `COPY_FLASH` (and on the next key press), like the data views.
+    copied_flash: Option<(String, std::time::Instant)>,
     /// Index/file mismatches detected at startup, shown as a warning panel.
     health_reports: Vec<crate::health::HealthReport>,
     /// Per-tensor dtype reinterpretation chosen in the data views, keyed by
@@ -1607,7 +1609,7 @@ impl Explorer {
         } else {
             &self.flattened_tree
         };
-        let (status_icon, status_ok, status_bar, status_secondary) = self.status_bar();
+        let (status_icon, status_bar, status_secondary) = self.status_bar();
         let config = DrawConfig {
             tree: tree_to_display,
             current_file: &title,
@@ -1619,7 +1621,6 @@ impl Explorer {
             search_query: &self.search_query,
             search_cursor: self.search_cursor,
             status_icon,
-            status_ok,
             status_bar: &status_bar,
             status_secondary: &status_secondary,
             health_warning: !self.health_reports.is_empty(),
@@ -1636,7 +1637,12 @@ impl Explorer {
             let _ = self.draw_tree(buf);
         });
         copy_to_clipboard(&text);
-        self.copied_flash = Some("screen contents".to_string());
+        self.flash_copied("screen contents");
+    }
+
+    /// Note a copy confirmation to flash on the bottom line for `COPY_FLASH`.
+    fn flash_copied(&mut self, what: &str) {
+        self.copied_flash = Some((what.to_string(), std::time::Instant::now()));
     }
 
     /// The tree browser. Handles in-place keys (navigation, search, expand) and
@@ -1648,9 +1654,27 @@ impl Explorer {
         self.ensure_full_load()?;
         loop {
             self.scroll_offset = self.draw_tree(&mut live_out())?;
+            // Overlay any copy confirmation on the bottom line, leaving the
+            // status bar's path/name visible above it.
+            if let Some((what, _)) = &self.copied_flash {
+                let _ = UI::draw_copied_flash(what);
+            }
 
-            if let Event::Key(key_event) = event::read()? {
-                // The copy confirmation only lasts until the next key press.
+            // While a copy confirmation is up, wake when it expires so it clears
+            // on its own after `COPY_FLASH` — not only on the next key press.
+            let ev = if let Some((_, at)) = &self.copied_flash {
+                let remaining = COPY_FLASH.saturating_sub(at.elapsed());
+                if remaining.is_zero() || !event::poll(remaining).unwrap_or(false) {
+                    self.copied_flash = None;
+                    continue; // expired — redraw without the confirmation
+                }
+                event::read()?
+            } else {
+                event::read()?
+            };
+
+            if let Event::Key(key_event) = ev {
+                // Any key also dismisses the copy confirmation.
                 self.copied_flash = None;
                 match key_event {
                     // `q` quits only outside search; while searching it is a
@@ -1858,38 +1882,32 @@ impl Explorer {
         }
     }
 
-    /// Two-line status bar for the row under the cursor: a leading glyph, an
-    /// "is this a success message" flag (the copy confirmation), a primary line
-    /// and a secondary line. For a tensor the primary is its full name (which the
-    /// tree row may abbreviate) and the secondary is its source file; for a group
-    /// the primary is its source file(s)/directory and the secondary is blank;
-    /// the copy confirmation occupies the primary line alone.
-    fn status_bar(&self) -> (&'static str, bool, String, String) {
-        if let Some(flash) = &self.copied_flash {
-            return ("✓", true, format!("Copied: {flash}"), String::new());
-        }
-
+    /// Two-line status bar for the row under the cursor: a leading glyph, a
+    /// primary line and a secondary line. For a tensor the primary is its full
+    /// name (which the tree row may abbreviate) and the secondary is its source
+    /// file; for a group the primary is its source file(s)/directory and the
+    /// secondary is blank. (A copy confirmation flashes as a separate bottom-line
+    /// overlay — see `copied_flash` — so it never hides this path/name.)
+    fn status_bar(&self) -> (&'static str, String, String) {
         let tree = if self.search_mode {
             &self.filtered_tree
         } else {
             &self.flattened_tree
         };
         let Some((node, _)) = tree.get(self.selected_idx) else {
-            return ("", false, String::new(), String::new());
+            return ("", String::new(), String::new());
         };
 
         match node {
             // The full name on the first line (the tree row often abbreviates it —
             // last segment or a compacted path), the source file on the second.
             // `n` copies the name, `f` the file.
-            TreeNode::Tensor { info, .. } => {
-                ("▪", false, info.name.clone(), info.source_path.clone())
-            }
+            TreeNode::Tensor { info, .. } => ("▪", info.name.clone(), info.source_path.clone()),
             TreeNode::Group { .. } => {
                 let mut files = BTreeSet::new();
                 collect_source_paths(node, &mut files);
                 let primary = match files.len() {
-                    0 => return ("", false, String::new(), String::new()),
+                    0 => return ("", String::new(), String::new()),
                     1 => ("▪", files.into_iter().next().unwrap()),
                     n => match common_dir(&files) {
                         // When the files share a directory, show that instead of
@@ -1902,13 +1920,13 @@ impl Explorer {
                         }
                     },
                 };
-                (primary.0, false, primary.1, String::new())
+                (primary.0, primary.1, String::new())
             }
             // The full metadata path on the first line (the tree row shows only
             // the short `…__metadata__` label); the value preview on the second.
             TreeNode::Metadata { info } => {
                 let value = info.value.split_whitespace().collect::<Vec<_>>().join(" ");
-                ("†", false, info.name.clone(), value)
+                ("†", info.name.clone(), value)
             }
         }
     }
@@ -1935,7 +1953,7 @@ impl Explorer {
         };
         if let Some(path) = path {
             copy_to_clipboard(&path);
-            self.copied_flash = Some(path);
+            self.flash_copied("the source path");
         }
     }
 
@@ -1946,10 +1964,18 @@ impl Explorer {
         let Some((node, _)) = self.flattened_tree.get(self.selected_idx) else {
             return;
         };
+        // Name the thing copied so the confirmation is unambiguous — `n` yields a
+        // tensor's full name, a group's path, or a metadata key depending on the
+        // selected row.
+        let what = match node {
+            TreeNode::Tensor { .. } => "the full tensor name",
+            TreeNode::Group { .. } => "the group path",
+            TreeNode::Metadata { .. } => "the metadata key",
+        };
         let name = node.name().to_string();
         if !name.is_empty() {
             copy_to_clipboard(&name);
-            self.copied_flash = Some(name);
+            self.flash_copied(what);
         }
     }
 
