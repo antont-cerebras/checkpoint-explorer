@@ -1241,6 +1241,7 @@ impl Explorer {
             health_warning: !self.health_reports.is_empty(),
             can_repack: self.repack_input().is_some(),
             unindexed: &self.unindexed,
+            packing_schemas: &self.packing_schemas,
         };
         UI::draw_screen(out, &config)
     }
