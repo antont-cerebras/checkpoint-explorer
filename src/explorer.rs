@@ -2884,9 +2884,11 @@ impl Explorer {
         }
         match handle.join() {
             Ok(Ok(())) => {
-                self.histogram_cache
-                    .borrow_mut()
-                    .insert(key, shared.snapshot(bins));
+                let mut hist = shared.snapshot(bins);
+                // Record the scan time so the heading keeps showing it after the
+                // bars have finished forming (mirroring the statistics line).
+                hist.elapsed = started.elapsed();
+                self.histogram_cache.borrow_mut().insert(key, hist);
             }
             Ok(Err(msg)) => {
                 let _ = UI::draw_message("Histogram unavailable", &msg);

@@ -1393,6 +1393,9 @@ pub struct Histogram {
     pub total: u64,
     /// Non-finite elements (NaN / ±Inf), not binned.
     pub nonfinite: u64,
+    /// How long the scan took. Zero for a running snapshot; set on the final
+    /// (cached) histogram so the heading can keep showing the time once done.
+    pub elapsed: std::time::Duration,
 }
 
 /// Live bin counts shared between the scan worker and the UI, so the histogram
@@ -1423,6 +1426,7 @@ impl HistShared {
                 .collect(),
             total: self.total.load(Ordering::Relaxed),
             nonfinite: self.nonfinite.load(Ordering::Relaxed),
+            elapsed: std::time::Duration::ZERO,
         }
     }
 }
