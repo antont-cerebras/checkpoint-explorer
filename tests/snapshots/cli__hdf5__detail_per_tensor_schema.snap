@@ -1,0 +1,19 @@
+---
+source: tests/cli.rs
+expression: "plain(&[\"--tensor\", \"model.layers.0.custom_proj.weight\"])"
+---
+Tensor Details
+──────────────
+Name: model.layers.0.custom_proj.weight
+Data Type: U16 as u4×4 (unpacked)
+Shape: (4, 5) as (16, 5)
+Parameters: 80 (80)
+Packing: u4×4 (bit widths [4, 4, 4, 4] · 4 experts/word · uniform)
+Size: 40 B · on disk: 39 B (⇩ gzip, 1.0×)
+Chunks: (4, 5) × 1
+File: [FIXTURE]
+
+Statistics: press s to scan the full tensor
+
+Press m for a heatmap, v for numeric values, h for a histogram, b to set its bin count, d to reinterpret the dtype, r to
+ reshape, c to copy, y to copy the command, l for the legend, ⌫ / \ to step back / forward, any other key to return...

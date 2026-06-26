@@ -1,0 +1,18 @@
+---
+source: tests/cli.rs
+expression: "plain(&[\"--tensor\", \"lm_head.weight\"])"
+---
+Tensor Details
+──────────────
+Name: lm_head.weight
+Data Type: F16
+Shape: (10, 4)
+Parameters: 40 (40)
+Size: 80 B · on disk: 27 B (⇩ gzip, 3.0×)
+Chunks: (10, 4) × 1
+File: [FIXTURE]
+
+Statistics: press s to scan the full tensor
+
+Press m for a heatmap, v for numeric values, h for a histogram, b to set its bin count, d to reinterpret the dtype, r to
+ reshape, c to copy, y to copy the command, l for the legend, ⌫ / \ to step back / forward, any other key to return...
