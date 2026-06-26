@@ -40,10 +40,6 @@ mod palette {
     /// The bottom status bar (foreground on background).
     pub const STATUS_FG: Color = Color::White;
     pub const STATUS_BG: Color = Color::DarkGrey;
-    /// A success accent (e.g. the "copied" status bar): dark text on green, as
-    /// a light foreground is hard to read on the bright green.
-    pub const OK_BG: Color = Color::Green;
-    pub const OK_FG: Color = Color::Black;
     /// A success accent used as a *foreground* (e.g. the "✓ copied" confirmation).
     pub const SUCCESS: Color = Color::Green;
     /// Marks a tensor present on disk but missing from the index — a vivid red
@@ -98,15 +94,13 @@ pub struct DrawConfig<'a> {
     pub search_query: &'a str,
     /// Caret position within `search_query`, as a character index in `0..=len`.
     pub search_cursor: usize,
-    /// Leading glyph for the status bar (e.g. `▪`, `▸`, `✓`), and whether it
-    /// is a success message (the copy confirmation) for accent colouring.
+    /// Leading glyph for the status bar (e.g. `▪`, `▸`, `†`).
     pub status_icon: &'a str,
-    pub status_ok: bool,
-    /// Bottom status line: a tensor's full name, a group's source
-    /// file(s)/directory, or a copy confirmation.
+    /// Bottom status line: a tensor's full name, or a group's source
+    /// file(s)/directory.
     pub status_bar: &'a str,
     /// Second status line, below `status_bar`: a tensor's source file (empty for
-    /// groups and the copy confirmation).
+    /// groups).
     pub status_secondary: &'a str,
     /// Whether a checkpoint health issue was detected (shows a header hint to
     /// press `h` for the report).
@@ -438,15 +432,13 @@ impl UI {
             write!(out, " to exit search\r")?;
         } else if !config.status_bar.is_empty() {
             // A colored chip: leading glyph + the path/text, truncated tail-first
-            // so the file name stays visible. Dark-on-green for a copy success,
-            // light-on-grey otherwise.
-            let (bg, fg) = if config.status_ok {
-                (palette::OK_BG, palette::OK_FG)
-            } else {
-                (palette::STATUS_BG, palette::STATUS_FG)
-            };
+            // so the file name stays visible.
             let text = truncate_keep_end(config.status_bar, max_text);
-            queue!(out, SetBackgroundColor(bg), SetForegroundColor(fg))?;
+            queue!(
+                out,
+                SetBackgroundColor(palette::STATUS_BG),
+                SetForegroundColor(palette::STATUS_FG)
+            )?;
             write!(out, " {} {text} ", config.status_icon)?;
             queue!(out, ResetColor)?;
         }
@@ -1655,13 +1647,26 @@ impl UI {
     /// OSC-52 clipboard copy doesn't reach the terminal and it must be copied by
     /// hand. The terminal soft-wraps a long command, but it stays one logical
     /// line, so the selection still yields the whole command.
-    /// Flash a "✓ Copied … to the clipboard" confirmation on the bottom line —
-    /// the status-line position — over whatever the view drew there, until the
-    /// next redraw clears it. Gives the data/detail views the copy feedback the
-    /// tree shows in its status chip. `what` names what was copied.
+    /// Flash a "✓ Copied … to the clipboard" confirmation on the bottom line,
+    /// over whatever the view drew there, until the next redraw clears it. Shared
+    /// by every screen's copy shortcuts (tree, detail, data) so the confirmation
+    /// never hides the content above it. `what` names what was copied.
     pub fn draw_copied_flash(what: &str) -> Result<()> {
         let mut out = io::stdout();
-        let (_, term_h) = terminal::size()?;
+        let (term_w, term_h) = terminal::size()?;
+        // Clamp to the width so a long message can't wrap off the last row and
+        // scroll the frame (this overlays the terminal's final line). Keep the
+        // head — the "✓ Copied …" — rather than the tail.
+        let full = format!("✓ Copied {what} to the clipboard");
+        let width = term_w as usize;
+        let msg = if full.chars().count() > width {
+            full.chars()
+                .take(width.saturating_sub(1))
+                .chain(std::iter::once('…'))
+                .collect()
+        } else {
+            full
+        };
         queue!(
             out,
             cursor::MoveTo(0, term_h.saturating_sub(1)),
@@ -1669,7 +1674,7 @@ impl UI {
             SetForegroundColor(palette::SUCCESS),
             SetAttribute(Attribute::Bold)
         )?;
-        write!(out, "✓ Copied {what} to the clipboard")?;
+        write!(out, "{msg}")?;
         queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
         out.flush()?;
         Ok(())
