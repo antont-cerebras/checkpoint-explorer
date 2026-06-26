@@ -2740,6 +2740,14 @@ fn write_histogram_section(
         }
         write!(head, " ({:.1}s)", elapsed.as_secs_f64())?;
         queue!(head, ResetColor)?;
+    } else if !hist.elapsed.is_zero() {
+        // Finished: keep the scan time on the heading, like the statistics line.
+        paint(
+            &mut head,
+            false,
+            palette::DIM,
+            &format!("  ({})", fmt_duration(hist.elapsed)),
+        )?;
     }
     line_end(&mut head)?;
     let heading_rows = count_physical_lines(&head, term_w);
