@@ -1,0 +1,15 @@
+---
+source: tests/cli.rs
+expression: report
+---
+$ checkpoint-explorer [FIXTURE] --tensor no.such.tensor --plain
+Error: no tensor named 'no.such.tensor' in this checkpoint
+
+$ checkpoint-explorer [FIXTURE] --metadata no.such.meta --plain
+Error: no metadata entry named 'no.such.meta' in this checkpoint
+
+$ checkpoint-explorer [FIXTURE] --tensor model.layers.0.mlp.down_proj.weight --shape abc --plain
+Error: --shape: 'abc' is not a whole number
+
+$ checkpoint-explorer [FIXTURE] --tensor model.layers.0.mlp.down_proj.weight --slice 9999 --plain
+Error: --slice: index 9999 is out of range — the last slice is 2

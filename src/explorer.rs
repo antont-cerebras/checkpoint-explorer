@@ -280,6 +280,23 @@ enum Interaction {
     OneShot,
 }
 
+/// How an [`OpenRequest`] is being served, which decides how a failure (a tensor
+/// that doesn't exist, an ambiguous request, bad `--shape`/`--slice`) is handled:
+/// the navigator can recover, but the headless and one-shot modes must surface it
+/// as a non-zero exit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    /// Interactive navigator: show a recoverable message, wait for a key, then
+    /// fall back to the tree. A failure is *not* fatal.
+    Interactive,
+    /// `--exit`: render the requested screen once. A failure is fatal — it
+    /// propagates as an error so the process exits non-zero.
+    OneShot,
+    /// `--plain` / `--emit-command`: no terminal. Return the screen for the
+    /// caller to render; a failure is fatal and reported on stderr.
+    Headless,
+}
+
 /// Whether the detail view starts the stats scan on open (`--compute-stats`) or
 /// leaves it for the user to trigger with `s`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1243,7 +1260,11 @@ impl Explorer {
                 req.histogram = false;
                 req.bins = None;
                 req.exit_after = false;
-                self.open_requested(req).unwrap_or(Screen::Tree)
+                // A failed request (unknown tensor/metadata, bad `--shape`/`--slice`)
+                // is fatal here — propagate it so the headless render exits non-zero
+                // rather than silently falling back to the tree.
+                self.open_requested(req, OpenMode::Headless)?
+                    .unwrap_or(Screen::Tree)
             }
             None => Screen::Tree,
         };
@@ -1521,14 +1542,27 @@ impl Explorer {
                 self.load_all_files()?;
             }
 
-            let one_shot = req.exit_after;
-            let seeded = self.open_requested(req);
-            if one_shot {
-                return Ok(());
-            }
-            if let Some(screen) = seeded {
-                history.push(screen);
-                cursor = 1;
+            let mode = if req.exit_after {
+                OpenMode::OneShot
+            } else {
+                OpenMode::Interactive
+            };
+            match self.open_requested(req, mode) {
+                Ok(seeded) => {
+                    // `--exit` renders inside `open_requested`; never enter the navigator.
+                    if mode == OpenMode::OneShot {
+                        return Ok(());
+                    }
+                    if let Some(screen) = seeded {
+                        history.push(screen);
+                        cursor = 1;
+                    }
+                }
+                // A one-shot failure is fatal (non-zero exit). Interactively, the
+                // recoverable message was already shown and a key awaited inside
+                // `open_requested`; fall through to the tree.
+                Err(e) if mode == OpenMode::OneShot => return Err(e),
+                Err(_) => {}
             }
         } else {
             self.load_all_files()?;
@@ -2200,11 +2234,33 @@ impl Explorer {
         None
     }
 
-    /// Apply a CLI `--tensor` request: locate the tensor, apply any dtype
-    /// override and edges/overview choice, then either render it once (`--exit`)
-    /// or return the [`Screen`] to seed the navigator with. Returns `None` when
-    /// the tensor isn't found, the slice is invalid, or it was a one-shot render.
-    fn open_requested(&mut self, req: OpenRequest) -> Option<Screen> {
+    /// Report a request that can't be honored. In the navigator this shows a
+    /// recoverable message and waits for a key (the caller then falls back to the
+    /// tree); the headless and one-shot modes draw nothing and rely on the
+    /// returned error, which propagates to a non-zero process exit.
+    fn reject_open(
+        &self,
+        mode: OpenMode,
+        title: &str,
+        screen_detail: &str,
+        error: &str,
+    ) -> anyhow::Error {
+        if mode == OpenMode::Interactive {
+            let _ = UI::draw_message(title, screen_detail);
+            let _ = event::read();
+        }
+        anyhow::anyhow!("{error}")
+    }
+
+    /// Apply a CLI open request: tree state/search, then locate the tensor and
+    /// apply any dtype/shape/slice/layout overrides, and either render it once
+    /// (`--exit`, [`OpenMode::OneShot`]) or return the [`Screen`] to render
+    /// ([`OpenMode::Headless`]) or seed the navigator with ([`OpenMode::Interactive`]).
+    /// `Ok(None)` means "show the tree" (no specific target requested); `Err`
+    /// means the request couldn't be honored (unknown tensor/metadata, ambiguous,
+    /// bad `--shape`/`--slice`) — fatal in the headless/one-shot modes, recoverable
+    /// in the navigator (see [`Self::reject_open`]).
+    fn open_requested(&mut self, req: OpenRequest, mode: OpenMode) -> Result<Option<Screen>> {
         // Tree-browser state applies whichever screen opens (and is what makes
         // these reachable headlessly): bulk expansion, then a search filter.
         match req.tree_state {
@@ -2221,24 +2277,22 @@ impl Explorer {
         if let Some(name) = &req.metadata {
             if self.metadata.iter().any(|m| &m.name == name) {
                 self.reveal_tensor(name);
-            } else {
-                let _ = UI::draw_message(
-                    "Metadata not found",
-                    &format!(
-                        "No metadata entry named '{name}' in this checkpoint — opening the browser instead."
-                    ),
-                );
-                if !req.exit_after {
-                    let _ = event::read();
-                }
+                return Ok(None);
             }
-            return None;
+            return Err(self.reject_open(
+                mode,
+                "Metadata not found",
+                &format!(
+                    "No metadata entry named '{name}' in this checkpoint — opening the browser instead."
+                ),
+                &format!("no metadata entry named '{name}' in this checkpoint"),
+            ));
         }
         // A tree screen with no specific tensor (`--tree-state` / `--search` /
         // `--legend` alone, or a bare launch routed to the tree): just show the
         // browser in whatever state the flags above set — don't demand a tensor.
         if req.view == OpenView::Tree && req.tensor.is_none() {
-            return None;
+            return Ok(None);
         }
         // Resolve the target tensor: the named one, or — when `--tensor` is
         // omitted — the sole tensor if the checkpoint has exactly one (e.g. any
@@ -2247,32 +2301,29 @@ impl Explorer {
             Some(name) => match self.tensors.iter().find(|t| t.name == *name) {
                 Some(t) => t.clone(),
                 None => {
-                    let _ = UI::draw_message(
+                    return Err(self.reject_open(
+                        mode,
                         "Tensor not found",
                         &format!(
                             "No tensor named '{name}' in this checkpoint — opening the browser instead."
                         ),
-                    );
-                    if !req.exit_after {
-                        let _ = event::read();
-                    }
-                    return None;
+                        &format!("no tensor named '{name}' in this checkpoint"),
+                    ));
                 }
             },
             None => match self.tensors.as_slice() {
                 [only] => only.clone(),
-                _ => {
-                    if self.tensors.len() > 1 {
-                        let _ = UI::draw_message(
-                            "Which tensor?",
-                            "This checkpoint has multiple tensors — name one with --tensor, or pick it in the browser.",
-                        );
-                        if !req.exit_after {
-                            let _ = event::read();
-                        }
-                    }
-                    return None;
+                // No `--tensor` and not a single-tensor checkpoint: ambiguous when
+                // there's more than one (an error), or nothing to open at all.
+                _ if self.tensors.len() > 1 => {
+                    return Err(self.reject_open(
+                        mode,
+                        "Which tensor?",
+                        "This checkpoint has multiple tensors — name one with --tensor, or pick it in the browser.",
+                        "this checkpoint has multiple tensors; name one with --tensor",
+                    ));
                 }
+                _ => return Ok(None),
             },
         };
         // Apply the dtype override (skipped for formats that can't reinterpret,
@@ -2308,11 +2359,12 @@ impl Explorer {
                         .insert(tensor.name.clone(), shape);
                 }
                 Err(msg) => {
-                    let _ = UI::draw_message("Invalid --shape", &msg);
-                    if !req.exit_after {
-                        let _ = event::read();
-                    }
-                    return None;
+                    return Err(self.reject_open(
+                        mode,
+                        "Can't apply --shape",
+                        &msg,
+                        &format!("--shape: {msg}"),
+                    ));
                 }
             }
         }
@@ -2353,11 +2405,12 @@ impl Explorer {
                 Ok(Some(n)) => n,
                 Ok(None) => 0,
                 Err(msg) => {
-                    let _ = UI::draw_message("Invalid --slice", &msg);
-                    if !req.exit_after {
-                        let _ = event::read();
-                    }
-                    return None;
+                    return Err(self.reject_open(
+                        mode,
+                        "Can't apply --slice",
+                        &msg,
+                        &format!("--slice: {msg}"),
+                    ));
                 }
             },
             None => 0,
@@ -2388,7 +2441,7 @@ impl Explorer {
             // stays on the tree (cursor 0) with the selection we just set.
             OpenView::Tree => {
                 self.reveal_tensor(&tensor.name);
-                return None;
+                return Ok(None);
             }
         };
 
@@ -2419,9 +2472,9 @@ impl Explorer {
             );
         }
 
-        // One-shot (`--exit`): render the requested screen once and return None
-        // (the navigator is never entered).
-        if req.exit_after {
+        // One-shot (`--exit`): render the requested screen once and return (the
+        // navigator is never entered).
+        if mode == OpenMode::OneShot {
             match &screen {
                 Screen::Detail { tensor, slice } => {
                     self.run_detail(tensor, *slice, stats_start, Interaction::OneShot);
@@ -2435,7 +2488,13 @@ impl Explorer {
                 }
                 Screen::Tree => {}
             }
-            return None;
+            return Ok(None);
+        }
+
+        // Headless (`--plain` / `--emit-command`): hand the resolved screen back
+        // for the caller to render — no interactive drawing on this path.
+        if mode == OpenMode::Headless {
+            return Ok(Some(screen));
         }
 
         // Interactive: `--compute-stats` pre-warms the detail's stats so they
@@ -2468,7 +2527,7 @@ impl Explorer {
                 );
             });
         }
-        Some(screen)
+        Ok(Some(screen))
     }
 
     /// The tensor detail screen. Sub-views: `m` heatmap, `v` numeric values
@@ -4316,7 +4375,7 @@ fn parse_shape_input(input: &str, elements: usize) -> Result<Vec<usize>, String>
         } else {
             let d = tok
                 .parse::<usize>()
-                .map_err(|_| format!("invalid dimension: {tok}"))?;
+                .map_err(|_| format!("'{tok}' is not a whole number"))?;
             if d == 0 {
                 return Err("dimensions must be non-zero".to_string());
             }
@@ -4369,10 +4428,10 @@ fn parse_slice_input(input: &str, slices: usize) -> Result<Option<usize>, String
         return Ok(None);
     }
     if let Some(pct_str) = s.strip_suffix('%') {
+        let pct_str = pct_str.trim();
         let pct: f64 = pct_str
-            .trim()
             .parse()
-            .map_err(|_| "invalid percentage — try e.g. 50%".to_string())?;
+            .map_err(|_| format!("'{pct_str}' is not a number — write a percentage like 50%"))?;
         if !(0.0..=100.0).contains(&pct) {
             return Err(format!("{pct}% is out of range — use 0% to 100%"));
         }
