@@ -233,6 +233,35 @@ fn y_roundtrips() {
     }
 }
 
+/// Opening an HDF5 file with a binary built *without* the `hdf5` feature must
+/// fail loudly (non-zero exit + an explanation that names the rebuild flag),
+/// rather than silently loading an empty checkpoint that reads "0 tensors". The
+/// non-zero exit must hold in headless `--exit`/`--plain` modes too, so scripts
+/// detect it. Only meaningful when the feature is off, so it's gated out of the
+/// `hdf5` build.
+#[cfg(not(feature = "hdf5"))]
+#[test]
+fn hdf5_without_feature_errors() {
+    const H5: &str = "tests/fixtures/tiny.hdf5";
+    for extra in [&[][..], &["--exit"][..], &["--plain"][..]] {
+        let mut args = vec![H5];
+        args.extend_from_slice(extra);
+        let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
+            .args(&args)
+            .output()
+            .expect("run checkpoint-explorer");
+        assert!(
+            !out.status.success(),
+            "expected non-zero exit for {args:?}, got success"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("without HDF5 support") && stderr.contains("--features hdf5"),
+            "expected an HDF5-support error naming the rebuild flag for {args:?}; stderr:\n{stderr}"
+        );
+    }
+}
+
 /// HDF5 fixture (`tests/fixtures/tiny.hdf5`, committed; regenerate with
 /// `cargo run --example gen_hdf5_fixture --features hdf5`). Gated on the `hdf5`
 /// feature so it only runs when the binary can read HDF5. Pins the fused-MoE
