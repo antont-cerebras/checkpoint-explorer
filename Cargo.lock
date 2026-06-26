@@ -141,6 +141,7 @@ dependencies = [
  "memmap2",
  "ndarray",
  "rayon",
+ "regex",
  "safetensors",
  "serde_json",
  "zip",

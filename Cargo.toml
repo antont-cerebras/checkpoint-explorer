@@ -46,6 +46,9 @@ zstd = { version = "0.13", optional = true }
 # rendered screen. Golden files live in tests/snapshots/ and are regenerated with
 # `cargo insta review` (or `INSTA_UPDATE=always cargo test`).
 insta = { version = "1", features = ["filters"] }
+# Normalize the scan-duration in the `y` round-trip comparison (which checks raw
+# renders, not snapshots).
+regex = "1"
 
 [features]
 hdf5 = ["dep:hdf5-metno", "dep:ndarray", "dep:hdf5-metno-sys", "dep:lz4_flex", "dep:half", "dep:zstd"]
