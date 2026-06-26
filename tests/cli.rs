@@ -233,6 +233,47 @@ fn y_roundtrips() {
     }
 }
 
+/// Run a failing `--plain` request: assert it exits non-zero (a snapshot can't
+/// see the exit code) and return the command line + its stderr for snapshotting.
+fn run_plain_err(extra_args: &[&str]) -> String {
+    ensure_fixture();
+    let mut args = vec![FIXTURE];
+    args.extend_from_slice(extra_args);
+    args.push("--plain");
+    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
+        .args(&args)
+        .output()
+        .expect("run checkpoint-explorer");
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit for {extra_args:?}, got success"
+    );
+    format!(
+        "$ checkpoint-explorer {}\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// A request that can't be honored must exit non-zero with an explanation, not
+/// silently fall back to an unrelated screen. `--plain` exercises the same
+/// resolution path as the interactive `--exit` one-shot (both headless), so it
+/// stands in for the `--exit` exit code (which needs a tty to reach). The
+/// snapshot pins the exact wording — which names the specific problem rather
+/// than a vague "invalid" — so any reword surfaces in `cargo insta review`.
+#[test]
+fn plain_request_errors() {
+    let t = "model.layers.0.mlp.down_proj.weight";
+    let report = [
+        run_plain_err(&["--tensor", "no.such.tensor"]),
+        run_plain_err(&["--metadata", "no.such.meta"]),
+        run_plain_err(&["--tensor", t, "--shape", "abc"]),
+        run_plain_err(&["--tensor", t, "--slice", "9999"]),
+    ]
+    .join("\n");
+    settings().bind(|| insta::assert_snapshot!(report));
+}
+
 /// Opening an HDF5 file with a binary built *without* the `hdf5` feature must
 /// fail loudly (non-zero exit + an explanation that names the rebuild flag),
 /// rather than silently loading an empty checkpoint that reads "0 tensors". The
