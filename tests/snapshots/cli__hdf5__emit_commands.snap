@@ -1,0 +1,11 @@
+---
+source: tests/cli.rs
+expression: out
+---
+detail: checkpoint-explorer [FIXTURE] --tensor model.layers.0.block_sparse_moe.experts.down_proj.weight
+dtype stored: checkpoint-explorer [FIXTURE] --tensor model.layers.0.block_sparse_moe.experts.down_proj.weight --dtype stored
+histogram: checkpoint-explorer [FIXTURE] --tensor model.layers.0.block_sparse_moe.experts.down_proj.weight --histogram
+histogram bins: checkpoint-explorer [FIXTURE] --tensor model.layers.0.block_sparse_moe.experts.down_proj.weight --histogram --bins 4
+values window: checkpoint-explorer [FIXTURE] --tensor model.layers.0.block_sparse_moe.experts.down_proj.weight --values --window=1,1
+values hex: checkpoint-explorer [FIXTURE] --tensor model.layers.0.block_sparse_moe.experts.down_proj.weight --values --edge --base hex
+heatmap: checkpoint-explorer [FIXTURE] --tensor model.layers.0.block_sparse_moe.experts.down_proj.weight --heatmap --edge

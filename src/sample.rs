@@ -160,7 +160,11 @@ impl ViewDtype {
     /// [`parse_view_dtype`].
     pub fn cli_value(self) -> Option<String> {
         Some(match self {
-            ViewDtype::Stored => return None,
+            // For a schema tensor `stored` is a real override (raw U16 vs the
+            // unpacked default), so it must round-trip via `--dtype stored`. For a
+            // plain tensor `stored` is the default and is never recorded as an
+            // override, so the flag is simply never emitted there.
+            ViewDtype::Stored => "stored".to_string(),
             ViewDtype::As(dt) => dt.to_ascii_lowercase(),
             ViewDtype::U4 => "u4".to_string(),
             ViewDtype::I4 => "i4".to_string(),

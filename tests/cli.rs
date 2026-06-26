@@ -93,13 +93,10 @@ fn ensure_fixture() {
     ONCE.call_once(|| write_fixture(FIXTURE));
 }
 
-/// Run the binary in `--plain` mode against `fixture` and return its screen text.
-fn run_plain(fixture: &str, extra_args: &[&str]) -> String {
-    let mut args = vec![fixture];
-    args.extend_from_slice(extra_args);
-    args.push("--plain");
+/// Run the binary with exactly `args` and return its stdout.
+fn run_bin(args: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
-        .args(&args)
+        .args(args)
         .output()
         .expect("run checkpoint-explorer");
     assert!(
@@ -108,6 +105,53 @@ fn run_plain(fixture: &str, extra_args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Run the binary in `--plain` mode against `fixture` and return its screen text.
+fn run_plain(fixture: &str, extra_args: &[&str]) -> String {
+    let mut args = vec![fixture];
+    args.extend_from_slice(extra_args);
+    args.push("--plain");
+    run_bin(&args)
+}
+
+/// Verify the `y` round-trip for a screen: render it directly, take the CLI
+/// command `y` would copy to reopen it (`--emit-command`), re-render from that,
+/// and require the two screens to be identical. Catches any state a screen shows
+/// but its reopen command fails to express.
+fn assert_y_roundtrip(fixture: &str, extra_args: &[&str]) {
+    let direct = run_plain(fixture, extra_args);
+
+    let mut emit = vec![fixture];
+    emit.extend_from_slice(extra_args);
+    emit.push("--emit-command");
+    let command = run_bin(&emit);
+
+    // The command is `checkpoint-explorer <path> <flags…>`; drop the program name
+    // and render what's left (the fixture's names/paths are shell-safe, so the
+    // tokens never need de-quoting).
+    let mut reopen: Vec<&str> = command.split_whitespace().skip(1).collect();
+    reopen.push("--plain");
+    let reopened = run_bin(&reopen);
+
+    // The two renders are independent scans, so a statistics / histogram duration
+    // (`(2ms)`) differs run to run — normalize it before comparing.
+    assert_eq!(
+        strip_scan_time(&direct),
+        strip_scan_time(&reopened),
+        "y round-trip diverged\n  opened with: {extra_args:?}\n  reopened by: {}",
+        command.trim(),
+    );
+}
+
+/// Replace the scan-duration suffix (`(2ms)`, `(1.0s)`) with a stable token, so
+/// the round-trip compares everything except the inherently-varying timing.
+fn strip_scan_time(s: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\(\d+(?:\.\d+)?m?s\)").unwrap())
+        .replace_all(s, "(<time>)")
+        .into_owned()
 }
 
 /// The generated safetensors fixture, in `--plain`.
@@ -164,6 +208,22 @@ fn plain_histogram_u16() {
             "--histogram"
         ]))
     });
+}
+
+#[test]
+fn y_roundtrips() {
+    ensure_fixture();
+    let t = "model.layers.0.mlp.down_proj.weight";
+    for extra in [
+        vec![],                             // tree
+        vec!["--tensor", t],                // detail
+        vec!["--tensor", t, "--histogram"], // detail + histogram
+        vec!["--tensor", t, "--values", "--slice", "1"],
+        vec!["--tensor", t, "--values", "--overview", "--base", "hex"],
+        vec!["--tensor", t, "--heatmap"],
+    ] {
+        assert_y_roundtrip(FIXTURE, &extra);
+    }
 }
 
 /// HDF5 fixture (`tests/fixtures/tiny.hdf5`, committed; regenerate with
@@ -244,5 +304,66 @@ mod hdf5 {
     fn heatmap() {
         let t = format!("{MOE}.down_proj.weight");
         settings().bind(|| insta::assert_snapshot!(plain(&["--tensor", &t, "--heatmap"])));
+    }
+
+    // The `y` round-trip meta-test: every state-bearing screen must reopen to
+    // itself from the command `y` copies. Covers the schema views and the full
+    // matrix of data-view state (layout + position, slice, zebra, base).
+    #[test]
+    fn y_roundtrips() {
+        let dp = format!("{MOE}.down_proj.weight");
+        let cases: &[Vec<&str>] = &[
+            vec![],                                     // tree
+            vec!["--tensor", &dp],                      // unpacked detail
+            vec!["--tensor", &dp, "--dtype", "stored"], // raw U16 over a schema
+            vec!["--tensor", &dp, "--histogram"],
+            vec!["--tensor", &dp, "--histogram", "--bins", "4"],
+            vec!["--tensor", &dp, "--compute-stats"],
+            vec!["--tensor", "model.layers.0.custom_proj.weight"], // per-tensor schema
+            vec!["--tensor", &dp, "--values"],
+            vec!["--tensor", &dp, "--values", "--overview"],
+            vec!["--tensor", &dp, "--values", "--window=1,1"],
+            vec!["--tensor", &dp, "--values", "--edge=0.25,0.75"],
+            vec!["--tensor", &dp, "--values", "--zebra", "cols"],
+            vec!["--tensor", &dp, "--values", "--base", "hex"],
+            vec!["--tensor", &dp, "--values", "--slice", "2"],
+            vec!["--tensor", &dp, "--heatmap"],
+        ];
+        for extra in cases {
+            super::assert_y_roundtrip(H5, extra);
+        }
+    }
+
+    // Pin the actual command `y` copies for each screen (documents the round-trip
+    // verified above). The fixture path is filtered to `[FIXTURE]`.
+    #[test]
+    fn emit_commands() {
+        let dp = format!("{MOE}.down_proj.weight");
+        let cases: &[(&str, Vec<&str>)] = &[
+            ("detail", vec!["--tensor", &dp]),
+            ("dtype stored", vec!["--tensor", &dp, "--dtype", "stored"]),
+            ("histogram", vec!["--tensor", &dp, "--histogram"]),
+            (
+                "histogram bins",
+                vec!["--tensor", &dp, "--histogram", "--bins", "4"],
+            ),
+            (
+                "values window",
+                vec!["--tensor", &dp, "--values", "--window=1,1"],
+            ),
+            (
+                "values hex",
+                vec!["--tensor", &dp, "--values", "--base", "hex"],
+            ),
+            ("heatmap", vec!["--tensor", &dp, "--heatmap"]),
+        ];
+        let mut out = String::new();
+        for (label, args) in cases {
+            let mut a = vec![H5];
+            a.extend_from_slice(args);
+            a.push("--emit-command");
+            out.push_str(&format!("{label}: {}\n", super::run_bin(&a).trim()));
+        }
+        settings().bind(|| insta::assert_snapshot!(out));
     }
 }

@@ -195,6 +195,12 @@ struct ExploreArgs {
         help = "Render the requested view once as plain text (no colour, no cursor control) and exit — for piping, grep, and end-to-end tests"
     )]
     plain: bool,
+
+    #[arg(
+        long,
+        help = "Print the CLI command that reopens the requested view (what `y` copies) and exit, instead of rendering"
+    )]
+    emit_command: bool,
 }
 
 #[derive(Subcommand)]
@@ -362,8 +368,10 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
     });
 
     let mut explorer = Explorer::new(files, health_reports, open, !args.no_preload);
-    if args.plain {
-        explorer.render_plain()
+    if args.emit_command {
+        explorer.render_plain(true)
+    } else if args.plain {
+        explorer.render_plain(false)
     } else {
         explorer.run()
     }

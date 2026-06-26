@@ -1175,7 +1175,7 @@ impl Explorer {
     /// ([`crate::plain::render`]) flattens its cursor moves / clears into a
     /// character grid, so the output matches what a terminal would show. For
     /// piping, `grep`, and end-to-end tests.
-    pub fn render_plain(&mut self) -> Result<()> {
+    pub fn render_plain(&mut self, emit_command: bool) -> Result<()> {
         // A fixed virtual size keeps the output deterministic regardless of the
         // ambient terminal: force it for the draw code (which reads it via
         // `plain::term_size`) and emulate onto a grid of the same size.
@@ -1207,6 +1207,14 @@ impl Explorer {
             None => Screen::Tree,
         };
 
+        // `--emit-command`: print the CLI that `y` would copy to reopen this exact
+        // screen, instead of rendering. Used by the round-trip test (render the
+        // screen, take this command, re-render, assert the two match).
+        if emit_command {
+            println!("{}", self.reopen_command(&screen, want_stats, want_hist));
+            return Ok(());
+        }
+
         let mut buf: Vec<u8> = Vec::new();
         match &screen {
             Screen::Tree => {
@@ -1226,6 +1234,38 @@ impl Explorer {
 
         println!("{}", crate::plain::render(&buf, COLS, ROWS));
         Ok(())
+    }
+
+    /// The CLI command that reopens `screen` — what the `y` shortcut copies.
+    /// Scans the statistics / histogram first when the screen would (so the
+    /// command emits `--histogram` once it's been computed, mirroring `y`).
+    fn reopen_command(&self, screen: &Screen, want_stats: bool, want_hist: bool) -> String {
+        match screen {
+            Screen::Tree => self.command_for_tree_selection(),
+            Screen::Detail { tensor, .. } => {
+                let Some(t) = self.tensors.iter().find(|t| &t.name == tensor).cloned() else {
+                    return String::new();
+                };
+                let view = self.active_view(&t.name);
+                if want_hist {
+                    self.compute_histogram_sync(&t, view);
+                }
+                if want_stats {
+                    self.compute_stats_sync(&t, view);
+                }
+                self.command_for_detail(&t)
+            }
+            Screen::Data {
+                tensor,
+                repr,
+                slice,
+            } => {
+                let Some(t) = self.tensors.iter().find(|t| &t.name == tensor).cloned() else {
+                    return String::new();
+                };
+                self.command_for_data(&t, *repr, *slice)
+            }
+        }
     }
 
     /// Render a tensor's detail screen into `out` (raw ANSI) for [`Self::render_plain`].
@@ -4002,8 +4042,8 @@ impl Explorer {
     /// The command that reopens this tensor's detail screen.
     fn command_for_detail(&self, tensor: &TensorInfo) -> String {
         let mut parts = self.command_base(tensor);
-        // Reopen with the histogram showing when it's been computed for this view.
         let view = self.active_view(&tensor.name);
+        // Reopen with the histogram showing when it's been computed for this view.
         let bins = self.histogram_bins.get();
         if self
             .histogram_cache
@@ -4016,6 +4056,11 @@ impl Explorer {
                 parts.push("--bins".to_string());
                 parts.push(n.to_string());
             }
+        }
+        // Reopen with the statistics showing when they've been computed for this
+        // view (the histogram already brings up the ones it needs for its range).
+        if self.cached_stats(tensor, view).is_some() {
+            parts.push("--compute-stats".to_string());
         }
         parts.join(" ")
     }
