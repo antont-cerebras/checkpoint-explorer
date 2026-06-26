@@ -263,6 +263,17 @@ pub enum Legend {
     Values,
 }
 
+/// A floating pop-up the detail screen can show *over* its live frame — drawn as
+/// the last layer of [`UI::draw_tensor_detail`] so the screen behind it keeps
+/// redrawing (a running scan's progress animates) while it's up. Dismissed by
+/// any key. Composited via [`write_legend_band`] / [`write_command_band`].
+pub enum Overlay {
+    /// The context-sensitive glyph legend (`l`).
+    Legend(Legend),
+    /// The copied CLI command box (`y`); holds the command to display.
+    Command(String),
+}
+
 /// Rows of chrome above the tree list: the title, the search/hint line, and the
 /// separator rule.
 const TREE_HEADER_HEIGHT: usize = 3;
@@ -702,6 +713,7 @@ impl UI {
         histogram: Option<&Histogram>,
         hist_scanning: Option<ScanProgress>,
         schema: Option<&PackingSchema>,
+        overlay: Option<&Overlay>,
     ) -> Result<()> {
         queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
 
@@ -943,11 +955,15 @@ impl UI {
         out.write_all(&footer)?;
 
         // No trailing newline (avoids scrolling); clear anything below.
-        queue!(
-            out,
-            terminal::Clear(ClearType::FromCursorDown),
-            EndSynchronizedUpdate
-        )?;
+        queue!(out, terminal::Clear(ClearType::FromCursorDown))?;
+        // A pop-up overlay composites last, over the live frame, so the detail
+        // (including a running scan's progress) keeps animating behind it.
+        match overlay {
+            Some(Overlay::Legend(l)) => Self::write_legend_band(out, *l)?,
+            Some(Overlay::Command(c)) => Self::write_command_band(out, c)?,
+            None => {}
+        }
+        queue!(out, EndSynchronizedUpdate)?;
         out.flush()?;
         Ok(())
     }
@@ -1660,6 +1676,18 @@ impl UI {
 
     pub fn draw_command(command: &str) -> Result<()> {
         let mut out = io::stdout();
+        queue!(out, BeginSynchronizedUpdate)?;
+        Self::write_command_band(&mut out, command)?;
+        queue!(out, EndSynchronizedUpdate)?;
+        out.flush()?;
+        Ok(())
+    }
+
+    /// Composite the copied-command box onto `out` (it does not bracket its own
+    /// synchronized update), centred vertically as a floating pop-up. Shared by
+    /// [`Self::draw_command`] and the overlay layer of
+    /// [`Self::draw_tensor_detail`].
+    fn write_command_band(mut out: &mut impl Write, command: &str) -> Result<()> {
         let (term_w, term_h) = terminal::size()?;
         let (term_w, term_h) = (term_w as usize, term_h as usize);
         let rule = "─".repeat(term_w);
@@ -1673,10 +1701,9 @@ impl UI {
 
         // Clear a band row so the underlying screen doesn't show through.
         let clear = ClearType::CurrentLine;
-        queue!(out, BeginSynchronizedUpdate)?;
         // Panel background: the band's cleared rows then erase to the pop-up
         // surface, lifting it off the view above and below.
-        begin_panel(&mut out)?;
+        begin_panel(out)?;
 
         // A cleared margin row above, so the band reads as a floating pop-up.
         queue!(out, cursor::MoveTo(0, row), terminal::Clear(clear))?;
@@ -1752,8 +1779,6 @@ impl UI {
         queue!(out, cursor::MoveTo(0, row), terminal::Clear(clear))?;
 
         end_panel(&mut out)?;
-        queue!(out, EndSynchronizedUpdate)?;
-        out.flush()?;
         Ok(())
     }
 
@@ -1827,10 +1852,25 @@ impl UI {
     /// takeover — so the surrounding view stays visible; the caller waits for a
     /// key, then redraws its own screen over it.
     pub fn draw_legend(legend: Legend) -> Result<()> {
+        let stdout = io::stdout();
+        let mut out = BufWriter::new(stdout.lock());
+        queue!(out, BeginSynchronizedUpdate)?;
+        Self::write_legend_band(&mut out, legend)?;
+        queue!(out, EndSynchronizedUpdate)?;
+        out.flush()?;
+        Ok(())
+    }
+
+    /// Composite the legend band onto `dst` (it does not bracket its own
+    /// synchronized update), centred vertically as a floating pop-up. Used both
+    /// standalone (by [`Self::draw_legend`]) and as the overlay layer of
+    /// [`Self::draw_tensor_detail`], drawn last over the live detail frame so the
+    /// screen behind keeps animating.
+    fn write_legend_band(dst: &mut impl Write, legend: Legend) -> Result<()> {
         // Render the legend body into a buffer first so it can be centred as a
         // floating band on replay. The body writes plain content — each line
         // ending in a newline — while the panel background and positioning are
-        // applied to the real screen below.
+        // applied to `dst` below.
         let mut out: Vec<u8> = Vec::new();
 
         let title = match legend {
@@ -2058,24 +2098,19 @@ impl UI {
         let band_h = lines + 2;
         let start = ((h as usize).saturating_sub(band_h) / 2) as u16;
 
-        let stdout = io::stdout();
-        let mut sink = BufWriter::new(stdout.lock());
-        queue!(sink, BeginSynchronizedUpdate)?;
-        begin_panel(&mut sink)?;
+        begin_panel(dst)?;
         // Blank margin row above the content (cleared to the panel surface).
         queue!(
-            sink,
+            dst,
             cursor::MoveTo(0, start),
             terminal::Clear(ClearType::CurrentLine)
         )?;
         // The content, then a blank margin row below it — the cursor lands there
         // after the footer's trailing newline.
-        queue!(sink, cursor::MoveTo(0, start + 1))?;
-        sink.write_all(&out)?;
-        queue!(sink, terminal::Clear(ClearType::CurrentLine))?;
-        end_panel(&mut sink)?;
-        queue!(sink, EndSynchronizedUpdate)?;
-        sink.flush()?;
+        queue!(dst, cursor::MoveTo(0, start + 1))?;
+        dst.write_all(&out)?;
+        queue!(dst, terminal::Clear(ClearType::CurrentLine))?;
+        end_panel(dst)?;
         Ok(())
     }
 }
