@@ -636,6 +636,23 @@ impl Explorer {
         let (tensors, metadata) = handle
             .join()
             .map_err(|_| anyhow::anyhow!("checkpoint loader thread panicked"))??;
+        self.finalize_load(tensors, metadata);
+        Ok(())
+    }
+
+    /// Read the checkpoint structure synchronously, with no loading animation —
+    /// for `--plain`, which renders once to a buffer and must not write spinner
+    /// frames to stdout.
+    fn load_quiet(&mut self) -> Result<()> {
+        self.tensors.clear();
+        self.metadata.clear();
+        let (tensors, metadata) = Self::gather_checkpoint(&self.files)?;
+        self.finalize_load(tensors, metadata);
+        Ok(())
+    }
+
+    /// Shared post-read setup: dedup, sort, parameter/schema/tree build.
+    fn finalize_load(&mut self, tensors: Vec<TensorInfo>, metadata: Vec<MetadataInfo>) {
         self.tensors = tensors;
         self.metadata = metadata;
 
@@ -649,7 +666,6 @@ impl Explorer {
         self.packing_schemas = crate::sample::parse_packing_schemas(&self.tensors, &self.metadata);
         self.build_tree();
         self.full_loaded = true;
-        Ok(())
     }
 
     /// Run the full structure load if it hasn't happened yet. The fast `--tensor`
@@ -1151,6 +1167,91 @@ impl Explorer {
                 .map(|(node, _)| (node, 0))
                 .collect();
         }
+    }
+
+    /// Headless render (`--plain`): produce the requested screen once as plain
+    /// text and print it — no raw mode, no alternate screen, no interactivity.
+    /// The real draw code runs into a buffer, then a tiny VT emulator
+    /// ([`crate::plain::render`]) flattens its cursor moves / clears into a
+    /// character grid, so the output matches what a terminal would show. For
+    /// piping, `grep`, and end-to-end tests.
+    pub fn render_plain(&mut self) -> Result<()> {
+        // A fixed virtual size keeps the output deterministic regardless of the
+        // ambient terminal: force it for the draw code (which reads it via
+        // `plain::term_size`) and emulate onto a grid of the same size.
+        const COLS: usize = 120;
+        const ROWS: usize = 40;
+        crate::plain::force_size(COLS as u16, ROWS as u16);
+
+        self.load_quiet()?;
+
+        // Resolve the requested screen and apply its dtype/shape/slice overrides.
+        // Histogram is dropped here: its scan is interactive (it reads key events),
+        // which has no place in a headless render — `--plain` histograms come later.
+        let screen = match self.open.take() {
+            Some(mut req) => {
+                req.histogram = false;
+                req.bins = None;
+                req.exit_after = false;
+                self.open_requested(req).unwrap_or(Screen::Tree)
+            }
+            None => Screen::Tree,
+        };
+
+        let mut buf: Vec<u8> = Vec::new();
+        match &screen {
+            Screen::Tree => {
+                self.draw_tree(&mut buf)?;
+            }
+            // The data views still need a `--plain` path; for now show the tensor's
+            // detail so the command still produces something useful.
+            Screen::Detail { tensor, .. } | Screen::Data { tensor, .. } => {
+                self.draw_detail_plain(&mut buf, tensor)?;
+            }
+        }
+
+        println!("{}", crate::plain::render(&buf, COLS, ROWS));
+        Ok(())
+    }
+
+    /// Render a tensor's detail screen into `out` (raw ANSI) for [`Self::render_plain`].
+    /// Mirrors the live detail draw, but with no background scan: statistics show
+    /// their pending hint and the histogram only appears if already cached.
+    fn draw_detail_plain(&self, out: &mut impl Write, tensor_name: &str) -> Result<()> {
+        let Some(tensor) = self.tensors.iter().find(|t| t.name == tensor_name).cloned() else {
+            return Ok(());
+        };
+        let view = self.active_view(&tensor.name);
+        let shape = self
+            .shape_overrides
+            .borrow()
+            .get(&tensor.name)
+            .cloned()
+            .unwrap_or_else(|| tensor.shape.clone());
+        let stats = self.cached_stats(&tensor, view);
+        let stats_view = match &stats {
+            Some(s) => StatsView::Ready(s),
+            None => StatsView::Pending,
+        };
+        let hist = self
+            .histogram_cache
+            .borrow()
+            .get(&(tensor.name.clone(), view, self.histogram_bins.get()))
+            .cloned();
+        UI::draw_tensor_detail(
+            out,
+            &tensor,
+            &shape,
+            view,
+            dtype_overridable(&tensor),
+            self.unindexed.contains(&tensor.source_path),
+            stats_view,
+            hist.as_ref(),
+            None,
+            self.schema_for(&tensor.name),
+            None,
+        )?;
+        Ok(())
     }
 
     pub fn run(&mut self) -> Result<()> {

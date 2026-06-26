@@ -41,6 +41,12 @@ half = { version = "2", optional = true }
 # filter, id 32015); decode-compatible with h5py + hdf5plugin's zstd.
 zstd = { version = "0.13", optional = true }
 
+[dev-dependencies]
+# Cram-like end-to-end CLI tests: run the binary in `--plain` and snapshot the
+# rendered screen. Golden files live in tests/snapshots/ and are regenerated with
+# `cargo insta review` (or `INSTA_UPDATE=always cargo test`).
+insta = { version = "1", features = ["filters"] }
+
 [features]
 hdf5 = ["dep:hdf5-metno", "dep:ndarray", "dep:hdf5-metno-sys", "dep:lz4_flex", "dep:half", "dep:zstd"]
 
