@@ -289,6 +289,10 @@ pub struct Explorer {
     files: Vec<PathBuf>,
     tensors: Vec<TensorInfo>,
     metadata: Vec<MetadataInfo>,
+    /// Whether the whole checkpoint structure has been read. A direct
+    /// `--tensor X` open reads just that tensor first (fast path), leaving this
+    /// `false` until the tree is shown and the full load runs.
+    full_loaded: bool,
     tree: Vec<TreeNode>,
     selected_idx: usize,
     scroll_offset: usize,
@@ -392,6 +396,7 @@ impl Explorer {
             files,
             tensors: Vec::new(),
             metadata: Vec::new(),
+            full_loaded: false,
             tree: Vec::new(),
             selected_idx: 0,
             scroll_offset: 0,
@@ -643,7 +648,58 @@ impl Explorer {
         self.total_parameters = self.tensors.iter().map(|t| t.num_elements).sum::<usize>();
         self.packing_schemas = crate::sample::parse_packing_schemas(&self.tensors, &self.metadata);
         self.build_tree();
+        self.full_loaded = true;
         Ok(())
+    }
+
+    /// Run the full structure load if it hasn't happened yet. The fast `--tensor`
+    /// path reads a single tensor and leaves the rest unread; this brings in the
+    /// whole tree the first time it's needed (e.g. on returning to the browser),
+    /// showing the loading spinner only then.
+    fn ensure_full_load(&mut self) -> Result<()> {
+        if !self.full_loaded {
+            self.load_all_files()?;
+        }
+        Ok(())
+    }
+
+    /// Try to read just `name` (plus its packing schema) without enumerating the
+    /// whole checkpoint, so a direct `--tensor X` view appears without the cold
+    /// full-load spinner. Only the single-HDF5-file case is worth special-casing
+    /// — other formats read their whole structure in one cheap header pass, and a
+    /// multi-file checkpoint may hold the tensor in any shard. Returns whether the
+    /// fast read succeeded; on `false` the caller does a normal full load.
+    fn try_load_single_tensor(&mut self, name: &str) -> bool {
+        #[cfg(feature = "hdf5")]
+        {
+            let [path] = self.files.as_slice() else {
+                return false;
+            };
+            if !matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("h5") | Some("hdf5")
+            ) {
+                return false;
+            }
+            match crate::hdf5::read_one(path, name) {
+                Ok(Some((tensor, metadata))) => {
+                    self.total_parameters = tensor.num_elements;
+                    self.tensors = vec![tensor];
+                    self.metadata = metadata;
+                    self.packing_schemas =
+                        crate::sample::parse_packing_schemas(&self.tensors, &self.metadata);
+                    true
+                }
+                // Not found or a read error — let the full load handle it (and
+                // surface the "tensor not found" message).
+                _ => false,
+            }
+        }
+        #[cfg(not(feature = "hdf5"))]
+        {
+            let _ = name;
+            false
+        }
     }
 
     /// The fused-codebook packing schema for `name`, if the checkpoint declared one.
@@ -1128,8 +1184,6 @@ impl Explorer {
     }
 
     fn interactive_loop(&mut self) -> Result<()> {
-        self.load_all_files()?;
-
         // Browser-style screen history: Backspace steps back through the screens
         // you've visited, `\` steps forward, and any fresh navigation truncates
         // the forward tail. The tree is the root.
@@ -1139,6 +1193,19 @@ impl Explorer {
         // A `--tensor` request seeds the history with that screen — or, with
         // `--exit`, renders it once and quits without entering the navigator.
         if let Some(req) = self.open.take() {
+            // Fast path: a single tensor's detail/data view doesn't need the
+            // whole tree, so read just that tensor and defer the (potentially
+            // slow) full structure load until the browser is actually shown.
+            let fast = req.metadata.is_none()
+                && !matches!(req.view, OpenView::Tree)
+                && req
+                    .tensor
+                    .as_deref()
+                    .is_some_and(|name| self.try_load_single_tensor(name));
+            if !fast {
+                self.load_all_files()?;
+            }
+
             let one_shot = req.exit_after;
             let seeded = self.open_requested(req);
             if one_shot {
@@ -1148,6 +1215,8 @@ impl Explorer {
                 history.push(screen);
                 cursor = 1;
             }
+        } else {
+            self.load_all_files()?;
         }
 
         loop {
@@ -1199,11 +1268,13 @@ impl Explorer {
             }
 
             // Returning to the tree from a tensor's detail/data view: select that
-            // tensor (revealing it) so you land where you were.
-            if matches!(history[cursor], Screen::Tree)
-                && let Some(name) = screen_tensor
-            {
-                self.reveal_tensor(&name);
+            // tensor (revealing it) so you land where you were. Revealing needs
+            // the full tree, so finish the deferred load before locating it.
+            if matches!(history[cursor], Screen::Tree) {
+                self.ensure_full_load()?;
+                if let Some(name) = screen_tensor {
+                    self.reveal_tensor(&name);
+                }
             }
         }
 
@@ -1259,6 +1330,9 @@ impl Explorer {
     /// returns a [`Nav`] when the user opens a tensor (`Enter`), moves through
     /// the screen history (Backspace / `\`), or quits.
     fn run_tree(&mut self) -> Result<Nav> {
+        // The browser needs the whole checkpoint; bring it in now if a fast
+        // `--tensor` open deferred the full load.
+        self.ensure_full_load()?;
         loop {
             self.scroll_offset = self.draw_tree(&mut live_out())?;
 
