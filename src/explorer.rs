@@ -23,7 +23,7 @@ use crate::sample::{HistShared, Histogram, PackingSchema, SampleMode, Stats, Vie
 use crate::tree::{
     Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key,
 };
-use crate::ui::{DrawConfig, Legend, NumBase, StatsView, StripeMode, UI};
+use crate::ui::{DrawConfig, Legend, NumBase, Overlay, StatsView, StripeMode, UI};
 use crate::utils::base64_encode;
 
 /// Whether the data views show the evenly-spaced overview or the first/last
@@ -2097,6 +2097,7 @@ impl Explorer {
                     None,
                     None,
                     self.schema_for(&tensor.name),
+                    None,
                 );
             });
         }
@@ -2139,6 +2140,10 @@ impl Explorer {
         let mut scan: Option<ScanJob> = None;
         let mut spin_frame = 0usize;
         let mut first = true;
+        // A floating pop-up (legend `l` / copied command `y`) shown over the live
+        // detail frame. While it's up the loop keeps redrawing and polling, so a
+        // running scan's progress animates behind it; any key dismisses it.
+        let mut overlay: Option<Overlay> = None;
         // Set right after `c` copies the screen; confirmed on the bottom line
         // until the next key or `COPY_FLASH` elapses.
         let mut copied_since: Option<std::time::Instant> = None;
@@ -2165,6 +2170,7 @@ impl Explorer {
                         None,
                         None,
                         self.schema_for(&tensor.name),
+                        None,
                     );
                 });
             }
@@ -2228,6 +2234,7 @@ impl Explorer {
                 hist.as_ref(),
                 None,
                 self.schema_for(&tensor.name),
+                overlay.as_ref(),
             )
             .is_err()
             {
@@ -2247,7 +2254,21 @@ impl Explorer {
             // the spinner keeps ticking and a finished scan is harvested promptly.
             // Pending input pauses the scan (it releases the file lock between
             // blocks) so the keypress's own work isn't stuck behind a block read.
-            let ev = if let Some(job) = &scan {
+            let ev = if overlay.is_some() {
+                // A pop-up is up: never pause the scan (the pop-up does no file
+                // I/O), and poll so its progress keeps animating behind it; with
+                // no scan there's nothing to animate, so just wait for the key.
+                if let Some(job) = &scan {
+                    job.pause.store(false, Ordering::Relaxed);
+                    if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false) {
+                        event::read()
+                    } else {
+                        continue;
+                    }
+                } else {
+                    event::read()
+                }
+            } else if let Some(job) = &scan {
                 if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false) {
                     job.pause.store(true, Ordering::Relaxed);
                     event::read()
@@ -2270,6 +2291,18 @@ impl Explorer {
             };
             // Any key dismisses a lingering copy confirmation; `c` sets it again.
             copied_since = None;
+            // While a pop-up overlay is up, any key dismisses it (Ctrl-C still
+            // quits) rather than acting as a screen command; the loop then
+            // redraws the detail without it.
+            if overlay.is_some() {
+                if let Ok(Event::Key(key)) = &ev
+                    && is_ctrl_c(key)
+                {
+                    quit_immediately();
+                }
+                overlay = None;
+                continue;
+            }
             match ev {
                 Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
                 Ok(Event::Key(KeyEvent {
@@ -2338,6 +2371,7 @@ impl Explorer {
                             None,
                             None,
                             self.schema_for(&tensor.name),
+                            None,
                         );
                     });
                 }
@@ -2396,26 +2430,28 @@ impl Explorer {
                             hist.as_ref(),
                             None,
                             self.schema_for(&tensor.name),
+                            None,
                         );
                     });
                     copy_to_clipboard(&text);
                     copied_since = Some(std::time::Instant::now());
                 }
-                // `y` shows and copies the CLI command that reopens this screen.
+                // `y` copies the CLI command and raises it as a pop-up over the
+                // live frame; the loop keeps animating any running scan behind it.
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('y'),
                     ..
-                })) => self.copy_command(
-                    &self.command_for_detail(tensor),
-                    scan.as_ref().map(|j| &*j.pause),
-                ),
-                // `l` opens the legend for the detail screen's glyphs, then
-                // returns here (the loop redraws the detail over it). The
-                // background stats scan keeps running while it's up.
+                })) => {
+                    let cmd = self.command_for_detail(tensor);
+                    copy_to_clipboard(&cmd);
+                    overlay = Some(Overlay::Command(cmd));
+                }
+                // `l` raises the legend as a pop-up over the live frame (same:
+                // the detail, including a running scan's progress, animates on).
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('l'),
                     ..
-                })) => self.show_legend(Legend::Detail, scan.as_ref().map(|j| &*j.pause)),
+                })) => overlay = Some(Overlay::Legend(Legend::Detail)),
                 // History navigation.
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Backspace,
@@ -2863,12 +2899,13 @@ impl Explorer {
                         None,
                         None,
                         self.schema_for(&tensor.name),
+                        None,
                     );
                 }),
                 ScanOutcome::Completed
             );
         if ready {
-            self.scan_histogram(tensor, view, |snap, scanning| {
+            self.scan_histogram(tensor, view, |snap, scanning, overlay| {
                 let stats = self.cached_stats(tensor, view);
                 let sv = match &stats {
                     Some(s) => StatsView::Ready(s),
@@ -2885,6 +2922,7 @@ impl Explorer {
                     Some(snap),
                     scanning,
                     self.schema_for(&tensor.name),
+                    overlay,
                 );
             });
         }
@@ -2892,16 +2930,18 @@ impl Explorer {
 
     /// Compute the whole-tensor value histogram for `(tensor, view)` into the
     /// cache, calling `redraw` with the running snapshot (and a spinner / elapsed
-    /// / fraction) each frame so the caller can animate the bins filling in on
-    /// its own screen. A no-op if already cached. Any key cancels (nothing is
-    /// cached, so it recomputes next time); Ctrl-C quits. The bin layout needs
-    /// the value range for floats / wide integers, taken from cached stats — the
-    /// caller computes those first when required (the 4-bit views don't need them).
+    /// / fraction, plus any pop-up overlay) each frame so the caller can animate
+    /// the bins filling in on its own screen. A no-op if already cached. `l` / `y`
+    /// raise the legend / copied-command pop-up over the still-filling bars
+    /// (dismissed by any key); any other key cancels the scan (nothing is cached,
+    /// so it recomputes next time); Ctrl-C quits. The bin layout needs the value
+    /// range for floats / wide integers, taken from cached stats — the caller
+    /// computes those first when required (the 4-bit views don't need them).
     fn scan_histogram(
         &self,
         tensor: &TensorInfo,
         view: ViewDtype,
-        mut redraw: impl FnMut(&Histogram, Option<crate::ui::ScanProgress>),
+        mut redraw: impl FnMut(&Histogram, Option<crate::ui::ScanProgress>, Option<&Overlay>),
     ) {
         let count = self.histogram_bins.get();
         let key = (tensor.name.clone(), view, count);
@@ -2945,6 +2985,9 @@ impl Explorer {
 
         let started = std::time::Instant::now();
         let mut frame = 0usize;
+        // A pop-up raised mid-scan (`l` / `y`); composited over the filling bars,
+        // it never cancels the scan, which keeps computing behind it.
+        let mut overlay: Option<Overlay> = None;
         while !handle.is_finished() {
             let progress =
                 (total > 0).then(|| (done.load(Ordering::Relaxed) as f64 / total as f64).min(1.0));
@@ -2955,16 +2998,32 @@ impl Explorer {
                     started.elapsed(),
                     progress,
                 )),
+                overlay.as_ref(),
             );
             frame += 1;
             if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false)
-                && let Ok(Event::Key(key)) = event::read()
+                && let Ok(Event::Key(kev)) = event::read()
             {
-                if is_ctrl_c(&key) {
+                if is_ctrl_c(&kev) {
                     quit_immediately();
                 }
-                cancel.store(true, Ordering::Relaxed);
-                return; // cancelled — leave it uncached so `g` recomputes
+                if overlay.is_some() {
+                    overlay = None; // dismiss the pop-up; the scan kept running
+                } else {
+                    match kev.code {
+                        KeyCode::Char('l') => overlay = Some(Overlay::Legend(Legend::Detail)),
+                        KeyCode::Char('y') => {
+                            let cmd = self.command_for_detail(tensor);
+                            copy_to_clipboard(&cmd);
+                            overlay = Some(Overlay::Command(cmd));
+                        }
+                        // Any other key aborts the (possibly slow) scan.
+                        _ => {
+                            cancel.store(true, Ordering::Relaxed);
+                            return; // cancelled — leave it uncached so `g` recomputes
+                        }
+                    }
+                }
             }
         }
         match handle.join() {
@@ -2973,6 +3032,17 @@ impl Explorer {
                 // Record the scan time so the heading keeps showing it after the
                 // bars have finished forming (mirroring the statistics line).
                 hist.elapsed = started.elapsed();
+                // A pop-up opened mid-scan stays up after the bars finish (rather
+                // than vanishing the instant it completes); any key dismisses it.
+                while overlay.is_some() {
+                    redraw(&hist, None, overlay.as_ref());
+                    if let Ok(Event::Key(kev)) = event::read() {
+                        if is_ctrl_c(&kev) {
+                            quit_immediately();
+                        }
+                        overlay = None;
+                    }
+                }
                 self.histogram_cache.borrow_mut().insert(key, hist);
             }
             Ok(Err(msg)) => {
@@ -3169,6 +3239,7 @@ impl Explorer {
                     None,
                     None,
                     self.schema_for(&tensor.name),
+                    None,
                 )
                 .is_ok(),
                 DtypePreview::Data { repr, slice, mode } => self
