@@ -54,3 +54,8 @@ hdf5 = ["dep:hdf5-metno", "dep:ndarray", "dep:hdf5-metno-sys", "dep:lz4_flex", "
 [[example]]
 name = "h5layout"
 required-features = ["hdf5"]
+
+# Regenerate the committed HDF5 end-to-end test fixture (tests/fixtures/tiny.hdf5).
+[[example]]
+name = "gen_hdf5_fixture"
+required-features = ["hdf5"]

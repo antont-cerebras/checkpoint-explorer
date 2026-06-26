@@ -10,8 +10,11 @@
 //! cargo insta review          # or: INSTA_UPDATE=always cargo test --test cli
 //! ```
 //!
-//! The fixture is generated fresh each run (pure Rust, deterministic), so nothing
-//! binary is committed.
+//! Fixtures: the safetensors one is generated fresh each run (pure Rust,
+//! deterministic, git-ignored); the HDF5 one is committed (`tests/fixtures/tiny.hdf5`,
+//! regenerated with `cargo run --example gen_hdf5_fixture --features hdf5`),
+//! because hdf5-metno isn't a dev-dependency. The HDF5 cases are gated on the
+//! `hdf5` feature.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -90,10 +93,9 @@ fn ensure_fixture() {
     ONCE.call_once(|| write_fixture(FIXTURE));
 }
 
-/// Run the binary in `--plain` mode and return its (normalized) screen text.
-fn plain(extra_args: &[&str]) -> String {
-    ensure_fixture();
-    let mut args = vec![FIXTURE];
+/// Run the binary in `--plain` mode against `fixture` and return its screen text.
+fn run_plain(fixture: &str, extra_args: &[&str]) -> String {
+    let mut args = vec![fixture];
     args.extend_from_slice(extra_args);
     args.push("--plain");
     let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
@@ -108,12 +110,18 @@ fn plain(extra_args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// The generated safetensors fixture, in `--plain`.
+fn plain(extra_args: &[&str]) -> String {
+    ensure_fixture();
+    run_plain(FIXTURE, extra_args)
+}
+
 /// Normalize the fixture's path (shown verbatim, absolute, or left-elided with
 /// `…` depending on the screen) to a stable token, so snapshots don't depend on
 /// the checkout location.
 fn settings() -> insta::Settings {
     let mut s = insta::Settings::clone_current();
-    s.add_filter(r"\S*tiny\.safetensors", "[FIXTURE]");
+    s.add_filter(r"\S*tiny\.(?:safetensors|hdf5)", "[FIXTURE]");
     s
 }
 
@@ -132,4 +140,50 @@ fn plain_detail_u16() {
 #[test]
 fn plain_detail_f16() {
     settings().bind(|| insta::assert_snapshot!(plain(&["--tensor", "model.embed_tokens.weight"])));
+}
+
+/// HDF5 fixture (`tests/fixtures/tiny.hdf5`, committed; regenerate with
+/// `cargo run --example gen_hdf5_fixture --features hdf5`). Gated on the `hdf5`
+/// feature so it only runs when the binary can read HDF5. Pins the fused-MoE
+/// quantization-schema display (top-level + per-tensor + non-uniform), the
+/// compression codec / `(uncompressed)` tags, and chunk reporting.
+#[cfg(feature = "hdf5")]
+mod hdf5 {
+    use super::{run_plain, settings};
+
+    const H5: &str = "tests/fixtures/tiny.hdf5";
+    const MOE: &str = "model.layers.0.block_sparse_moe.experts";
+
+    fn plain(extra_args: &[&str]) -> String {
+        run_plain(H5, extra_args)
+    }
+
+    #[test]
+    fn tree() {
+        settings().bind(|| insta::assert_snapshot!(plain(&[])));
+    }
+
+    #[test]
+    fn detail_down_proj_uniform_schema() {
+        let t = format!("{MOE}.down_proj.weight");
+        settings().bind(|| insta::assert_snapshot!(plain(&["--tensor", &t])));
+    }
+
+    #[test]
+    fn detail_gate_up_nonuniform_schema() {
+        let t = format!("{MOE}.gate_up_proj.weight");
+        settings().bind(|| insta::assert_snapshot!(plain(&["--tensor", &t])));
+    }
+
+    #[test]
+    fn detail_per_tensor_schema() {
+        settings().bind(|| {
+            insta::assert_snapshot!(plain(&["--tensor", "model.layers.0.custom_proj.weight"]))
+        });
+    }
+
+    #[test]
+    fn detail_compressed_f16() {
+        settings().bind(|| insta::assert_snapshot!(plain(&["--tensor", "lm_head.weight"])));
+    }
 }

@@ -1,0 +1,19 @@
+---
+source: tests/cli.rs
+expression: "plain(&[\"--tensor\", &t])"
+---
+Tensor Details
+──────────────
+Name: model.layers.0.block_sparse_moe.experts.gate_up_proj.weight
+Data Type: U16 as [4,3,3,6] (unpacked)
+Shape: (6, 3, 4) as (24, 3, 4)
+Parameters: 288 (288)
+Packing: [4,3,3,6] (bit widths [4, 3, 3, 6] · 4 experts/word · non-uniform)
+Size: 144 B · on disk: 134 B (⇩ gzip, 1.1×)
+Chunks: (2, 3, 4) × 3
+File: [FIXTURE]
+
+Statistics: press s to scan the full tensor
+
+Press m for a heatmap, v for numeric values, h for a histogram, b to set its bin count, d to reinterpret the dtype, r to
+ reshape, c to copy, y to copy the command, l for the legend, ⌫ / \ to step back / forward, any other key to return...
