@@ -63,6 +63,12 @@ mod palette {
     /// or columns, like a dim highlighter.
     pub const STRIPE_DARK: Color = Color::AnsiValue(234);
     pub const STRIPE_LITE: Color = Color::AnsiValue(237);
+    /// Background for floating pop-ups (legend, the `y` command panel, message
+    /// screens) — a neutral dark grey a few shades above black, in the same
+    /// family as the zebra greys above, so an overlay reads as a raised surface
+    /// over the main screen while staying within the dark theme. Light/accent
+    /// foregrounds keep their contrast; dim text stays legible.
+    pub const PANEL_BG: Color = Color::AnsiValue(236);
 }
 
 /// Marks a tensor that's on disk but not listed in the index (an "extra"),
@@ -1605,8 +1611,11 @@ impl UI {
     /// A simple full-screen message (e.g. when a data preview is unavailable).
     pub fn draw_message(title: &str, message: &str) -> Result<()> {
         let mut stdout = io::stdout();
+        // Panel background first, so `Clear(All)` erases the whole screen to the
+        // pop-up surface (the text is then written over it).
         execute!(
             stdout,
+            SetBackgroundColor(palette::PANEL_BG),
             terminal::Clear(ClearType::All),
             cursor::MoveTo(0, 0)
         )?;
@@ -1615,6 +1624,7 @@ impl UI {
         writeln!(stdout, "{message}\r")?;
         writeln!(stdout, "\r")?;
         writeln!(stdout, "Press any key to return...\r")?;
+        execute!(stdout, ResetColor)?;
         stdout.flush()?;
         Ok(())
     }
@@ -1664,6 +1674,9 @@ impl UI {
         // Clear a band row so the underlying screen doesn't show through.
         let clear = ClearType::CurrentLine;
         queue!(out, BeginSynchronizedUpdate)?;
+        // Panel background: the band's cleared rows then erase to the pop-up
+        // surface, lifting it off the view above and below.
+        begin_panel(&mut out)?;
 
         // A cleared margin row above, so the band reads as a floating pop-up.
         queue!(out, cursor::MoveTo(0, row), terminal::Clear(clear))?;
@@ -1680,11 +1693,14 @@ impl UI {
         write!(out, "CLI command")?;
         queue!(
             out,
+            // `Attribute::Reset` clears the bold *and* the panel background, so
+            // restore the surface before continuing the band.
             SetAttribute(Attribute::Reset),
+            SetBackgroundColor(palette::PANEL_BG),
             SetForegroundColor(palette::SUCCESS)
         )?;
         write!(out, "   ✓ copied to the clipboard")?;
-        queue!(out, ResetColor)?;
+        reset_fg(&mut out)?;
         row += 1;
 
         // Opening rule.
@@ -1695,7 +1711,7 @@ impl UI {
             SetForegroundColor(palette::ACCENT)
         )?;
         write!(out, "{rule}")?;
-        queue!(out, ResetColor)?;
+        reset_fg(&mut out)?;
         row += 1;
 
         // The command: blank its rows first, then write it at column 0 so it
@@ -1715,7 +1731,7 @@ impl UI {
             SetForegroundColor(palette::ACCENT)
         )?;
         write!(out, "{rule}")?;
-        queue!(out, ResetColor)?;
+        reset_fg(&mut out)?;
         row += 1;
 
         // Footer hint.
@@ -1729,12 +1745,13 @@ impl UI {
             out,
             "select the command above to copy it by hand · any key to dismiss"
         )?;
-        queue!(out, ResetColor)?;
+        reset_fg(&mut out)?;
         row += 1;
 
         // A cleared margin row below.
         queue!(out, cursor::MoveTo(0, row), terminal::Clear(clear))?;
 
+        end_panel(&mut out)?;
         queue!(out, EndSynchronizedUpdate)?;
         out.flush()?;
         Ok(())
@@ -1812,6 +1829,10 @@ impl UI {
         let stdout = io::stdout();
         let mut out = BufWriter::new(stdout.lock());
         queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
+        // Panel background for the whole screen: every `line_end` / `Clear` below
+        // (down to the closing `FromCursorDown`) erases to this surface, so the
+        // legend reads as a pop-up over the view it was opened from.
+        begin_panel(&mut out)?;
 
         let title = match legend {
             Legend::Tree => "Legend — checkpoint tree",
@@ -1821,10 +1842,10 @@ impl UI {
         };
         queue!(out, SetForegroundColor(palette::ACCENT))?;
         write!(out, "{title}")?;
-        queue!(out, ResetColor, SetForegroundColor(palette::DIM))?;
+        queue!(out, SetForegroundColor(palette::DIM))?;
         line_end(&mut out)?;
         write!(out, "{}", "─".repeat(title.chars().count()))?;
-        queue!(out, ResetColor)?;
+        reset_fg(&mut out)?;
         line_end(&mut out)?;
         line_end(&mut out)?;
 
@@ -1933,7 +1954,7 @@ impl UI {
                     out,
                     "  Statistics:  zeros = fraction of exactly-zero values · non-finite = count of NaN/∞"
                 )?;
-                queue!(out, ResetColor)?;
+                reset_fg(&mut out)?;
                 write!(out, "\r\n")?;
             }
             Legend::Heatmap => {
@@ -1958,14 +1979,14 @@ impl UI {
                 write!(out, "  ")?;
                 queue!(out, SetForegroundColor(palette::DIM))?;
                 write!(out, "low ")?;
-                queue!(out, ResetColor)?;
+                reset_fg(&mut out)?;
                 for i in 0..24 {
                     queue!(out, SetForegroundColor(heat_color(i as f64 / 23.0)))?;
                     write!(out, "█")?;
                 }
-                queue!(out, ResetColor, SetForegroundColor(palette::DIM))?;
+                queue!(out, SetForegroundColor(palette::DIM))?;
                 write!(out, " high")?;
-                queue!(out, ResetColor)?;
+                reset_fg(&mut out)?;
                 write!(out, "   colour scale: cool = low value, warm = high value")?;
                 write!(out, "\r\n")?;
             }
@@ -2010,7 +2031,9 @@ impl UI {
                 write!(out, " 12 ")?;
                 queue!(out, SetBackgroundColor(palette::STRIPE_LITE))?;
                 write!(out, " 34 ")?;
-                queue!(out, SetBackgroundColor(Color::Reset))?;
+                // Back to the pop-up surface (not the terminal default) for the
+                // description that follows.
+                queue!(out, SetBackgroundColor(palette::PANEL_BG))?;
                 queue!(out, cursor::MoveToColumn(col))?;
                 write!(
                     out,
@@ -2024,13 +2047,13 @@ impl UI {
         write!(out, "\r\n")?;
         queue!(out, SetForegroundColor(palette::DIM))?;
         write!(out, "Press any key to close.")?;
-        queue!(out, ResetColor)?;
+        reset_fg(&mut out)?;
 
-        queue!(
-            out,
-            terminal::Clear(ClearType::FromCursorDown),
-            EndSynchronizedUpdate
-        )?;
+        // Fill the rest of the screen with the panel surface (bg still set), then
+        // drop the colours so the panel doesn't bleed past the dismissed pop-up.
+        queue!(out, terminal::Clear(ClearType::FromCursorDown))?;
+        end_panel(&mut out)?;
+        queue!(out, EndSynchronizedUpdate)?;
         out.flush()?;
         Ok(())
     }
@@ -2091,6 +2114,33 @@ fn legend_line(
     }
     queue!(out, cursor::MoveToColumn(desc_col))?;
     write!(out, "{desc}\r\n")?;
+    Ok(())
+}
+
+/// Start a floating pop-up panel: set the distinct [`palette::PANEL_BG`] so the
+/// overlay reads as a raised surface. While it is active, every `Clear` fills
+/// with the panel background (background-colour erase) and written cells inherit
+/// it, so the whole panel — content, gaps, and cleared margins — is one surface.
+/// Reset foregrounds with [`reset_fg`] (not `ResetColor`) so the panel persists,
+/// and finish with [`end_panel`].
+fn begin_panel(out: &mut impl Write) -> Result<()> {
+    queue!(out, SetBackgroundColor(palette::PANEL_BG))?;
+    Ok(())
+}
+
+/// Reset only the foreground colour, keeping the pop-up panel background so a
+/// following `Clear` still erases to the panel surface rather than to the
+/// terminal default. Use inside a [`begin_panel`] region in place of `ResetColor`.
+fn reset_fg(out: &mut impl Write) -> Result<()> {
+    queue!(out, SetForegroundColor(Color::Reset))?;
+    Ok(())
+}
+
+/// Finish a [`begin_panel`] region: clear colours so the panel background does
+/// not leak into later writes. Cells already painted keep the panel surface
+/// until the caller redraws its own screen over the dismissed pop-up.
+fn end_panel(out: &mut impl Write) -> Result<()> {
+    queue!(out, ResetColor)?;
     Ok(())
 }
 
