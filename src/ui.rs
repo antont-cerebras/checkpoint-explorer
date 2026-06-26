@@ -4,7 +4,7 @@ use crossterm::{
     style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{self, BeginSynchronizedUpdate, ClearType, EndSynchronizedUpdate},
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufWriter, Write};
 use std::time::Duration;
 
@@ -111,6 +111,9 @@ pub struct DrawConfig<'a> {
     /// `source_path`s of tensors present on disk but not listed in the index
     /// (a stale `model.safetensors.index.json`), flagged in the tree.
     pub unindexed: &'a HashSet<String>,
+    /// Per-tensor fused-codebook packing schemas, keyed by tensor name. A tensor
+    /// with one shows its logical (unmerged) dtype and shape beside the physical.
+    pub packing_schemas: &'a HashMap<String, PackingSchema>,
 }
 
 /// How a screen should render the statistics area: not computed yet, a scan in
@@ -384,7 +387,14 @@ impl UI {
                 )?;
             }
 
-            Self::draw_node(node, *depth, is_selected, config.unindexed, &mut *out)?;
+            Self::draw_node(
+                node,
+                *depth,
+                is_selected,
+                config.unindexed,
+                config.packing_schemas,
+                &mut *out,
+            )?;
 
             if is_selected {
                 queue!(out, ResetColor)?;
@@ -450,6 +460,7 @@ impl UI {
         depth: usize,
         selected: bool,
         unindexed: &HashSet<String>,
+        packing_schemas: &HashMap<String, PackingSchema>,
         out: &mut impl Write,
     ) -> Result<()> {
         let indent = "  ".repeat(depth);
@@ -526,7 +537,22 @@ impl UI {
                 }
                 write!(out, " {display_name} [")?;
                 paint(out, selected, palette::DTYPE, &info.dtype)?;
-                write!(out, ", {}, ", format_shape(&info.shape))?;
+                // A fused-codebook tensor carries a logical (unmerged) layout that
+                // matters more than its sizes: show `physical as logical` for both
+                // the dtype and the shape (e.g. `U16 as u3×5, (26,…) as (130,…)`).
+                let schema = packing_schemas.get(&info.name);
+                if let Some(s) = schema {
+                    paint(out, selected, palette::DIM, " as ")?;
+                    paint(out, selected, palette::DTYPE, &s.label())?;
+                }
+                write!(out, ", {}", format_shape(&info.shape))?;
+                if let Some(s) = schema {
+                    let logical =
+                        ViewDtype::Unpacked.logical_shape_with(&info.shape, &info.dtype, Some(s));
+                    paint(out, selected, palette::DIM, " as ")?;
+                    write!(out, "{}", format_shape(&logical))?;
+                }
+                write!(out, ", ")?;
                 match &info.storage {
                     Storage::Compressed {
                         codec,
