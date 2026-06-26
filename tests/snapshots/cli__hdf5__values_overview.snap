@@ -1,0 +1,17 @@
+---
+source: tests/cli.rs
+expression: "plain(&[\"--tensor\", &t, \"--values\", \"--overview\"])"
+---
+Values: model.layers.0.block_sparse_moe.experts.down_proj.weight
+File: [FIXTURE]
+U16 as u3×5 (unpacked) (6, 3, 4) as (30, 3, 4) → sampled 3 of 3 rows × 4 of 4 cols (indices shown)
+mean 0.9667 · std 1.7854 · zeros 69.2%  (<time>)
+expert 0 of 30 — stored word 0, field 0/5 (3-bit) — ← → step · Shift+← → jump 5% (both wrap) · / index or %
+
+        0  1  2  3
+     0  0  1  2  3
+     1  4  5  6  7
+     2  0  1  2  3
+
+m heatmap · ← → step · Shift+← → jump 5% · / index or % · d dtype · r reshape · e edges · z zebra: rows · b base: dec ·
+c copy · y copy cmd · l legend · ⌫ back · \ fwd · any other key to return...

@@ -944,7 +944,7 @@ impl UI {
         // bytes (the blank line above the histogram already sets it off from the
         // statistics, so no extra spacer is reserved below it).
         if let Some(hist) = histogram {
-            let (term_w, term_h) = terminal::size().unwrap_or((100, 40));
+            let (term_w, term_h) = crate::plain::term_size();
             let (tw, th) = (term_w as usize, term_h as usize);
             let body_rows = count_physical_lines(&body, tw);
             let footer_rows = count_physical_lines(&footer, tw);
@@ -2745,7 +2745,7 @@ fn truncate_keep_end(s: &str, width: usize) -> String {
 /// so both remain on screen above a grid of any size. `kind` is the view label
 /// (`Values` / `Heatmap`).
 fn write_data_view_title(out: &mut impl Write, kind: &str, tensor: &TensorInfo) -> Result<()> {
-    let width = terminal::size().map(|(w, _)| w as usize).unwrap_or(100);
+    let width = crate::plain::term_size().0 as usize;
     write!(out, "{kind}: ")?;
     write!(
         out,
