@@ -46,66 +46,145 @@ fn read_tensors(file: &hdf5_metno::File, path: &std::path::Path) -> Result<Vec<T
 
     let mut tensors = Vec::with_capacity(members.len());
     for key in members {
-        // Each top-level member is a tensor dataset; skip anything that is not a
-        // dataset (e.g. a stray group) rather than failing the whole file.
-        let Ok(dataset) = file.dataset(&key) else {
-            continue;
-        };
-
-        let shape = dataset.shape();
-        let num_elements: usize = shape.iter().product();
-
-        let (dtype, item_size) = match dataset.dtype() {
-            Ok(dt) => {
-                let item = dt.size();
-                let name = dt
-                    .to_descriptor()
-                    .ok()
-                    .map(|d| dtype_name(&d))
-                    .unwrap_or_else(|| "?".to_string());
-                (name, item)
-            }
-            Err(_) => ("?".to_string(), 0),
-        };
-
-        // Logical (uncompressed) size, and the on-disk size when a compression
-        // filter is in the pipeline.
-        let size_bytes = num_elements * item_size;
-        let storage = match dataset.filters().iter().find_map(compression_codec) {
-            Some(codec) => {
-                let stored = dataset.storage_size() as usize;
-                if stored > 0 {
-                    Storage::Compressed {
-                        codec,
-                        stored_bytes: stored,
-                    }
-                } else {
-                    Storage::Raw
-                }
-            }
-            None => Storage::Raw,
-        };
-
-        // HDF5 data is chunked rather than a flat slice; report the chunk shape
-        // and count when present.
-        let layout = match (dataset.chunk(), dataset.num_chunks()) {
-            (Some(chunk), Some(num_chunks)) => Layout::Chunked { chunk, num_chunks },
-            _ => Layout::None,
-        };
-
-        tensors.push(TensorInfo {
-            name: percent_decode(&key),
-            dtype,
-            shape,
-            size_bytes,
-            num_elements,
-            storage,
-            source_path: source_path.clone(),
-            layout,
-        });
+        if let Some(info) = dataset_info(file, &key, &source_path) {
+            tensors.push(info);
+        }
     }
 
     Ok(tensors)
+}
+
+/// Build a [`TensorInfo`] for one top-level dataset, or `None` if the member is
+/// not a dataset (e.g. a stray group). The expensive part of enumerating a cold
+/// HDF5 file lives here — `storage_size()` / `num_chunks()` each read the chunk
+/// index — so opening a single tensor reads only this one rather than all of them.
+fn dataset_info(file: &hdf5_metno::File, key: &str, source_path: &str) -> Option<TensorInfo> {
+    let dataset = file.dataset(key).ok()?;
+
+    let shape = dataset.shape();
+    let num_elements: usize = shape.iter().product();
+
+    let (dtype, item_size) = match dataset.dtype() {
+        Ok(dt) => {
+            let item = dt.size();
+            let name = dt
+                .to_descriptor()
+                .ok()
+                .map(|d| dtype_name(&d))
+                .unwrap_or_else(|| "?".to_string());
+            (name, item)
+        }
+        Err(_) => ("?".to_string(), 0),
+    };
+
+    // Logical (uncompressed) size, and the on-disk size when a compression
+    // filter is in the pipeline.
+    let size_bytes = num_elements * item_size;
+    let storage = match dataset.filters().iter().find_map(compression_codec) {
+        Some(codec) => {
+            let stored = dataset.storage_size() as usize;
+            if stored > 0 {
+                Storage::Compressed {
+                    codec,
+                    stored_bytes: stored,
+                }
+            } else {
+                Storage::Raw
+            }
+        }
+        None => Storage::Raw,
+    };
+
+    // HDF5 data is chunked rather than a flat slice; report the chunk shape
+    // and count when present.
+    let layout = match (dataset.chunk(), dataset.num_chunks()) {
+        (Some(chunk), Some(num_chunks)) => Layout::Chunked { chunk, num_chunks },
+        _ => Layout::None,
+    };
+
+    Some(TensorInfo {
+        name: percent_decode(key),
+        dtype,
+        shape,
+        size_bytes,
+        num_elements,
+        storage,
+        source_path: source_path.to_string(),
+        layout,
+    })
+}
+
+/// Read just one tensor (by its decoded name) plus the root attributes that
+/// could carry its packing schema, from a single file open. Returns `Ok(None)`
+/// if no top-level dataset decodes to `name`, so the caller can fall back to a
+/// full load (which surfaces the "tensor not found" message).
+///
+/// This is the fast path behind `checkpoint-explorer … --tensor X` for a cold
+/// HDF5 file: enumerating every dataset's chunk index can take seconds, but a
+/// direct tensor view only needs that one tensor and its schema.
+pub fn read_one(
+    path: &std::path::Path,
+    name: &str,
+) -> Result<Option<(TensorInfo, Vec<MetadataInfo>)>> {
+    let file = hdf5_metno::File::open(path)
+        .with_context(|| format!("Failed to open HDF5 file: {}", path.display()))?;
+    crate::hdf5_lz4::register();
+    crate::hdf5_zstd::register();
+
+    let members = file
+        .member_names()
+        .with_context(|| format!("Failed to list members of: {}", path.display()))?;
+    // Member names are percent-encoded on disk; match on the decoded form the
+    // user typed (and that the tree shows).
+    let Some(key) = members.into_iter().find(|k| percent_decode(k) == name) else {
+        return Ok(None);
+    };
+
+    let source_path = std::path::absolute(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let Some(tensor) = dataset_info(&file, &key, &source_path) else {
+        return Ok(None);
+    };
+
+    let metadata = read_schema_metadata(&file, &tensor.name, &key);
+    Ok(Some((tensor, metadata)))
+}
+
+/// Read only the root attributes that the schema parser consults for one tensor:
+/// the per-tensor `<tensor>.__metadata__` / `<tensor>.quantization_schema[.__metadata__]`
+/// forms (tried under both the decoded name and the encoded key) and the
+/// checkpoint-wide `codebook_packing_schema[.__metadata__]` fallback. Reading
+/// these by name avoids enumerating every attribute on a many-tensor file.
+fn read_schema_metadata(file: &hdf5_metno::File, name: &str, key: &str) -> Vec<MetadataInfo> {
+    let mut candidates = vec![
+        format!("{name}.__metadata__"),
+        format!("{name}.quantization_schema.__metadata__"),
+        format!("{name}.quantization_schema"),
+        "codebook_packing_schema.__metadata__".to_string(),
+        "codebook_packing_schema".to_string(),
+    ];
+    if key != name {
+        candidates.push(format!("{key}.__metadata__"));
+        candidates.push(format!("{key}.quantization_schema.__metadata__"));
+        candidates.push(format!("{key}.quantization_schema"));
+    }
+
+    let mut out = Vec::new();
+    for attr_name in candidates {
+        let Some((raw, value_type)) = read_attr_value(file, &attr_name) else {
+            continue;
+        };
+        let (value, value_type) =
+            unwrap_metadata_value(&attr_name, &raw).unwrap_or((raw, value_type));
+        out.push(MetadataInfo {
+            name: attr_name,
+            value,
+            value_type,
+        });
+    }
+    out
 }
 
 /// Read root-level HDF5 attributes as checkpoint metadata. Cerebras checkpoints
