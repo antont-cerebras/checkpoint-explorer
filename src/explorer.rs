@@ -1374,7 +1374,9 @@ impl Explorer {
                     KeyEvent {
                         code: KeyCode::Char('y'),
                         ..
-                    } if !self.search_mode => self.copy_command(&self.command_for_tree_selection()),
+                    } if !self.search_mode => {
+                        self.copy_command(&self.command_for_tree_selection(), None)
+                    }
                     // `h` shows the checkpoint health report (when there is one).
                     KeyEvent {
                         code: KeyCode::Char('h'),
@@ -1384,7 +1386,7 @@ impl Explorer {
                     KeyEvent {
                         code: KeyCode::Char('l'),
                         ..
-                    } if !self.search_mode => self.show_legend(Legend::Tree),
+                    } if !self.search_mode => self.show_legend(Legend::Tree, None),
                     // `E` / `C` expand / collapse every group at once.
                     KeyEvent {
                         code: KeyCode::Char('E'),
@@ -2403,13 +2405,17 @@ impl Explorer {
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('y'),
                     ..
-                })) => self.copy_command(&self.command_for_detail(tensor)),
+                })) => self.copy_command(
+                    &self.command_for_detail(tensor),
+                    scan.as_ref().map(|j| &*j.pause),
+                ),
                 // `l` opens the legend for the detail screen's glyphs, then
-                // returns here (the loop redraws the detail over it).
+                // returns here (the loop redraws the detail over it). The
+                // background stats scan keeps running while it's up.
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('l'),
                     ..
-                })) => self.show_legend(Legend::Detail),
+                })) => self.show_legend(Legend::Detail, scan.as_ref().map(|j| &*j.pause)),
                 // History navigation.
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Backspace,
@@ -2781,15 +2787,20 @@ impl Explorer {
                             }
                             // `y` shows and copies the CLI command that reopens
                             // this exact view.
-                            KeyCode::Char('y') => {
-                                self.copy_command(&self.command_for_data(tensor, repr, slice))
-                            }
+                            KeyCode::Char('y') => self.copy_command(
+                                &self.command_for_data(tensor, repr, slice),
+                                scan.as_ref().map(|j| &*j.pause),
+                            ),
                             // Open the legend for this representation, then
-                            // redraw the data view over it.
-                            KeyCode::Char('l') => self.show_legend(match repr {
-                                Representation::Heatmap => Legend::Heatmap,
-                                Representation::Values => Legend::Values,
-                            }),
+                            // redraw the data view over it. The background stats
+                            // scan keeps running while it's up.
+                            KeyCode::Char('l') => self.show_legend(
+                                match repr {
+                                    Representation::Heatmap => Legend::Heatmap,
+                                    Representation::Values => Legend::Values,
+                                },
+                                scan.as_ref().map(|j| &*j.pause),
+                            ),
                             // History navigation: Backspace back, `\` forward.
                             KeyCode::Backspace => return (Nav::Back, repr, slice),
                             KeyCode::Char('\\') => return (Nav::Forward, repr, slice),
@@ -3579,7 +3590,15 @@ impl Explorer {
     /// Show the context-sensitive legend for the current screen (`l`), then wait
     /// for any key to dismiss it (Ctrl-C still quits). The caller's loop redraws
     /// its own screen over the overlay on the next iteration.
-    fn show_legend(&self, legend: Legend) {
+    ///
+    /// `resume` is the pause flag of a background scan that the caller paused for
+    /// this keypress (or `None`). The overlay does no file I/O, so we clear it to
+    /// let the scan keep computing while the legend is up — its result is
+    /// harvested when the caller redraws — instead of stalling it until dismissal.
+    fn show_legend(&self, legend: Legend, resume: Option<&AtomicBool>) {
+        if let Some(pause) = resume {
+            pause.store(false, Ordering::Relaxed);
+        }
         if UI::draw_legend(legend).is_ok()
             && let Ok(Event::Key(key)) = event::read()
             && is_ctrl_c(&key)
@@ -3590,9 +3609,14 @@ impl Explorer {
 
     /// Copy `command` to the clipboard and show it in a dismissible box, so the
     /// user can both see and paste the exact invocation that reopens this screen
-    /// (the `y` shortcut). Any key returns; Ctrl-C still quits.
-    fn copy_command(&self, command: &str) {
+    /// (the `y` shortcut). Any key returns; Ctrl-C still quits. `resume` keeps a
+    /// caller-paused background scan running while the box is up (see
+    /// [`Self::show_legend`]).
+    fn copy_command(&self, command: &str, resume: Option<&AtomicBool>) {
         copy_to_clipboard(command);
+        if let Some(pause) = resume {
+            pause.store(false, Ordering::Relaxed);
+        }
         if UI::draw_command(command).is_ok()
             && let Ok(Event::Key(key)) = event::read()
             && is_ctrl_c(&key)
