@@ -329,6 +329,30 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         std::process::exit(1);
     }
 
+    // Reading HDF5 needs the `hdf5` build feature; without it these files would
+    // load as empty and the tree would misleadingly read "0 tensors, 0 params,
+    // 0 B". Say so plainly instead. Directory scans already skip HDF5 when the
+    // feature is off, so this only fires for files the user named explicitly.
+    #[cfg(not(feature = "hdf5"))]
+    {
+        let hdf5: Vec<&PathBuf> = files
+            .iter()
+            .filter(|p| matches!(p.extension().and_then(|s| s.to_str()), Some("h5" | "hdf5")))
+            .collect();
+        if !hdf5.is_empty() {
+            eprintln!(
+                "Error: this build of checkpoint-explorer was compiled without HDF5 support, so it cannot read:"
+            );
+            for path in &hdf5 {
+                eprintln!("  {}", path.display());
+            }
+            eprintln!();
+            eprintln!("Rebuild and reinstall with the `hdf5` feature, e.g.:");
+            eprintln!("  cargo install --path . --features hdf5");
+            std::process::exit(1);
+        }
+    }
+
     // Flags that target the tree browser rather than a tensor view: with no
     // `--tensor` (and no data view), they make the tree the opened screen, so
     // e.g. `--expand-all` or `--legend` alone don't demand a tensor.
