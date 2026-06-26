@@ -938,18 +938,19 @@ impl UI {
         out.write_all(&body)?;
 
         // The whole-tensor value histogram, below the statistics (when computed
-        // or being computed), sized to exactly the rows left between the header
-        // and the footer — so it fills the screen with no blank line above the
-        // footer and never scrolls. Both heights are measured from the rendered
-        // bytes (the blank line above the histogram already sets it off from the
-        // statistics, so no extra spacer is reserved below it).
+        // or being computed), sized to the rows left between the header and the
+        // footer — so it fills the screen and never scrolls. Both heights are
+        // measured from the rendered bytes. A blank line is left below the bars
+        // (it's reserved in the budget) so the footer's key hints don't crowd the
+        // last bar — mirroring the blank line above the histogram.
         if let Some(hist) = histogram {
             let (term_w, term_h) = crate::plain::term_size();
             let (tw, th) = (term_w as usize, term_h as usize);
             let body_rows = count_physical_lines(&body, tw);
             let footer_rows = count_physical_lines(&footer, tw);
-            let section = th.saturating_sub(body_rows + footer_rows).max(2);
+            let section = th.saturating_sub(body_rows + footer_rows + 1).max(2);
             write_histogram_section(&mut *out, hist, hist_scanning, tw, section)?;
+            line_end(&mut *out)?; // blank spacer before the footer
         }
 
         out.write_all(&footer)?;
