@@ -1,11 +1,11 @@
 use anyhow::Result;
 use crossterm::{
-    cursor, execute, queue,
+    cursor, queue,
     style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{self, BeginSynchronizedUpdate, ClearType, EndSynchronizedUpdate},
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{self, BufWriter, Write};
+use std::io::Write;
 use std::time::Duration;
 
 use ratatui::Frame;
@@ -938,735 +938,129 @@ impl UI {
         render_panel_band(frame, band);
     }
 
-    /// A loading screen shown while the checkpoint structure is read: the same
-    /// title line + rule as the tree browser, a spinner where the rows will land,
-    /// and a hint pinned to the bottom — so the header/footer are up immediately
-    /// and the tree fills into the same frame once the read finishes.
-    pub fn draw_loading(
+    /// The Ratatui port of [`Self::draw_loading`]: the tree browser's title + rule
+    /// header, a spinner on the row where the tree's first node will land, and the
+    /// cancel hint pinned to the bottom — so the chrome is up immediately and the
+    /// tree fills into the same frame once the read finishes.
+    pub fn render_loading(
+        frame: &mut Frame,
         file: &str,
         total_files: usize,
         spinner: char,
         elapsed: std::time::Duration,
-    ) -> Result<()> {
-        let mut out = io::stdout();
-        let (w, h) = terminal::size()?;
-        let (w, h) = (w as usize, h as usize);
-        queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
+    ) {
+        let area = frame.area();
+        let width = area.width as usize;
+        let height = area.height;
 
-        // Each element is positioned with an explicit `MoveTo` so the layout is
-        // exact regardless of how the terminal handles the full-width rule's
-        // wrap. Header: title line (row 0), full-width rule (row 1).
-        queue!(out, terminal::Clear(ClearType::CurrentLine))?;
-        write!(out, "Checkpoint Explorer - {file}")?;
+        // Title (row 0), with the same "+N more" note for a multi-file load.
+        let mut title = vec![Span::raw(format!("Checkpoint Explorer - {file}"))];
         if total_files > 1 {
-            queue!(out, SetForegroundColor(palette::DIM))?;
-            write!(out, "  (+{} more)", total_files - 1)?;
-            queue!(out, ResetColor)?;
+            title.push(dim_span(format!("  (+{} more)", total_files - 1)));
         }
-        queue!(
-            out,
-            cursor::MoveTo(0, 1),
-            terminal::Clear(ClearType::CurrentLine),
-            SetForegroundColor(palette::DIM)
-        )?;
-        write!(out, "{}", "─".repeat(w))?;
-        queue!(out, ResetColor)?;
+        // Full-width rule (row 1).
+        let mut lines: Vec<Line> = vec![
+            Line::from(title),
+            Line::from(dim_span("─".repeat(width))),
+            Line::default(),
+        ];
+        // The spinner lands on the row where the tree's first node will (row 3,
+        // clamped). Rows above it are blank spacers added above.
+        let spinner_row = 3u16.min(height.saturating_sub(2));
+        for _ in lines.len() as u16..spinner_row {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("{spinner} reading checkpoint structure"),
+                Style::default().fg(to_ratatui(palette::ACCENT)),
+            ),
+            dim_span(format!("  ({:.1}s)", elapsed.as_secs_f64())),
+        ]));
+        Paragraph::new(lines).render(area, frame.buffer_mut());
 
-        // Wipe everything below the header, then the spinner just under it — on
-        // the row where the tree's first node will land, so it reads as content
-        // loading in place rather than floating mid-screen.
-        let spinner_row = 3u16.min(h.saturating_sub(2) as u16);
-        queue!(
-            out,
-            cursor::MoveTo(0, 2),
-            terminal::Clear(ClearType::FromCursorDown),
-            cursor::MoveTo(2, spinner_row),
-            SetForegroundColor(palette::ACCENT)
-        )?;
-        write!(out, "{spinner} reading checkpoint structure")?;
-        queue!(out, ResetColor, SetForegroundColor(palette::DIM))?;
-        write!(out, "  ({:.1}s)", elapsed.as_secs_f64())?;
-        queue!(out, ResetColor)?;
-
-        // Footer hint pinned to the bottom (no trailing newline → no scroll).
-        queue!(
-            out,
-            cursor::MoveTo(0, h.saturating_sub(1) as u16),
-            terminal::Clear(ClearType::CurrentLine),
-            SetForegroundColor(palette::DIM)
-        )?;
-        write!(out, "Press ")?;
-        queue!(out, ResetColor)?;
-        key_hint(&mut out, "q")?;
-        queue!(out, SetForegroundColor(palette::DIM))?;
-        write!(out, " to cancel")?;
-        queue!(out, ResetColor)?;
-
-        queue!(out, EndSynchronizedUpdate)?;
-        out.flush()?;
-        Ok(())
+        // Footer hint pinned to the bottom row.
+        Paragraph::new(Line::from(vec![
+            dim_span("Press "),
+            key_span("q"),
+            dim_span(" to cancel"),
+        ]))
+        .render(
+            Rect {
+                x: 0,
+                y: height.saturating_sub(1),
+                width: area.width,
+                height: 1,
+            },
+            frame.buffer_mut(),
+        );
     }
 
-    /// Draw the tensor detail screen. `view` is the active dtype reinterpretation
-    /// (which changes the shown dtype, shape and parameter count); `overridable`
-    /// gates the `d` hint. `histogram` adds the value-histogram section below the
-    /// stats. Rendered flicker-free so it can also serve as the live preview
-    /// while choosing a dtype in the menu.
-    #[allow(clippy::too_many_arguments)] // a screen renderer; the params are all distinct
-    pub fn draw_tensor_detail(
-        out: &mut impl Write,
-        tensor: &TensorInfo,
-        shape: &[usize],
-        view: ViewDtype,
-        overridable: bool,
-        unindexed: bool,
-        stats: StatsView,
-        histogram: Option<&Histogram>,
-        hist_scanning: Option<ScanProgress>,
-        schema: Option<&PackingSchema>,
-        overlay: Option<&Overlay>,
-    ) -> Result<()> {
-        queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
+    /// The Ratatui port of [`Self::draw_metadata_detail`]: the Key/Type/Value
+    /// header, then the value — pretty, syntax-highlighted JSON converted from its
+    /// ANSI form via `ansi-to-tui` (so the same `colored_json` palette shows
+    /// through), or the raw text lines for a non-JSON value — with the same
+    /// line-budget elision and footer.
+    pub fn render_metadata_detail(frame: &mut Frame, metadata: &MetadataInfo) {
+        use ansi_to_tui::IntoText;
+        let area = frame.area();
+        let rows = area.height as usize;
 
-        // The header (title, fields, statistics) is rendered into a buffer so
-        // its exact wrapped height can be measured; the histogram below is then
-        // sized to the rows that remain, leaving no gap and never scrolling.
-        let mut body: Vec<u8> = Vec::new();
-        queue!(body, SetForegroundColor(palette::ACCENT))?;
-        write!(body, "Tensor Details")?;
-        queue!(body, ResetColor, SetForegroundColor(palette::DIM))?;
-        line_end(&mut body)?;
-        write!(body, "{}", "─".repeat(14))?;
-        queue!(body, ResetColor)?;
-        line_end(&mut body)?;
-        paint(&mut body, false, palette::DIM, "Name: ")?;
-        write!(body, "{}", tensor.name)?;
-        line_end(&mut body)?;
+        let mut lines: Vec<Line> = vec![
+            Line::from(Span::styled(
+                "Metadata Details",
+                Style::default().fg(to_ratatui(palette::ACCENT)),
+            )),
+            Line::from(dim_span("================")),
+            Line::from(vec![dim_span("Key: "), Span::raw(metadata.name.clone())]),
+            Line::from(vec![
+                dim_span("Type: "),
+                Span::raw(metadata.value_type.clone()),
+            ]),
+            Line::from(dim_span("Value:")),
+        ];
 
-        // Data type, with the active reinterpretation highlighted.
-        let unpacked_label = schema.map(PackingSchema::label);
-        paint(&mut body, false, palette::DIM, "Data Type: ")?;
-        write_view_dtype(&mut body, &tensor.dtype, view, unpacked_label.as_deref())?;
-        line_end(&mut body)?;
-
-        // Shape and parameter count reflect the overrides: `shape` is the
-        // effective (possibly reshaped) shape, and a packed dtype view unpacks
-        // several values per stored element (the codebook unmerge grows the first
-        // dimension, the 4-bit views the last). Show `stored as reinterpreted`.
-        let logical = view.logical_shape_with(shape, &tensor.dtype, schema);
-        let num_elements: usize = logical.iter().product();
-        paint(&mut body, false, palette::DIM, "Shape: ")?;
-        write_view_shape(&mut body, &tensor.shape, &logical)?;
-        line_end(&mut body)?;
-        paint(&mut body, false, palette::DIM, "Parameters: ")?;
-        write!(body, "{} ", format_parameters(num_elements))?;
-        paint(
-            &mut body,
-            false,
-            palette::DIM,
-            &format!("({})", with_thousands(num_elements)),
-        )?;
-        line_end(&mut body)?;
-
-        // Codebook packing schema disclosure (only for tensors that carry one).
-        if let Some(s) = schema {
-            paint(&mut body, false, palette::DIM, "Packing: ")?;
-            write!(body, "{} ", s.label())?;
-            let widths = s
-                .bit_widths()
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            let mode = s
-                .quant_mode()
-                .map(|m| format!(" · {m}"))
-                .unwrap_or_default();
-            let uniform = if s.uniform_width().is_some() {
-                "uniform"
-            } else {
-                "non-uniform"
-            };
-            paint(
-                &mut body,
-                false,
-                palette::DIM,
-                &format!(
-                    "(bit widths [{widths}] · {} experts/word · {uniform}{mode})",
-                    s.len_p()
-                ),
-            )?;
-            line_end(&mut body)?;
-        }
-
-        paint(&mut body, false, palette::DIM, "Size: ")?;
-        write!(body, "{}", format_size(tensor.size_bytes))?;
-        // On-disk size + codec on the same line, for formats that track
-        // compression (HDF5); safetensors leaves it off entirely.
-        match &tensor.storage {
-            Storage::Compressed {
-                codec,
-                stored_bytes,
-            } => {
-                // Show the compression ratio so the on-disk vs logical gap is
-                // explicit (e.g. 4-bit weights in 16-bit words only reach ~2×
-                // under byte-oriented LZ4).
-                let ratio = tensor.size_bytes as f64 / (*stored_bytes).max(1) as f64;
-                write!(body, " · on disk: {} ", format_size(*stored_bytes))?;
-                paint(
-                    &mut body,
-                    false,
-                    palette::DIM,
-                    &format!("({COMPRESSED_MARK} {codec}, {ratio:.1}×)"),
-                )?;
-            }
-            Storage::Raw => {
-                write!(
-                    body,
-                    " · on disk: {} {UNCOMPRESSED_TAG}",
-                    format_size(tensor.size_bytes)
-                )?;
-            }
-            Storage::Unknown => {}
-        }
-        line_end(&mut body)?;
-        // Where the data lives within the file.
-        match &tensor.layout {
-            Layout::ByteRange { start, end } => {
-                paint(&mut body, false, palette::DIM, "Data offsets: ")?;
-                write!(
-                    body,
-                    "{} – {}  (within file data)",
-                    with_thousands(*start as usize),
-                    with_thousands(*end as usize)
-                )?;
-                line_end(&mut body)?;
-            }
-            Layout::Offset(offset) => {
-                paint(&mut body, false, palette::DIM, "Data offset: ")?;
-                write!(
-                    body,
-                    "{}  (within tensor data)",
-                    with_thousands(*offset as usize)
-                )?;
-                line_end(&mut body)?;
-            }
-            Layout::Chunked { chunk, num_chunks } => {
-                paint(&mut body, false, palette::DIM, "Chunks: ")?;
-                write!(
-                    body,
-                    "{} × {}",
-                    format_shape(chunk),
-                    with_thousands(*num_chunks)
-                )?;
-                line_end(&mut body)?;
-            }
-            Layout::None => {}
-        }
-        paint(&mut body, false, palette::DIM, "File: ")?;
-        write!(body, "{}", tensor.source_path)?;
-        line_end(&mut body)?;
-        // Flag a tensor that's on disk but absent from the index.
-        if unindexed {
-            queue!(body, SetForegroundColor(palette::UNINDEXED))?;
-            write!(
-                body,
-                "{UNINDEXED_MARK} on disk but not listed in model.safetensors.index.json"
-            )?;
-            queue!(body, ResetColor)?;
-            line_end(&mut body)?;
-        }
-        line_end(&mut body)?;
-
-        // Exact whole-tensor statistics: shown once computed, else a hint.
-        match stats {
-            StatsView::Ready(s) => {
-                // min/max are exact integers for integer dtypes — show them as
-                // such (no `.0000`).
-                let integer = view.is_integer(&tensor.dtype);
-                paint(&mut body, false, palette::DIM, "Statistics: ")?;
-                write!(
-                    body,
-                    "min {} · max {} · ",
-                    fmt_value(s.min, integer),
-                    fmt_value(s.max, integer)
-                )?;
-                write_stats_line(&mut body, s)?;
-            }
-            StatsView::Computing {
-                spinner,
-                elapsed,
-                progress,
-            } => {
-                paint(&mut body, false, palette::DIM, "Statistics: ")?;
-                write_computing(&mut body, spinner, elapsed, progress)?;
-            }
-            StatsView::Pending => {
-                queue!(body, SetForegroundColor(palette::DIM))?;
-                write!(body, "Statistics: press ")?;
-                queue!(body, ResetColor)?;
-                key_hint(&mut body, "s")?;
-                queue!(body, SetForegroundColor(palette::DIM))?;
-                write!(body, " to scan the full tensor")?;
-                queue!(body, ResetColor)?;
-            }
-        }
-        line_end(&mut body)?;
-        line_end(&mut body)?;
-
-        // Footer hints (keys highlighted) — built into a buffer first so its
-        // wrapped height can be measured and the histogram sized to fit exactly.
-        let mut footer: Vec<u8> = Vec::new();
-        write!(footer, "Press ")?;
-        key_hint(&mut footer, "m")?;
-        write!(footer, " for a heatmap, ")?;
-        key_hint(&mut footer, "v")?;
-        write!(footer, " for numeric values, ")?;
-        key_hint(&mut footer, "h")?;
-        write!(footer, " for a histogram, ")?;
-        key_hint(&mut footer, "b")?;
-        write!(footer, " to set its bin count, ")?;
-        if overridable {
-            key_hint(&mut footer, "d")?;
-            write!(footer, " to reinterpret the dtype, ")?;
-            key_hint(&mut footer, "r")?;
-            write!(footer, " to reshape, ")?;
-        }
-        key_hint(&mut footer, "c")?;
-        write!(footer, " to copy, ")?;
-        key_hint(&mut footer, "y")?;
-        write!(footer, " to copy the command, ")?;
-        key_hint(&mut footer, "l")?;
-        write!(footer, " for the legend, ")?;
-        key_hint(&mut footer, "⌫")?;
-        write!(footer, " / ")?;
-        key_hint(&mut footer, "\\")?;
-        write!(
-            footer,
-            " to step back / forward, any other key to return..."
-        )?;
-
-        out.write_all(&body)?;
-
-        // The whole-tensor value histogram, below the statistics (when computed
-        // or being computed), sized to the rows left between the header and the
-        // footer — so it fills the screen and never scrolls. Both heights are
-        // measured from the rendered bytes. A blank line is left below the bars
-        // (it's reserved in the budget) so the footer's key hints don't crowd the
-        // last bar — mirroring the blank line above the histogram.
-        if let Some(hist) = histogram {
-            let (term_w, term_h) = crate::plain::term_size();
-            let (tw, th) = (term_w as usize, term_h as usize);
-            let body_rows = count_physical_lines(&body, tw);
-            let footer_rows = count_physical_lines(&footer, tw);
-            let section = th.saturating_sub(body_rows + footer_rows + 1).max(2);
-            write_histogram_section(&mut *out, hist, hist_scanning, tw, section)?;
-            line_end(&mut *out)?; // blank spacer before the footer
-        }
-
-        out.write_all(&footer)?;
-
-        // No trailing newline (avoids scrolling); clear anything below.
-        queue!(out, terminal::Clear(ClearType::FromCursorDown))?;
-        // A pop-up overlay composites last, over the live frame, so the detail
-        // (including a running scan's progress) keeps animating behind it.
-        match overlay {
-            Some(Overlay::Legend(l)) => Self::write_legend_band(out, *l)?,
-            Some(Overlay::Command(c)) => Self::write_command_band(out, c)?,
-            None => {}
-        }
-        queue!(out, EndSynchronizedUpdate)?;
-        out.flush()?;
-        Ok(())
-    }
-
-    pub fn draw_metadata_detail(metadata: &MetadataInfo) -> Result<()> {
-        let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            terminal::Clear(ClearType::All),
-            cursor::MoveTo(0, 0)
-        )?;
-
-        writeln!(stdout, "Metadata Details\r")?;
-        writeln!(stdout, "================\r")?;
-        writeln!(stdout, "Key: {}\r", metadata.name)?;
-        writeln!(stdout, "Type: {}\r", metadata.value_type)?;
-
-        // When the value is a JSON object/array, pretty-print it with syntax
-        // highlighting (colors keys/strings/numbers/literals); otherwise show the
-        // raw text lines.
-        let highlighted = highlight_json(&metadata.value);
-        let lines: Vec<String> = match highlighted {
-            Some(colored) => colored,
-            None => metadata.value.lines().map(str::to_string).collect(),
+        // A JSON object/array is highlighted (via `colored_json`'s ANSI, parsed
+        // back into styled spans); everything else falls back to plain text lines.
+        let value_lines: Vec<Line> = match highlight_json(&metadata.value) {
+            Some(colored) => colored
+                .join("\n")
+                .into_text()
+                .map(|t| t.lines)
+                .unwrap_or_else(|_| {
+                    metadata
+                        .value
+                        .lines()
+                        .map(|l| Line::from(l.to_string()))
+                        .collect()
+                }),
+            None => metadata
+                .value
+                .lines()
+                .map(|l| Line::from(l.to_string()))
+                .collect(),
         };
-        writeln!(stdout, "Value:\r")?;
 
-        // Show as many value lines as fit the terminal (the lines above plus a
-        // short footer below), noting how many were elided rather than cutting
-        // silently — metadata values like a quant config run dozens of lines.
-        let rows = terminal::size().map(|(_, h)| h as usize).unwrap_or(40);
+        // Show as many value lines as fit (header above + a short footer below),
+        // noting how many were elided rather than cutting silently.
         let budget = rows.saturating_sub(8).max(1);
-        let shown = lines.len().min(budget);
-        for line in &lines[..shown] {
-            writeln!(stdout, "  {line}\r")?;
+        let shown = value_lines.len().min(budget);
+        for line in value_lines.iter().take(shown) {
+            let mut indented = vec![Span::raw("  ")];
+            indented.extend(line.spans.iter().cloned());
+            lines.push(Line::from(indented));
         }
-        if lines.len() > shown {
-            writeln!(stdout, "  … ({} more lines)\r", lines.len() - shown)?;
-        }
-
-        writeln!(stdout, "\r")?;
-        writeln!(stdout, "Press any key to return...\r")?;
-
-        stdout.flush()?;
-        Ok(())
-    }
-
-    /// Render a sampled tensor as a colored heatmap. Each character cell is an
-    /// upper-half block `▀` whose foreground is the value above and background
-    /// the value below, so one text row shows two data rows — doubling the
-    /// vertical resolution (a terminal cell is ~twice as tall as it is wide).
-    pub fn draw_heatmap(
-        out: &mut impl Write,
-        tensor: &TensorInfo,
-        sample: &Sample,
-        stats: StatsView,
-    ) -> Result<()> {
-        // Present the whole frame atomically (the terminal buffers everything
-        // between Begin/End and paints it in one go, so a redraw never shows a
-        // half-updated screen — this is what eliminates the flicker). We also
-        // overwrite in place: write each line's new content first, then clear
-        // only the leftover tail (`line_end`), and never emit a trailing
-        // newline (which could scroll the screen and flash).
-        queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
-
-        write_data_view_title(&mut *out, "Heatmap", tensor)?;
-        let integer = sample.view.is_integer(&tensor.dtype);
-        // Use the exact whole-tensor range (and color scale) once stats are
-        // ready; otherwise fall back to the sampled range, flagged as such.
-        let (rmin, rmax) = match stats {
-            StatsView::Ready(s) => (s.min, s.max),
-            _ => (sample.min, sample.max),
-        };
-        let lo = fmt_value(rmin, integer);
-        let hi = fmt_value(rmax, integer);
-        let range_note = if matches!(stats, StatsView::Ready(_)) {
-            ""
-        } else {
-            " (sampled)"
-        };
-        write_view_dtype(
-            &mut *out,
-            &tensor.dtype,
-            sample.view,
-            sample.schema_label.as_deref(),
-        )?;
-        write!(out, " ")?;
-        write_view_shape(&mut *out, &tensor.shape, &sample.display_shape)?;
-        let what = match sample.mode {
-            SampleMode::Edges { .. } => "edges",
-            SampleMode::Window { .. } => "window",
-            SampleMode::Grid => "sampled",
-        };
-        write!(
-            out,
-            " → {what} {}×{}, value range [{lo}, {hi}]{range_note}",
-            sample.rows.len(),
-            sample.cols.len(),
-        )?;
-        line_end(&mut *out)?;
-        write_stats_view(&mut *out, stats)?;
-        if sample.slices > 1 {
-            write_slice_header(&mut *out, sample)?;
-            line_end(&mut *out)?;
-        }
-        line_end(&mut *out)?;
-
-        let range = rmax - rmin;
-        let norm = |v: f64| {
-            if range > 0.0 { (v - rmin) / range } else { 0.5 }
-        };
-        // Two data rows per text line: foreground = the upper row's value,
-        // background = the lower row's. A trailing odd row keeps the default
-        // (dark) background for its empty lower half.
-        let mut r = 0;
-        while r < sample.values.len() {
-            let top = &sample.values[r];
-            let bottom = sample.values.get(r + 1);
-            for (c, &tv) in top.iter().enumerate() {
-                queue!(out, SetForegroundColor(heat_color(norm(tv))))?;
-                match bottom {
-                    Some(below) => queue!(out, SetBackgroundColor(heat_color(norm(below[c]))))?,
-                    None => queue!(out, SetBackgroundColor(Color::Reset))?,
-                }
-                write!(out, "▀")?;
-            }
-            queue!(out, ResetColor)?;
-            line_end(&mut *out)?;
-            r += 2;
+        if value_lines.len() > shown {
+            lines.push(Line::from(dim_span(format!(
+                "  … ({} more lines)",
+                value_lines.len() - shown
+            ))));
         }
 
-        line_end(&mut *out)?;
-        write!(out, "{lo} low ")?;
-        for i in 0..24 {
-            queue!(out, SetForegroundColor(heat_color(i as f64 / 23.0)))?;
-            write!(out, "█")?;
-        }
-        queue!(out, ResetColor)?;
-        write!(out, " high {hi}")?;
-        line_end(&mut *out)?;
-
-        line_end(&mut *out)?;
-        write_view_footer(&mut *out, sample, true, StripeMode::Off, NumBase::Decimal)?;
-
-        // Clear the footer's tail and everything below (no trailing newline),
-        // then end the synchronized frame.
-        queue!(
-            out,
-            terminal::Clear(ClearType::FromCursorDown),
-            EndSynchronizedUpdate
-        )?;
-        out.flush()?;
-        Ok(())
-    }
-
-    /// Render a sampled tensor as a grid of numeric values with row/column
-    /// indices (edges included).
-    pub fn draw_values(
-        out: &mut impl Write,
-        tensor: &TensorInfo,
-        sample: &Sample,
-        stats: StatsView,
-        stripe: StripeMode,
-        base: NumBase,
-    ) -> Result<()> {
-        // Cell width adapts to the data: floats need room for scientific
-        // notation, while small integers (incl. sparse values in a wide dtype)
-        // are 1-3 digits, so we pack many narrow columns onto the screen. The
-        // raw-bit bases reserve a fixed width: the dtype's digit count + a gap.
-        let cw = base.cell_width(sample.view, &tensor.dtype, stats.value_range());
-        // Synchronized, in-place overwrite (see `draw_heatmap`) to avoid flicker.
-        queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
-
-        write_data_view_title(&mut *out, "Values", tensor)?;
-        write_view_dtype(
-            &mut *out,
-            &tensor.dtype,
-            sample.view,
-            sample.schema_label.as_deref(),
-        )?;
-        write!(out, " ")?;
-        write_view_shape(&mut *out, &tensor.shape, &sample.display_shape)?;
-        // Describe the layout: a contiguous window, the first/last edges (for
-        // padding), or an evenly-spaced overview.
-        let edges = matches!(sample.mode, SampleMode::Edges { .. });
-        match sample.mode {
-            SampleMode::Edges { .. } => write!(
-                out,
-                " → edges: {} of {} rows × {} of {} cols (indices shown)",
-                edge_desc(&sample.rows, sample.total_rows),
-                sample.total_rows,
-                edge_desc(&sample.cols, sample.total_cols),
-                sample.total_cols
-            )?,
-            SampleMode::Window { .. } => write!(
-                out,
-                " → window: rows {} of {} × cols {} of {} (contiguous)",
-                span_desc(&sample.rows),
-                sample.total_rows,
-                span_desc(&sample.cols),
-                sample.total_cols
-            )?,
-            SampleMode::Grid => write!(
-                out,
-                " → sampled {} of {} rows × {} of {} cols (indices shown)",
-                sample.rows.len(),
-                sample.total_rows,
-                sample.cols.len(),
-                sample.total_cols
-            )?,
-        }
-        line_end(&mut *out)?;
-        write_stats_view(&mut *out, stats)?;
-        if sample.slices > 1 {
-            write_slice_header(&mut *out, sample)?;
-            line_end(&mut *out)?;
-        }
-        line_end(&mut *out)?;
-
-        // In edges mode, the index after which rows/cols jump (the padding
-        // boundary), so we can draw a dotted separator there. `None` in grid
-        // mode, or when the matrix was small enough to show contiguously.
-        let gap = |idx: &[usize]| -> Option<usize> {
-            edges
-                .then(|| idx.windows(2).position(|w| w[1] != w[0] + 1))
-                .flatten()
-        };
-        let row_gap = gap(&sample.rows);
-        let col_gap = gap(&sample.cols);
-        // Width of the row-index column. Values are right-aligned in their own
-        // cells (each with ≥1 leading space), so no extra separator is needed —
-        // keeping the whole grid one column further left.
-        let lw = 6usize;
-
-        // Column-index header (with a "⋯" separator column at the gap). With
-        // wide cells the index fits in a single row; with narrow cells (sub-byte
-        // / small-int views) the index is as wide as a cell or wider, so we
-        // stagger the labels across two rows ("leap-frog") to keep them legible.
-        let idx_w = sample
-            .cols
-            .iter()
-            .map(|&c| c.to_string().len())
-            .max()
-            .unwrap_or(1);
-        if idx_w >= cw {
-            // Stagger labels across two rows ("leap-frog") so each may be up to
-            // two cells wide; and when even that is too tight (very wide indices
-            // over very narrow cells) skip every `step`-th label so the ones we
-            // do show don't collide. `step` is the smallest stride whose
-            // two-row spacing (`2 * step * cw`) fits a label plus a space.
-            let step = (idx_w + 1).div_ceil(2 * cw).max(1);
-            // Column offset (within the line) of the right edge of cell `j`,
-            // accounting for the row-label prefix and the extra "⋯" gap cell
-            // that sits after `col_gap`.
-            let right_edge = |j: usize| -> usize {
-                let gap_cells = matches!(col_gap, Some(g) if j > g) as usize;
-                lw + (j + 1 + gap_cells) * cw
-            };
-            let width = right_edge(sample.cols.len().saturating_sub(1)).max(lw);
-            let mut top = vec![' '; width];
-            let mut bot = vec![' '; width];
-            let mut rank = 0usize; // position among the labels we actually show
-            for (j, &c) in sample.cols.iter().enumerate() {
-                if !j.is_multiple_of(step) {
-                    continue;
-                }
-                let label = c.to_string();
-                let end = right_edge(j);
-                let start = end.saturating_sub(label.len());
-                let buf = if rank.is_multiple_of(2) {
-                    &mut top
-                } else {
-                    &mut bot
-                };
-                for (k, ch) in label.chars().enumerate() {
-                    buf[start + k] = ch;
-                }
-                rank += 1;
-            }
-            // Mark the skipped-columns gap with a dotted separator on both rows,
-            // but only where the cell is still blank — a label wider than a cell
-            // can overflow into the gap, and we must not clobber its digits.
-            if let Some(g) = col_gap {
-                let pos = right_edge(g) + cw - 1;
-                if pos < width {
-                    for buf in [&mut top, &mut bot] {
-                        if buf[pos] == ' ' {
-                            buf[pos] = '⋯';
-                        }
-                    }
-                }
-            }
-            let top: String = top.into_iter().collect();
-            let bot: String = bot.into_iter().collect();
-            // The index labels are dimmed so they recede behind the values.
-            queue!(out, SetForegroundColor(palette::DIM))?;
-            write!(out, "{}", top.trim_end())?;
-            queue!(out, ResetColor)?;
-            line_end(&mut *out)?;
-            queue!(out, SetForegroundColor(palette::DIM))?;
-            write!(out, "{}", bot.trim_end())?;
-            queue!(out, ResetColor)?;
-            line_end(&mut *out)?;
-        } else {
-            queue!(out, SetForegroundColor(palette::DIM))?;
-            write!(out, "{:>lw$}", "")?;
-            for (j, &c) in sample.cols.iter().enumerate() {
-                write!(out, "{c:>cw$}")?;
-                if Some(j) == col_gap {
-                    write!(out, "{:>cw$}", "⋯")?;
-                }
-            }
-            queue!(out, ResetColor)?;
-            line_end(&mut *out)?;
-        }
-
-        // Integer dtypes print as plain integers; floats use scientific notation.
-        let integer = sample.view.is_integer(&tensor.dtype);
-        // Alternating "dim highlighter" backgrounds: a full band per visual row,
-        // or — for columns — a background hugging just the digits of each visual
-        // column (so it never colours the empty alignment padding).
-        let band = |k: usize| {
-            if k.is_multiple_of(2) {
-                palette::STRIPE_DARK
-            } else {
-                palette::STRIPE_LITE
-            }
-        };
-        for (i, row) in sample.values.iter().enumerate() {
-            // Row striping paints the whole band (label + values) in one go.
-            if stripe == StripeMode::Rows {
-                queue!(out, SetBackgroundColor(band(i)))?;
-            }
-            // Dimmed row index (then back to the default fg, keeping any bg).
-            queue!(out, SetForegroundColor(palette::DIM))?;
-            write!(out, "{:>lw$}", sample.rows[i])?;
-            queue!(out, SetForegroundColor(Color::Reset))?;
-            let mut vcol = 0usize; // visual column ordinal (counts the gap cell)
-            for (j, &v) in row.iter().enumerate() {
-                let s = match base {
-                    NumBase::Decimal if integer => format!("{:>cw$}", v as i64),
-                    NumBase::Decimal => format!("{v:>cw$.3e}"),
-                    // The raw stored bits, zero-padded to the dtype's width.
-                    _ => {
-                        let rb = sample.raw[i][j];
-                        let d = base.digits(rb.width as u32);
-                        let body = match base {
-                            NumBase::Hex => format!("{:0d$x}", rb.bits),
-                            NumBase::Octal => format!("{:0d$o}", rb.bits),
-                            NumBase::Binary => format!("{:0d$b}", rb.bits),
-                            NumBase::Decimal => unreachable!(),
-                        };
-                        format!("{body:>cw$}")
-                    }
-                };
-                let bg = (stripe == StripeMode::Cols).then(|| band(vcol));
-                write_grid_cell(&mut *out, &s, bg, false)?;
-                vcol += 1;
-                if Some(j) == col_gap {
-                    let bg = (stripe == StripeMode::Cols).then(|| band(vcol));
-                    write_grid_cell(&mut *out, &format!("{:>cw$}", "⋯"), bg, true)?;
-                    vcol += 1;
-                }
-            }
-            queue!(out, ResetColor)?;
-            line_end(&mut *out)?;
-            // Dotted row after the gap to mark the rows that were skipped.
-            if Some(i) == row_gap {
-                queue!(out, SetForegroundColor(palette::DIM))?;
-                write!(out, "{:>lw$}", "⋮")?;
-                for j in 0..row.len() {
-                    write!(out, "{:>cw$}", "⋮")?;
-                    if Some(j) == col_gap {
-                        write!(out, "{:>cw$}", "⋱")?;
-                    }
-                }
-                queue!(out, ResetColor)?;
-                line_end(&mut *out)?;
-            }
-        }
-
-        line_end(&mut *out)?;
-        write_view_footer(&mut *out, sample, false, stripe, base)?;
-
-        queue!(
-            out,
-            terminal::Clear(ClearType::FromCursorDown),
-            EndSynchronizedUpdate
-        )?;
-        out.flush()?;
-        Ok(())
+        lines.push(Line::default());
+        lines.push(Line::from(Span::raw("Press any key to return...")));
+        Paragraph::new(lines).render(area, frame.buffer_mut());
     }
 
     /// Render a sampled tensor as a heatmap — the Ratatui port of
@@ -1987,252 +1381,147 @@ impl UI {
         Paragraph::new(lines).render(area, frame.buffer_mut());
     }
 
-    /// Overlay a dtype-selection menu on the bottom two lines of a data view: a
-    /// strip of the available views with `current` highlighted, plus a hint
-    /// line. The data view behind it is a live preview of the highlighted view.
-    pub fn draw_dtype_menu(options: &[ViewDtype], current: usize) -> Result<()> {
-        let stdout = io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
-        let (_w, h) = terminal::size()?;
-
-        queue!(
-            out,
-            cursor::MoveTo(0, h.saturating_sub(2)),
-            terminal::Clear(ClearType::CurrentLine),
-            SetForegroundColor(palette::DIM)
-        )?;
-        write!(out, "view as:")?;
-        queue!(out, ResetColor)?;
+    /// The Ratatui port of [`Self::draw_dtype_menu`]: overlay a dtype-selection
+    /// menu on the bottom two rows of the live preview frame — a `view as:` label
+    /// followed by the available views as buttons (`current` highlighted), with a
+    /// hint line below. Composited *after* the preview is drawn into the frame.
+    pub fn render_dtype_menu(frame: &mut Frame, options: &[ViewDtype], current: usize) {
+        let mut menu: Vec<Span> = vec![dim_span("view as:")];
         for (i, opt) in options.iter().enumerate() {
+            let label = format!(" {} ", opt.menu_label());
             if i == current {
-                // The selected entry is a highlighted "button".
-                queue!(
-                    out,
-                    SetAttribute(Attribute::Bold),
-                    SetForegroundColor(palette::SELECT_FG),
-                    SetBackgroundColor(palette::SELECT_BG)
-                )?;
-                write!(out, " {} ", opt.menu_label())?;
-                queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+                menu.push(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(to_ratatui(palette::SELECT_FG))
+                        .bg(to_ratatui(palette::SELECT_BG))
+                        .add_modifier(Modifier::BOLD),
+                ));
             } else {
-                queue!(out, SetForegroundColor(palette::DIM))?;
-                write!(out, " {} ", opt.menu_label())?;
-                queue!(out, ResetColor)?;
+                menu.push(dim_span(label));
             }
         }
-
-        queue!(
-            out,
-            cursor::MoveTo(0, h.saturating_sub(1)),
-            terminal::Clear(ClearType::CurrentLine)
-        )?;
-        hint_line(
-            &mut out,
-            &[
-                ("← → or d/D", "move"),
-                ("Enter", "apply"),
-                ("Esc", "cancel"),
-            ],
-        )?;
-
-        out.flush()?;
-        Ok(())
+        let hints = Line::from(hint_spans(&[
+            ("← → or d/D", "move"),
+            ("Enter", "apply"),
+            ("Esc", "cancel"),
+        ]));
+        render_bottom_band(frame, Line::from(menu), hints);
     }
 
-    /// A prompt pinned to the bottom of the screen for jumping to a slice by
-    /// typing its index (overlaid on the current data view). The label and a
-    /// fixed-width input box are colored; `error`, when set, is shown in red on
-    /// the line below (e.g. for an out-of-range index).
-    pub fn draw_slice_prompt(slices: usize, input: &str, error: Option<&str>) -> Result<()> {
-        let stdout = io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
-        let (_w, h) = terminal::size()?;
-
-        // Prompt line.
-        queue!(
-            out,
-            cursor::MoveTo(0, h.saturating_sub(2)),
-            terminal::Clear(ClearType::CurrentLine),
-            SetForegroundColor(palette::KEY)
-        )?;
-        write!(out, "Go to slice ")?;
-        queue!(out, SetForegroundColor(palette::DIM))?;
-        write!(out, "(0-{} or 0-100%)", slices.saturating_sub(1))?;
-        queue!(out, ResetColor)?;
-        write!(out, "  ")?;
-        input_box(&mut out, input, input.chars().count(), 5)?;
-        write!(out, "  ")?;
-        key_hint(&mut out, "Enter")?;
-        queue!(out, SetForegroundColor(palette::DIM))?;
-        write!(out, " to jump · ")?;
-        queue!(out, ResetColor)?;
-        key_hint(&mut out, "Esc")?;
-        queue!(out, SetForegroundColor(palette::DIM))?;
-        write!(out, " to cancel")?;
-        queue!(out, ResetColor)?;
-
-        // Feedback line below (out-of-range / invalid input).
-        queue!(
-            out,
-            cursor::MoveTo(0, h.saturating_sub(1)),
-            terminal::Clear(ClearType::CurrentLine)
-        )?;
-        if let Some(msg) = error {
-            queue!(out, SetForegroundColor(palette::ERROR))?;
-            write!(out, "{msg}")?;
-            queue!(out, ResetColor)?;
-        }
-
-        out.flush()?;
-        Ok(())
+    /// The Ratatui port of [`Self::draw_slice_prompt`]: a bottom-pinned prompt to
+    /// jump to a slice by index (over the live data view), with a fixed-width
+    /// input box and a feedback line below for an out-of-range / invalid entry.
+    pub fn render_slice_prompt(frame: &mut Frame, slices: usize, input: &str, error: Option<&str>) {
+        let mut prompt: Vec<Span> = vec![
+            Span::styled(
+                "Go to slice ",
+                Style::default().fg(to_ratatui(palette::KEY)),
+            ),
+            dim_span(format!("(0-{} or 0-100%)", slices.saturating_sub(1))),
+            Span::raw("  "),
+        ];
+        prompt.extend(input_box_spans(input, input.chars().count(), 5));
+        prompt.push(Span::raw("  "));
+        prompt.push(key_span("Enter"));
+        prompt.push(dim_span(" to jump · "));
+        prompt.push(key_span("Esc"));
+        prompt.push(dim_span(" to cancel"));
+        render_bottom_band(frame, Line::from(prompt), error_line(error));
     }
 
-    /// The reshape prompt (`r`): shows the stored shape and the element count the
-    /// entry must multiply to, the input box, and a feedback line for errors.
-    pub fn draw_reshape_prompt(
+    /// The Ratatui port of [`Self::draw_reshape_prompt`]: shows the stored shape
+    /// and the element count the entry must multiply to, the input box, and a
+    /// feedback line for errors.
+    pub fn render_reshape_prompt(
+        frame: &mut Frame,
         elements: usize,
         stored: &[usize],
         input: &str,
         error: Option<&str>,
-    ) -> Result<()> {
-        let stdout = io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
-        let (_w, h) = terminal::size()?;
-
-        queue!(
-            out,
-            cursor::MoveTo(0, h.saturating_sub(2)),
-            terminal::Clear(ClearType::CurrentLine),
-            SetForegroundColor(palette::KEY)
-        )?;
-        write!(out, "Reshape {} ", format_shape(stored))?;
-        queue!(out, SetForegroundColor(palette::DIM))?;
-        write!(
-            out,
-            "(dims multiplying to {elements}; `-1`/`*`/`_` infers one; empty clears)"
-        )?;
-        queue!(out, ResetColor)?;
-        write!(out, "  ")?;
-        input_box(&mut out, input, input.chars().count(), 16)?;
-        write!(out, "  ")?;
-        key_hint(&mut out, "Enter")?;
-        queue!(out, SetForegroundColor(palette::DIM))?;
-        write!(out, " to apply · ")?;
-        queue!(out, ResetColor)?;
-        key_hint(&mut out, "Esc")?;
-        queue!(out, SetForegroundColor(palette::DIM))?;
-        write!(out, " to cancel")?;
-        queue!(out, ResetColor)?;
-
-        queue!(
-            out,
-            cursor::MoveTo(0, h.saturating_sub(1)),
-            terminal::Clear(ClearType::CurrentLine)
-        )?;
-        if let Some(msg) = error {
-            queue!(out, SetForegroundColor(palette::ERROR))?;
-            write!(out, "{msg}")?;
-            queue!(out, ResetColor)?;
-        }
-
-        out.flush()?;
-        Ok(())
+    ) {
+        let mut prompt: Vec<Span> = vec![
+            Span::styled(
+                format!("Reshape {} ", format_shape(stored)),
+                Style::default().fg(to_ratatui(palette::KEY)),
+            ),
+            dim_span(format!(
+                "(dims multiplying to {elements}; `-1`/`*`/`_` infers one; empty clears)"
+            )),
+            Span::raw("  "),
+        ];
+        prompt.extend(input_box_spans(input, input.chars().count(), 16));
+        prompt.push(Span::raw("  "));
+        prompt.push(key_span("Enter"));
+        prompt.push(dim_span(" to apply · "));
+        prompt.push(key_span("Esc"));
+        prompt.push(dim_span(" to cancel"));
+        render_bottom_band(frame, Line::from(prompt), error_line(error));
     }
 
-    /// A full-screen single-choice menu: a title and a strip of `options` with
-    /// `current` highlighted. Used to pick the repack codec.
-    pub fn draw_choice_menu(title: &str, options: &[&str], current: usize) -> Result<()> {
-        let stdout = io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
-        queue!(
-            out,
-            BeginSynchronizedUpdate,
-            terminal::Clear(ClearType::All),
-            cursor::MoveTo(0, 0)
-        )?;
-        write!(out, "{title}\r\n")?;
-        write!(out, "{}\r\n\r\n", "=".repeat(title.len().max(10)))?;
+    /// The Ratatui port of [`Self::draw_text_prompt`]: a bottom-pinned free-text
+    /// input (label + editable box + optional error line). Used for the repack
+    /// output filename, buffer size, and histogram bin count.
+    pub fn render_text_prompt(frame: &mut Frame, label: &str, input: &str, error: Option<&str>) {
+        let mut prompt: Vec<Span> = vec![Span::styled(
+            format!("{label} "),
+            Style::default().fg(to_ratatui(palette::KEY)),
+        )];
+        prompt.extend(input_box_spans(input, input.chars().count(), 24));
+        prompt.push(Span::raw("  "));
+        prompt.push(key_span("Enter"));
+        prompt.push(dim_span(" to confirm · "));
+        prompt.push(key_span("Esc"));
+        prompt.push(dim_span(" to cancel"));
+        render_bottom_band(frame, Line::from(prompt), error_line(error));
+    }
+
+    /// The Ratatui port of [`Self::draw_choice_menu`]: a full-screen single-choice
+    /// menu — a title, an underline rule, and a strip of `options` with `current`
+    /// highlighted, plus a hint line. Used to pick the repack codec / confirm.
+    pub fn render_choice_menu(frame: &mut Frame, title: &str, options: &[&str], current: usize) {
+        let mut strip: Vec<Span> = Vec::new();
         for (i, opt) in options.iter().enumerate() {
+            let label = format!(" {opt} ");
             if i == current {
-                queue!(
-                    out,
-                    SetAttribute(Attribute::Bold),
-                    SetForegroundColor(palette::SELECT_FG),
-                    SetBackgroundColor(palette::SELECT_BG)
-                )?;
-                write!(out, " {opt} ")?;
-                queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
+                strip.push(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(to_ratatui(palette::SELECT_FG))
+                        .bg(to_ratatui(palette::SELECT_BG))
+                        .add_modifier(Modifier::BOLD),
+                ));
             } else {
-                queue!(out, SetForegroundColor(palette::DIM))?;
-                write!(out, " {opt} ")?;
-                queue!(out, ResetColor)?;
+                strip.push(dim_span(label));
             }
-            write!(out, " ")?;
+            strip.push(Span::raw(" "));
         }
-        write!(out, "\r\n\r\n")?;
-        hint_line(
-            &mut out,
-            &[("← →", "move"), ("Enter", "select"), ("Esc", "cancel")],
-        )?;
-        write!(out, "\r\n")?;
-        queue!(out, EndSynchronizedUpdate)?;
-        out.flush()?;
-        Ok(())
+        let lines: Vec<Line> = vec![
+            Line::from(Span::raw(title.to_string())),
+            Line::from(Span::raw("=".repeat(title.len().max(10)))),
+            Line::default(),
+            Line::from(strip),
+            Line::default(),
+            Line::from(hint_spans(&[
+                ("← →", "move"),
+                ("Enter", "select"),
+                ("Esc", "cancel"),
+            ])),
+        ];
+        Paragraph::new(lines).render(frame.area(), frame.buffer_mut());
     }
 
-    /// A free-text input prompt pinned to the bottom (label + editable box +
-    /// optional error line). Used to ask for the repack output filename.
-    pub fn draw_text_prompt(label: &str, input: &str, error: Option<&str>) -> Result<()> {
-        let stdout = io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
-        let (_w, h) = terminal::size()?;
-
-        queue!(
-            out,
-            cursor::MoveTo(0, h.saturating_sub(2)),
-            terminal::Clear(ClearType::CurrentLine),
-            SetForegroundColor(palette::KEY)
-        )?;
-        write!(out, "{label} ")?;
-        queue!(out, ResetColor)?;
-        input_box(&mut out, input, input.chars().count(), 24)?;
-        write!(out, "  ")?;
-        key_hint(&mut out, "Enter")?;
-        queue!(out, SetForegroundColor(palette::DIM))?;
-        write!(out, " to confirm · ")?;
-        queue!(out, ResetColor)?;
-        key_hint(&mut out, "Esc")?;
-        queue!(out, SetForegroundColor(palette::DIM))?;
-        write!(out, " to cancel")?;
-        queue!(out, ResetColor)?;
-
-        queue!(
-            out,
-            cursor::MoveTo(0, h.saturating_sub(1)),
-            terminal::Clear(ClearType::CurrentLine)
-        )?;
-        if let Some(msg) = error {
-            queue!(out, SetForegroundColor(palette::ERROR))?;
-            write!(out, "{msg}")?;
-            queue!(out, ResetColor)?;
-        }
-        out.flush()?;
-        Ok(())
-    }
-
-    /// A full-screen progress view with a bar, `done/total` count and a detail
-    /// line (e.g. the dataset currently being written). Drawn in place.
+    /// The Ratatui port of [`Self::draw_progress`]: a full-screen progress view
+    /// with a 40-cell bar, a `done/total` count and a detail line (e.g. the
+    /// dataset currently being written).
     #[cfg(feature = "hdf5")]
-    pub fn draw_progress(title: &str, done: usize, total: usize, detail: &str) -> Result<()> {
-        let stdout = io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
-        queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
-        write!(out, "{title}")?;
-        line_end(&mut out)?;
-        write!(out, "{}", "=".repeat(title.len().max(10)))?;
-        line_end(&mut out)?;
-        line_end(&mut out)?;
-
+    pub fn render_progress(
+        frame: &mut Frame,
+        title: &str,
+        done: usize,
+        total: usize,
+        detail: &str,
+    ) {
         const WIDTH: usize = 40;
         let frac = if total > 0 {
             done as f64 / total as f64
@@ -2240,47 +1529,45 @@ impl UI {
             0.0
         };
         let filled = (frac * WIDTH as f64).round() as usize;
-        write!(out, "[")?;
-        queue!(out, SetForegroundColor(palette::KEY))?;
-        write!(out, "{}", "█".repeat(filled))?;
-        queue!(out, SetForegroundColor(palette::DIM))?;
-        write!(out, "{}", "░".repeat(WIDTH.saturating_sub(filled)))?;
-        queue!(out, ResetColor)?;
-        write!(out, "] {done}/{total}")?;
-        line_end(&mut out)?;
-        queue!(out, SetForegroundColor(palette::DIM))?;
-        write!(out, "{detail}")?;
-        queue!(out, ResetColor)?;
-        line_end(&mut out)?;
-
-        queue!(
-            out,
-            terminal::Clear(ClearType::FromCursorDown),
-            EndSynchronizedUpdate
-        )?;
-        out.flush()?;
-        Ok(())
+        let bar = Line::from(vec![
+            Span::raw("["),
+            Span::styled(
+                "█".repeat(filled),
+                Style::default().fg(to_ratatui(palette::KEY)),
+            ),
+            dim_span("░".repeat(WIDTH.saturating_sub(filled))),
+            Span::raw(format!("] {done}/{total}")),
+        ]);
+        let lines: Vec<Line> = vec![
+            Line::from(Span::raw(title.to_string())),
+            Line::from(Span::raw("=".repeat(title.len().max(10)))),
+            Line::default(),
+            bar,
+            Line::from(dim_span(detail.to_string())),
+        ];
+        Paragraph::new(lines).render(frame.area(), frame.buffer_mut());
     }
 
-    /// A simple full-screen message (e.g. when a data preview is unavailable).
-    pub fn draw_message(title: &str, message: &str) -> Result<()> {
-        let mut stdout = io::stdout();
-        // Panel background first, so `Clear(All)` erases the whole screen to the
-        // pop-up surface (the text is then written over it).
-        execute!(
-            stdout,
-            SetBackgroundColor(palette::PANEL_BG),
-            terminal::Clear(ClearType::All),
-            cursor::MoveTo(0, 0)
-        )?;
-        writeln!(stdout, "{title}\r")?;
-        writeln!(stdout, "{}\r", "=".repeat(title.len().max(10)))?;
-        writeln!(stdout, "{message}\r")?;
-        writeln!(stdout, "\r")?;
-        writeln!(stdout, "Press any key to return...\r")?;
-        execute!(stdout, ResetColor)?;
-        stdout.flush()?;
-        Ok(())
+    /// The Ratatui port of [`Self::draw_message`]: a simple full-screen message
+    /// (title, underline rule, body, footer) over the pop-up panel surface.
+    pub fn render_message(frame: &mut Frame, title: &str, message: &str) {
+        let area = frame.area();
+        let panel = Style::default().bg(to_ratatui(palette::PANEL_BG));
+        // Fill the whole screen with the panel surface first, like the raw path's
+        // `Clear(All)` over a set background.
+        Paragraph::new("")
+            .style(panel)
+            .render(area, frame.buffer_mut());
+        let lines: Vec<Line> = vec![
+            Line::from(Span::raw(title.to_string())),
+            Line::from(Span::raw("=".repeat(title.len().max(10)))),
+            Line::from(Span::raw(message.to_string())),
+            Line::default(),
+            Line::from(Span::raw("Press any key to return...")),
+        ];
+        Paragraph::new(lines)
+            .style(panel)
+            .render(area, frame.buffer_mut());
     }
 
     /// Draw the copied CLI command as a borderless pop-up *over* the current
@@ -2296,15 +1583,15 @@ impl UI {
     /// over whatever the view drew there, until the next redraw clears it. Shared
     /// by every screen's copy shortcuts (tree, detail, data) so the confirmation
     /// never hides the content above it. `what` names what was copied.
-    pub fn draw_copied_flash(what: &str) -> Result<()> {
-        let mut out = io::stdout();
-        let (term_w, term_h) = terminal::size()?;
-        // Clamp to the width so a long message can't wrap off the last row and
-        // scroll the frame (this overlays the terminal's final line). Keep the
-        // head — the "✓ Copied …" — rather than the tail.
+    /// The Ratatui port of [`Self::draw_copied_flash`]: a bold green "✓ Copied …"
+    /// confirmation composited over the frame's bottom row (clamped to the width
+    /// so it never wraps and scrolls). Drawn last, over the live detail/data
+    /// frame, so the content above it stays put.
+    pub fn render_copied_flash(frame: &mut Frame, what: &str) {
+        let area = frame.area();
+        let width = area.width as usize;
         let full = format!("✓ Copied {what} to the clipboard");
-        let width = term_w as usize;
-        let msg = if full.chars().count() > width {
+        let msg: String = if full.chars().count() > width {
             full.chars()
                 .take(width.saturating_sub(1))
                 .chain(std::iter::once('…'))
@@ -2312,204 +1599,76 @@ impl UI {
         } else {
             full
         };
-        queue!(
-            out,
-            cursor::MoveTo(0, term_h.saturating_sub(1)),
-            terminal::Clear(ClearType::CurrentLine),
-            SetForegroundColor(palette::SUCCESS),
-            SetAttribute(Attribute::Bold)
-        )?;
-        write!(out, "{msg}")?;
-        queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
-        out.flush()?;
-        Ok(())
+        Paragraph::new(Line::from(Span::styled(
+            msg,
+            Style::default()
+                .fg(to_ratatui(palette::SUCCESS))
+                .add_modifier(Modifier::BOLD),
+        )))
+        .render(
+            Rect {
+                x: 0,
+                y: area.height.saturating_sub(1),
+                width: area.width,
+                height: 1,
+            },
+            frame.buffer_mut(),
+        );
     }
 
-    pub fn draw_command(command: &str) -> Result<()> {
-        let mut out = io::stdout();
-        queue!(out, BeginSynchronizedUpdate)?;
-        Self::write_command_band(&mut out, command)?;
-        queue!(out, EndSynchronizedUpdate)?;
-        out.flush()?;
-        Ok(())
-    }
-
-    /// Composite the copied-command box onto `out` (it does not bracket its own
-    /// synchronized update), centred vertically as a floating pop-up. Shared by
-    /// [`Self::draw_command`] and the overlay layer of
-    /// [`Self::draw_tensor_detail`].
-    fn write_command_band(mut out: &mut impl Write, command: &str) -> Result<()> {
-        let (term_w, term_h) = terminal::size()?;
-        let (term_w, term_h) = (term_w as usize, term_h as usize);
-        let rule = "─".repeat(term_w);
-
-        // How many rows the command occupies once soft-wrapped at full width;
-        // used to place the closing rule/footer below it. Centre the band.
-        let cmd_rows = command.chars().count().div_ceil(term_w.max(1)).max(1);
-        // blank, header, rule, command, rule, footer, blank
-        let band_h = cmd_rows + 6;
-        let mut row = (term_h.saturating_sub(band_h) / 2) as u16;
-
-        // Clear a band row so the underlying screen doesn't show through.
-        let clear = ClearType::CurrentLine;
-        // Panel background: the band's cleared rows then erase to the pop-up
-        // surface, lifting it off the view above and below.
-        begin_panel(out)?;
-
-        // A cleared margin row above, so the band reads as a floating pop-up.
-        queue!(out, cursor::MoveTo(0, row), terminal::Clear(clear))?;
-        row += 1;
-
-        // Header: title + copied confirmation.
-        queue!(
-            out,
-            cursor::MoveTo(0, row),
-            terminal::Clear(clear),
-            SetForegroundColor(palette::KEY),
-            SetAttribute(Attribute::Bold)
-        )?;
-        write!(out, "CLI command")?;
-        queue!(
-            out,
-            // `Attribute::Reset` clears the bold *and* the panel background, so
-            // restore the surface before continuing the band.
-            SetAttribute(Attribute::Reset),
-            SetBackgroundColor(palette::PANEL_BG),
-            SetForegroundColor(palette::SUCCESS)
-        )?;
-        write!(out, "   ✓ copied to the clipboard")?;
-        reset_fg(&mut out)?;
-        row += 1;
-
-        // Opening rule.
-        queue!(
-            out,
-            cursor::MoveTo(0, row),
-            terminal::Clear(clear),
-            SetForegroundColor(palette::ACCENT)
-        )?;
-        write!(out, "{rule}")?;
-        reset_fg(&mut out)?;
-        row += 1;
-
-        // The command: blank its rows first, then write it at column 0 so it
-        // soft-wraps cleanly with nothing flanking it.
-        for r in 0..cmd_rows as u16 {
-            queue!(out, cursor::MoveTo(0, row + r), terminal::Clear(clear))?;
-        }
-        queue!(out, cursor::MoveTo(0, row))?;
-        write!(out, "{command}")?;
-        row += cmd_rows as u16;
-
-        // Closing rule.
-        queue!(
-            out,
-            cursor::MoveTo(0, row),
-            terminal::Clear(clear),
-            SetForegroundColor(palette::ACCENT)
-        )?;
-        write!(out, "{rule}")?;
-        reset_fg(&mut out)?;
-        row += 1;
-
-        // Footer hint.
-        queue!(
-            out,
-            cursor::MoveTo(0, row),
-            terminal::Clear(clear),
-            SetForegroundColor(palette::DIM)
-        )?;
-        write!(
-            out,
-            "select the command above to copy it by hand · any key to dismiss"
-        )?;
-        reset_fg(&mut out)?;
-        row += 1;
-
-        // A cleared margin row below.
-        queue!(out, cursor::MoveTo(0, row), terminal::Clear(clear))?;
-
-        end_panel(&mut out)?;
-        Ok(())
-    }
-
-    /// Draw a full-screen warning panel summarising checkpoint health issues,
-    /// shown once at startup. Each category is capped so the panel stays small.
-    pub fn draw_health_warning(reports: &[HealthReport]) -> Result<()> {
-        let mut stdout = io::stdout();
-        execute!(
-            stdout,
-            terminal::Clear(ClearType::All),
-            cursor::MoveTo(0, 0)
-        )?;
-
-        execute!(stdout, SetForegroundColor(palette::WARN))?;
-        writeln!(stdout, "⚠  Checkpoint health check\r")?;
-        writeln!(stdout, "{}\r", "=".repeat(60))?;
-        execute!(stdout, ResetColor)?;
-
+    /// The Ratatui port of [`Self::draw_health_warning`]: a full-screen warning
+    /// panel summarising checkpoint health issues. Each category is capped so the
+    /// panel stays small; missing items are red, extra items yellow.
+    pub fn render_health_warning(frame: &mut Frame, reports: &[HealthReport]) {
+        let mut lines: Vec<Line> = vec![
+            Line::from(Span::styled(
+                "⚠  Checkpoint health check",
+                Style::default().fg(to_ratatui(palette::WARN)),
+            )),
+            Line::from(Span::styled(
+                "=".repeat(60),
+                Style::default().fg(to_ratatui(palette::WARN)),
+            )),
+        ];
         for report in reports {
-            writeln!(stdout, "\r")?;
-            execute!(stdout, SetForegroundColor(palette::WARN))?;
-            writeln!(
-                stdout,
-                "{} does not match the .safetensors files on disk.\r",
-                report.index_path
-            )?;
-            execute!(stdout, ResetColor)?;
-            writeln!(stdout, "\r")?;
-            // "missing" issues are red (something is gone), "extra" issues are
-            // yellow (present but unexpected).
-            health_section(
-                &mut stdout,
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} does not match the .safetensors files on disk.",
+                    report.index_path
+                ),
+                Style::default().fg(to_ratatui(palette::WARN)),
+            )));
+            lines.push(Line::default());
+            health_section_lines(
+                &mut lines,
                 "Referenced by the index but MISSING",
                 &report.missing_files,
                 palette::ERROR,
-            )?;
-            health_section(
-                &mut stdout,
+            );
+            health_section_lines(
+                &mut lines,
                 "Present on disk but NOT in the index",
                 &report.extra_files,
                 palette::WARN,
-            )?;
-            health_section(
-                &mut stdout,
+            );
+            health_section_lines(
+                &mut lines,
                 "Expected by the index but absent from their file",
                 &report.missing_tensors,
                 palette::ERROR,
-            )?;
-            health_section(
-                &mut stdout,
+            );
+            health_section_lines(
+                &mut lines,
                 "In files but not listed in the index",
                 &report.extra_tensors,
                 palette::WARN,
-            )?;
+            );
         }
-
-        execute!(stdout, SetForegroundColor(palette::DIM))?;
-        writeln!(
-            stdout,
-            "The explorer scans the directory directly when the index is stale. Press any key to return.\r"
-        )?;
-        execute!(stdout, ResetColor)?;
-
-        stdout.flush()?;
-        Ok(())
-    }
-
-    /// Draw a context-sensitive legend explaining the glyphs (and a few colour
-    /// cues) on whichever screen the user opened it from (`l`). A flicker-free
-    /// floating band centred over the current screen — not a full-screen
-    /// takeover — so the surrounding view stays visible; the caller waits for a
-    /// key, then redraws its own screen over it.
-    pub fn draw_legend(legend: Legend) -> Result<()> {
-        let stdout = io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
-        queue!(out, BeginSynchronizedUpdate)?;
-        Self::write_legend_band(&mut out, legend)?;
-        queue!(out, EndSynchronizedUpdate)?;
-        out.flush()?;
-        Ok(())
+        lines.push(Line::from(dim_span(
+            "The explorer scans the directory directly when the index is stale. Press any key to return.",
+        )));
+        Paragraph::new(lines).render(frame.area(), frame.buffer_mut());
     }
 
     /// Composite the legend band onto `dst` (it does not bracket its own
@@ -2888,6 +2047,104 @@ fn render_panel_band(frame: &mut Frame, lines: Vec<Line<'static>>) {
     );
 }
 
+/// Composite a bottom-pinned two-row prompt (`prompt` on the second-to-last row,
+/// `feedback` on the last) over the live frame — the Ratatui equivalent of the
+/// raw prompts' `MoveTo(0, h-2)` / `MoveTo(0, h-1)` line writes. Each row is
+/// cleared (its tail blanked) so a shorter new prompt leaves nothing stale behind.
+fn render_bottom_band(frame: &mut Frame, prompt: Line<'static>, feedback: Line<'static>) {
+    let area = frame.area();
+    if area.height < 2 {
+        return;
+    }
+    Paragraph::new(prompt).render(
+        Rect {
+            x: 0,
+            y: area.height - 2,
+            width: area.width,
+            height: 1,
+        },
+        frame.buffer_mut(),
+    );
+    Paragraph::new(feedback).render(
+        Rect {
+            x: 0,
+            y: area.height - 1,
+            width: area.width,
+            height: 1,
+        },
+        frame.buffer_mut(),
+    );
+}
+
+/// The feedback line below a prompt: a red error message, or an empty line (which
+/// still clears the row) when there's nothing to report.
+fn error_line(error: Option<&str>) -> Line<'static> {
+    match error {
+        Some(msg) => Line::from(Span::styled(
+            msg.to_string(),
+            Style::default().fg(to_ratatui(palette::ERROR)),
+        )),
+        None => Line::default(),
+    }
+}
+
+/// The input box as styled spans — the Ratatui port of [`input_box`]: a padded,
+/// input-coloured field with the caret drawn as an inverted character (or a block
+/// at the end), padded to at least `min_chars`.
+fn input_box_spans(text: &str, cursor: usize, min_chars: usize) -> Vec<Span<'static>> {
+    let field = Style::default()
+        .fg(to_ratatui(palette::INPUT_FG))
+        .bg(to_ratatui(palette::INPUT_BG));
+    let caret = Style::default()
+        .fg(to_ratatui(palette::INPUT_BG))
+        .bg(to_ratatui(palette::INPUT_FG));
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let mut spans: Vec<Span> = vec![Span::styled(" ", field)];
+    for (i, ch) in chars.iter().enumerate() {
+        let style = if i == cursor { caret } else { field };
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+    if cursor >= chars.len() {
+        spans.push(Span::styled("█", field));
+    }
+    if chars.len() < min_chars {
+        spans.push(Span::styled(" ".repeat(min_chars - chars.len()), field));
+    }
+    spans.push(Span::styled(" ", field));
+    spans
+}
+
+/// Append one health-report section to `lines` (the Ratatui port of
+/// [`health_section`]): a coloured title with the count, up to `CAP` items, and a
+/// dimmed "… and N more" when capped, then a blank separator. Empty sections are
+/// skipped.
+fn health_section_lines(
+    lines: &mut Vec<Line<'static>>,
+    title: &str,
+    items: &[String],
+    color: Color,
+) {
+    if items.is_empty() {
+        return;
+    }
+    const CAP: usize = 6;
+    lines.push(Line::from(Span::styled(
+        format!("{title} ({}):", items.len()),
+        Style::default().fg(to_ratatui(color)),
+    )));
+    for item in items.iter().take(CAP) {
+        lines.push(Line::from(Span::raw(format!("  {item}"))));
+    }
+    if items.len() > CAP {
+        lines.push(Line::from(dim_span(format!(
+            "  … and {} more",
+            items.len() - CAP
+        ))));
+    }
+    lines.push(Line::default());
+}
+
 /// Build the context-sensitive legend body as styled [`Line`]s — the Ratatui port
 /// of the body [`UI::write_legend_band`] composes. Title, rule, blank, the
 /// per-screen rows, then the closing blank + "Press any key to close." footer.
@@ -3181,40 +2438,6 @@ fn line_end(out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-/// For a multi-slice (3D) tensor, write the line announcing which 2D slice is
-/// shown and how to change it (keys highlighted, no trailing newline — the
-/// caller ends the line). Only called when `sample.slices > 1`.
-fn write_slice_header(out: &mut impl Write, sample: &Sample) -> Result<()> {
-    match sample.unpacked_field {
-        // The codebook unmerge: each logical expert is a field unmerged from a
-        // stored word, so spell out the mapping rather than "fixed leading index".
-        Some(f) => write!(
-            out,
-            "expert {} of {} — stored word {}, field {}/{} ({}-bit) — ",
-            sample.slice, sample.slices, f.stored_slice, f.field, f.len_p, f.field_bits,
-        )?,
-        None => write!(
-            out,
-            "slice {} of {} (fixed leading index) — ",
-            sample.slice, sample.slices
-        )?,
-    }
-    // The overview frees the arrows for slice stepping; the edges and window
-    // layouts claim them (divider / pan), so slices move on `[` / `]` there.
-    if matches!(sample.mode, SampleMode::Grid) {
-        hint_line(
-            out,
-            &[
-                ("← →", "step"),
-                ("Shift+← →", "jump 5% (both wrap)"),
-                ("/", "index or %"),
-            ],
-        )
-    } else {
-        hint_line(out, &[("[ ]", "step"), ("/", "index or %")])
-    }
-}
-
 /// Footer for the data views: offers the other representation (`m`/`v` switch
 /// in place, no trip back to the detail screen) and mentions slice navigation
 /// only when there is more than one slice to move between. Keys highlighted.
@@ -3325,24 +2548,6 @@ pub fn data_view_footer_lines(
         })
         .sum();
     1 + len.div_ceil(width.max(1)).max(1)
-}
-
-fn write_view_footer(
-    out: &mut impl Write,
-    sample: &Sample,
-    heatmap: bool,
-    stripe: StripeMode,
-    base: NumBase,
-) -> Result<()> {
-    let items = view_footer_items(
-        sample.mode,
-        sample.slices,
-        sample.overridable,
-        heatmap,
-        stripe,
-        base,
-    );
-    hint_line(out, &items)
 }
 
 /// The data-view title block as styled [`Line`]s — the Ratatui port of
@@ -3523,35 +2728,6 @@ impl FlushSpan for String {
     }
 }
 
-/// Write one right-aligned numeric cell (already formatted to the cell width).
-/// When `bg` is set (column striping), the background covers a *constant* band —
-/// the whole cell except its first column — so every column's stripe is the
-/// same width and a one-space gutter separates neighbouring stripes (values are
-/// right-aligned and never fill that first column). `dim` dims the glyphs (used
-/// for the "⋯" gap marker).
-fn write_grid_cell(out: &mut impl Write, s: &str, bg: Option<Color>, dim: bool) -> Result<()> {
-    if dim {
-        queue!(out, SetForegroundColor(palette::DIM))?;
-    }
-    match bg {
-        // Leave the first column an uncoloured gutter and band the rest, so the
-        // stripe is the same width for every column.
-        Some(c) => {
-            let split = s.char_indices().nth(1).map_or(s.len(), |(i, _)| i);
-            let (gutter, band) = s.split_at(split);
-            write!(out, "{gutter}")?;
-            queue!(out, SetBackgroundColor(c))?;
-            write!(out, "{band}")?;
-            queue!(out, SetBackgroundColor(Color::Reset))?;
-        }
-        None => write!(out, "{s}")?,
-    }
-    if dim {
-        queue!(out, SetForegroundColor(Color::Reset))?;
-    }
-    Ok(())
-}
-
 /// One numeric-grid cell as styled span(s) — the Ratatui port of
 /// [`write_grid_cell`]. `col_bg` is the column-stripe background (which, like the
 /// raw path, bands all but the cell's first column so every stripe is the same
@@ -3655,93 +2831,6 @@ fn input_box(out: &mut impl Write, text: &str, cursor: usize, min_chars: usize) 
     Ok(())
 }
 
-/// Write a one-line statistics summary (mean, std, sparsity, non-finite count),
-/// with field labels dimmed; the non-finite count is highlighted when nonzero.
-fn write_stats_line(out: &mut impl Write, s: &Stats) -> Result<()> {
-    queue!(out, SetForegroundColor(palette::DIM))?;
-    write!(out, "mean ")?;
-    queue!(out, ResetColor)?;
-    write!(out, "{:.4}", s.mean)?;
-    queue!(out, SetForegroundColor(palette::DIM))?;
-    write!(out, " · std ")?;
-    queue!(out, ResetColor)?;
-    write!(out, "{:.4}", s.std)?;
-    queue!(out, SetForegroundColor(palette::DIM))?;
-    write!(out, " · zeros ")?;
-    queue!(out, ResetColor)?;
-    // Distinguish "no zeros at all" from "some, but a tiny fraction": the latter
-    // would otherwise round to a misleading `0.0%` (e.g. when min is exactly 0),
-    // so show the small fraction in scientific notation to keep its magnitude.
-    let pct = s.zero_fraction() * 100.0;
-    if s.zeros == 0 {
-        write!(out, "0%")?;
-    } else if pct < 0.1 {
-        write!(out, "{pct:.1e}%")?;
-    } else {
-        write!(out, "{pct:.1}%")?;
-    }
-    if s.nonfinite > 0 {
-        queue!(out, SetForegroundColor(palette::WARN))?;
-        write!(out, " · {} non-finite", s.nonfinite)?;
-        queue!(out, ResetColor)?;
-    }
-    // How long the scan took, dimmed.
-    queue!(out, SetForegroundColor(palette::DIM))?;
-    write!(out, "  ({})", fmt_duration(s.elapsed))?;
-    queue!(out, ResetColor)?;
-    Ok(())
-}
-
-/// Render the stats line for a data view (heatmap/numeric): the stats once
-/// `Ready`, a spinner while `Computing`, nothing while `Pending`. Ends the line.
-fn write_stats_view(out: &mut impl Write, stats: StatsView) -> Result<()> {
-    match stats {
-        StatsView::Ready(s) => {
-            write_stats_line(out, s)?;
-            line_end(out)?;
-        }
-        StatsView::Computing {
-            spinner,
-            elapsed,
-            progress,
-        } => {
-            write_computing(out, spinner, elapsed, progress)?;
-            line_end(out)?;
-        }
-        StatsView::Pending => {}
-    }
-    Ok(())
-}
-
-/// Write the "scan in progress" stats segment: a spinner (accent colour), a
-/// dimmed label, a progress bar with a percentage (when the fraction is known)
-/// and the running elapsed time. Drawn in place of the stats.
-fn write_computing(
-    out: &mut impl Write,
-    spinner: char,
-    elapsed: Duration,
-    progress: Option<f64>,
-) -> Result<()> {
-    queue!(out, SetForegroundColor(palette::KEY))?;
-    write!(out, "{spinner} ")?;
-    queue!(out, SetForegroundColor(palette::DIM))?;
-    write!(out, "computing statistics… ")?;
-    if let Some(frac) = progress {
-        const WIDTH: usize = 16;
-        let frac = frac.clamp(0.0, 1.0);
-        let filled = (frac * WIDTH as f64).round() as usize;
-        write!(out, "[")?;
-        queue!(out, SetForegroundColor(palette::KEY))?;
-        write!(out, "{}", "█".repeat(filled))?;
-        queue!(out, SetForegroundColor(palette::DIM))?;
-        write!(out, "{}", "░".repeat(WIDTH - filled))?;
-        write!(out, "] {:>3.0}% · ", frac * 100.0)?;
-    }
-    write!(out, "{}", fmt_duration(elapsed))?;
-    queue!(out, ResetColor)?;
-    Ok(())
-}
-
 /// Human-readable scan duration: milliseconds under a second, else seconds.
 fn fmt_duration(d: Duration) -> String {
     let ms = d.as_millis();
@@ -3760,89 +2849,6 @@ fn fmt_value(v: f64, integer: bool) -> String {
     } else {
         format!("{v:.4}")
     }
-}
-
-/// Write the dtype shown in a data-view header. With no override this is just
-/// the stored dtype; when overridden it fades the original dtype and highlights
-/// the active reinterpretation, e.g. a dimmed `BF16 as` then a bold `u4`.
-fn write_view_dtype(
-    out: &mut impl Write,
-    stored: &str,
-    view: ViewDtype,
-    unpacked_label: Option<&str>,
-) -> Result<()> {
-    // The codebook unmerge shows the schema-derived label (e.g. `u3×5`) instead
-    // of the generic `unpacked`.
-    let label: Option<String> = match (view, unpacked_label) {
-        (ViewDtype::Unpacked, Some(l)) => Some(format!("{l} (unpacked)")),
-        _ => view.label().map(str::to_string),
-    };
-    match label.as_deref() {
-        Some(label) => {
-            queue!(out, SetForegroundColor(palette::DIM))?;
-            write!(out, "{stored} as ")?;
-            queue!(
-                out,
-                ResetColor,
-                SetAttribute(Attribute::Bold),
-                SetForegroundColor(palette::KEY)
-            )?;
-            write!(out, "{label}")?;
-            queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
-        }
-        None => write!(out, "{stored}")?,
-    }
-    Ok(())
-}
-
-/// Write the shape shown in a detail / data-view header. When the active view
-/// changes the logical shape — only a packed 4-bit view does, growing the last
-/// dimension — fade the stored shape and highlight the reinterpreted one (e.g.
-/// `(128, 2880) as (128, 11520)`), mirroring how [`write_view_dtype`] shows the
-/// dtype. Otherwise just the (unchanged) shape.
-fn write_view_shape(out: &mut impl Write, stored: &[usize], logical: &[usize]) -> Result<()> {
-    if stored == logical {
-        write!(out, "{}", format_shape(logical))?;
-    } else {
-        queue!(out, SetForegroundColor(palette::DIM))?;
-        write!(out, "{} as ", format_shape(stored))?;
-        queue!(
-            out,
-            ResetColor,
-            SetAttribute(Attribute::Bold),
-            SetForegroundColor(palette::KEY)
-        )?;
-        write!(out, "{}", format_shape(logical))?;
-        queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
-    }
-    Ok(())
-}
-
-/// Write one capped section of the health panel: a titled list (in `color`) of
-/// up to `CAP` items, then a dimmed "… and N more" when truncated.
-fn health_section(
-    stdout: &mut io::Stdout,
-    title: &str,
-    items: &[String],
-    color: Color,
-) -> Result<()> {
-    if items.is_empty() {
-        return Ok(());
-    }
-    const CAP: usize = 6;
-    execute!(stdout, SetForegroundColor(color))?;
-    writeln!(stdout, "{title} ({}):\r", items.len())?;
-    execute!(stdout, ResetColor)?;
-    for item in items.iter().take(CAP) {
-        writeln!(stdout, "  {item}\r")?;
-    }
-    if items.len() > CAP {
-        execute!(stdout, SetForegroundColor(palette::DIM))?;
-        writeln!(stdout, "  … and {} more\r", items.len() - CAP)?;
-        execute!(stdout, ResetColor)?;
-    }
-    writeln!(stdout, "\r")?;
-    Ok(())
 }
 
 /// Returns the number of layers when `children` form a stack of numbered
@@ -4640,29 +3646,6 @@ fn truncate_keep_end(s: &str, width: usize) -> String {
     format!("…{tail}")
 }
 
-/// Write a data view's title block — the tensor name and its source file — each
-/// kept to a single line (truncated tail-first, so the distinguishing end stays)
-/// so both remain on screen above a grid of any size. `kind` is the view label
-/// (`Values` / `Heatmap`).
-fn write_data_view_title(out: &mut impl Write, kind: &str, tensor: &TensorInfo) -> Result<()> {
-    let width = crate::plain::term_size().0 as usize;
-    write!(out, "{kind}: ")?;
-    write!(
-        out,
-        "{}",
-        truncate_keep_end(&tensor.name, width.saturating_sub(kind.len() + 2))
-    )?;
-    line_end(&mut *out)?;
-    paint(&mut *out, false, palette::DIM, "File: ")?;
-    write!(
-        out,
-        "{}",
-        truncate_keep_end(&tensor.source_path, width.saturating_sub(6))
-    )?;
-    line_end(&mut *out)?;
-    Ok(())
-}
-
 /// Map a normalized value in `[0, 1]` to a blue→green→red 256-color ramp
 /// (the 6×6×6 ANSI color cube, indices 16..=231).
 fn heat_color(t: f64) -> Color {
@@ -4706,177 +3689,6 @@ fn bar(frac: f64, width: usize) -> String {
     } else {
         "▆".repeat(cells)
     }
-}
-
-/// Render the value histogram as horizontal bars — one per bin, with its label,
-/// absolute count, and percentage of the finite values — for embedding in the
-/// detail screen below the statistics. The whole section (heading + bars + an
-/// "N more" note when clipped) fits within `max_rows`, so it never pushes the
-/// footer off a short screen. `scanning` (spinner, elapsed, fraction) marks a
-/// still-forming scan so the bars animate as they fill in.
-fn write_histogram_section(
-    out: &mut impl Write,
-    hist: &Histogram,
-    scanning: Option<ScanProgress>,
-    term_w: usize,
-    max_rows: usize,
-) -> Result<()> {
-    // Heading: how many values, any non-finite, and the scan indicator. Built
-    // into a buffer so its own wrapped height is known (the scan line can be
-    // long), leaving the rest of the budget for bars.
-    let mut head: Vec<u8> = Vec::new();
-    paint(&mut head, false, palette::DIM, "Histogram: ")?;
-    write!(head, "{} values", with_thousands(hist.total as usize))?;
-    if hist.nonfinite > 0 {
-        paint(
-            &mut head,
-            false,
-            palette::DIM,
-            &format!(
-                "  ·  {} non-finite",
-                with_thousands(hist.nonfinite as usize)
-            ),
-        )?;
-    }
-    if let Some((spinner, elapsed, progress)) = scanning {
-        queue!(head, SetForegroundColor(palette::ACCENT))?;
-        write!(head, "   {spinner} scanning")?;
-        if let Some(p) = progress {
-            write!(head, " {:.0}%", p * 100.0)?;
-        }
-        write!(head, " ({:.1}s)", elapsed.as_secs_f64())?;
-        queue!(head, ResetColor)?;
-    } else if !hist.elapsed.is_zero() {
-        // Finished: keep the scan time on the heading, like the statistics line.
-        paint(
-            &mut head,
-            false,
-            palette::DIM,
-            &format!("  ({})", fmt_duration(hist.elapsed)),
-        )?;
-    }
-    line_end(&mut head)?;
-    let heading_rows = count_physical_lines(&head, term_w);
-    out.write_all(&head)?;
-
-    let n = hist.counts.len();
-    // Bin labels: the integer value, or the bin's lower edge for range bins.
-    let labels: Vec<String> = (0..n)
-        .map(|i| match hist.bins {
-            HistBins::IntBins { start, step } => (start + i as i64 * step).to_string(),
-            HistBins::Range { lo, hi } => fmt_hist_edge(lo + (hi - lo) * i as f64 / n as f64),
-        })
-        .collect();
-    let label_w = labels.iter().map(|l| l.chars().count()).max().unwrap_or(1);
-    let counts: Vec<String> = hist
-        .counts
-        .iter()
-        .map(|c| with_thousands(*c as usize))
-        .collect();
-    let count_w = counts.iter().map(|s| s.chars().count()).max().unwrap_or(1);
-    let max_count = hist.counts.iter().copied().max().unwrap_or(0).max(1);
-    let total = hist.total.max(1);
-    // Percentages: a non-empty bin with a tiny share would round to a misleading
-    // `0.0%`, so show its magnitude in scientific notation instead (matching the
-    // stats line's zero-fraction). Empty bins stay a plain `0.0%`.
-    let pcts: Vec<String> = hist
-        .counts
-        .iter()
-        .map(|&c| {
-            let pct = c as f64 / total as f64 * 100.0;
-            if c == 0 {
-                "0.0%".to_string()
-            } else if pct < 0.1 {
-                format!("{pct:.1e}%")
-            } else {
-                format!("{pct:.1}%")
-            }
-        })
-        .collect();
-    let pct_w = pcts.iter().map(|s| s.chars().count()).max().unwrap_or(4);
-
-    // The bar gets whatever width is left after `label │ … count (pct)`.
-    let fixed = label_w + 3 + 1 + count_w + pct_w + 3;
-    let bar_w = term_w.saturating_sub(fixed).clamp(1, 100);
-    // `max_rows` bounds the whole section; the heading took `heading_rows`, so
-    // the rest is for bars — and when clipping, one more is left for the note.
-    let bar_rows = max_rows.saturating_sub(heading_rows).max(1);
-    let shown = if n <= bar_rows {
-        n
-    } else {
-        bar_rows.saturating_sub(1).max(1)
-    };
-
-    for i in 0..shown {
-        let frac = hist.counts[i] as f64 / max_count as f64;
-        // The bin value (left) and the count (right) are the data, so both read
-        // at full strength; only the `│` separator and the percentage's
-        // parentheses are dimmed as chrome.
-        write!(out, "{:>label_w$} ", labels[i])?;
-        paint(out, false, palette::DIM, "│")?;
-        queue!(out, SetForegroundColor(palette::ACCENT))?;
-        write!(out, "{}", bar(frac, bar_w))?;
-        queue!(out, ResetColor)?;
-        queue!(out, SetAttribute(Attribute::Bold))?;
-        write!(out, " {:>count_w$} ", counts[i])?;
-        queue!(out, SetAttribute(Attribute::Reset))?;
-        paint(out, false, palette::DIM, "(")?;
-        write!(out, "{}", pcts[i])?;
-        paint(out, false, palette::DIM, ")")?;
-        line_end(out)?;
-    }
-    if n > shown {
-        paint(
-            out,
-            false,
-            palette::DIM,
-            &format!("… {} more bins (enlarge the terminal)", n - shown),
-        )?;
-        line_end(out)?;
-    }
-    Ok(())
-}
-
-/// Visible (printable) character count of a rendered byte buffer — ANSI escape
-/// sequences and carriage returns excluded. Used to measure how wide a styled
-/// line is so its wrapped height can be computed.
-fn visible_len(buf: &[u8]) -> usize {
-    let text = String::from_utf8_lossy(buf);
-    let mut chars = text.chars().peekable();
-    let mut len = 0;
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip a CSI sequence: `ESC [ … <final letter>`.
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                while let Some(&d) = chars.peek() {
-                    chars.next();
-                    if d.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            }
-        } else if c != '\r' && c != '\n' {
-            len += 1;
-        }
-    }
-    len
-}
-
-/// Number of terminal rows a rendered buffer occupies at the given width:
-/// every `\n`-terminated line wraps to `ceil(visible / width)` rows (at least
-/// one), so the height accounts for both explicit line breaks and autowrap.
-fn count_physical_lines(buf: &[u8], width: usize) -> usize {
-    let text = String::from_utf8_lossy(buf);
-    let mut lines: Vec<&str> = text.split('\n').collect();
-    // A trailing newline leaves an empty final segment that isn't its own row.
-    if lines.last() == Some(&"") {
-        lines.pop();
-    }
-    lines
-        .iter()
-        .map(|line| visible_len(line.as_bytes()).div_ceil(width.max(1)).max(1))
-        .sum()
 }
 
 /// Compact label for a range-histogram bin's lower edge.
