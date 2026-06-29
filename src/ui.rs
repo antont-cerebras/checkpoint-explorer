@@ -297,15 +297,23 @@ impl UI {
         search_mode: bool,
         can_repack: bool,
     ) -> usize {
+        let header = Self::tree_header_rows(width, search_mode, can_repack);
+        (height as usize)
+            .saturating_sub(header + TREE_FOOTER_HEIGHT)
+            .max(1)
+    }
+
+    /// The first terminal row of the tree body — the header height (title +
+    /// hint/search line(s) + rule). Used for mouse hit-testing: a click at row
+    /// `r >= tree_header_rows()` and above the 2-line status bar lands on tree
+    /// row `scroll_offset + (r - tree_header_rows())`.
+    pub fn tree_header_rows(width: u16, search_mode: bool, can_repack: bool) -> usize {
         let hint_rows = if search_mode {
             1
         } else {
             tree_hint_lines(can_repack, width).len()
         };
-        let header = 1 + hint_rows + 1; // title + hint(s) + rule
-        (height as usize)
-            .saturating_sub(header + TREE_FOOTER_HEIGHT)
-            .max(1)
+        1 + hint_rows + 1 // title + hint(s) + rule
     }
 
     /// Ratatui render of the tree browser: header (title, hint or search line,
@@ -587,7 +595,7 @@ impl UI {
         }
         band.push(Line::from(Span::styled(rule, rule_color)));
         band.push(Line::from(dim_span(
-            "select the command above to copy it by hand · any key to dismiss",
+            "copied to the clipboard · click or press any key to dismiss",
         )));
         band.push(Line::default());
         render_panel_band(frame, band);
@@ -714,7 +722,7 @@ impl UI {
         }
 
         lines.push(Line::default());
-        lines.push(Line::from(Span::raw("Press any key to return...")));
+        lines.push(Line::from(Span::raw("Click or press any key to return...")));
         Paragraph::new(lines).render(area, frame.buffer_mut());
     }
 
@@ -1212,7 +1220,7 @@ impl UI {
             Line::from(Span::raw("=".repeat(title.len().max(10)))),
             Line::from(Span::raw(message.to_string())),
             Line::default(),
-            Line::from(Span::raw("Press any key to return...")),
+            Line::from(Span::raw("Click or press any key to return...")),
         ];
         Paragraph::new(lines)
             .style(panel)
@@ -1315,7 +1323,7 @@ impl UI {
             );
         }
         lines.push(Line::from(dim_span(
-            "The explorer scans the directory directly when the index is stale. Press any key to return.",
+            "The explorer scans the directory directly when the index is stale. Click or press any key to return.",
         )));
         Paragraph::new(lines).render(frame.area(), frame.buffer_mut());
     }
@@ -1700,7 +1708,7 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
     }
 
     lines.push(Line::default());
-    lines.push(Line::from(dim_span("Press any key to close.")));
+    lines.push(Line::from(dim_span("Click or press any key to close.")));
     lines
 }
 

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind},
     execute,
     terminal::{self, ClearType},
 };
@@ -188,6 +188,14 @@ const HDR_COLINDEX_ROW: usize = 1;
 /// How long the "✓ Copied …" confirmation stays on screen after `c` before it
 /// auto-dismisses (it also clears on the next key press).
 const COPY_FLASH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Two left-clicks on the same tree row within this window count as a double
+/// click (which opens it); a lone click just selects it (visible feedback).
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Rows the tree viewport scrolls per mouse-wheel notch (independent of the
+/// selection, like a normal scrollable list).
+const WHEEL_STEP: usize = 3;
 
 /// A statistics scan running on a worker thread for a data view's current
 /// `(tensor, view)`. The view stays fully interactive while it runs; the main
@@ -1851,13 +1859,24 @@ impl Explorer {
 
     /// Recompute the scroll offset so the selected row stays visible, given the
     /// live terminal size (so it matches [`UI::render_tree`]'s body height).
+    /// Whether the loaded checkpoint can be repacked (gates the `R` hint and is
+    /// part of the tree's header height).
+    fn can_repack(&self) -> bool {
+        self.repack_input().is_some()
+    }
+
+    /// Number of rows in the tree currently shown (the search results when
+    /// searching, else the full flattened tree).
+    fn current_tree_len(&self) -> usize {
+        if self.search_mode {
+            self.filtered_tree.len()
+        } else {
+            self.flattened_tree.len()
+        }
+    }
+
     fn update_tree_scroll(&mut self, width: u16, height: u16) {
-        let body = UI::tree_visible_rows(
-            width,
-            height,
-            self.search_mode,
-            self.repack_input().is_some(),
-        );
+        let body = UI::tree_visible_rows(width, height, self.search_mode, self.can_repack());
         let sel = self.selected_idx;
         self.scroll_offset = if sel >= self.scroll_offset + body {
             sel.saturating_sub(body - 1)
@@ -1891,6 +1910,12 @@ impl Explorer {
         // Force a full repaint on entry so the tree fully overwrites whatever
         // screen (detail/data view, or the loading frame) preceded it.
         let mut first = true;
+        // The last left-click (time, terminal row), for double-click detection.
+        let mut last_click: Option<(std::time::Instant, u16)> = None;
+        // The selection as of the last frame: when it changes (arrows/click) we
+        // snap the viewport to keep it visible; when it's unchanged we leave the
+        // scroll offset alone so the wheel can scroll freely past the selection.
+        let mut last_sel = usize::MAX;
         loop {
             // Draw the tree through the owned Ratatui terminal.
             let mut term = self
@@ -1901,8 +1926,17 @@ impl Explorer {
                 term.clear()?;
                 first = false;
             }
-            if let Ok(sz) = term.size() {
-                self.update_tree_scroll(sz.width, sz.height);
+            let size = term.size().ok();
+            if let Some(sz) = size {
+                if self.selected_idx != last_sel {
+                    self.update_tree_scroll(sz.width, sz.height); // snap to the moved selection
+                    last_sel = self.selected_idx;
+                }
+                // Clamp the (possibly wheel-scrolled) offset to the valid range.
+                let body =
+                    UI::tree_visible_rows(sz.width, sz.height, self.search_mode, self.can_repack());
+                let total = self.current_tree_len();
+                self.scroll_offset = self.scroll_offset.min(total.saturating_sub(body));
             }
             term.draw(|f| self.render_tree_frame(f))?;
             self.terminal = Some(term);
@@ -1919,6 +1953,76 @@ impl Explorer {
             } else {
                 event::read()?
             };
+
+            // Mouse: click a row to act on it (like Enter), wheel to move the
+            // selection. Hit-test against the body region (below the header, above
+            // the 2-line status bar) using the size captured for this frame.
+            if let Event::Mouse(m) = &ev {
+                let (kind, row, col) = (m.kind, m.row, m.column);
+                self.copied_flash = None;
+                match kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(sz) = size {
+                            let body_top =
+                                UI::tree_header_rows(sz.width, self.search_mode, self.can_repack())
+                                    as u16;
+                            let body_bottom = sz.height.saturating_sub(2); // status bar
+                            if row >= body_top && row < body_bottom {
+                                let idx = self.scroll_offset + (row - body_top) as usize;
+                                if idx < self.current_tree_len() {
+                                    // A click exactly on a group's ▸/▾ twisty (the
+                                    // arrow sits at column `2 * depth`) toggles it on
+                                    // a single click, like clicking a folder's arrow.
+                                    let on_arrow = {
+                                        let tree = if self.search_mode {
+                                            &self.filtered_tree
+                                        } else {
+                                            &self.flattened_tree
+                                        };
+                                        matches!(
+                                            tree.get(idx),
+                                            Some((TreeNode::Group { .. }, depth)) if col == 2 * *depth as u16
+                                        )
+                                    };
+                                    self.selected_idx = idx;
+                                    if on_arrow {
+                                        last_click = None;
+                                        self.activate_selection(); // group → toggle
+                                    } else {
+                                        // Otherwise a lone click just selects the row
+                                        // (highlight + status bar move there — visible
+                                        // feedback); a double-click opens it / toggles.
+                                        let double = matches!(
+                                            last_click,
+                                            Some((t, r)) if r == row && t.elapsed() < DOUBLE_CLICK
+                                        );
+                                        if double {
+                                            last_click = None;
+                                            if self.search_mode {
+                                                self.reveal_search_result();
+                                            } else if let Some(nav) = self.activate_selection() {
+                                                return Ok(nav);
+                                            }
+                                        } else {
+                                            last_click = Some((std::time::Instant::now(), row));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Wheel scrolls the viewport (not the selection); the offset
+                    // is clamped to range before the next draw.
+                    MouseEventKind::ScrollDown => {
+                        self.scroll_offset = self.scroll_offset.saturating_add(WHEEL_STEP)
+                    }
+                    MouseEventKind::ScrollUp => {
+                        self.scroll_offset = self.scroll_offset.saturating_sub(WHEEL_STEP)
+                    }
+                    _ => {}
+                }
+                continue;
+            }
 
             if let Event::Key(key_event) = ev {
                 // Any key also dismisses the copy confirmation.
@@ -2099,27 +2203,19 @@ impl Explorer {
                     KeyEvent {
                         code: KeyCode::Enter,
                         ..
-                    } => match self.handle_selection() {
-                        (Some(screen), _) => return Ok(Nav::Open(screen)),
-                        (None, Some(info)) => {
-                            let mut term = self.terminal.take().expect("interactive loop owns it");
-                            self.show_metadata_detail(&mut term, &info);
-                            self.terminal = Some(term);
+                    } => {
+                        if let Some(nav) = self.activate_selection() {
+                            return Ok(nav);
                         }
-                        (None, None) => {}
-                    },
+                    }
                     KeyEvent {
                         code: KeyCode::Char(' '),
                         ..
-                    } if !self.search_mode => match self.handle_selection() {
-                        (Some(screen), _) => return Ok(Nav::Open(screen)),
-                        (None, Some(info)) => {
-                            let mut term = self.terminal.take().expect("interactive loop owns it");
-                            self.show_metadata_detail(&mut term, &info);
-                            self.terminal = Some(term);
+                    } if !self.search_mode => {
+                        if let Some(nav) = self.activate_selection() {
+                            return Ok(nav);
                         }
-                        (None, None) => {}
-                    },
+                    }
                     // While searching, space is ignored rather than typed into the query.
                     KeyEvent {
                         code: KeyCode::Char(' '),
@@ -2429,6 +2525,22 @@ impl Explorer {
         };
         self.exit_search_mode();
         self.reveal_tensor(&name);
+    }
+
+    /// Activate the highlighted tree row (shared by Enter, Space, and a left
+    /// mouse click): open a tensor (returns `Nav::Open`), toggle a group, or show
+    /// metadata in place. Returns `Some(nav)` when the caller should navigate.
+    fn activate_selection(&mut self) -> Option<Nav> {
+        match self.handle_selection() {
+            (Some(screen), _) => Some(Nav::Open(screen)),
+            (None, Some(info)) => {
+                let mut term = self.terminal.take().expect("interactive loop owns it");
+                self.show_metadata_detail(&mut term, &info);
+                self.terminal = Some(term);
+                None
+            }
+            (None, None) => None,
+        }
     }
 
     /// Act on the highlighted tree row. Returns `Some(Screen::Detail)` when a
@@ -3017,12 +3129,20 @@ impl Explorer {
             // quits) rather than acting as a screen command; the loop then
             // redraws the detail without it.
             if overlay.is_some() {
-                if let Ok(Event::Key(key)) = &ev
-                    && is_ctrl_c(key)
-                {
-                    quit_immediately();
+                // A key or a mouse click dismisses the pop-up; mouse motion / drag
+                // / wheel is ignored so a modifier-drag to select doesn't close it.
+                match &ev {
+                    Ok(Event::Key(key)) => {
+                        if is_ctrl_c(key) {
+                            quit_immediately();
+                        }
+                        overlay = None;
+                    }
+                    Ok(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => {
+                        overlay = None;
+                    }
+                    _ => {}
                 }
-                overlay = None;
                 continue;
             }
             match ev {
@@ -3492,12 +3612,20 @@ impl Explorer {
             // quits) rather than acting as a screen command; the loop then redraws
             // the data view without it.
             if overlay.is_some() {
-                if let Ok(Event::Key(key)) = &pending
-                    && is_ctrl_c(key)
-                {
-                    quit_immediately();
+                // A key or a mouse click dismisses the pop-up; mouse motion / drag
+                // / wheel is ignored so a modifier-drag to select doesn't close it.
+                match &pending {
+                    Ok(Event::Key(key)) => {
+                        if is_ctrl_c(key) {
+                            quit_immediately();
+                        }
+                        overlay = None;
+                    }
+                    Ok(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => {
+                        overlay = None;
+                    }
+                    _ => {}
                 }
-                overlay = None;
                 continue;
             }
             loop {
@@ -3726,6 +3854,14 @@ impl Explorer {
                             }
                         }
                     }
+                    // Mouse wheel pages through the slices (like `]` / `[`).
+                    Ok(Event::Mouse(m)) => match m.kind {
+                        MouseEventKind::ScrollDown if slices > 1 => slice = (slice + 1) % slices,
+                        MouseEventKind::ScrollUp if slices > 1 => {
+                            slice = (slice + slices - 1) % slices
+                        }
+                        _ => {}
+                    },
                     Ok(_) => {} // resize etc.: re-sample and redraw the same slice
                     Err(_) => return (Nav::Back, repr, slice),
                 }
@@ -4284,12 +4420,8 @@ impl Explorer {
             .draw(|f| UI::render_metadata_detail(f, metadata))
             .is_ok()
         {
-            // Wait for any key press (Ctrl-C quits the app).
-            if let Ok(Event::Key(key)) = event::read()
-                && is_ctrl_c(&key)
-            {
-                quit_immediately();
-            }
+            // Wait for a key (ignore mouse) so the value can be selected by mouse.
+            wait_for_dismiss();
         }
     }
 
@@ -4299,12 +4431,7 @@ impl Explorer {
                 .draw(|f| UI::render_health_warning(f, &self.health_reports))
                 .is_ok()
         {
-            // Wait for any key press (Ctrl-C quits the app).
-            if let Ok(Event::Key(key)) = event::read()
-                && is_ctrl_c(&key)
-            {
-                quit_immediately();
-            }
+            wait_for_dismiss();
         }
     }
 
@@ -4661,10 +4788,8 @@ impl Explorer {
                 UI::render_legend_band(f, legend);
             })
             .is_ok()
-            && let Ok(Event::Key(key)) = event::read()
-            && is_ctrl_c(&key)
         {
-            quit_immediately();
+            wait_for_dismiss();
         }
     }
 
@@ -4691,10 +4816,10 @@ impl Explorer {
                 UI::render_command_band(f, command);
             })
             .is_ok()
-            && let Ok(Event::Key(key)) = event::read()
-            && is_ctrl_c(&key)
         {
-            quit_immediately();
+            // Wait for a key (mouse events are ignored) so the command text can be
+            // selected with the mouse without the pop-up closing.
+            wait_for_dismiss();
         }
     }
 
@@ -5045,12 +5170,32 @@ fn quit_immediately() -> ! {
     // drop the prompt onto a fresh line below the preserved frame.
     let _ = execute!(
         stdout,
+        crossterm::event::DisableMouseCapture,
         terminal::Clear(ClearType::FromCursorDown),
         cursor::Show
     );
     let _ = terminal::disable_raw_mode();
     println!();
     std::process::exit(0);
+}
+
+/// Block until a key is pressed or the mouse is clicked, then dismiss. Mouse
+/// motion / drag / wheel and resize are ignored, so a modifier-drag to select the
+/// text (e.g. iTerm2 Option-drag, which bypasses capture entirely) doesn't close
+/// the pop-up. Ctrl-C quits the app. Used by the "any key to dismiss" pop-ups.
+fn wait_for_dismiss() {
+    loop {
+        match event::read() {
+            Ok(Event::Key(key)) => {
+                if is_ctrl_c(&key) {
+                    quit_immediately();
+                }
+                return;
+            }
+            Ok(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => return,
+            _ => {} // mouse motion / drag / wheel, resize: keep waiting
+        }
+    }
 }
 
 /// Resolve a path to an absolute string without requiring it to exist or
