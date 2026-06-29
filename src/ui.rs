@@ -1669,6 +1669,324 @@ impl UI {
         Ok(())
     }
 
+    /// Render a sampled tensor as a heatmap — the Ratatui port of
+    /// [`UI::draw_heatmap`]. Each text row shows two data rows via the upper-half
+    /// block `▀`: the cell's foreground is the upper data row's heat color, its
+    /// background the lower row's. A trailing odd row keeps the default background
+    /// for its empty lower half. The title / dtype-shape / slice / range chrome
+    /// and the footer match the numeric grid; the layout is top-aligned so a small
+    /// sample leaves the lower screen blank, exactly like the raw renderer (which
+    /// wrote sequentially and cleared below).
+    pub fn render_heatmap(
+        frame: &mut Frame,
+        tensor: &TensorInfo,
+        sample: &Sample,
+        stats: StatsView,
+    ) {
+        let area = frame.area();
+        let width = area.width as usize;
+        let mut lines: Vec<Line> = data_view_title_lines("Heatmap", tensor, width);
+
+        let integer = sample.view.is_integer(&tensor.dtype);
+        // The exact whole-tensor range once stats are ready; else the sampled
+        // range, flagged as such.
+        let (rmin, rmax) = match stats {
+            StatsView::Ready(s) => (s.min, s.max),
+            _ => (sample.min, sample.max),
+        };
+        let lo = fmt_value(rmin, integer);
+        let hi = fmt_value(rmax, integer);
+        let range_note = if matches!(stats, StatsView::Ready(_)) {
+            ""
+        } else {
+            " (sampled)"
+        };
+        let what = match sample.mode {
+            SampleMode::Edges { .. } => "edges",
+            SampleMode::Window { .. } => "window",
+            SampleMode::Grid => "sampled",
+        };
+        let mut dtype_line =
+            view_dtype_spans(&tensor.dtype, sample.view, sample.schema_label.as_deref());
+        dtype_line.push(Span::raw(" "));
+        dtype_line.extend(view_shape_spans(&tensor.shape, &sample.display_shape));
+        dtype_line.push(Span::raw(format!(
+            " → {what} {}×{}, value range [{lo}, {hi}]{range_note}",
+            sample.rows.len(),
+            sample.cols.len(),
+        )));
+        lines.push(Line::from(dtype_line));
+
+        if let Some(stats_line) = data_stats_view_line(stats) {
+            lines.push(stats_line);
+        }
+        if sample.slices > 1 {
+            lines.push(slice_header_line(sample));
+        }
+        lines.push(Line::default());
+
+        let range = rmax - rmin;
+        let norm = |v: f64| {
+            if range > 0.0 { (v - rmin) / range } else { 0.5 }
+        };
+        // Two data rows per text line: foreground = the upper row's value,
+        // background = the lower row's; a trailing odd row keeps the default bg.
+        let mut r = 0;
+        while r < sample.values.len() {
+            let top = &sample.values[r];
+            let bottom = sample.values.get(r + 1);
+            let mut spans: Vec<Span> = Vec::with_capacity(top.len());
+            for (c, &tv) in top.iter().enumerate() {
+                let mut style = Style::default().fg(to_ratatui(heat_color(norm(tv))));
+                if let Some(below) = bottom {
+                    style = style.bg(to_ratatui(heat_color(norm(below[c]))));
+                }
+                spans.push(Span::styled("▀", style));
+            }
+            lines.push(Line::from(spans));
+            r += 2;
+        }
+
+        lines.push(Line::default());
+        let mut legend = vec![Span::raw(format!("{lo} low "))];
+        for i in 0..24 {
+            legend.push(Span::styled(
+                "█",
+                Style::default().fg(to_ratatui(heat_color(i as f64 / 23.0))),
+            ));
+        }
+        legend.push(Span::raw(format!(" high {hi}")));
+        lines.push(Line::from(legend));
+
+        lines.push(Line::default());
+        lines.extend(data_view_footer_wrapped_lines(
+            sample.mode,
+            sample.slices,
+            true,
+            true,
+            StripeMode::Off,
+            NumBase::Decimal,
+            width,
+        ));
+
+        Paragraph::new(lines).render(area, frame.buffer_mut());
+    }
+
+    /// Render a sampled tensor as a grid of numeric values with row/column
+    /// indices — the Ratatui port of [`UI::draw_values`]. Same title / dtype-shape
+    /// / slice / footer chrome as the heatmap; each value cell is a styled span
+    /// (right-aligned, optional zebra-stripe background, dimmed gap markers) built
+    /// the same way [`write_grid_cell`] writes one. Top-aligned, like the raw
+    /// renderer.
+    pub fn render_values(
+        frame: &mut Frame,
+        tensor: &TensorInfo,
+        sample: &Sample,
+        stats: StatsView,
+        stripe: StripeMode,
+        base: NumBase,
+    ) {
+        let area = frame.area();
+        let width = area.width as usize;
+        // Cell width adapts to the data (same call the sampler uses, so the column
+        // count agrees).
+        let cw = base.cell_width(sample.view, &tensor.dtype, stats.value_range());
+
+        let mut lines: Vec<Line> = data_view_title_lines("Values", tensor, width);
+
+        let mut dtype_line =
+            view_dtype_spans(&tensor.dtype, sample.view, sample.schema_label.as_deref());
+        dtype_line.push(Span::raw(" "));
+        dtype_line.extend(view_shape_spans(&tensor.shape, &sample.display_shape));
+        let edges = matches!(sample.mode, SampleMode::Edges { .. });
+        dtype_line.push(Span::raw(match sample.mode {
+            SampleMode::Edges { .. } => format!(
+                " → edges: {} of {} rows × {} of {} cols (indices shown)",
+                edge_desc(&sample.rows, sample.total_rows),
+                sample.total_rows,
+                edge_desc(&sample.cols, sample.total_cols),
+                sample.total_cols
+            ),
+            SampleMode::Window { .. } => format!(
+                " → window: rows {} of {} × cols {} of {} (contiguous)",
+                span_desc(&sample.rows),
+                sample.total_rows,
+                span_desc(&sample.cols),
+                sample.total_cols
+            ),
+            SampleMode::Grid => format!(
+                " → sampled {} of {} rows × {} of {} cols (indices shown)",
+                sample.rows.len(),
+                sample.total_rows,
+                sample.cols.len(),
+                sample.total_cols
+            ),
+        }));
+        lines.push(Line::from(dtype_line));
+
+        if let Some(stats_line) = data_stats_view_line(stats) {
+            lines.push(stats_line);
+        }
+        if sample.slices > 1 {
+            lines.push(slice_header_line(sample));
+        }
+        lines.push(Line::default());
+
+        // The index after which rows/cols jump (the padding boundary in edges
+        // mode), so the dotted separator can be drawn there.
+        let gap = |idx: &[usize]| -> Option<usize> {
+            edges
+                .then(|| idx.windows(2).position(|w| w[1] != w[0] + 1))
+                .flatten()
+        };
+        let row_gap = gap(&sample.rows);
+        let col_gap = gap(&sample.cols);
+        let lw = 6usize;
+        let dim = Style::default().fg(to_ratatui(palette::DIM));
+
+        // Column-index header (with a "⋯" gap column). Wide cells fit the index
+        // in a single row; narrow cells stagger labels across two rows.
+        let idx_w = sample
+            .cols
+            .iter()
+            .map(|&c| c.to_string().len())
+            .max()
+            .unwrap_or(1);
+        if idx_w >= cw {
+            let step = (idx_w + 1).div_ceil(2 * cw).max(1);
+            let right_edge = |j: usize| -> usize {
+                let gap_cells = matches!(col_gap, Some(g) if j > g) as usize;
+                lw + (j + 1 + gap_cells) * cw
+            };
+            let hwidth = right_edge(sample.cols.len().saturating_sub(1)).max(lw);
+            let mut top = vec![' '; hwidth];
+            let mut bot = vec![' '; hwidth];
+            let mut rank = 0usize;
+            for (j, &c) in sample.cols.iter().enumerate() {
+                if !j.is_multiple_of(step) {
+                    continue;
+                }
+                let label = c.to_string();
+                let end = right_edge(j);
+                let start = end.saturating_sub(label.len());
+                let buf = if rank.is_multiple_of(2) {
+                    &mut top
+                } else {
+                    &mut bot
+                };
+                for (k, ch) in label.chars().enumerate() {
+                    buf[start + k] = ch;
+                }
+                rank += 1;
+            }
+            if let Some(g) = col_gap {
+                let pos = right_edge(g) + cw - 1;
+                if pos < hwidth {
+                    for buf in [&mut top, &mut bot] {
+                        if buf[pos] == ' ' {
+                            buf[pos] = '⋯';
+                        }
+                    }
+                }
+            }
+            let top: String = top.into_iter().collect();
+            let bot: String = bot.into_iter().collect();
+            lines.push(Line::from(Span::styled(top.trim_end().to_string(), dim)));
+            lines.push(Line::from(Span::styled(bot.trim_end().to_string(), dim)));
+        } else {
+            let mut header = String::new();
+            header.push_str(&format!("{:>lw$}", ""));
+            for (j, &c) in sample.cols.iter().enumerate() {
+                header.push_str(&format!("{c:>cw$}"));
+                if Some(j) == col_gap {
+                    header.push_str(&format!("{:>cw$}", "⋯"));
+                }
+            }
+            lines.push(Line::from(Span::styled(header, dim)));
+        }
+
+        let integer = sample.view.is_integer(&tensor.dtype);
+        let band = |k: usize| {
+            if k.is_multiple_of(2) {
+                palette::STRIPE_DARK
+            } else {
+                palette::STRIPE_LITE
+            }
+        };
+        for (i, row) in sample.values.iter().enumerate() {
+            // Row striping bands the whole line; carried as a per-span background
+            // so the index label is included like the raw path's band start.
+            let row_bg = (stripe == StripeMode::Rows).then(|| to_ratatui(band(i)));
+            let bg_style = |base: Style| match row_bg {
+                Some(c) => base.bg(c),
+                None => base,
+            };
+            let mut spans: Vec<Span> = Vec::new();
+            // Dimmed row index.
+            spans.push(Span::styled(
+                format!("{:>lw$}", sample.rows[i]),
+                bg_style(dim),
+            ));
+            let mut vcol = 0usize;
+            for (j, &v) in row.iter().enumerate() {
+                let s = match base {
+                    NumBase::Decimal if integer => format!("{:>cw$}", v as i64),
+                    NumBase::Decimal => format!("{v:>cw$.3e}"),
+                    _ => {
+                        let rb = sample.raw[i][j];
+                        let d = base.digits(rb.width as u32);
+                        let body = match base {
+                            NumBase::Hex => format!("{:0d$x}", rb.bits),
+                            NumBase::Octal => format!("{:0d$o}", rb.bits),
+                            NumBase::Binary => format!("{:0d$b}", rb.bits),
+                            NumBase::Decimal => unreachable!(),
+                        };
+                        format!("{body:>cw$}")
+                    }
+                };
+                let col_bg = (stripe == StripeMode::Cols).then(|| to_ratatui(band(vcol)));
+                spans.extend(grid_cell_spans(&s, col_bg, false, row_bg));
+                vcol += 1;
+                if Some(j) == col_gap {
+                    let col_bg = (stripe == StripeMode::Cols).then(|| to_ratatui(band(vcol)));
+                    spans.extend(grid_cell_spans(
+                        &format!("{:>cw$}", "⋯"),
+                        col_bg,
+                        true,
+                        row_bg,
+                    ));
+                    vcol += 1;
+                }
+            }
+            lines.push(Line::from(spans));
+            // Dotted row marking the rows skipped after the gap.
+            if Some(i) == row_gap {
+                let mut s = String::new();
+                s.push_str(&format!("{:>lw$}", "⋮"));
+                for j in 0..row.len() {
+                    s.push_str(&format!("{:>cw$}", "⋮"));
+                    if Some(j) == col_gap {
+                        s.push_str(&format!("{:>cw$}", "⋱"));
+                    }
+                }
+                lines.push(Line::from(Span::styled(s, dim)));
+            }
+        }
+
+        lines.push(Line::default());
+        lines.extend(data_view_footer_wrapped_lines(
+            sample.mode,
+            sample.slices,
+            sample.overridable,
+            false,
+            stripe,
+            base,
+            width,
+        ));
+
+        Paragraph::new(lines).render(area, frame.buffer_mut());
+    }
+
     /// Overlay a dtype-selection menu on the bottom two lines of a data view: a
     /// strip of the available views with `current` highlighted, plus a hint
     /// line. The data view behind it is a live preview of the highlighted view.
@@ -3027,6 +3345,184 @@ fn write_view_footer(
     hint_line(out, &items)
 }
 
+/// The data-view title block as styled [`Line`]s — the Ratatui port of
+/// [`write_data_view_title`]: the view label and tensor name, then a dimmed
+/// `File:` and source path, each clipped (tail-kept) to `width` so both stay on
+/// screen above a grid of any size. `kind` is the view label (`Values` / `Heatmap`).
+fn data_view_title_lines(kind: &str, tensor: &TensorInfo, width: usize) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::raw(format!("{kind}: ")),
+            Span::raw(truncate_keep_end(
+                &tensor.name,
+                width.saturating_sub(kind.len() + 2),
+            )),
+        ]),
+        Line::from(vec![
+            dim_span("File: "),
+            Span::raw(truncate_keep_end(
+                &tensor.source_path,
+                width.saturating_sub(6),
+            )),
+        ]),
+    ]
+}
+
+/// The data-view dtype span(s) — Ratatui port of [`write_view_dtype`]: just the
+/// stored dtype, or a dimmed `stored as` + the bold reinterpretation label.
+fn view_dtype_spans(
+    stored: &str,
+    view: ViewDtype,
+    unpacked_label: Option<&str>,
+) -> Vec<Span<'static>> {
+    let label: Option<String> = match (view, unpacked_label) {
+        (ViewDtype::Unpacked, Some(l)) => Some(format!("{l} (unpacked)")),
+        _ => view.label().map(str::to_string),
+    };
+    match label {
+        Some(label) => vec![dim_span(format!("{stored} as ")), key_span(label)],
+        None => vec![Span::raw(stored.to_string())],
+    }
+}
+
+/// The data-view shape span(s) — Ratatui port of [`write_view_shape`].
+fn view_shape_spans(stored: &[usize], logical: &[usize]) -> Vec<Span<'static>> {
+    if stored == logical {
+        vec![Span::raw(format_shape(logical))]
+    } else {
+        vec![
+            dim_span(format!("{} as ", format_shape(stored))),
+            key_span(format_shape(logical)),
+        ]
+    }
+}
+
+/// The one-line statistics view for a data screen as a styled [`Line`] — Ratatui
+/// port of [`write_stats_view`]: the finished stats, a spinner while computing,
+/// or `None` while pending (the raw path writes nothing then).
+fn data_stats_view_line(stats: StatsView) -> Option<Line<'static>> {
+    match stats {
+        StatsView::Ready(s) => Some(Line::from(detail_stats_summary_spans(s))),
+        StatsView::Computing {
+            spinner,
+            elapsed,
+            progress,
+        } => Some(Line::from(detail_computing_spans(
+            spinner, elapsed, progress,
+        ))),
+        StatsView::Pending => None,
+    }
+}
+
+/// The 3D slice-navigation header as a styled [`Line`] — Ratatui port of
+/// [`write_slice_header`]. Only used when `sample.slices > 1`.
+fn slice_header_line(sample: &Sample) -> Line<'static> {
+    let mut spans: Vec<Span> = Vec::new();
+    match sample.unpacked_field {
+        Some(f) => spans.push(Span::raw(format!(
+            "expert {} of {} — stored word {}, field {}/{} ({}-bit) — ",
+            sample.slice, sample.slices, f.stored_slice, f.field, f.len_p, f.field_bits,
+        ))),
+        None => spans.push(Span::raw(format!(
+            "slice {} of {} (fixed leading index) — ",
+            sample.slice, sample.slices
+        ))),
+    }
+    let items: &[(&str, &str)] = if matches!(sample.mode, SampleMode::Grid) {
+        &[
+            ("← →", "step"),
+            ("Shift+← →", "jump 5% (both wrap)"),
+            ("/", "index or %"),
+        ]
+    } else {
+        &[("[ ]", "step"), ("/", "index or %")]
+    };
+    spans.extend(hint_spans(items));
+    Line::from(spans)
+}
+
+/// A hint line `key label · key label · …` as styled spans, keys highlighted —
+/// the Ratatui port of [`hint_line`]. An empty key writes the label plain; an
+/// empty label writes just the key.
+fn hint_spans(items: &[(&str, &str)]) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(to_ratatui(palette::DIM));
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, (key, label)) in items.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", dim));
+        }
+        if key.is_empty() {
+            spans.push(Span::raw(label.to_string()));
+        } else {
+            spans.push(key_span(key.to_string()));
+            if !label.is_empty() {
+                spans.push(Span::raw(format!(" {label}")));
+            }
+        }
+    }
+    spans
+}
+
+/// The data-view footer as styled [`Line`]s — the Ratatui port of
+/// [`write_view_footer`]. The raw footer is one logical line the terminal hard-
+/// wraps at the screen edge (mid-chip, even mid-word), so we hard-wrap the styled
+/// spans by character at `width` to match that exactly.
+fn data_view_footer_wrapped_lines(
+    mode: SampleMode,
+    slices: usize,
+    overridable: bool,
+    heatmap: bool,
+    stripe: StripeMode,
+    base: NumBase,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let items = view_footer_items(mode, slices, overridable, heatmap, stripe, base);
+    wrap_spans_hard(hint_spans(&items), width)
+}
+
+/// Hard-wrap a styled span run at `width` characters, splitting mid-span (and
+/// mid-word) exactly where a terminal's line wrap would, so a footer built as
+/// one logical line lays out identically across the migration.
+fn wrap_spans_hard(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines: Vec<Line> = Vec::new();
+    let mut cur: Vec<Span> = Vec::new();
+    let mut col = 0usize;
+    for span in spans {
+        let style = span.style;
+        let mut buf = String::new();
+        for ch in span.content.chars() {
+            if col == width {
+                buf.clear_into_line(&mut cur, style);
+                lines.push(Line::from(std::mem::take(&mut cur)));
+                col = 0;
+            }
+            buf.push(ch);
+            col += 1;
+        }
+        if !buf.is_empty() {
+            cur.push(Span::styled(buf, style));
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(Line::from(cur));
+    }
+    lines
+}
+
+/// Helper for [`wrap_spans_hard`]: flush the in-progress char buffer to the
+/// current line as a styled span (no-op when empty), leaving the buffer cleared.
+trait FlushSpan {
+    fn clear_into_line(&mut self, cur: &mut Vec<Span<'static>>, style: Style);
+}
+impl FlushSpan for String {
+    fn clear_into_line(&mut self, cur: &mut Vec<Span<'static>>, style: Style) {
+        if !self.is_empty() {
+            cur.push(Span::styled(std::mem::take(self), style));
+        }
+    }
+}
+
 /// Write one right-aligned numeric cell (already formatted to the cell width).
 /// When `bg` is set (column striping), the background covers a *constant* band —
 /// the whole cell except its first column — so every column's stripe is the
@@ -3054,6 +3550,42 @@ fn write_grid_cell(out: &mut impl Write, s: &str, bg: Option<Color>, dim: bool) 
         queue!(out, SetForegroundColor(Color::Reset))?;
     }
     Ok(())
+}
+
+/// One numeric-grid cell as styled span(s) — the Ratatui port of
+/// [`write_grid_cell`]. `col_bg` is the column-stripe background (which, like the
+/// raw path, bands all but the cell's first column so every stripe is the same
+/// width and a one-space gutter separates neighbours); `row_bg` is the ambient
+/// row-stripe background carried across the whole cell (incl. the gutter), set
+/// once by the caller for a row band. `dim` dims the glyphs (the "⋯" gap marker).
+fn grid_cell_spans(
+    s: &str,
+    col_bg: Option<ratatui::style::Color>,
+    dim: bool,
+    row_bg: Option<ratatui::style::Color>,
+) -> Vec<Span<'static>> {
+    let base = if dim {
+        Style::default().fg(to_ratatui(palette::DIM))
+    } else {
+        Style::default()
+    };
+    let with_bg = |style: Style, bg: Option<ratatui::style::Color>| match bg {
+        Some(c) => style.bg(c),
+        None => style,
+    };
+    match col_bg {
+        // Leave the first column an uncoloured gutter (just the row band, if any)
+        // and band the rest, so the stripe is the same width for every column.
+        Some(c) => {
+            let split = s.char_indices().nth(1).map_or(s.len(), |(i, _)| i);
+            let (gutter, band) = s.split_at(split);
+            vec![
+                Span::styled(gutter.to_string(), with_bg(base, row_bg)),
+                Span::styled(band.to_string(), with_bg(base, Some(c))),
+            ]
+        }
+        None => vec![Span::styled(s.to_string(), with_bg(base, row_bg))],
+    }
 }
 
 /// Describe a contiguous window's extent along one axis — e.g. `120–179` for the
