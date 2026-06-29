@@ -794,6 +794,150 @@ impl UI {
         );
     }
 
+    /// Render the tensor detail screen — the Ratatui port of
+    /// [`UI::draw_tensor_detail`]. `view` is the active dtype reinterpretation
+    /// (which changes the shown dtype, shape and parameter count); `overridable`
+    /// gates the `d`/`r` hints. `histogram` adds the value-histogram section below
+    /// the header. A pop-up `overlay` (legend / copied command) composites last.
+    ///
+    /// Header fields are one [`Line`] each (clipped, not wrapped); when a
+    /// histogram is present the header pins to the top, the histogram fills the
+    /// middle (sized to `h - header - footer - 1`), one blank row separates it from
+    /// the footer pinned to the bottom — filling the screen exactly with no scroll.
+    /// Without a histogram the header is immediately followed by the footer,
+    /// top-aligned.
+    #[allow(clippy::too_many_arguments)] // a screen renderer; the params are all distinct
+    pub fn render_detail(
+        frame: &mut Frame,
+        tensor: &TensorInfo,
+        shape: &[usize],
+        view: ViewDtype,
+        overridable: bool,
+        unindexed: bool,
+        stats: StatsView,
+        histogram: Option<&Histogram>,
+        hist_scanning: Option<ScanProgress>,
+        schema: Option<&PackingSchema>,
+        overlay: Option<&Overlay>,
+    ) {
+        let area = frame.area();
+        let (width, height) = (area.width, area.height);
+
+        let header = detail_field_lines(tensor, shape, view, unindexed, stats, schema);
+        let footer = detail_footer_lines(overridable, width);
+        let header_len = header.len();
+        let footer_len = footer.len();
+
+        if let Some(hist) = histogram {
+            // Header, then the histogram (capped to the rows the raw renderer's
+            // `term_h - body_rows - footer_rows - 1` budget would allow), then a
+            // blank spacer, then the footer flowed right below the bars — the raw
+            // path wrote these sequentially, so a small histogram leaves the footer
+            // near the top while a full one pushes it to the screen's bottom.
+            Paragraph::new(header).render(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: header_len as u16,
+                },
+                frame.buffer_mut(),
+            );
+            let section = (height as usize)
+                .saturating_sub(header_len + footer_len + 1)
+                .max(2);
+            let used = render_histogram(
+                frame,
+                Rect {
+                    x: 0,
+                    y: header_len as u16,
+                    width,
+                    height: section as u16,
+                },
+                hist,
+                hist_scanning,
+            );
+            // Footer one blank row below the bars, clamped so it always fits.
+            let footer_y =
+                (header_len + used + 1).min((height as usize).saturating_sub(footer_len)) as u16;
+            Paragraph::new(footer).render(
+                Rect {
+                    x: 0,
+                    y: footer_y,
+                    width,
+                    height: footer_len as u16,
+                },
+                frame.buffer_mut(),
+            );
+        } else {
+            // No histogram: header then footer, top-aligned, the rest left blank.
+            let mut lines = header;
+            lines.extend(footer);
+            Paragraph::new(lines).render(area, frame.buffer_mut());
+        }
+
+        // A pop-up overlay composites last, over the live frame, so the detail
+        // (including a running scan's progress) keeps animating behind it.
+        match overlay {
+            Some(Overlay::Legend(l)) => Self::render_legend_band(frame, *l),
+            Some(Overlay::Command(c)) => Self::render_command_band(frame, c),
+            None => {}
+        }
+    }
+
+    /// Composite the context-sensitive glyph legend over the live detail frame as
+    /// a floating, panel-backed band centred vertically — the Ratatui port of
+    /// [`Self::write_legend_band`], drawn last so the screen behind keeps
+    /// animating. (The raw band is still used by the tree's `show_legend`, the
+    /// data views and `--plain` for the non-detail screens.)
+    pub fn render_legend_band(frame: &mut Frame, legend: Legend) {
+        let content = legend_band_lines(legend);
+        // Band = a blank margin row, the content, a blank margin row; centred.
+        let mut band: Vec<Line> = vec![Line::default()];
+        band.extend(content);
+        band.push(Line::default());
+        render_panel_band(frame, band);
+    }
+
+    /// Composite the copied-CLI-command pop-up over the live detail frame — a
+    /// centred, panel-backed band (blank, title, rule, the wrapped command, rule,
+    /// footer, blank). The Ratatui port of [`Self::write_command_band`].
+    pub fn render_command_band(frame: &mut Frame, command: &str) {
+        let term_w = frame.area().width as usize;
+        let rule_color = Style::default().fg(to_ratatui(palette::ACCENT));
+        let rule = "─".repeat(term_w);
+
+        // blank, header, rule, command(rows), rule, footer, blank.
+        let mut band: Vec<Line> = vec![Line::default()];
+        // Header: title + copied confirmation.
+        band.push(Line::from(vec![
+            Span::styled(
+                "CLI command",
+                Style::default()
+                    .fg(to_ratatui(palette::KEY))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "   ✓ copied to the clipboard",
+                Style::default().fg(to_ratatui(palette::SUCCESS)),
+            ),
+        ]));
+        band.push(Line::from(Span::styled(rule.clone(), rule_color)));
+        // The command, soft-wrapped at full width onto its own line(s).
+        let chars: Vec<char> = command.chars().collect();
+        let cmd_rows = chars.len().div_ceil(term_w.max(1)).max(1);
+        for r in 0..cmd_rows {
+            let seg: String = chars.iter().skip(r * term_w).take(term_w).collect();
+            band.push(Line::from(Span::raw(seg)));
+        }
+        band.push(Line::from(Span::styled(rule, rule_color)));
+        band.push(Line::from(dim_span(
+            "select the command above to copy it by hand · any key to dismiss",
+        )));
+        band.push(Line::default());
+        render_panel_band(frame, band);
+    }
+
     /// A loading screen shown while the checkpoint structure is read: the same
     /// title line + rule as the tree browser, a spinner where the rows will land,
     /// and a hint pinned to the bottom — so the header/footer are up immediately
@@ -2363,6 +2507,278 @@ fn legend_line(
     Ok(())
 }
 
+/// One legend row as a styled [`Line`]: a two-space indent, the `symbol` (in
+/// `color`, else default), then the description starting at absolute column
+/// `desc_col` — the Ratatui port of [`legend_line`]. The gap is filled with
+/// spaces sized to the symbol's *rendered* display width (so the description
+/// lines up like the raw `MoveToColumn`). An all-empty row is a blank separator.
+fn legend_row_line(color: Option<Color>, symbol: &str, desc: &str, desc_col: u16) -> Line<'static> {
+    use unicode_width::UnicodeWidthStr;
+    if symbol.is_empty() && desc.is_empty() {
+        return Line::default();
+    }
+    let mut spans: Vec<Span> = vec![Span::raw("  ")];
+    match color {
+        Some(c) => spans.push(Span::styled(
+            symbol.to_string(),
+            Style::default().fg(to_ratatui(c)),
+        )),
+        None => spans.push(Span::raw(symbol.to_string())),
+    }
+    // Pad from the current column (2 + rendered symbol width) to `desc_col`.
+    let used = 2 + symbol.width();
+    let pad = (desc_col as usize).saturating_sub(used).max(1);
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::raw(desc.to_string()));
+    Line::from(spans)
+}
+
+/// Composite `lines` as a floating, panel-backed band centred vertically over the
+/// frame — shared by [`UI::render_legend_band`] and [`UI::render_command_band`].
+/// Every band row is padded to the full width with panel-background spaces so it
+/// fully overwrites the screen beneath (symbols *and* colour), reading as a raised
+/// pop-up — the Ratatui equivalent of the raw bands' full-width line clears.
+fn render_panel_band(frame: &mut Frame, lines: Vec<Line<'static>>) {
+    use unicode_width::UnicodeWidthStr;
+    let area = frame.area();
+    let width = area.width as usize;
+    let panel = Style::default().bg(to_ratatui(palette::PANEL_BG));
+    let band_h = lines.len() as u16;
+    let start = area.height.saturating_sub(band_h) / 2;
+
+    // Pad each line to the full width with panel-styled spaces so the cells under
+    // the band (the live frame's symbols) are overwritten, not just recoloured.
+    let padded: Vec<Line> = lines
+        .into_iter()
+        .map(|mut line| {
+            let used: usize = line.spans.iter().map(|s| s.content.width()).sum();
+            if used < width {
+                line.spans
+                    .push(Span::styled(" ".repeat(width - used), panel));
+            }
+            line.style(panel)
+        })
+        .collect();
+    Paragraph::new(padded).style(panel).render(
+        Rect {
+            x: 0,
+            y: start,
+            width: area.width,
+            height: band_h.min(area.height.saturating_sub(start)),
+        },
+        frame.buffer_mut(),
+    );
+}
+
+/// Build the context-sensitive legend body as styled [`Line`]s — the Ratatui port
+/// of the body [`UI::write_legend_band`] composes. Title, rule, blank, the
+/// per-screen rows, then the closing blank + "Press any key to close." footer.
+fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
+    let title = match legend {
+        Legend::Tree => "Legend — checkpoint tree",
+        Legend::Detail => "Legend — tensor details",
+        Legend::Heatmap => "Legend — heatmap",
+        Legend::Values => "Legend — numeric values",
+    };
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            title.to_string(),
+            Style::default().fg(to_ratatui(palette::ACCENT)),
+        )),
+        Line::from(dim_span("─".repeat(title.chars().count()))),
+        Line::default(),
+    ];
+
+    match legend {
+        Legend::Tree => {
+            let size_example = format!("A {SIZE_ARROW} B");
+            let codec_example = format!("{COMPRESSED_MARK} lz4");
+            let rows = [
+                (
+                    Some(palette::ACCENT),
+                    "▾ ▸",
+                    "a group, expanded / collapsed (Enter or Space toggles it)",
+                ),
+                (Some(palette::DIM), "·", "a tensor (a stored array)"),
+                (
+                    Some(palette::UNINDEXED),
+                    UNINDEXED_MARK,
+                    "an extra tensor on disk but not listed in the index (model.safetensors.index.json)",
+                ),
+                (
+                    Some(palette::META),
+                    "†",
+                    "a metadata entry (shown beside its tensor, or in the Metadata group)",
+                ),
+                (
+                    None,
+                    "☰ N",
+                    "number of layers (numbered sub-groups) in the group",
+                ),
+                (None, "▦ N", "number of tensors in the group / checkpoint"),
+                (
+                    None,
+                    size_example.as_str(),
+                    "logical size → on-disk size (shown only when they differ)",
+                ),
+                (
+                    Some(palette::DIM),
+                    codec_example.as_str(),
+                    "compressed on disk; the codec is named after the glyph",
+                ),
+                (
+                    Some(palette::DIM),
+                    UNCOMPRESSED_TAG,
+                    "stored uncompressed on disk",
+                ),
+                (None, "", ""),
+                (
+                    Some(palette::DTYPE),
+                    "I16",
+                    "the tensor's data type is tinted (warm amber)",
+                ),
+                (
+                    None,
+                    "▪ ▸",
+                    "status bar: a single source file / a directory of shards",
+                ),
+            ];
+            let col = legend_desc_col(&rows, 0);
+            for (color, sym, desc) in rows {
+                lines.push(legend_row_line(color, sym, desc, col));
+            }
+        }
+        Legend::Detail => {
+            let codec_example = format!("{COMPRESSED_MARK} lz4");
+            let rows = [
+                (
+                    Some(palette::DIM),
+                    codec_example.as_str(),
+                    "on-disk compression codec; the N× beside it is the ratio (logical ÷ stored)",
+                ),
+                (
+                    Some(palette::KEY),
+                    "as",
+                    "the active dtype reinterpretation (press d), e.g. 'BF16 as u4'",
+                ),
+                (
+                    None,
+                    "A – B",
+                    "a byte range within the file (the tensor's data offsets)",
+                ),
+                (Some(palette::DIM), "·", "separates fields on a line"),
+                (
+                    Some(palette::UNINDEXED),
+                    UNINDEXED_MARK,
+                    "this tensor is an extra: on disk but not listed in the index (model.safetensors.index.json)",
+                ),
+                (
+                    Some(palette::KEY),
+                    "⠋",
+                    "a statistics scan is running (press s to start; any key cancels)",
+                ),
+            ];
+            let col = legend_desc_col(&rows, 0);
+            for (color, sym, desc) in rows {
+                lines.push(legend_row_line(color, sym, desc, col));
+            }
+            lines.push(legend_row_line(None, "", "", col));
+            lines.push(Line::from(dim_span(
+                "  Statistics:  zeros = fraction of exactly-zero values · non-finite = count of NaN/∞",
+            )));
+        }
+        Legend::Heatmap => {
+            let rows = [
+                (
+                    None,
+                    "▀",
+                    "one cell packs two data rows: its top half is the upper row, its lower half the next",
+                ),
+                (
+                    None,
+                    "A → B",
+                    "the stored dtype/shape → the sampled grid size and value range",
+                ),
+            ];
+            let col = legend_desc_col(&rows, 0);
+            for (color, sym, desc) in rows {
+                lines.push(legend_row_line(color, sym, desc, col));
+            }
+            // The actual colour ramp, so the scale is unambiguous.
+            let mut ramp: Vec<Span> = vec![Span::raw("  "), dim_span("low ")];
+            for i in 0..24 {
+                ramp.push(Span::styled(
+                    "█",
+                    Style::default().fg(to_ratatui(heat_color(i as f64 / 23.0))),
+                ));
+            }
+            ramp.push(dim_span(" high"));
+            ramp.push(Span::raw(
+                "   colour scale: cool = low value, warm = high value",
+            ));
+            lines.push(Line::from(ramp));
+        }
+        Legend::Values => {
+            let rows = [
+                (
+                    Some(palette::DIM),
+                    "12  34",
+                    "row / column indices into the full tensor (dimmed), not data values",
+                ),
+                (
+                    Some(palette::DIM),
+                    "⋯",
+                    "columns were skipped here (the gap between the first and last columns)",
+                ),
+                (Some(palette::DIM), "⋮", "rows were skipped here"),
+                (
+                    Some(palette::DIM),
+                    "⋱",
+                    "both rows and columns were skipped (the corner)",
+                ),
+                (
+                    None,
+                    "1.2e-3",
+                    "floats use scientific notation; integers print plain",
+                ),
+                (
+                    None,
+                    "3f800000",
+                    "press b to cycle the base: dec / hex / oct / bin (raw stored bits)",
+                ),
+            ];
+            // Reserve room for the wider zebra swatch row drawn below.
+            let col = legend_desc_col(&rows, 8);
+            for (color, sym, desc) in rows {
+                lines.push(legend_row_line(color, sym, desc, col));
+            }
+            // A live zebra swatch, since it is a background cue, not a glyph.
+            let mut swatch: Vec<Span> = vec![
+                Span::raw("  "),
+                Span::styled(
+                    " 12 ",
+                    Style::default().bg(to_ratatui(palette::STRIPE_DARK)),
+                ),
+                Span::styled(
+                    " 34 ",
+                    Style::default().bg(to_ratatui(palette::STRIPE_LITE)),
+                ),
+            ];
+            // Pad to the description column (the swatch is 2 + 8 = 10 cells wide).
+            let pad = (col as usize).saturating_sub(2 + 8).max(1);
+            swatch.push(Span::raw(" ".repeat(pad)));
+            swatch.push(Span::raw(
+                "zebra striping traces a row or column (cycle rows/cols/off with z)",
+            ));
+            lines.push(Line::from(swatch));
+        }
+    }
+
+    lines.push(Line::default());
+    lines.push(Line::from(dim_span("Press any key to close.")));
+    lines
+}
+
 /// Start a floating pop-up panel: set the distinct [`palette::PANEL_BG`] so the
 /// overlay reads as a raised surface. While it is active, every `Clear` fills
 /// with the panel background (background-colour erase) and written cells inherit
@@ -3195,6 +3611,463 @@ fn tree_node_line(
         }
     }
     Line::from(s)
+}
+
+/// A dimmed span (field labels, chrome) for the detail screen.
+fn dim_span(text: impl Into<String>) -> Span<'static> {
+    Span::styled(text.into(), Style::default().fg(to_ratatui(palette::DIM)))
+}
+
+/// A bold bright-cyan key span (e.g. `s`, `d`) — the Ratatui equivalent of the
+/// raw [`key_hint`].
+fn key_span(key: impl Into<String>) -> Span<'static> {
+    Span::styled(
+        key.into(),
+        Style::default()
+            .fg(to_ratatui(palette::KEY))
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+/// Build the detail screen's dtype span(s): the stored dtype plain, or — when a
+/// view reinterpretation is active — a dimmed `stored as` followed by the bold
+/// reinterpretation label. The Ratatui port of [`write_view_dtype`].
+fn detail_dtype_spans(
+    stored: &str,
+    view: ViewDtype,
+    unpacked_label: Option<&str>,
+) -> Vec<Span<'static>> {
+    let label: Option<String> = match (view, unpacked_label) {
+        (ViewDtype::Unpacked, Some(l)) => Some(format!("{l} (unpacked)")),
+        _ => view.label().map(str::to_string),
+    };
+    match label {
+        Some(label) => vec![dim_span(format!("{stored} as ")), key_span(label)],
+        None => vec![Span::raw(stored.to_string())],
+    }
+}
+
+/// Build the detail screen's shape span(s): the (unchanged) shape plain, or a
+/// dimmed `stored as` followed by the bold reinterpreted shape. Port of
+/// [`write_view_shape`].
+fn detail_shape_spans(stored: &[usize], logical: &[usize]) -> Vec<Span<'static>> {
+    if stored == logical {
+        vec![Span::raw(format_shape(logical))]
+    } else {
+        vec![
+            dim_span(format!("{} as ", format_shape(stored))),
+            key_span(format_shape(logical)),
+        ]
+    }
+}
+
+/// The one-line statistics summary (mean, std, sparsity, non-finite count) as
+/// styled spans — the Ratatui port of [`write_stats_line`]. Field labels dimmed;
+/// the non-finite count highlighted (warn) when nonzero.
+fn detail_stats_summary_spans(s: &Stats) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        dim_span("mean "),
+        Span::raw(format!("{:.4}", s.mean)),
+        dim_span(" · std "),
+        Span::raw(format!("{:.4}", s.std)),
+        dim_span(" · zeros "),
+    ];
+    // Distinguish "no zeros" from "a tiny fraction" (which would round to a
+    // misleading `0.0%`), matching the raw line.
+    let pct = s.zero_fraction() * 100.0;
+    let zeros = if s.zeros == 0 {
+        "0%".to_string()
+    } else if pct < 0.1 {
+        format!("{pct:.1e}%")
+    } else {
+        format!("{pct:.1}%")
+    };
+    spans.push(Span::raw(zeros));
+    if s.nonfinite > 0 {
+        spans.push(Span::styled(
+            format!(" · {} non-finite", s.nonfinite),
+            Style::default().fg(to_ratatui(palette::WARN)),
+        ));
+    }
+    spans.push(dim_span(format!("  ({})", fmt_duration(s.elapsed))));
+    spans
+}
+
+/// The "scan in progress" stats segment as styled spans — Ratatui port of
+/// [`write_computing`]: an accent spinner, a dimmed label, a progress bar with a
+/// percentage (when the fraction is known), and the running elapsed time.
+fn detail_computing_spans(
+    spinner: char,
+    elapsed: Duration,
+    progress: Option<f64>,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        key_span(format!("{spinner} ")),
+        dim_span("computing statistics… "),
+    ];
+    if let Some(frac) = progress {
+        const WIDTH: usize = 16;
+        let frac = frac.clamp(0.0, 1.0);
+        let filled = (frac * WIDTH as f64).round() as usize;
+        spans.push(Span::raw("["));
+        spans.push(key_span("█".repeat(filled)));
+        spans.push(dim_span("░".repeat(WIDTH - filled)));
+        spans.push(Span::raw(format!("] {:>3.0}% · ", frac * 100.0)));
+    }
+    spans.push(Span::raw(fmt_duration(elapsed)));
+    spans
+}
+
+/// Build the detail screen's header field lines (title + rule, Name, Data Type,
+/// Shape, Parameters, optional Packing, Size [+ on-disk/codec], offsets/Chunks,
+/// File, optional unindexed flag, blank, Statistics, blank) — one [`Line`] each,
+/// clipped (not wrapped) by the caller's `Paragraph`.
+fn detail_field_lines(
+    tensor: &TensorInfo,
+    shape: &[usize],
+    view: ViewDtype,
+    unindexed: bool,
+    stats: StatsView,
+    schema: Option<&PackingSchema>,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        "Tensor Details",
+        Style::default().fg(to_ratatui(palette::ACCENT)),
+    )));
+    lines.push(Line::from(dim_span("─".repeat(14))));
+    lines.push(Line::from(vec![
+        dim_span("Name: "),
+        Span::raw(tensor.name.clone()),
+    ]));
+
+    // Data type, with the active reinterpretation highlighted.
+    let unpacked_label = schema.map(PackingSchema::label);
+    let mut dtype_line = vec![dim_span("Data Type: ")];
+    dtype_line.extend(detail_dtype_spans(
+        &tensor.dtype,
+        view,
+        unpacked_label.as_deref(),
+    ));
+    lines.push(Line::from(dtype_line));
+
+    // Shape and parameter count reflect the overrides.
+    let logical = view.logical_shape_with(shape, &tensor.dtype, schema);
+    let num_elements: usize = logical.iter().product();
+    let mut shape_line = vec![dim_span("Shape: ")];
+    shape_line.extend(detail_shape_spans(&tensor.shape, &logical));
+    lines.push(Line::from(shape_line));
+    lines.push(Line::from(vec![
+        dim_span("Parameters: "),
+        Span::raw(format!("{} ", format_parameters(num_elements))),
+        dim_span(format!("({})", with_thousands(num_elements))),
+    ]));
+
+    // Codebook packing schema disclosure (only for tensors that carry one).
+    if let Some(s) = schema {
+        let widths = s
+            .bit_widths()
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mode = s
+            .quant_mode()
+            .map(|m| format!(" · {m}"))
+            .unwrap_or_default();
+        let uniform = if s.uniform_width().is_some() {
+            "uniform"
+        } else {
+            "non-uniform"
+        };
+        lines.push(Line::from(vec![
+            dim_span("Packing: "),
+            Span::raw(format!("{} ", s.label())),
+            dim_span(format!(
+                "(bit widths [{widths}] · {} experts/word · {uniform}{mode})",
+                s.len_p()
+            )),
+        ]));
+    }
+
+    // Size, with on-disk size + codec for formats that track compression.
+    let mut size_line = vec![
+        dim_span("Size: "),
+        Span::raw(format_size(tensor.size_bytes)),
+    ];
+    match &tensor.storage {
+        Storage::Compressed {
+            codec,
+            stored_bytes,
+        } => {
+            let ratio = tensor.size_bytes as f64 / (*stored_bytes).max(1) as f64;
+            size_line.push(Span::raw(format!(
+                " · on disk: {} ",
+                format_size(*stored_bytes)
+            )));
+            size_line.push(dim_span(format!(
+                "({COMPRESSED_MARK} {codec}, {ratio:.1}×)"
+            )));
+        }
+        Storage::Raw => {
+            size_line.push(Span::raw(format!(
+                " · on disk: {} {UNCOMPRESSED_TAG}",
+                format_size(tensor.size_bytes)
+            )));
+        }
+        Storage::Unknown => {}
+    }
+    lines.push(Line::from(size_line));
+
+    // Where the data lives within the file.
+    match &tensor.layout {
+        Layout::ByteRange { start, end } => {
+            lines.push(Line::from(vec![
+                dim_span("Data offsets: "),
+                Span::raw(format!(
+                    "{} – {}  (within file data)",
+                    with_thousands(*start as usize),
+                    with_thousands(*end as usize)
+                )),
+            ]));
+        }
+        Layout::Offset(offset) => {
+            lines.push(Line::from(vec![
+                dim_span("Data offset: "),
+                Span::raw(format!(
+                    "{}  (within tensor data)",
+                    with_thousands(*offset as usize)
+                )),
+            ]));
+        }
+        Layout::Chunked { chunk, num_chunks } => {
+            lines.push(Line::from(vec![
+                dim_span("Chunks: "),
+                Span::raw(format!(
+                    "{} × {}",
+                    format_shape(chunk),
+                    with_thousands(*num_chunks)
+                )),
+            ]));
+        }
+        Layout::None => {}
+    }
+
+    lines.push(Line::from(vec![
+        dim_span("File: "),
+        Span::raw(tensor.source_path.clone()),
+    ]));
+    // Flag a tensor that's on disk but absent from the index.
+    if unindexed {
+        lines.push(Line::from(Span::styled(
+            format!("{UNINDEXED_MARK} on disk but not listed in model.safetensors.index.json"),
+            Style::default().fg(to_ratatui(palette::UNINDEXED)),
+        )));
+    }
+    lines.push(Line::default());
+
+    // Exact whole-tensor statistics: shown once computed, else a hint.
+    let stats_line: Vec<Span> = match stats {
+        StatsView::Ready(s) => {
+            let integer = view.is_integer(&tensor.dtype);
+            let mut spans = vec![
+                dim_span("Statistics: "),
+                Span::raw(format!(
+                    "min {} · max {} · ",
+                    fmt_value(s.min, integer),
+                    fmt_value(s.max, integer)
+                )),
+            ];
+            spans.extend(detail_stats_summary_spans(s));
+            spans
+        }
+        StatsView::Computing {
+            spinner,
+            elapsed,
+            progress,
+        } => {
+            let mut spans = vec![dim_span("Statistics: ")];
+            spans.extend(detail_computing_spans(spinner, elapsed, progress));
+            spans
+        }
+        StatsView::Pending => vec![
+            dim_span("Statistics: press "),
+            key_span("s"),
+            dim_span(" to scan the full tensor"),
+        ],
+    };
+    lines.push(Line::from(stats_line));
+    lines.push(Line::default());
+
+    lines
+}
+
+/// The detail screen's footer hint as wrapped [`Line`]s — the Ratatui port of the
+/// raw footer in [`UI::draw_tensor_detail`], wrapped on the ` · `-free `key
+/// label,` chips the raw line builds (here split into wrappable chunks). Mirrors
+/// the tree's [`tree_hint_lines`] wrapping at `width`.
+fn detail_footer_lines(overridable: bool, width: u16) -> Vec<Line<'static>> {
+    // Each chunk is a run of spans that should not be split across lines; the
+    // trailing text of each (the comma + space) keeps the on-screen wording.
+    let mut chunks: Vec<Vec<Span<'static>>> = vec![vec![Span::raw("Press ")]];
+    let mut push = |chunk: Vec<Span<'static>>| chunks.push(chunk);
+    push(vec![key_span("m"), Span::raw(" for a heatmap, ")]);
+    push(vec![key_span("v"), Span::raw(" for numeric values, ")]);
+    push(vec![key_span("h"), Span::raw(" for a histogram, ")]);
+    push(vec![key_span("b"), Span::raw(" to set its bin count, ")]);
+    if overridable {
+        push(vec![
+            key_span("d"),
+            Span::raw(" to reinterpret the dtype, "),
+        ]);
+        push(vec![key_span("r"), Span::raw(" to reshape, ")]);
+    }
+    push(vec![key_span("c"), Span::raw(" to copy, ")]);
+    push(vec![key_span("y"), Span::raw(" to copy the command, ")]);
+    push(vec![key_span("l"), Span::raw(" for the legend, ")]);
+    push(vec![
+        key_span("⌫"),
+        Span::raw(" / "),
+        key_span("\\"),
+        Span::raw(" to step back / forward, any other key to return..."),
+    ]);
+
+    // Greedily pack chunks onto lines, breaking before a chunk that would overflow
+    // (each chunk already carries its own separator, so no extra is inserted).
+    let width = (width as usize).max(1);
+    let chunk_w = |c: &[Span]| -> usize { c.iter().map(|s| s.content.chars().count()).sum() };
+    let mut lines: Vec<Line> = Vec::new();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut col = 0usize;
+    for chunk in chunks {
+        let w = chunk_w(&chunk);
+        if !spans.is_empty() && col + w > width {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            col = 0;
+        }
+        spans.extend(chunk);
+        col += w;
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// Render the value histogram into `rect` — the Ratatui port of
+/// [`write_histogram_section`]: a heading (value count, any non-finite, the scan
+/// indicator), then one bar per bin (label │ bar count (pct)), then a clipped-bin
+/// note when they don't all fit. The whole section stays within `rect.height`.
+/// Returns the number of rows actually drawn, so the caller can flow the footer
+/// right below it (the raw renderer wrote these sequentially, so a small histogram
+/// leaves the footer near the top rather than at the screen's bottom).
+fn render_histogram(
+    frame: &mut Frame,
+    rect: Rect,
+    hist: &Histogram,
+    scanning: Option<ScanProgress>,
+) -> usize {
+    let term_w = rect.width as usize;
+    let max_rows = rect.height as usize;
+    if max_rows == 0 {
+        return 0;
+    }
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Heading.
+    let mut head = vec![
+        dim_span("Histogram: "),
+        Span::raw(format!("{} values", with_thousands(hist.total as usize))),
+    ];
+    if hist.nonfinite > 0 {
+        head.push(dim_span(format!(
+            "  ·  {} non-finite",
+            with_thousands(hist.nonfinite as usize)
+        )));
+    }
+    if let Some((spinner, elapsed, progress)) = scanning {
+        let mut s = format!("   {spinner} scanning");
+        if let Some(p) = progress {
+            s.push_str(&format!(" {:.0}%", p * 100.0));
+        }
+        s.push_str(&format!(" ({:.1}s)", elapsed.as_secs_f64()));
+        head.push(Span::styled(
+            s,
+            Style::default().fg(to_ratatui(palette::ACCENT)),
+        ));
+    } else if !hist.elapsed.is_zero() {
+        head.push(dim_span(format!("  ({})", fmt_duration(hist.elapsed))));
+    }
+    lines.push(Line::from(head));
+    let heading_rows = 1usize;
+
+    let n = hist.counts.len();
+    let labels: Vec<String> = (0..n)
+        .map(|i| match hist.bins {
+            HistBins::IntBins { start, step } => (start + i as i64 * step).to_string(),
+            HistBins::Range { lo, hi } => fmt_hist_edge(lo + (hi - lo) * i as f64 / n as f64),
+        })
+        .collect();
+    let label_w = labels.iter().map(|l| l.chars().count()).max().unwrap_or(1);
+    let counts: Vec<String> = hist
+        .counts
+        .iter()
+        .map(|c| with_thousands(*c as usize))
+        .collect();
+    let count_w = counts.iter().map(|s| s.chars().count()).max().unwrap_or(1);
+    let max_count = hist.counts.iter().copied().max().unwrap_or(0).max(1);
+    let total = hist.total.max(1);
+    let pcts: Vec<String> = hist
+        .counts
+        .iter()
+        .map(|&c| {
+            let pct = c as f64 / total as f64 * 100.0;
+            if c == 0 {
+                "0.0%".to_string()
+            } else if pct < 0.1 {
+                format!("{pct:.1e}%")
+            } else {
+                format!("{pct:.1}%")
+            }
+        })
+        .collect();
+    let pct_w = pcts.iter().map(|s| s.chars().count()).max().unwrap_or(4);
+
+    // The bar gets whatever width is left after `label │ … count (pct)`.
+    let fixed = label_w + 3 + 1 + count_w + pct_w + 3;
+    let bar_w = term_w.saturating_sub(fixed).clamp(1, 100);
+    let bar_rows = max_rows.saturating_sub(heading_rows).max(1);
+    let shown = if n <= bar_rows {
+        n
+    } else {
+        bar_rows.saturating_sub(1).max(1)
+    };
+
+    let accent = Style::default().fg(to_ratatui(palette::ACCENT));
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    for i in 0..shown {
+        let frac = hist.counts[i] as f64 / max_count as f64;
+        lines.push(Line::from(vec![
+            Span::raw(format!("{:>label_w$} ", labels[i])),
+            dim_span("│"),
+            Span::styled(bar(frac, bar_w), accent),
+            Span::styled(format!(" {:>count_w$} ", counts[i]), bold),
+            dim_span("("),
+            Span::raw(pcts[i].clone()),
+            dim_span(")"),
+        ]));
+    }
+    if n > shown {
+        lines.push(Line::from(dim_span(format!(
+            "… {} more bins (enlarge the terminal)",
+            n - shown
+        ))));
+    }
+
+    let used = lines.len().min(max_rows);
+    Paragraph::new(lines).render(rect, frame.buffer_mut());
+    used
 }
 
 /// If `raw` is a JSON object or array, pretty-print it with syntax highlighting

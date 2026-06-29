@@ -1283,10 +1283,20 @@ impl Explorer {
         }
 
         // The tree is migrated to Ratatui: render it via the in-memory backend,
-        // unless a `--legend` overlay is requested (still on the raw path during
-        // the migration, so fall through to compose the band below).
+        // unless a `--legend` overlay is requested (the tree's legend band is
+        // still on the raw path during the migration, so fall through to compose
+        // it below).
         if matches!(screen, Screen::Tree) && !want_legend {
             println!("{}", self.tree_plain()?);
+            return Ok(());
+        }
+        // The detail screen (and its legend band) is migrated to Ratatui too:
+        // render it — overlay included — via the in-memory backend.
+        if let Screen::Detail { tensor, .. } = &screen {
+            println!(
+                "{}",
+                self.draw_detail_plain(tensor, want_stats, want_hist, want_legend)?
+            );
             return Ok(());
         }
 
@@ -1295,9 +1305,7 @@ impl Explorer {
             Screen::Tree => {
                 self.draw_tree(&mut buf)?;
             }
-            Screen::Detail { tensor, .. } => {
-                self.draw_detail_plain(&mut buf, tensor, want_stats, want_hist)?;
-            }
+            Screen::Detail { .. } => unreachable!("detail is rendered via Ratatui above"),
             Screen::Data {
                 tensor,
                 repr,
@@ -1312,7 +1320,10 @@ impl Explorer {
         if want_legend {
             let legend = match &screen {
                 Screen::Tree => Legend::Tree,
-                Screen::Detail { .. } => Legend::Detail,
+                // Detail (and its legend) is rendered via Ratatui above.
+                Screen::Detail { .. } => {
+                    unreachable!("detail legend is rendered via Ratatui above")
+                }
                 Screen::Data {
                     repr: Representation::Heatmap,
                     ..
@@ -1358,18 +1369,20 @@ impl Explorer {
         }
     }
 
-    /// Render a tensor's detail screen into `out` (raw ANSI) for [`Self::render_plain`].
-    /// Mirrors the live detail draw; statistics and the histogram, when requested,
-    /// are scanned synchronously here rather than animated on a worker thread.
+    /// Render a tensor's detail screen to plain text for [`Self::render_plain`],
+    /// via the in-memory Ratatui backend (mirrors the live detail draw).
+    /// Statistics and the histogram, when requested, are scanned synchronously
+    /// here rather than animated on a worker thread; an optional `--legend`
+    /// overlay composites the (now-Ratatui) legend band on top.
     fn draw_detail_plain(
         &self,
-        out: &mut impl Write,
         tensor_name: &str,
         want_stats: bool,
         want_hist: bool,
-    ) -> Result<()> {
+        want_legend: bool,
+    ) -> Result<String> {
         let Some(tensor) = self.tensors.iter().find(|t| t.name == tensor_name).cloned() else {
-            return Ok(());
+            return Ok(String::new());
         };
         let view = self.active_view(&tensor.name);
         let shape = self
@@ -1395,8 +1408,8 @@ impl Explorer {
             Some(s) => StatsView::Ready(s),
             None => StatsView::Pending,
         };
-        UI::draw_tensor_detail(
-            out,
+        let overlay = want_legend.then_some(Overlay::Legend(Legend::Detail));
+        self.detail_plain(
             &tensor,
             &shape,
             view,
@@ -1404,11 +1417,8 @@ impl Explorer {
             self.unindexed.contains(&tensor.source_path),
             stats_view,
             hist.as_ref(),
-            None,
-            self.schema_for(&tensor.name),
-            None,
-        )?;
-        Ok(())
+            overlay.as_ref(),
+        )
     }
 
     /// Render a tensor's numeric / heatmap data view into `out` for
@@ -1712,6 +1722,69 @@ impl Explorer {
     /// headless (`--plain`) tree and the `c` screen-copy share this.
     fn tree_plain(&self) -> Result<String> {
         crate::tui::headless_render(120, 40, |f| self.render_tree_frame(f))
+    }
+
+    /// Build the detail-screen draw config and render it into `frame` — the
+    /// Ratatui counterpart of [`Self::render_tree_frame`], shared by the live loop
+    /// and the headless render.
+    #[allow(clippy::too_many_arguments)] // mirrors the screen renderer's params
+    fn render_detail_frame(
+        &self,
+        frame: &mut ratatui::Frame,
+        tensor: &TensorInfo,
+        shape: &[usize],
+        view: ViewDtype,
+        overridable: bool,
+        unindexed: bool,
+        stats: StatsView,
+        histogram: Option<&Histogram>,
+        hist_scanning: Option<crate::ui::ScanProgress>,
+        overlay: Option<&Overlay>,
+    ) {
+        UI::render_detail(
+            frame,
+            tensor,
+            shape,
+            view,
+            overridable,
+            unindexed,
+            stats,
+            histogram,
+            hist_scanning,
+            self.schema_for(&tensor.name),
+            overlay,
+        );
+    }
+
+    /// Render a tensor's detail screen to plain text via an in-memory Ratatui
+    /// backend — the headless (`--plain`) detail and the `c` screen-copy share
+    /// this. Mirrors [`Self::tree_plain`].
+    #[allow(clippy::too_many_arguments)] // mirrors the screen renderer's params
+    fn detail_plain(
+        &self,
+        tensor: &TensorInfo,
+        shape: &[usize],
+        view: ViewDtype,
+        overridable: bool,
+        unindexed: bool,
+        stats: StatsView,
+        histogram: Option<&Histogram>,
+        overlay: Option<&Overlay>,
+    ) -> Result<String> {
+        crate::tui::headless_render(120, 40, |f| {
+            self.render_detail_frame(
+                f,
+                tensor,
+                shape,
+                view,
+                overridable,
+                unindexed,
+                stats,
+                histogram,
+                None,
+                overlay,
+            )
+        })
     }
 
     /// Recompute the scroll offset so the selected row stays visible, given the
@@ -2556,13 +2629,22 @@ impl Explorer {
                 .get(&tensor.name)
                 .cloned()
                 .unwrap_or_else(|| tensor.shape.clone());
+            // The pre-warm animates through the live terminal (set in interactive
+            // / one-shot modes; this block never runs headless, where the request
+            // strips `--histogram`/`--bins`).
+            let mut term = self
+                .terminal
+                .take()
+                .expect("interactive loop owns the terminal");
             self.ensure_detail_histogram(
+                &mut term,
                 &tensor,
                 view,
                 &shape,
                 dtype_overridable(&tensor),
                 self.unindexed.contains(&tensor.source_path),
             );
+            self.terminal = Some(term);
         }
 
         // One-shot (`--exit`): render the requested screen once and return (the
@@ -2604,21 +2686,27 @@ impl Explorer {
                 .get(&tensor.name)
                 .cloned()
                 .unwrap_or_else(|| tensor.shape.clone());
+            let mut term = self
+                .terminal
+                .take()
+                .expect("interactive loop owns the terminal");
             self.compute_stats_animated(&tensor, view, |sv| {
-                let _ = UI::draw_tensor_detail(
-                    &mut live_out(),
-                    &tensor,
-                    &shape,
-                    view,
-                    overridable,
-                    unindexed,
-                    sv,
-                    None,
-                    None,
-                    self.schema_for(&tensor.name),
-                    None,
-                );
+                let _ = term.draw(|f| {
+                    self.render_detail_frame(
+                        f,
+                        &tensor,
+                        &shape,
+                        view,
+                        overridable,
+                        unindexed,
+                        sv,
+                        None,
+                        None,
+                        None,
+                    )
+                });
             });
+            self.terminal = Some(term);
         }
         Ok(Some(screen))
     }
@@ -2628,7 +2716,37 @@ impl Explorer {
     /// compute statistics. Backspace / `\` step through the screen history; any
     /// other key goes back to the tree. Returns the chosen [`Nav`].
     fn run_detail(
+        &mut self,
+        tensor_name: &str,
+        start_slice: usize,
+        stats_start: StatsStart,
+        interaction: Interaction,
+    ) -> Nav {
+        // Own the live Ratatui terminal for the duration of the screen (taken out
+        // of `self` so the immutable-borrow draw closures can coexist with it),
+        // then hand it back — mirroring `run_tree`'s take/put-back.
+        let mut term = self
+            .terminal
+            .take()
+            .expect("interactive loop owns the terminal");
+        let nav = self.run_detail_loop(
+            &mut term,
+            tensor_name,
+            start_slice,
+            stats_start,
+            interaction,
+        );
+        self.terminal = Some(term);
+        nav
+    }
+
+    /// The detail screen's interactive loop, drawing through the borrowed live
+    /// `term`. Split out of [`Self::run_detail`] so the terminal can be lent as a
+    /// `&mut` separate from `&self` (the cached-stats / override reads go through
+    /// `RefCell`, so the loop only needs `&self`).
+    fn run_detail_loop(
         &self,
+        term: &mut crate::tui::LiveTerminal,
         tensor_name: &str,
         start_slice: usize,
         stats_start: StatsStart,
@@ -2666,6 +2784,10 @@ impl Explorer {
         // Set right after `c` copies the screen; confirmed on the bottom line
         // until the next key or `COPY_FLASH` elapses.
         let mut copied_since: Option<std::time::Instant> = None;
+        // Force a full repaint on entry, and again after any raw sub-screen (the
+        // `d`/`r`/`b` prompts, the copy-flash bottom line) draws over the Ratatui
+        // frame — the bridge while those screens are still on the raw path.
+        let mut dirty = true;
         loop {
             let view = self.active_view(&tensor.name);
             let shape = self
@@ -2678,19 +2800,20 @@ impl Explorer {
             // animating the spinner right here; normal browsing stays fast.
             if first && stats_start == StatsStart::Auto {
                 self.compute_stats_animated(tensor, view, |sv| {
-                    let _ = UI::draw_tensor_detail(
-                        &mut live_out(),
-                        tensor,
-                        &shape,
-                        view,
-                        overridable,
-                        unindexed,
-                        sv,
-                        None,
-                        None,
-                        self.schema_for(&tensor.name),
-                        None,
-                    );
+                    let _ = term.draw(|f| {
+                        self.render_detail_frame(
+                            f,
+                            tensor,
+                            &shape,
+                            view,
+                            overridable,
+                            unindexed,
+                            sv,
+                            None,
+                            None,
+                            None,
+                        )
+                    });
                 });
             }
             // Stats: shown if cached, else — while warming — a live spinner for
@@ -2742,27 +2865,40 @@ impl Explorer {
                 .borrow()
                 .get(&(tensor.name.clone(), view, self.histogram_bins.get()))
                 .cloned();
-            if UI::draw_tensor_detail(
-                &mut live_out(),
-                tensor,
-                &shape,
-                view,
-                overridable,
-                unindexed,
-                stats_view,
-                hist.as_ref(),
-                None,
-                self.schema_for(&tensor.name),
-                overlay.as_ref(),
-            )
-            .is_err()
+            // A raw sub-screen (a `d`/`r`/`b` prompt, the copy-flash) may have
+            // drawn over the frame; clear once so Ratatui fully repaints over it.
+            if dirty {
+                if term.clear().is_err() {
+                    return Nav::Quit;
+                }
+                dirty = false;
+            }
+            if term
+                .draw(|f| {
+                    self.render_detail_frame(
+                        f,
+                        tensor,
+                        &shape,
+                        view,
+                        overridable,
+                        unindexed,
+                        stats_view,
+                        hist.as_ref(),
+                        None,
+                        overlay.as_ref(),
+                    )
+                })
+                .is_err()
             {
                 return Nav::Quit;
             }
             // Confirm a screen copy on the bottom line while the flash is still
-            // within its window (dismissed by the next key or the timed poll).
+            // within its window (dismissed by the next key or the timed poll). The
+            // flash is a raw write over the frame, so mark the frame dirty for the
+            // next iteration to repaint over it.
             if copied_since.is_some_and(|t| t.elapsed() < COPY_FLASH) {
                 let _ = UI::draw_copied_flash("screen contents");
+                dirty = true;
             }
             // One-shot mode: leave this frame up and exit without reading keys.
             if first && interaction == Interaction::OneShot {
@@ -2850,7 +2986,16 @@ impl Explorer {
                     code: KeyCode::Char('h'),
                     ..
                 })) => {
-                    self.ensure_detail_histogram(tensor, view, &shape, overridable, unindexed);
+                    self.ensure_detail_histogram(
+                        term,
+                        tensor,
+                        view,
+                        &shape,
+                        overridable,
+                        unindexed,
+                    );
+                    // A histogram-scan error path draws a raw message; repaint over it.
+                    dirty = true;
                 }
                 // Set the histogram's bucket count (then (re)compute and show it).
                 Ok(Event::Key(KeyEvent {
@@ -2868,8 +3013,16 @@ impl Explorer {
                         }
                         BinsChoice::Cancel => false,
                     };
+                    dirty = true; // the raw bins prompt drew over the frame
                     if changed {
-                        self.ensure_detail_histogram(tensor, view, &shape, overridable, unindexed);
+                        self.ensure_detail_histogram(
+                            term,
+                            tensor,
+                            view,
+                            &shape,
+                            overridable,
+                            unindexed,
+                        );
                     }
                 }
                 // Compute exact whole-tensor statistics on demand, animating the
@@ -2879,19 +3032,20 @@ impl Explorer {
                     ..
                 })) => {
                     self.compute_stats_animated(tensor, view, |sv| {
-                        let _ = UI::draw_tensor_detail(
-                            &mut live_out(),
-                            tensor,
-                            &shape,
-                            view,
-                            overridable,
-                            unindexed,
-                            sv,
-                            None,
-                            None,
-                            self.schema_for(&tensor.name),
-                            None,
-                        );
+                        let _ = term.draw(|f| {
+                            self.render_detail_frame(
+                                f,
+                                tensor,
+                                &shape,
+                                view,
+                                overridable,
+                                unindexed,
+                                sv,
+                                None,
+                                None,
+                                None,
+                            )
+                        });
                     });
                 }
                 // Reinterpret the dtype from the detail screen too.
@@ -2908,6 +3062,7 @@ impl Explorer {
                             overrides.insert(tensor.name.clone(), chosen);
                         }
                     }
+                    dirty = true; // the raw dtype menu drew over the frame
                 }
                 // Reshape (shape override) from the detail screen too.
                 Ok(Event::Key(KeyEvent {
@@ -2926,6 +3081,7 @@ impl Explorer {
                         }
                         ReshapeChoice::Cancel => {}
                     }
+                    dirty = true; // the raw reshape prompt drew over the frame
                 }
                 // Copy the detail screen's text to the clipboard.
                 Ok(Event::Key(KeyEvent {
@@ -2937,22 +3093,20 @@ impl Explorer {
                         .borrow()
                         .get(&(tensor.name.clone(), view, self.histogram_bins.get()))
                         .cloned();
-                    let text = screen_text(|buf| {
-                        let _ = UI::draw_tensor_detail(
-                            buf,
-                            tensor,
-                            &shape,
-                            view,
-                            overridable,
-                            unindexed,
-                            stats_view,
-                            hist.as_ref(),
-                            None,
-                            self.schema_for(&tensor.name),
-                            None,
-                        );
-                    });
-                    copy_to_clipboard(&text);
+                    // Capture the screen via the same Ratatui render as the live
+                    // frame (no overlay), so the copied text matches what's shown.
+                    if let Ok(text) = self.detail_plain(
+                        tensor,
+                        &shape,
+                        view,
+                        overridable,
+                        unindexed,
+                        stats_view,
+                        hist.as_ref(),
+                        None,
+                    ) {
+                        copy_to_clipboard(&text);
+                    }
                     copied_since = Some(std::time::Instant::now());
                 }
                 // `y` copies the CLI command and raises it as a pop-up over the
@@ -3393,6 +3547,7 @@ impl Explorer {
     /// so both produce the same result and `y` round-trips it.
     fn ensure_detail_histogram(
         &self,
+        term: &mut crate::tui::LiveTerminal,
         tensor: &TensorInfo,
         view: ViewDtype,
         shape: &[usize],
@@ -3407,42 +3562,44 @@ impl Explorer {
         let ready = !need_stats
             || matches!(
                 self.compute_stats_animated(tensor, view, |sv| {
-                    let _ = UI::draw_tensor_detail(
-                        &mut live_out(),
+                    let _ = term.draw(|f| {
+                        self.render_detail_frame(
+                            f,
+                            tensor,
+                            shape,
+                            view,
+                            overridable,
+                            unindexed,
+                            sv,
+                            None,
+                            None,
+                            None,
+                        )
+                    });
+                }),
+                ScanOutcome::Completed
+            );
+        if ready {
+            self.scan_histogram(term, tensor, view, |term, snap, scanning, overlay| {
+                let stats = self.cached_stats(tensor, view);
+                let sv = match &stats {
+                    Some(s) => StatsView::Ready(s),
+                    None => StatsView::Pending,
+                };
+                let _ = term.draw(|f| {
+                    self.render_detail_frame(
+                        f,
                         tensor,
                         shape,
                         view,
                         overridable,
                         unindexed,
                         sv,
-                        None,
-                        None,
-                        self.schema_for(&tensor.name),
-                        None,
-                    );
-                }),
-                ScanOutcome::Completed
-            );
-        if ready {
-            self.scan_histogram(tensor, view, |snap, scanning, overlay| {
-                let stats = self.cached_stats(tensor, view);
-                let sv = match &stats {
-                    Some(s) => StatsView::Ready(s),
-                    None => StatsView::Pending,
-                };
-                let _ = UI::draw_tensor_detail(
-                    &mut live_out(),
-                    tensor,
-                    shape,
-                    view,
-                    overridable,
-                    unindexed,
-                    sv,
-                    Some(snap),
-                    scanning,
-                    self.schema_for(&tensor.name),
-                    overlay,
-                );
+                        Some(snap),
+                        scanning,
+                        overlay,
+                    )
+                });
             });
         }
     }
@@ -3458,9 +3615,15 @@ impl Explorer {
     /// computes those first when required (the 4-bit views don't need them).
     fn scan_histogram(
         &self,
+        term: &mut crate::tui::LiveTerminal,
         tensor: &TensorInfo,
         view: ViewDtype,
-        mut redraw: impl FnMut(&Histogram, Option<crate::ui::ScanProgress>, Option<&Overlay>),
+        mut redraw: impl FnMut(
+            &mut crate::tui::LiveTerminal,
+            &Histogram,
+            Option<crate::ui::ScanProgress>,
+            Option<&Overlay>,
+        ),
     ) {
         let count = self.histogram_bins.get();
         let key = (tensor.name.clone(), view, count);
@@ -3511,6 +3674,7 @@ impl Explorer {
             let progress =
                 (total > 0).then(|| (done.load(Ordering::Relaxed) as f64 / total as f64).min(1.0));
             redraw(
+                term,
                 &shared.snapshot(bins),
                 Some((
                     STATS_SPINNER[frame % STATS_SPINNER.len()],
@@ -3554,7 +3718,7 @@ impl Explorer {
                 // A pop-up opened mid-scan stays up after the bars finish (rather
                 // than vanishing the instant it completes); any key dismisses it.
                 while overlay.is_some() {
-                    redraw(&hist, None, overlay.as_ref());
+                    redraw(term, &hist, None, overlay.as_ref());
                     if let Ok(Event::Key(kev)) = event::read() {
                         if is_ctrl_c(&kev) {
                             quit_immediately();
