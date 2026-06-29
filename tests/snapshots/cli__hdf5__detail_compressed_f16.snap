@@ -2,7 +2,7 @@
 source: tests/cli.rs
 expression: "plain(&[\"--tensor\", \"lm_head.weight\"])"
 ---
-Tensor Details
+Tensor Details                                                                                                       [×]
 ──────────────
 Name: lm_head.weight
 Data Type: F16

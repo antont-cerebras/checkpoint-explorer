@@ -568,14 +568,17 @@ impl UI {
         hist_scanning: Option<ScanProgress>,
         schema: Option<&PackingSchema>,
         overlay: Option<&Overlay>,
-    ) {
+    ) -> Vec<(Rect, KeyEvent)> {
         let area = frame.area();
         let (width, height) = (area.width, area.height);
 
         let header = detail_field_lines(tensor, shape, view, unindexed, stats, schema);
-        let footer = detail_footer_lines(overridable, width);
+        let (footer, chips) = detail_footer_lines(overridable, width);
         let header_len = header.len();
         let footer_len = footer.len();
+        // The screen row the footer block begins on (filled in per layout branch
+        // below), so the relative chip lines can be made absolute for hit-testing.
+        let footer_top;
 
         if let Some(hist) = histogram {
             // Header, then the histogram (capped to the rows the raw renderer's
@@ -609,6 +612,7 @@ impl UI {
             // Footer one blank row below the bars, clamped so it always fits.
             let footer_y =
                 (header_len + used + 1).min((height as usize).saturating_sub(footer_len)) as u16;
+            footer_top = footer_y;
             Paragraph::new(footer).render(
                 Rect {
                     x: 0,
@@ -620,10 +624,32 @@ impl UI {
             );
         } else {
             // No histogram: header then footer, top-aligned, the rest left blank.
+            footer_top = header_len as u16;
             let mut lines = header;
             lines.extend(footer);
             Paragraph::new(lines).render(area, frame.buffer_mut());
         }
+
+        // Clickable regions: each footer chip (made absolute via the footer's
+        // start row) plus the top-right `[×]` (→ step back, like `⌫`).
+        let mut regions: Vec<(Rect, KeyEvent)> = chips
+            .iter()
+            .map(|c| {
+                (
+                    Rect {
+                        x: c.col,
+                        y: footer_top + c.line,
+                        width: c.width,
+                        height: 1,
+                    },
+                    c.key,
+                )
+            })
+            .collect();
+        regions.extend(close_button(
+            frame,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        ));
 
         // A pop-up overlay composites last, over the live frame, so the detail
         // (including a running scan's progress) keeps animating behind it.
@@ -632,6 +658,7 @@ impl UI {
             Some(Overlay::Command(c)) => Self::render_command_band(frame, c),
             None => {}
         }
+        regions
     }
 
     /// Composite the context-sensitive glyph legend over the live frame as a
@@ -2835,44 +2862,68 @@ fn detail_field_lines(
 /// The detail screen's footer hint as wrapped [`Line`]s, split into `key label,`
 /// chips that wrap at `width` (so a chip is never broken across lines). Mirrors
 /// the tree's [`tree_hint_lines`] wrapping.
-fn detail_footer_lines(overridable: bool, width: u16) -> Vec<Line<'static>> {
+fn detail_footer_lines(overridable: bool, width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
     // Each chunk is a run of spans that should not be split across lines; the
-    // trailing text of each (the comma + space) keeps the on-screen wording.
-    let mut chunks: Vec<Vec<Span<'static>>> = vec![vec![Span::raw("Press ")]];
-    let mut push = |chunk: Vec<Span<'static>>| chunks.push(chunk);
-    push(vec![key_span("m"), Span::raw(" for a heatmap, ")]);
-    push(vec![key_span("v"), Span::raw(" for numeric values, ")]);
-    push(vec![key_span("h"), Span::raw(" for a histogram, ")]);
-    push(vec![key_span("b"), Span::raw(" to set its bin count, ")]);
+    // trailing text of each (the comma + space) keeps the on-screen wording. The
+    // second field lists the chunk's clickable glyphs as `(char offset within the
+    // chunk, glyph width, key)` so a click can be turned into the equivalent key.
+    type Chunk = (Vec<Span<'static>>, Vec<(usize, u16, KeyEvent)>);
+    let key_chunk = |glyph: &'static str, rest: &'static str, key: KeyEvent| -> Chunk {
+        (
+            vec![key_span(glyph), Span::raw(rest)],
+            vec![(0, glyph.chars().count() as u16, key)],
+        )
+    };
+    let mut chunks: Vec<Chunk> = vec![(vec![Span::raw("Press ")], vec![])];
+    chunks.push(key_chunk("m", " for a heatmap, ", hint_key('m')));
+    chunks.push(key_chunk("v", " for numeric values, ", hint_key('v')));
+    chunks.push(key_chunk("h", " for a histogram, ", hint_key('h')));
+    chunks.push(key_chunk("b", " to set its bin count, ", hint_key('b')));
     if overridable {
-        push(vec![
-            key_span("d"),
-            Span::raw(" to reinterpret the dtype, "),
-        ]);
-        push(vec![key_span("r"), Span::raw(" to reshape, ")]);
+        chunks.push(key_chunk("d", " to reinterpret the dtype, ", hint_key('d')));
+        chunks.push(key_chunk("r", " to reshape, ", hint_key('r')));
     }
-    push(vec![key_span("c"), Span::raw(" to copy, ")]);
-    push(vec![key_span("y"), Span::raw(" to copy the command, ")]);
-    push(vec![key_span("l"), Span::raw(" for the legend, ")]);
-    push(vec![
-        key_span("⌫"),
-        Span::raw(" / "),
-        key_span("\\"),
-        Span::raw(" to step back / forward, any other key to return..."),
-    ]);
+    chunks.push(key_chunk("c", " to copy, ", hint_key('c')));
+    chunks.push(key_chunk("y", " to copy the command, ", hint_key('y')));
+    chunks.push(key_chunk("l", " for the legend, ", hint_key('l')));
+    // The dual ⌫ / \ chunk: two independently clickable glyphs. `\` sits at char
+    // offset 4 (after "⌫" + " / ").
+    chunks.push((
+        vec![
+            key_span("⌫"),
+            Span::raw(" / "),
+            key_span("\\"),
+            Span::raw(" to step back / forward, any other key to return..."),
+        ],
+        vec![
+            (0, 1, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            (4, 1, hint_key('\\')),
+        ],
+    ));
 
     // Greedily pack chunks onto lines, breaking before a chunk that would overflow
     // (each chunk already carries its own separator, so no extra is inserted).
     let width = (width as usize).max(1);
     let chunk_w = |c: &[Span]| -> usize { c.iter().map(|s| s.content.chars().count()).sum() };
     let mut lines: Vec<Line> = Vec::new();
+    let mut chips: Vec<ChipHit> = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
     let mut col = 0usize;
-    for chunk in chunks {
+    for (chunk, keys) in chunks {
         let w = chunk_w(&chunk);
         if !spans.is_empty() && col + w > width {
             lines.push(Line::from(std::mem::take(&mut spans)));
             col = 0;
+        }
+        // This chunk starts at column `col` on line `lines.len()`; record each of
+        // its clickable glyphs at its own sub-column.
+        for (off, glyph_w, key) in keys {
+            chips.push(ChipHit {
+                line: lines.len() as u16,
+                col: (col + off) as u16,
+                width: glyph_w,
+                key,
+            });
         }
         spans.extend(chunk);
         col += w;
@@ -2880,7 +2931,7 @@ fn detail_footer_lines(overridable: bool, width: u16) -> Vec<Line<'static>> {
     if !spans.is_empty() {
         lines.push(Line::from(spans));
     }
-    lines
+    (lines, chips)
 }
 
 /// Render the value histogram into `rect` — the Ratatui port of

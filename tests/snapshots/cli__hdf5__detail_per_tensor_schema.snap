@@ -2,7 +2,7 @@
 source: tests/cli.rs
 expression: "plain(&[\"--tensor\", \"model.layers.0.custom_proj.weight\"])"
 ---
-Tensor Details
+Tensor Details                                                                                                       [×]
 ──────────────
 Name: model.layers.0.custom_proj.weight
 Data Type: U16 as u4×4 (unpacked)
