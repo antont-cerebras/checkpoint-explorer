@@ -372,9 +372,13 @@ pub struct Explorer {
     /// own after `COPY_FLASH` (and on the next key press), like the data views.
     copied_flash: Option<(String, std::time::Instant)>,
     /// The live Ratatui terminal, owned for the duration of the interactive loop
-    /// (`None` headlessly and before/after `run`). Screens migrated to Ratatui
-    /// render through it; the rest still write raw ANSI during the migration.
+    /// (`None` headlessly and before/after `run`).
     terminal: Option<crate::tui::LiveTerminal>,
+    /// Clickable regions for the frame currently on screen: each footer key-hint
+    /// chip and the `[×]` close control, paired with the `KeyEvent` a click on it
+    /// synthesizes. Rebuilt every frame by the `render_*` functions; read by the
+    /// loops' mouse handlers to turn a click into the equivalent keypress.
+    clickable: RefCell<Vec<(ratatui::layout::Rect, KeyEvent)>>,
     /// Index/file mismatches detected at startup, shown as a warning panel.
     health_reports: Vec<crate::health::HealthReport>,
     /// Per-tensor dtype reinterpretation chosen in the data views, keyed by
@@ -477,6 +481,7 @@ impl Explorer {
             filtered_tree: Vec::new(),
             copied_flash: None,
             terminal: None,
+            clickable: RefCell::new(Vec::new()),
             health_reports,
             dtype_overrides: RefCell::new(HashMap::new()),
             packing_schemas: HashMap::new(),
@@ -1686,7 +1691,7 @@ impl Explorer {
             packing_schemas: &self.packing_schemas,
             copied_flash: self.copied_flash.as_ref().map(|(what, _)| what.as_str()),
         };
-        UI::render_tree(frame, &config);
+        *self.clickable.borrow_mut() = UI::render_tree(frame, &config);
     }
 
     /// Render the tree to plain text via an in-memory Ratatui backend — the
@@ -1954,15 +1959,19 @@ impl Explorer {
                 event::read()?
             };
 
-            // Mouse: click a row to act on it (like Enter), wheel to move the
-            // selection. Hit-test against the body region (below the header, above
-            // the 2-line status bar) using the size captured for this frame.
+            // Mouse: a click on a footer hint chip or the `[×]` acts like its key
+            // (routed through the key match below); a click on a tree row selects
+            // or opens it; the wheel scrolls the viewport.
+            let mut synth: Option<KeyEvent> = None;
             if let Event::Mouse(m) = &ev {
                 let (kind, row, col) = (m.kind, m.row, m.column);
                 self.copied_flash = None;
                 match kind {
                     MouseEventKind::Down(MouseButton::Left) => {
-                        if let Some(sz) = size {
+                        let hit = crate::ui::region_hit(&self.clickable.borrow(), col, row);
+                        if let Some(k) = hit {
+                            synth = Some(k); // clicked a hint chip / [×]
+                        } else if let Some(sz) = size {
                             let body_top =
                                 UI::tree_header_rows(sz.width, self.search_mode, self.can_repack())
                                     as u16;
@@ -2021,10 +2030,22 @@ impl Explorer {
                     }
                     _ => {}
                 }
-                continue;
+                // A clicked hint becomes a synthesized key handled below; any other
+                // mouse event was handled inline here.
+                if synth.is_none() {
+                    continue;
+                }
             }
 
-            if let Event::Key(key_event) = ev {
+            // Handle a real key press, or one synthesized from a clicked hint / [×].
+            let key_event = match synth {
+                Some(k) => k,
+                None => match ev {
+                    Event::Key(k) => k,
+                    _ => continue,
+                },
+            };
+            {
                 // Any key also dismisses the copy confirmation.
                 self.copied_flash = None;
                 match key_event {

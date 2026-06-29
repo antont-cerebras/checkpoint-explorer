@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -11,6 +12,50 @@ use crate::health::HealthReport;
 use crate::sample::{HistBins, Histogram, PackingSchema, Sample, SampleMode, Stats, ViewDtype};
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo, TreeNode, metadata_short};
 use crate::utils::{format_parameters, format_shape, format_size};
+
+/// A clickable footer key-hint chip: where it sits within a hint block (line
+/// index + column + width) and the key it stands for. The `render_*` functions
+/// translate these to absolute screen [`Rect`]s and pair them with the key, so a
+/// click can be turned into the equivalent keypress.
+pub struct ChipHit {
+    pub line: u16,
+    pub col: u16,
+    pub width: u16,
+    pub key: KeyEvent,
+}
+
+/// A plain (no-modifier) key event — what clicking a single-letter hint stands for.
+fn hint_key(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+}
+
+/// Draw a `[×]` close control in the top-right corner and return its clickable
+/// region paired with the key a click should synthesize (`q` to quit the tree,
+/// `⌫` to step back from a sub-screen). No-op (empty region list) if too narrow.
+fn close_button(frame: &mut Frame, key: KeyEvent) -> Vec<(Rect, KeyEvent)> {
+    let area = frame.area();
+    if area.width < 3 {
+        return Vec::new();
+    }
+    let rect = Rect {
+        x: area.width - 3,
+        y: 0,
+        width: 3,
+        height: 1,
+    };
+    frame
+        .buffer_mut()
+        .set_string(rect.x, rect.y, "[×]", Style::default().fg(palette::ACCENT));
+    vec![(rect, key)]
+}
+
+/// True when `(col, row)` falls inside a clickable region.
+pub fn region_hit(regions: &[(Rect, KeyEvent)], col: u16, row: u16) -> Option<KeyEvent> {
+    regions
+        .iter()
+        .find(|(r, _)| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height)
+        .map(|(_, k)| *k)
+}
 
 /// A still-forming scan's progress indicator: a spinner glyph, the elapsed time,
 /// and an optional completed fraction (`None` when the total isn't known).
@@ -311,7 +356,7 @@ impl UI {
         let hint_rows = if search_mode {
             1
         } else {
-            tree_hint_lines(can_repack, width).len()
+            tree_hint_lines(can_repack, width).0.len()
         };
         1 + hint_rows + 1 // title + hint(s) + rule
     }
@@ -319,12 +364,14 @@ impl UI {
     /// Ratatui render of the tree browser: header (title, hint or search line,
     /// rule), the visible tree rows from `config.scroll_offset`, and the bottom
     /// two-line status bar, driven by the shared `DrawConfig`.
-    pub fn render_tree(frame: &mut Frame, config: &DrawConfig) {
+    pub fn render_tree(frame: &mut Frame, config: &DrawConfig) -> Vec<(Rect, KeyEvent)> {
         let area = frame.area();
         let (width, height) = (area.width, area.height);
         if height < (TREE_FOOTER_HEIGHT as u16 + 1) {
-            return;
+            return Vec::new();
         }
+        // Clickable footer chips (built below) become absolute screen rects here.
+        let mut chips: Vec<ChipHit> = Vec::new();
 
         // --- header + tree rows (the region above the 2-line status bar) ---
         let mut lines: Vec<Line> = Vec::new();
@@ -354,7 +401,9 @@ impl UI {
         if config.search_mode {
             lines.push(tree_search_line(config));
         } else {
-            lines.extend(tree_hint_lines(config.can_repack, width));
+            let (hint_lines, hint_chips) = tree_hint_lines(config.can_repack, width);
+            lines.extend(hint_lines);
+            chips = hint_chips;
         }
 
         // Separator rule.
@@ -457,6 +506,25 @@ impl UI {
             },
             frame.buffer_mut(),
         );
+
+        // Clickable regions: each footer chip (the hint block starts at row 1,
+        // below the title) plus the top-right `[×]` (→ quit the tree).
+        let mut regions: Vec<(Rect, KeyEvent)> = chips
+            .iter()
+            .map(|c| {
+                (
+                    Rect {
+                        x: c.col,
+                        y: 1 + c.line,
+                        width: c.width,
+                        height: 1,
+                    },
+                    c.key,
+                )
+            })
+            .collect();
+        regions.extend(close_button(frame, hint_key('q')));
+        regions
     }
 
     /// Render the tensor detail screen. `view` is the active dtype reinterpretation
@@ -2166,25 +2234,27 @@ fn tree_span(selected: bool, color: Color, text: impl Into<String>) -> Span<'sta
 
 /// The tree browser's key-hint line(s), word-wrapped to `width` on the
 /// ` · `-separated `key label` chips (the long hint spills onto a second line).
-fn tree_hint_lines(can_repack: bool, width: u16) -> Vec<Line<'static>> {
-    let mut items: Vec<(&str, &str)> = vec![
-        ("↑/↓", "navigate"),
-        ("←/→", "parent/child"),
-        ("Shift+↑/↓", "sibling"),
-        ("Enter/Space", "expand"),
-        ("E/C", "all"),
-        ("/", "search"),
-        ("l", "legend"),
-        ("c", "copy screen"),
-        ("f", "copy file"),
-        ("n", "copy name"),
-        ("y", "copy command"),
-        ("⌫/\\", "back/fwd"),
+fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
+    // The third field is the key a click on the chip synthesizes; `None` for the
+    // dual/directional chips (they have wheel / click / `[×]` equivalents).
+    let mut items: Vec<(&str, &str, Option<char>)> = vec![
+        ("↑/↓", "navigate", None),
+        ("←/→", "parent/child", None),
+        ("Shift+↑/↓", "sibling", None),
+        ("Enter/Space", "expand", None),
+        ("E/C", "all", None),
+        ("/", "search", Some('/')),
+        ("l", "legend", Some('l')),
+        ("c", "copy screen", Some('c')),
+        ("f", "copy file", Some('f')),
+        ("n", "copy name", Some('n')),
+        ("y", "copy command", Some('y')),
+        ("⌫/\\", "back/fwd", None),
     ];
     if can_repack {
-        items.push(("R", "repack"));
+        items.push(("R", "repack", Some('R')));
     }
-    items.push(("q", "quit"));
+    items.push(("q", "quit", Some('q')));
 
     let width = width as usize;
     let key_style = Style::default()
@@ -2192,9 +2262,10 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> Vec<Line<'static>> {
         .add_modifier(Modifier::BOLD);
     let sep_style = Style::default().fg(palette::DIM);
     let mut lines: Vec<Line> = Vec::new();
+    let mut chips: Vec<ChipHit> = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
     let mut col = 0usize;
-    for (key, label) in items {
+    for (key, label, action) in items {
         let item_w = key.chars().count() + 1 + label.chars().count();
         let has_prev = !spans.is_empty();
         if has_prev && col + 3 + item_w > width {
@@ -2205,6 +2276,14 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> Vec<Line<'static>> {
             spans.push(Span::styled(" · ", sep_style));
             col += 3;
         }
+        if let Some(c) = action {
+            chips.push(ChipHit {
+                line: lines.len() as u16,
+                col: col as u16,
+                width: item_w as u16,
+                key: hint_key(c),
+            });
+        }
         spans.push(Span::styled(key.to_string(), key_style));
         spans.push(Span::raw(format!(" {label}")));
         col += item_w;
@@ -2212,7 +2291,7 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> Vec<Line<'static>> {
     if !spans.is_empty() {
         lines.push(Line::from(spans));
     }
-    lines
+    (lines, chips)
 }
 
 /// The search bar header line: `Search [query▒]  N matches  Enter view · …`.
