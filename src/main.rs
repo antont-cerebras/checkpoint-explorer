@@ -11,7 +11,6 @@ mod hdf5_lz4;
 mod hdf5_zstd;
 mod health;
 mod npy;
-mod plain;
 mod sample;
 mod tree;
 mod tui;

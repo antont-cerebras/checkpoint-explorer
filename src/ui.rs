@@ -1,23 +1,15 @@
-use anyhow::Result;
-use crossterm::{
-    cursor, queue,
-    style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
-    terminal::{self, BeginSynchronizedUpdate, ClearType, EndSynchronizedUpdate},
-};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
 use crate::health::HealthReport;
 use crate::sample::{HistBins, Histogram, PackingSchema, Sample, SampleMode, Stats, ViewDtype};
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo, TreeNode, metadata_short};
-use crate::tui::to_ratatui;
 use crate::utils::{format_parameters, format_shape, format_size};
 
 /// A still-forming scan's progress indicator: a spinner glyph, the elapsed time,
@@ -28,50 +20,50 @@ pub type ScanProgress = (char, std::time::Duration, Option<f64>);
 /// thing is styled, so the same role looks the same on every screen. Change a
 /// colour here and it updates everywhere it's used.
 mod palette {
-    use crossterm::style::Color;
+    use ratatui::style::Color;
 
-    /// Interactive keys in hint lines (rendered bold, via [`super::key_hint`]).
-    pub const KEY: Color = Color::Cyan;
+    /// Interactive keys in hint lines (rendered bold).
+    pub const KEY: Color = Color::Indexed(14);
     /// Secondary / de-emphasised hint text (ranges, "to cancel", …).
-    pub const DIM: Color = Color::DarkGrey;
+    pub const DIM: Color = Color::Indexed(8);
     /// Selected tree row (foreground on background).
-    pub const SELECT_FG: Color = Color::Black;
-    pub const SELECT_BG: Color = Color::White;
+    pub const SELECT_FG: Color = Color::Indexed(0);
+    pub const SELECT_BG: Color = Color::Indexed(15);
     /// The slice-jump input box (foreground on background).
-    pub const INPUT_FG: Color = Color::White;
-    pub const INPUT_BG: Color = Color::DarkBlue;
+    pub const INPUT_FG: Color = Color::Indexed(15);
+    pub const INPUT_BG: Color = Color::Indexed(4);
     /// Something missing / wrong / out of range.
-    pub const ERROR: Color = Color::Red;
+    pub const ERROR: Color = Color::Indexed(9);
     /// Something present but unexpected (a softer alert than [`ERROR`]).
-    pub const WARN: Color = Color::Yellow;
+    pub const WARN: Color = Color::Indexed(11);
     /// The bottom status bar (foreground on background).
-    pub const STATUS_FG: Color = Color::White;
-    pub const STATUS_BG: Color = Color::DarkGrey;
+    pub const STATUS_FG: Color = Color::Indexed(15);
+    pub const STATUS_BG: Color = Color::Indexed(8);
     /// A success accent used as a *foreground* (e.g. the "✓ copied" confirmation).
-    pub const SUCCESS: Color = Color::Green;
+    pub const SUCCESS: Color = Color::Indexed(10);
     /// Marks a tensor present on disk but missing from the index — a vivid red
     /// that stands out clearly against the tree's default and dimmed text.
-    pub const UNINDEXED: Color = Color::AnsiValue(196);
+    pub const UNINDEXED: Color = Color::Indexed(196);
     /// Group names and expand arrows in the tree — the primary accent (a bright
     /// sky-cyan), so the structure stands out from the leaf tensors.
-    pub const ACCENT: Color = Color::AnsiValue(81);
+    pub const ACCENT: Color = Color::Indexed(81);
     /// A tensor's data type (warm amber, so the type pops).
-    pub const DTYPE: Color = Color::AnsiValue(215);
+    pub const DTYPE: Color = Color::Indexed(215);
     /// Metadata entries (the `†` marker and the entry name) — a muted slate
     /// violet, distinct from the cyan groups and amber dtypes but quiet enough
     /// that metadata reads as a side note rather than competing with tensors.
-    pub const META: Color = Color::AnsiValue(103);
+    pub const META: Color = Color::Indexed(103);
     /// Zebra striping for the numeric grid — two subtle dark backgrounds (one
     /// "dark", one "less dark") that alternate to guide the eye along the rows
     /// or columns, like a dim highlighter.
-    pub const STRIPE_DARK: Color = Color::AnsiValue(234);
-    pub const STRIPE_LITE: Color = Color::AnsiValue(237);
+    pub const STRIPE_DARK: Color = Color::Indexed(234);
+    pub const STRIPE_LITE: Color = Color::Indexed(237);
     /// Background for floating pop-ups (legend, the `y` command panel, message
     /// screens) — a neutral dark grey a few shades above black, in the same
     /// family as the zebra greys above, so an overlay reads as a raised surface
     /// over the main screen while staying within the dark theme. Light/accent
     /// foregrounds keep their contrast; dim text stays legible.
-    pub const PANEL_BG: Color = Color::AnsiValue(236);
+    pub const PANEL_BG: Color = Color::Indexed(236);
 }
 
 /// Marks a tensor that's on disk but not listed in the index (an "extra"),
@@ -268,9 +260,9 @@ pub enum Legend {
 }
 
 /// A floating pop-up the detail screen can show *over* its live frame — drawn as
-/// the last layer of [`UI::draw_tensor_detail`] so the screen behind it keeps
+/// the last layer of [`UI::render_detail`] so the screen behind it keeps
 /// redrawing (a running scan's progress animates) while it's up. Dismissed by
-/// any key. Composited via [`write_legend_band`] / [`write_command_band`].
+/// any key. Composited via [`UI::render_legend_band`] / [`UI::render_command_band`].
 pub enum Overlay {
     /// The context-sensitive glyph legend (`l`).
     Legend(Legend),
@@ -293,340 +285,6 @@ impl UI {
         (terminal_height as usize)
             .saturating_sub(TREE_HEADER_HEIGHT + TREE_FOOTER_HEIGHT)
             .max(1)
-    }
-
-    /// Render the tree browser into `out` (a buffered stdout for the live
-    /// screen, or an in-memory buffer when capturing the screen for copy).
-    /// Writing the whole frame at once and flushing once — combined with
-    /// overwriting in place (clearing each line rather than the whole screen up
-    /// front) — removes the flicker a per-frame `Clear(All)` produced.
-    pub fn draw_screen(out: &mut impl Write, config: &DrawConfig) -> Result<usize> {
-        let (terminal_width, terminal_height) = crate::plain::term_size();
-        let header_height = TREE_HEADER_HEIGHT;
-        // Two bottom lines for the status bar: the selected tensor's full name on
-        // the first, its source file on the second (the per-checkpoint totals now
-        // live in the tree root instead of a footer).
-        let footer_height = TREE_FOOTER_HEIGHT;
-        let available_height =
-            (terminal_height as usize).saturating_sub(header_height + footer_height);
-
-        queue!(out, BeginSynchronizedUpdate, cursor::MoveTo(0, 0))?;
-
-        // Header
-        queue!(out, terminal::Clear(ClearType::CurrentLine))?;
-        write!(
-            out,
-            "Checkpoint Explorer - {} ({}/{})",
-            config.current_file,
-            config.file_idx + 1,
-            config.total_files
-        )?;
-        if config.health_warning {
-            queue!(out, SetForegroundColor(palette::ERROR))?;
-            write!(out, "   ⚠ index/file mismatch — press ")?;
-            key_hint(&mut *out, "h")?;
-            queue!(out, ResetColor)?;
-        }
-        write!(out, "\r\n")?;
-        queue!(out, terminal::Clear(ClearType::CurrentLine))?;
-        if config.search_mode {
-            queue!(out, SetForegroundColor(palette::DIM))?;
-            write!(out, "Search ")?;
-            queue!(out, ResetColor)?;
-            input_box(&mut *out, config.search_query, config.search_cursor, 16)?;
-            // The running match count, between the query box and the hints. Only
-            // shown once something is typed — with an empty query the list is the
-            // whole tree, not a set of matches.
-            if config.search_query.is_empty() {
-                write!(out, "  ")?;
-            } else {
-                let n = config.tree.len();
-                queue!(out, SetForegroundColor(palette::DIM))?;
-                write!(out, "  {n} {}  ", if n == 1 { "match" } else { "matches" })?;
-                queue!(out, ResetColor)?;
-            }
-            hint_line(
-                &mut *out,
-                &[("Enter", "view"), ("Tab", "in tree"), ("Esc", "exit")],
-            )?;
-            write!(out, "\r\n")?;
-        } else {
-            let mut hints: Vec<(&str, &str)> = vec![
-                ("↑/↓", "navigate"),
-                ("←/→", "parent/child"),
-                ("Shift+↑/↓", "sibling"),
-                ("Enter/Space", "expand"),
-                ("E/C", "all"),
-                ("/", "search"),
-                ("l", "legend"),
-                ("c", "copy screen"),
-                ("f", "copy file"),
-                ("n", "copy name"),
-                ("y", "copy command"),
-                ("⌫/\\", "back/fwd"),
-            ];
-            if config.can_repack {
-                hints.push(("R", "repack"));
-            }
-            hints.push(("q", "quit"));
-            hint_line(&mut *out, &hints)?;
-            write!(out, "\r\n")?;
-        }
-        queue!(
-            out,
-            terminal::Clear(ClearType::CurrentLine),
-            SetForegroundColor(palette::DIM)
-        )?;
-        write!(out, "{}\r\n", "─".repeat(terminal_width as usize))?;
-        queue!(out, ResetColor)?;
-
-        // Calculate scroll offset
-        let new_scroll_offset = if config.selected_idx >= config.scroll_offset + available_height {
-            config.selected_idx.saturating_sub(available_height - 1)
-        } else if config.selected_idx < config.scroll_offset {
-            config.selected_idx
-        } else {
-            config.scroll_offset
-        };
-
-        // Draw tree
-        for (actual_index, (node, depth)) in config
-            .tree
-            .iter()
-            .enumerate()
-            .skip(new_scroll_offset)
-            .take(available_height)
-        {
-            let is_selected = actual_index == config.selected_idx;
-
-            queue!(out, terminal::Clear(ClearType::CurrentLine))?;
-            if is_selected {
-                queue!(
-                    out,
-                    SetForegroundColor(palette::SELECT_FG),
-                    SetBackgroundColor(palette::SELECT_BG)
-                )?;
-            }
-
-            Self::draw_node(
-                node,
-                *depth,
-                is_selected,
-                config.unindexed,
-                config.packing_schemas,
-                &mut *out,
-            )?;
-
-            if is_selected {
-                queue!(out, ResetColor)?;
-            }
-        }
-
-        // Wipe any rows left over from a previous, taller frame.
-        queue!(out, terminal::Clear(ClearType::FromCursorDown))?;
-
-        // Two-line status bar pinned to the bottom (no trailing newline on the
-        // last, to avoid scrolling). First line: the selected row's primary text
-        // (tensor name / group files / copy confirmation) as a coloured chip;
-        // second line: the tensor's source file, dimmed and aligned under the
-        // chip text. Both truncate tail-first so the meaningful end stays visible.
-        let max_text = (terminal_width as usize).saturating_sub(6);
-        queue!(out, cursor::MoveTo(0, terminal_height.saturating_sub(2)))?;
-        if config.search_mode && config.tree.is_empty() {
-            write!(
-                out,
-                "No results found for \"{}\" | Press ",
-                config.search_query
-            )?;
-            key_hint(&mut *out, "Esc")?;
-            write!(out, " to exit search\r")?;
-        } else if !config.status_bar.is_empty() {
-            // A colored chip: leading glyph + the path/text, truncated tail-first
-            // so the file name stays visible.
-            let text = truncate_keep_end(config.status_bar, max_text);
-            queue!(
-                out,
-                SetBackgroundColor(palette::STATUS_BG),
-                SetForegroundColor(palette::STATUS_FG)
-            )?;
-            write!(out, " {} {text} ", config.status_icon)?;
-            queue!(out, ResetColor)?;
-        }
-        // Second line: the source file, dimmed, indented under the chip's text.
-        queue!(
-            out,
-            cursor::MoveTo(0, terminal_height.saturating_sub(1)),
-            terminal::Clear(ClearType::CurrentLine)
-        )?;
-        if !config.status_secondary.is_empty() {
-            let text = truncate_keep_end(config.status_secondary, max_text);
-            queue!(out, SetForegroundColor(palette::DIM))?;
-            write!(out, "   {text}")?;
-            queue!(out, ResetColor)?;
-        }
-
-        queue!(out, EndSynchronizedUpdate)?;
-        out.flush()?;
-        Ok(new_scroll_offset)
-    }
-
-    /// Render one tree row. `selected` rows are drawn plain so the caller's
-    /// highlight (inverse video) reads cleanly; other rows are colour-coded by
-    /// kind — group names in the accent and dtypes amber, with the name, shape
-    /// and size at full strength and only the leaf marker / storage tag dimmed.
-    fn draw_node(
-        node: &TreeNode,
-        depth: usize,
-        selected: bool,
-        unindexed: &HashSet<String>,
-        packing_schemas: &HashMap<String, PackingSchema>,
-        out: &mut impl Write,
-    ) -> Result<()> {
-        let indent = "  ".repeat(depth);
-
-        match node {
-            TreeNode::Group {
-                name,
-                children,
-                expanded,
-                tensor_count,
-                params,
-                total_size,
-                stored_size,
-            } => {
-                // ▾ open / ▸ collapsed — the arrow doubles as the folder marker.
-                let arrow = if *expanded { "▾" } else { "▸" };
-                // A repeated-block stack (e.g. a transformer's `layers` group)
-                // has children that are all numbered subgroups; the `☰` glyph
-                // counts them, `▦` the tensors — so depth is visible without
-                // expanding. When any descendant is compressed the on-disk total
-                // differs from the logical total; show both, mirroring tensors.
-                let layer_prefix = match layer_count(children) {
-                    Some(n) => format!("☰ {n}, "),
-                    None => String::new(),
-                };
-                let size_field = if stored_size != total_size {
-                    format!(
-                        "{} {SIZE_ARROW} {}",
-                        format_size(*total_size),
-                        format_size(*stored_size)
-                    )
-                } else {
-                    format_size(*total_size)
-                };
-                write!(out, "{indent}")?;
-                paint(out, selected, palette::ACCENT, arrow)?;
-                write!(out, " ")?;
-                paint(out, selected, palette::ACCENT, name)?;
-                let meta = if depth == 0 {
-                    // The checkpoint root: summarise the whole model, including
-                    // the total parameter count (which used to live in a footer).
-                    format!(
-                        " (▦ {tensor_count}, {} params, {size_field})",
-                        format_parameters(*params)
-                    )
-                } else {
-                    format!(" ({layer_prefix}▦ {tensor_count}, {size_field})")
-                };
-                write!(out, "{meta}\r\n")?;
-            }
-            TreeNode::Tensor { info, label } => {
-                // In search mode (depth 0), show the full name; otherwise the
-                // compacted label if this leaf absorbed a single-child folder
-                // chain (e.g. `self_attn.k_norm.weight`), else the last segment.
-                let display_name = if depth == 0 {
-                    info.name.as_str()
-                } else if let Some(label) = label {
-                    label.as_str()
-                } else {
-                    crate::tree::last_segment(&info.name)
-                };
-                // The name, shape and size read at full strength; only the leaf
-                // marker and the storage tag (codec / "uncompressed") are dimmed, and the
-                // dtype is tinted. `⇩` marks a compressed tensor. A tensor on disk
-                // but absent from the index gets a red `✚` (an "extra") instead of
-                // the dot.
-                // Align the leaf marker with sibling group markers at this depth
-                // (the depth already accounts for nesting — no extra indent).
-                write!(out, "{indent}")?;
-                if unindexed.contains(&info.source_path) {
-                    paint(out, selected, palette::UNINDEXED, UNINDEXED_MARK)?;
-                } else {
-                    paint(out, selected, palette::DIM, "·")?;
-                }
-                write!(out, " {display_name} [")?;
-                paint(out, selected, palette::DTYPE, &info.dtype)?;
-                // A fused-codebook tensor carries a logical (unmerged) layout that
-                // matters more than its sizes: show `physical as logical` for both
-                // the dtype and the shape (e.g. `U16 as u3×5, (26,…) as (130,…)`).
-                let schema = packing_schemas.get(&info.name);
-                if let Some(s) = schema {
-                    paint(out, selected, palette::DIM, " as ")?;
-                    paint(out, selected, palette::DTYPE, &s.label())?;
-                }
-                write!(out, ", {}", format_shape(&info.shape))?;
-                if let Some(s) = schema {
-                    let logical =
-                        ViewDtype::Unpacked.logical_shape_with(&info.shape, &info.dtype, Some(s));
-                    paint(out, selected, palette::DIM, " as ")?;
-                    write!(out, "{}", format_shape(&logical))?;
-                }
-                write!(out, ", ")?;
-                match &info.storage {
-                    Storage::Compressed {
-                        codec,
-                        stored_bytes,
-                    } => {
-                        write!(
-                            out,
-                            "{} {SIZE_ARROW} {} ",
-                            format_size(info.size_bytes),
-                            format_size(*stored_bytes)
-                        )?;
-                        paint(
-                            out,
-                            selected,
-                            palette::DIM,
-                            &format!("({COMPRESSED_MARK} {codec})"),
-                        )?;
-                    }
-                    Storage::Raw => {
-                        write!(out, "{} ", format_size(info.size_bytes))?;
-                        paint(out, selected, palette::DIM, UNCOMPRESSED_TAG)?;
-                    }
-                    Storage::Unknown => write!(out, "{}", format_size(info.size_bytes))?,
-                }
-                write!(out, "]\r\n")?;
-            }
-            TreeNode::Metadata { info } => {
-                // Collapse the value (which may be multi-line pretty-printed
-                // JSON) into a compact one-line preview — otherwise its newlines
-                // cascade across the tree. The full value shows in the detail
-                // view. Truncate by chars so we never split a UTF-8 boundary.
-                let flat = info.value.split_whitespace().collect::<Vec<_>>().join(" ");
-                let truncated_value = if flat.chars().count() > 50 {
-                    let head: String = flat.chars().take(47).collect();
-                    format!("{head}...")
-                } else {
-                    flat
-                };
-                // Align the leaf marker with sibling group markers at this depth
-                // (the depth already accounts for nesting — no extra indent).
-                write!(out, "{indent}")?;
-                // Muted symbol + name so the whole row reads as a side note.
-                paint(out, selected, palette::META, "†")?;
-                write!(out, " ")?;
-                paint(out, selected, palette::META, &metadata_short(&info.name))?;
-                paint(
-                    out,
-                    selected,
-                    palette::DIM,
-                    &format!(" [{}]: {truncated_value}", info.value_type),
-                )?;
-                write!(out, "\r\n")?;
-            }
-        }
-        Ok(())
     }
 
     /// Body rows visible in the tree at the given size — used to compute the
@@ -652,8 +310,7 @@ impl UI {
 
     /// Ratatui render of the tree browser: header (title, hint or search line,
     /// rule), the visible tree rows from `config.scroll_offset`, and the bottom
-    /// two-line status bar. The Ratatui port of [`Self::draw_screen`]; shares the
-    /// same `DrawConfig`.
+    /// two-line status bar, driven by the shared `DrawConfig`.
     pub fn render_tree(frame: &mut Frame, config: &DrawConfig) {
         let area = frame.area();
         let (width, height) = (area.width, area.height);
@@ -674,12 +331,12 @@ impl UI {
         if config.health_warning {
             title.push(Span::styled(
                 "   ⚠ index/file mismatch — press ",
-                Style::default().fg(to_ratatui(palette::ERROR)),
+                Style::default().fg(palette::ERROR),
             ));
             title.push(Span::styled(
                 "h",
                 Style::default()
-                    .fg(to_ratatui(palette::KEY))
+                    .fg(palette::KEY)
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -695,7 +352,7 @@ impl UI {
         // Separator rule.
         lines.push(Line::from(Span::styled(
             "─".repeat(width as usize),
-            Style::default().fg(to_ratatui(palette::DIM)),
+            Style::default().fg(palette::DIM),
         )));
 
         let header_rows = lines.len();
@@ -740,7 +397,7 @@ impl UI {
                 Span::styled(
                     "Esc",
                     Style::default()
-                        .fg(to_ratatui(palette::KEY))
+                        .fg(palette::KEY)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" to exit search"),
@@ -750,8 +407,8 @@ impl UI {
             Line::from(Span::styled(
                 format!(" {} {text} ", config.status_icon),
                 Style::default()
-                    .bg(to_ratatui(palette::STATUS_BG))
-                    .fg(to_ratatui(palette::STATUS_FG)),
+                    .bg(palette::STATUS_BG)
+                    .fg(palette::STATUS_FG),
             ))
         } else {
             Line::default()
@@ -771,14 +428,14 @@ impl UI {
             Line::from(Span::styled(
                 format!("✓ Copied {flash} to the clipboard"),
                 Style::default()
-                    .fg(to_ratatui(palette::SUCCESS))
+                    .fg(palette::SUCCESS)
                     .add_modifier(Modifier::BOLD),
             ))
         } else if !config.status_secondary.is_empty() {
             let text = truncate_keep_end(config.status_secondary, max_text);
             Line::from(Span::styled(
                 format!("   {text}"),
-                Style::default().fg(to_ratatui(palette::DIM)),
+                Style::default().fg(palette::DIM),
             ))
         } else {
             Line::default()
@@ -794,8 +451,7 @@ impl UI {
         );
     }
 
-    /// Render the tensor detail screen — the Ratatui port of
-    /// [`UI::draw_tensor_detail`]. `view` is the active dtype reinterpretation
+    /// Render the tensor detail screen. `view` is the active dtype reinterpretation
     /// (which changes the shown dtype, shape and parameter count); `overridable`
     /// gates the `d`/`r` hints. `histogram` adds the value-histogram section below
     /// the header. A pop-up `overlay` (legend / copied command) composites last.
@@ -885,11 +541,10 @@ impl UI {
         }
     }
 
-    /// Composite the context-sensitive glyph legend over the live detail frame as
-    /// a floating, panel-backed band centred vertically — the Ratatui port of
-    /// [`Self::write_legend_band`], drawn last so the screen behind keeps
-    /// animating. (The raw band is still used by the tree's `show_legend`, the
-    /// data views and `--plain` for the non-detail screens.)
+    /// Composite the context-sensitive glyph legend over the live frame as a
+    /// floating, panel-backed band centred vertically, drawn last so the screen
+    /// behind keeps animating. Shared by every screen's `l` overlay and by
+    /// `--plain --legend`.
     pub fn render_legend_band(frame: &mut Frame, legend: Legend) {
         let content = legend_band_lines(legend);
         // Band = a blank margin row, the content, a blank margin row; centred.
@@ -899,12 +554,12 @@ impl UI {
         render_panel_band(frame, band);
     }
 
-    /// Composite the copied-CLI-command pop-up over the live detail frame — a
-    /// centred, panel-backed band (blank, title, rule, the wrapped command, rule,
-    /// footer, blank). The Ratatui port of [`Self::write_command_band`].
+    /// Composite the copied-CLI-command pop-up over the live frame — a centred,
+    /// panel-backed band (blank, title, rule, the wrapped command, rule, footer,
+    /// blank).
     pub fn render_command_band(frame: &mut Frame, command: &str) {
         let term_w = frame.area().width as usize;
-        let rule_color = Style::default().fg(to_ratatui(palette::ACCENT));
+        let rule_color = Style::default().fg(palette::ACCENT);
         let rule = "─".repeat(term_w);
 
         // blank, header, rule, command(rows), rule, footer, blank.
@@ -914,12 +569,12 @@ impl UI {
             Span::styled(
                 "CLI command",
                 Style::default()
-                    .fg(to_ratatui(palette::KEY))
+                    .fg(palette::KEY)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "   ✓ copied to the clipboard",
-                Style::default().fg(to_ratatui(palette::SUCCESS)),
+                Style::default().fg(palette::SUCCESS),
             ),
         ]));
         band.push(Line::from(Span::styled(rule.clone(), rule_color)));
@@ -974,7 +629,7 @@ impl UI {
             Span::raw("  "),
             Span::styled(
                 format!("{spinner} reading checkpoint structure"),
-                Style::default().fg(to_ratatui(palette::ACCENT)),
+                Style::default().fg(palette::ACCENT),
             ),
             dim_span(format!("  ({:.1}s)", elapsed.as_secs_f64())),
         ]));
@@ -1010,7 +665,7 @@ impl UI {
         let mut lines: Vec<Line> = vec![
             Line::from(Span::styled(
                 "Metadata Details",
-                Style::default().fg(to_ratatui(palette::ACCENT)),
+                Style::default().fg(palette::ACCENT),
             )),
             Line::from(dim_span("================")),
             Line::from(vec![dim_span("Key: "), Span::raw(metadata.name.clone())]),
@@ -1131,9 +786,9 @@ impl UI {
             let bottom = sample.values.get(r + 1);
             let mut spans: Vec<Span> = Vec::with_capacity(top.len());
             for (c, &tv) in top.iter().enumerate() {
-                let mut style = Style::default().fg(to_ratatui(heat_color(norm(tv))));
+                let mut style = Style::default().fg(heat_color(norm(tv)));
                 if let Some(below) = bottom {
-                    style = style.bg(to_ratatui(heat_color(norm(below[c]))));
+                    style = style.bg(heat_color(norm(below[c])));
                 }
                 spans.push(Span::styled("▀", style));
             }
@@ -1146,7 +801,7 @@ impl UI {
         for i in 0..24 {
             legend.push(Span::styled(
                 "█",
-                Style::default().fg(to_ratatui(heat_color(i as f64 / 23.0))),
+                Style::default().fg(heat_color(i as f64 / 23.0)),
             ));
         }
         legend.push(Span::raw(format!(" high {hi}")));
@@ -1236,7 +891,7 @@ impl UI {
         let row_gap = gap(&sample.rows);
         let col_gap = gap(&sample.cols);
         let lw = 6usize;
-        let dim = Style::default().fg(to_ratatui(palette::DIM));
+        let dim = Style::default().fg(palette::DIM);
 
         // Column-index header (with a "⋯" gap column). Wide cells fit the index
         // in a single row; narrow cells stagger labels across two rows.
@@ -1310,7 +965,7 @@ impl UI {
         for (i, row) in sample.values.iter().enumerate() {
             // Row striping bands the whole line; carried as a per-span background
             // so the index label is included like the raw path's band start.
-            let row_bg = (stripe == StripeMode::Rows).then(|| to_ratatui(band(i)));
+            let row_bg = (stripe == StripeMode::Rows).then(|| band(i));
             let bg_style = |base: Style| match row_bg {
                 Some(c) => base.bg(c),
                 None => base,
@@ -1338,11 +993,11 @@ impl UI {
                         format!("{body:>cw$}")
                     }
                 };
-                let col_bg = (stripe == StripeMode::Cols).then(|| to_ratatui(band(vcol)));
+                let col_bg = (stripe == StripeMode::Cols).then(|| band(vcol));
                 spans.extend(grid_cell_spans(&s, col_bg, false, row_bg));
                 vcol += 1;
                 if Some(j) == col_gap {
-                    let col_bg = (stripe == StripeMode::Cols).then(|| to_ratatui(band(vcol)));
+                    let col_bg = (stripe == StripeMode::Cols).then(|| band(vcol));
                     spans.extend(grid_cell_spans(
                         &format!("{:>cw$}", "⋯"),
                         col_bg,
@@ -1393,8 +1048,8 @@ impl UI {
                 menu.push(Span::styled(
                     label,
                     Style::default()
-                        .fg(to_ratatui(palette::SELECT_FG))
-                        .bg(to_ratatui(palette::SELECT_BG))
+                        .fg(palette::SELECT_FG)
+                        .bg(palette::SELECT_BG)
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
@@ -1414,10 +1069,7 @@ impl UI {
     /// input box and a feedback line below for an out-of-range / invalid entry.
     pub fn render_slice_prompt(frame: &mut Frame, slices: usize, input: &str, error: Option<&str>) {
         let mut prompt: Vec<Span> = vec![
-            Span::styled(
-                "Go to slice ",
-                Style::default().fg(to_ratatui(palette::KEY)),
-            ),
+            Span::styled("Go to slice ", Style::default().fg(palette::KEY)),
             dim_span(format!("(0-{} or 0-100%)", slices.saturating_sub(1))),
             Span::raw("  "),
         ];
@@ -1443,7 +1095,7 @@ impl UI {
         let mut prompt: Vec<Span> = vec![
             Span::styled(
                 format!("Reshape {} ", format_shape(stored)),
-                Style::default().fg(to_ratatui(palette::KEY)),
+                Style::default().fg(palette::KEY),
             ),
             dim_span(format!(
                 "(dims multiplying to {elements}; `-1`/`*`/`_` infers one; empty clears)"
@@ -1465,7 +1117,7 @@ impl UI {
     pub fn render_text_prompt(frame: &mut Frame, label: &str, input: &str, error: Option<&str>) {
         let mut prompt: Vec<Span> = vec![Span::styled(
             format!("{label} "),
-            Style::default().fg(to_ratatui(palette::KEY)),
+            Style::default().fg(palette::KEY),
         )];
         prompt.extend(input_box_spans(input, input.chars().count(), 24));
         prompt.push(Span::raw("  "));
@@ -1487,8 +1139,8 @@ impl UI {
                 strip.push(Span::styled(
                     label,
                     Style::default()
-                        .fg(to_ratatui(palette::SELECT_FG))
-                        .bg(to_ratatui(palette::SELECT_BG))
+                        .fg(palette::SELECT_FG)
+                        .bg(palette::SELECT_BG)
                         .add_modifier(Modifier::BOLD),
                 ));
             } else {
@@ -1531,10 +1183,7 @@ impl UI {
         let filled = (frac * WIDTH as f64).round() as usize;
         let bar = Line::from(vec![
             Span::raw("["),
-            Span::styled(
-                "█".repeat(filled),
-                Style::default().fg(to_ratatui(palette::KEY)),
-            ),
+            Span::styled("█".repeat(filled), Style::default().fg(palette::KEY)),
             dim_span("░".repeat(WIDTH.saturating_sub(filled))),
             Span::raw(format!("] {done}/{total}")),
         ]);
@@ -1552,7 +1201,7 @@ impl UI {
     /// (title, underline rule, body, footer) over the pop-up panel surface.
     pub fn render_message(frame: &mut Frame, title: &str, message: &str) {
         let area = frame.area();
-        let panel = Style::default().bg(to_ratatui(palette::PANEL_BG));
+        let panel = Style::default().bg(palette::PANEL_BG);
         // Fill the whole screen with the panel surface first, like the raw path's
         // `Clear(All)` over a set background.
         Paragraph::new("")
@@ -1602,7 +1251,7 @@ impl UI {
         Paragraph::new(Line::from(Span::styled(
             msg,
             Style::default()
-                .fg(to_ratatui(palette::SUCCESS))
+                .fg(palette::SUCCESS)
                 .add_modifier(Modifier::BOLD),
         )))
         .render(
@@ -1623,11 +1272,11 @@ impl UI {
         let mut lines: Vec<Line> = vec![
             Line::from(Span::styled(
                 "⚠  Checkpoint health check",
-                Style::default().fg(to_ratatui(palette::WARN)),
+                Style::default().fg(palette::WARN),
             )),
             Line::from(Span::styled(
                 "=".repeat(60),
-                Style::default().fg(to_ratatui(palette::WARN)),
+                Style::default().fg(palette::WARN),
             )),
         ];
         for report in reports {
@@ -1637,7 +1286,7 @@ impl UI {
                     "{} does not match the .safetensors files on disk.",
                     report.index_path
                 ),
-                Style::default().fg(to_ratatui(palette::WARN)),
+                Style::default().fg(palette::WARN),
             )));
             lines.push(Line::default());
             health_section_lines(
@@ -1670,260 +1319,6 @@ impl UI {
         )));
         Paragraph::new(lines).render(frame.area(), frame.buffer_mut());
     }
-
-    /// Composite the legend band onto `dst` (it does not bracket its own
-    /// synchronized update), centred vertically as a floating pop-up. Used both
-    /// standalone (by [`Self::draw_legend`]) and as the overlay layer of
-    /// [`Self::draw_tensor_detail`], drawn last over the live detail frame so the
-    /// screen behind keeps animating; also appended after a `--plain` screen to
-    /// render `--legend`.
-    pub fn write_legend_band(dst: &mut impl Write, legend: Legend) -> Result<()> {
-        // Render the legend body into a buffer first so it can be centred as a
-        // floating band on replay. The body writes plain content — each line
-        // ending in a newline — while the panel background and positioning are
-        // applied to `dst` below.
-        let mut out: Vec<u8> = Vec::new();
-
-        let title = match legend {
-            Legend::Tree => "Legend — checkpoint tree",
-            Legend::Detail => "Legend — tensor details",
-            Legend::Heatmap => "Legend — heatmap",
-            Legend::Values => "Legend — numeric values",
-        };
-        queue!(out, SetForegroundColor(palette::ACCENT))?;
-        write!(out, "{title}")?;
-        queue!(out, SetForegroundColor(palette::DIM))?;
-        line_end(&mut out)?;
-        write!(out, "{}", "─".repeat(title.chars().count()))?;
-        reset_fg(&mut out)?;
-        line_end(&mut out)?;
-        line_end(&mut out)?;
-
-        match legend {
-            Legend::Tree => {
-                // Example symbols built from the shared glyph constants so the
-                // legend matches what the tree actually renders.
-                let size_example = format!("A {SIZE_ARROW} B");
-                let codec_example = format!("{COMPRESSED_MARK} lz4");
-                let rows = [
-                    (
-                        Some(palette::ACCENT),
-                        "▾ ▸",
-                        "a group, expanded / collapsed (Enter or Space toggles it)",
-                    ),
-                    (Some(palette::DIM), "·", "a tensor (a stored array)"),
-                    (
-                        Some(palette::UNINDEXED),
-                        UNINDEXED_MARK,
-                        "an extra tensor on disk but not listed in the index (model.safetensors.index.json)",
-                    ),
-                    (
-                        Some(palette::META),
-                        "†",
-                        "a metadata entry (shown beside its tensor, or in the Metadata group)",
-                    ),
-                    (
-                        None,
-                        "☰ N",
-                        "number of layers (numbered sub-groups) in the group",
-                    ),
-                    (None, "▦ N", "number of tensors in the group / checkpoint"),
-                    (
-                        None,
-                        size_example.as_str(),
-                        "logical size → on-disk size (shown only when they differ)",
-                    ),
-                    (
-                        Some(palette::DIM),
-                        codec_example.as_str(),
-                        "compressed on disk; the codec is named after the glyph",
-                    ),
-                    (
-                        Some(palette::DIM),
-                        UNCOMPRESSED_TAG,
-                        "stored uncompressed on disk",
-                    ),
-                    (None, "", ""),
-                    (
-                        Some(palette::DTYPE),
-                        "I16",
-                        "the tensor's data type is tinted (warm amber)",
-                    ),
-                    (
-                        None,
-                        "▪ ▸",
-                        "status bar: a single source file / a directory of shards",
-                    ),
-                ];
-                let col = legend_desc_col(&rows, 0);
-                for (color, sym, desc) in rows {
-                    legend_line(&mut out, color, sym, desc, col)?;
-                }
-            }
-            Legend::Detail => {
-                let codec_example = format!("{COMPRESSED_MARK} lz4");
-                let rows = [
-                    (
-                        Some(palette::DIM),
-                        codec_example.as_str(),
-                        "on-disk compression codec; the N× beside it is the ratio (logical ÷ stored)",
-                    ),
-                    (
-                        Some(palette::KEY),
-                        "as",
-                        "the active dtype reinterpretation (press d), e.g. 'BF16 as u4'",
-                    ),
-                    (
-                        None,
-                        "A – B",
-                        "a byte range within the file (the tensor's data offsets)",
-                    ),
-                    (Some(palette::DIM), "·", "separates fields on a line"),
-                    (
-                        Some(palette::UNINDEXED),
-                        UNINDEXED_MARK,
-                        "this tensor is an extra: on disk but not listed in the index (model.safetensors.index.json)",
-                    ),
-                    (
-                        Some(palette::KEY),
-                        "⠋",
-                        "a statistics scan is running (press s to start; any key cancels)",
-                    ),
-                ];
-                let col = legend_desc_col(&rows, 0);
-                for (color, sym, desc) in rows {
-                    legend_line(&mut out, color, sym, desc, col)?;
-                }
-                legend_line(&mut out, None, "", "", col)?;
-                queue!(
-                    out,
-                    terminal::Clear(ClearType::CurrentLine),
-                    SetForegroundColor(palette::DIM)
-                )?;
-                write!(
-                    out,
-                    "  Statistics:  zeros = fraction of exactly-zero values · non-finite = count of NaN/∞"
-                )?;
-                reset_fg(&mut out)?;
-                write!(out, "\r\n")?;
-            }
-            Legend::Heatmap => {
-                let rows = [
-                    (
-                        None,
-                        "▀",
-                        "one cell packs two data rows: its top half is the upper row, its lower half the next",
-                    ),
-                    (
-                        None,
-                        "A → B",
-                        "the stored dtype/shape → the sampled grid size and value range",
-                    ),
-                ];
-                let col = legend_desc_col(&rows, 0);
-                for (color, sym, desc) in rows {
-                    legend_line(&mut out, color, sym, desc, col)?;
-                }
-                // The actual colour ramp, so the scale is unambiguous.
-                queue!(out, terminal::Clear(ClearType::CurrentLine))?;
-                write!(out, "  ")?;
-                queue!(out, SetForegroundColor(palette::DIM))?;
-                write!(out, "low ")?;
-                reset_fg(&mut out)?;
-                for i in 0..24 {
-                    queue!(out, SetForegroundColor(heat_color(i as f64 / 23.0)))?;
-                    write!(out, "█")?;
-                }
-                queue!(out, SetForegroundColor(palette::DIM))?;
-                write!(out, " high")?;
-                reset_fg(&mut out)?;
-                write!(out, "   colour scale: cool = low value, warm = high value")?;
-                write!(out, "\r\n")?;
-            }
-            Legend::Values => {
-                let rows = [
-                    (
-                        Some(palette::DIM),
-                        "12  34",
-                        "row / column indices into the full tensor (dimmed), not data values",
-                    ),
-                    (
-                        Some(palette::DIM),
-                        "⋯",
-                        "columns were skipped here (the gap between the first and last columns)",
-                    ),
-                    (Some(palette::DIM), "⋮", "rows were skipped here"),
-                    (
-                        Some(palette::DIM),
-                        "⋱",
-                        "both rows and columns were skipped (the corner)",
-                    ),
-                    (
-                        None,
-                        "1.2e-3",
-                        "floats use scientific notation; integers print plain",
-                    ),
-                    (
-                        None,
-                        "3f800000",
-                        "press b to cycle the base: dec / hex / oct / bin (raw stored bits)",
-                    ),
-                ];
-                // Reserve room for the wider zebra swatch row drawn below.
-                let col = legend_desc_col(&rows, 8);
-                for (color, sym, desc) in rows {
-                    legend_line(&mut out, color, sym, desc, col)?;
-                }
-                // A live zebra swatch, since it is a background cue, not a glyph.
-                queue!(out, terminal::Clear(ClearType::CurrentLine))?;
-                write!(out, "  ")?;
-                queue!(out, SetBackgroundColor(palette::STRIPE_DARK))?;
-                write!(out, " 12 ")?;
-                queue!(out, SetBackgroundColor(palette::STRIPE_LITE))?;
-                write!(out, " 34 ")?;
-                // Back to the pop-up surface (not the terminal default) for the
-                // description that follows.
-                queue!(out, SetBackgroundColor(palette::PANEL_BG))?;
-                queue!(out, cursor::MoveToColumn(col))?;
-                write!(
-                    out,
-                    "zebra striping traces a row or column (cycle rows/cols/off with z)"
-                )?;
-                write!(out, "\r\n")?;
-            }
-        }
-
-        queue!(out, terminal::Clear(ClearType::CurrentLine))?;
-        write!(out, "\r\n")?;
-        queue!(out, SetForegroundColor(palette::DIM))?;
-        write!(out, "Press any key to close.")?;
-        reset_fg(&mut out)?;
-        line_end(&mut out)?;
-
-        // Replay the buffered legend as a floating band centred over the current
-        // screen: a panel-filled row per content line, framed by a blank margin
-        // row above and below, with the surrounding view left untouched. Every
-        // line ends in a newline, so the newline count is the content height.
-        let lines = out.iter().filter(|&&b| b == b'\n').count();
-        let (_w, h) = crate::plain::term_size();
-        let band_h = lines + 2;
-        let start = ((h as usize).saturating_sub(band_h) / 2) as u16;
-
-        begin_panel(dst)?;
-        // Blank margin row above the content (cleared to the panel surface).
-        queue!(
-            dst,
-            cursor::MoveTo(0, start),
-            terminal::Clear(ClearType::CurrentLine)
-        )?;
-        // The content, then a blank margin row below it — the cursor lands there
-        // after the footer's trailing newline.
-        queue!(dst, cursor::MoveTo(0, start + 1))?;
-        dst.write_all(&out)?;
-        queue!(dst, terminal::Clear(ClearType::CurrentLine))?;
-        end_panel(dst)?;
-        Ok(())
-    }
 }
 
 /// Worst-case display width of a legend symbol: every non-ASCII glyph is counted
@@ -1952,43 +1347,11 @@ fn legend_desc_col(rows: &[(Option<Color>, &str, &str)], reserve: usize) -> u16 
     (2 + widest + 2) as u16
 }
 
-/// Write one legend row: the `symbol` (in `color`, or the default foreground
-/// when `None`), then its description starting at the absolute column `desc_col`.
-/// The description is positioned with a cursor move rather than space-padding, so
-/// it lines up no matter how wide the terminal renders the symbol glyphs. The
-/// whole line is cleared first so the skipped gap shows nothing from the screen
-/// underneath. An all-empty row is just a blank separator line.
-fn legend_line(
-    out: &mut impl Write,
-    color: Option<Color>,
-    symbol: &str,
-    desc: &str,
-    desc_col: u16,
-) -> Result<()> {
-    queue!(out, terminal::Clear(ClearType::CurrentLine))?;
-    if symbol.is_empty() && desc.is_empty() {
-        write!(out, "\r\n")?;
-        return Ok(());
-    }
-    write!(out, "  ")?;
-    match color {
-        Some(c) => {
-            queue!(out, SetForegroundColor(c))?;
-            write!(out, "{symbol}")?;
-            queue!(out, SetForegroundColor(Color::Reset))?;
-        }
-        None => write!(out, "{symbol}")?,
-    }
-    queue!(out, cursor::MoveToColumn(desc_col))?;
-    write!(out, "{desc}\r\n")?;
-    Ok(())
-}
-
 /// One legend row as a styled [`Line`]: a two-space indent, the `symbol` (in
 /// `color`, else default), then the description starting at absolute column
-/// `desc_col` — the Ratatui port of [`legend_line`]. The gap is filled with
-/// spaces sized to the symbol's *rendered* display width (so the description
-/// lines up like the raw `MoveToColumn`). An all-empty row is a blank separator.
+/// `desc_col`. The gap is filled with spaces sized to the symbol's *rendered*
+/// display width, so the description lines up. An all-empty row is a blank
+/// separator.
 fn legend_row_line(color: Option<Color>, symbol: &str, desc: &str, desc_col: u16) -> Line<'static> {
     use unicode_width::UnicodeWidthStr;
     if symbol.is_empty() && desc.is_empty() {
@@ -1996,10 +1359,7 @@ fn legend_row_line(color: Option<Color>, symbol: &str, desc: &str, desc_col: u16
     }
     let mut spans: Vec<Span> = vec![Span::raw("  ")];
     match color {
-        Some(c) => spans.push(Span::styled(
-            symbol.to_string(),
-            Style::default().fg(to_ratatui(c)),
-        )),
+        Some(c) => spans.push(Span::styled(symbol.to_string(), Style::default().fg(c))),
         None => spans.push(Span::raw(symbol.to_string())),
     }
     // Pad from the current column (2 + rendered symbol width) to `desc_col`.
@@ -2019,7 +1379,7 @@ fn render_panel_band(frame: &mut Frame, lines: Vec<Line<'static>>) {
     use unicode_width::UnicodeWidthStr;
     let area = frame.area();
     let width = area.width as usize;
-    let panel = Style::default().bg(to_ratatui(palette::PANEL_BG));
+    let panel = Style::default().bg(palette::PANEL_BG);
     let band_h = lines.len() as u16;
     let start = area.height.saturating_sub(band_h) / 2;
 
@@ -2082,7 +1442,7 @@ fn error_line(error: Option<&str>) -> Line<'static> {
     match error {
         Some(msg) => Line::from(Span::styled(
             msg.to_string(),
-            Style::default().fg(to_ratatui(palette::ERROR)),
+            Style::default().fg(palette::ERROR),
         )),
         None => Line::default(),
     }
@@ -2092,12 +1452,8 @@ fn error_line(error: Option<&str>) -> Line<'static> {
 /// input-coloured field with the caret drawn as an inverted character (or a block
 /// at the end), padded to at least `min_chars`.
 fn input_box_spans(text: &str, cursor: usize, min_chars: usize) -> Vec<Span<'static>> {
-    let field = Style::default()
-        .fg(to_ratatui(palette::INPUT_FG))
-        .bg(to_ratatui(palette::INPUT_BG));
-    let caret = Style::default()
-        .fg(to_ratatui(palette::INPUT_BG))
-        .bg(to_ratatui(palette::INPUT_FG));
+    let field = Style::default().fg(palette::INPUT_FG).bg(palette::INPUT_BG);
+    let caret = Style::default().fg(palette::INPUT_BG).bg(palette::INPUT_FG);
     let chars: Vec<char> = text.chars().collect();
     let cursor = cursor.min(chars.len());
     let mut spans: Vec<Span> = vec![Span::styled(" ", field)];
@@ -2131,7 +1487,7 @@ fn health_section_lines(
     const CAP: usize = 6;
     lines.push(Line::from(Span::styled(
         format!("{title} ({}):", items.len()),
-        Style::default().fg(to_ratatui(color)),
+        Style::default().fg(color),
     )));
     for item in items.iter().take(CAP) {
         lines.push(Line::from(Span::raw(format!("  {item}"))));
@@ -2145,9 +1501,9 @@ fn health_section_lines(
     lines.push(Line::default());
 }
 
-/// Build the context-sensitive legend body as styled [`Line`]s — the Ratatui port
-/// of the body [`UI::write_legend_band`] composes. Title, rule, blank, the
-/// per-screen rows, then the closing blank + "Press any key to close." footer.
+/// Build the context-sensitive legend body as styled [`Line`]s for
+/// [`UI::render_legend_band`]. Title, rule, blank, the per-screen rows, then the
+/// closing blank + "Press any key to close." footer.
 fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
     let title = match legend {
         Legend::Tree => "Legend — checkpoint tree",
@@ -2158,7 +1514,7 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
             title.to_string(),
-            Style::default().fg(to_ratatui(palette::ACCENT)),
+            Style::default().fg(palette::ACCENT),
         )),
         Line::from(dim_span("─".repeat(title.chars().count()))),
         Line::default(),
@@ -2284,7 +1640,7 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
             for i in 0..24 {
                 ramp.push(Span::styled(
                     "█",
-                    Style::default().fg(to_ratatui(heat_color(i as f64 / 23.0))),
+                    Style::default().fg(heat_color(i as f64 / 23.0)),
                 ));
             }
             ramp.push(dim_span(" high"));
@@ -2330,14 +1686,8 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
             // A live zebra swatch, since it is a background cue, not a glyph.
             let mut swatch: Vec<Span> = vec![
                 Span::raw("  "),
-                Span::styled(
-                    " 12 ",
-                    Style::default().bg(to_ratatui(palette::STRIPE_DARK)),
-                ),
-                Span::styled(
-                    " 34 ",
-                    Style::default().bg(to_ratatui(palette::STRIPE_LITE)),
-                ),
+                Span::styled(" 12 ", Style::default().bg(palette::STRIPE_DARK)),
+                Span::styled(" 34 ", Style::default().bg(palette::STRIPE_LITE)),
             ];
             // Pad to the description column (the swatch is 2 + 8 = 10 cells wide).
             let pad = (col as usize).saturating_sub(2 + 8).max(1);
@@ -2352,90 +1702,6 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
     lines.push(Line::default());
     lines.push(Line::from(dim_span("Press any key to close.")));
     lines
-}
-
-/// Start a floating pop-up panel: set the distinct [`palette::PANEL_BG`] so the
-/// overlay reads as a raised surface. While it is active, every `Clear` fills
-/// with the panel background (background-colour erase) and written cells inherit
-/// it, so the whole panel — content, gaps, and cleared margins — is one surface.
-/// Reset foregrounds with [`reset_fg`] (not `ResetColor`) so the panel persists,
-/// and finish with [`end_panel`].
-fn begin_panel(out: &mut impl Write) -> Result<()> {
-    queue!(out, SetBackgroundColor(palette::PANEL_BG))?;
-    Ok(())
-}
-
-/// Reset only the foreground colour, keeping the pop-up panel background so a
-/// following `Clear` still erases to the panel surface rather than to the
-/// terminal default. Use inside a [`begin_panel`] region in place of `ResetColor`.
-fn reset_fg(out: &mut impl Write) -> Result<()> {
-    queue!(out, SetForegroundColor(Color::Reset))?;
-    Ok(())
-}
-
-/// Finish a [`begin_panel`] region: clear colours so the panel background does
-/// not leak into later writes. Cells already painted keep the panel surface
-/// until the caller redraws its own screen over the dismissed pop-up.
-fn end_panel(out: &mut impl Write) -> Result<()> {
-    queue!(out, ResetColor)?;
-    Ok(())
-}
-
-/// Write `text` in `color`, unless `selected` — then write it plain so the
-/// caller's row highlight (inverse video) shows through. Only the foreground is
-/// touched (reset to default after), so any background the caller set persists.
-fn paint(out: &mut impl Write, selected: bool, color: Color, text: &str) -> Result<()> {
-    if selected {
-        write!(out, "{text}")?;
-    } else {
-        queue!(out, SetForegroundColor(color))?;
-        write!(out, "{text}")?;
-        queue!(out, SetForegroundColor(Color::Reset))?;
-    }
-    Ok(())
-}
-
-/// Write a key name highlighted (bold bright-cyan) so it stands out from the
-/// surrounding prose in a hint line. Uses `queue!` so it composes inside a
-/// buffered frame; the caller is responsible for flushing.
-fn key_hint(out: &mut impl Write, key: &str) -> Result<()> {
-    queue!(
-        out,
-        SetAttribute(Attribute::Bold),
-        SetForegroundColor(palette::KEY)
-    )?;
-    write!(out, "{key}")?;
-    queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
-    Ok(())
-}
-
-/// Render a hint line as `key label · key label · …`, highlighting each key.
-/// An item with an empty key is written as a plain segment (e.g. a trailing
-/// "any other key to return"); an empty label writes just the key.
-fn hint_line(out: &mut impl Write, items: &[(&str, &str)]) -> Result<()> {
-    for (i, (key, label)) in items.iter().enumerate() {
-        if i > 0 {
-            write!(out, " · ")?;
-        }
-        if key.is_empty() {
-            write!(out, "{label}")?;
-        } else {
-            key_hint(out, key)?;
-            if !label.is_empty() {
-                write!(out, " {label}")?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Finish the current line: clear any leftover tail (so a shorter new line
-/// doesn't leave stale characters), then move to the start of the next line.
-/// Writing content *before* this clear is what keeps redraws flicker-free.
-fn line_end(out: &mut impl Write) -> Result<()> {
-    queue!(out, terminal::Clear(ClearType::UntilNewLine))?;
-    write!(out, "\r\n")?;
-    Ok(())
 }
 
 /// Footer for the data views: offers the other representation (`m`/`v` switch
@@ -2650,7 +1916,7 @@ fn slice_header_line(sample: &Sample) -> Line<'static> {
 /// the Ratatui port of [`hint_line`]. An empty key writes the label plain; an
 /// empty label writes just the key.
 fn hint_spans(items: &[(&str, &str)]) -> Vec<Span<'static>> {
-    let dim = Style::default().fg(to_ratatui(palette::DIM));
+    let dim = Style::default().fg(palette::DIM);
     let mut spans: Vec<Span> = Vec::new();
     for (i, (key, label)) in items.iter().enumerate() {
         if i > 0 {
@@ -2741,7 +2007,7 @@ fn grid_cell_spans(
     row_bg: Option<ratatui::style::Color>,
 ) -> Vec<Span<'static>> {
     let base = if dim {
-        Style::default().fg(to_ratatui(palette::DIM))
+        Style::default().fg(palette::DIM)
     } else {
         Style::default()
     };
@@ -2788,49 +2054,6 @@ fn edge_desc(idx: &[usize], total: usize) -> String {
     }
 }
 
-/// Render a text-input field: the typed `text` plus a block cursor, on the
-/// input palette colours, padded to at least `min_chars` characters wide. Used
-/// by the search bar and the slice-jump prompt so every input box matches. The
-/// block cursor sits at character index `cursor` (in `0..=len`): inside the text
-/// it inverts the character under it, at the end it is a trailing block.
-fn input_box(out: &mut impl Write, text: &str, cursor: usize, min_chars: usize) -> Result<()> {
-    queue!(
-        out,
-        SetBackgroundColor(palette::INPUT_BG),
-        SetForegroundColor(palette::INPUT_FG)
-    )?;
-    let chars: Vec<char> = text.chars().collect();
-    let cursor = cursor.min(chars.len());
-    write!(out, " ")?;
-    for (i, ch) in chars.iter().enumerate() {
-        if i == cursor {
-            // Invert the input colours to draw the caret over this character.
-            queue!(
-                out,
-                SetBackgroundColor(palette::INPUT_FG),
-                SetForegroundColor(palette::INPUT_BG)
-            )?;
-            write!(out, "{ch}")?;
-            queue!(
-                out,
-                SetBackgroundColor(palette::INPUT_BG),
-                SetForegroundColor(palette::INPUT_FG)
-            )?;
-        } else {
-            write!(out, "{ch}")?;
-        }
-    }
-    if cursor >= chars.len() {
-        write!(out, "█")?;
-    }
-    for _ in chars.len()..min_chars {
-        write!(out, " ")?;
-    }
-    write!(out, " ")?;
-    queue!(out, ResetColor)?;
-    Ok(())
-}
-
 /// Human-readable scan duration: milliseconds under a second, else seconds.
 fn fmt_duration(d: Duration) -> String {
     let ms = d.as_millis();
@@ -2871,21 +2094,30 @@ fn layer_count(children: &[TreeNode]) -> Option<usize> {
 }
 
 /// Translate a palette [`Color`] to the equivalent `yansi` color, so the JSON
-/// highlighter can be styled from the same constants as the rest of the UI.
+/// highlighter can be styled from the same constants as the rest of the UI. The
+/// 16 ANSI-named indices map to yansi's named colors (so e.g. `Indexed(8)` emits
+/// the bright-black SGR, not `38;5;8`); other indices use the 256-color cube.
 fn to_yansi(color: Color) -> yansi::Color {
     use yansi::Color as Y;
     match color {
-        Color::AnsiValue(n) => Y::Fixed(n),
-        Color::Rgb { r, g, b } => Y::Rgb(r, g, b),
-        Color::Black => Y::Black,
-        Color::DarkGrey => Y::BrightBlack,
-        Color::Red | Color::DarkRed => Y::Red,
-        Color::Green | Color::DarkGreen => Y::Green,
-        Color::Yellow | Color::DarkYellow => Y::Yellow,
-        Color::Blue | Color::DarkBlue => Y::Blue,
-        Color::Magenta | Color::DarkMagenta => Y::Magenta,
-        Color::Cyan | Color::DarkCyan => Y::Cyan,
-        Color::White | Color::Grey => Y::White,
+        Color::Black | Color::Indexed(0) => Y::Black,
+        Color::Red | Color::Indexed(1) => Y::Red,
+        Color::Green | Color::Indexed(2) => Y::Green,
+        Color::Yellow | Color::Indexed(3) => Y::Yellow,
+        Color::Blue | Color::Indexed(4) => Y::Blue,
+        Color::Magenta | Color::Indexed(5) => Y::Magenta,
+        Color::Cyan | Color::Indexed(6) => Y::Cyan,
+        Color::Gray | Color::Indexed(7) => Y::White,
+        Color::DarkGray | Color::Indexed(8) => Y::BrightBlack,
+        Color::LightRed | Color::Indexed(9) => Y::Red,
+        Color::LightGreen | Color::Indexed(10) => Y::Green,
+        Color::LightYellow | Color::Indexed(11) => Y::Yellow,
+        Color::LightBlue | Color::Indexed(12) => Y::Blue,
+        Color::LightMagenta | Color::Indexed(13) => Y::Magenta,
+        Color::LightCyan | Color::Indexed(14) => Y::Cyan,
+        Color::White | Color::Indexed(15) => Y::White,
+        Color::Indexed(n) => Y::Fixed(n),
+        Color::Rgb(r, g, b) => Y::Rgb(r, g, b),
         _ => Y::Primary,
     }
 }
@@ -2916,10 +2148,10 @@ fn json_styler() -> colored_json::Styler {
 fn tree_span(selected: bool, color: Color, text: impl Into<String>) -> Span<'static> {
     let style = if selected {
         Style::default()
-            .fg(to_ratatui(palette::SELECT_FG))
-            .bg(to_ratatui(palette::SELECT_BG))
+            .fg(palette::SELECT_FG)
+            .bg(palette::SELECT_BG)
     } else {
-        Style::default().fg(to_ratatui(color))
+        Style::default().fg(color)
     };
     Span::styled(text.into(), style)
 }
@@ -2948,9 +2180,9 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> Vec<Line<'static>> {
 
     let width = width as usize;
     let key_style = Style::default()
-        .fg(to_ratatui(palette::KEY))
+        .fg(palette::KEY)
         .add_modifier(Modifier::BOLD);
-    let sep_style = Style::default().fg(to_ratatui(palette::DIM));
+    let sep_style = Style::default().fg(palette::DIM);
     let mut lines: Vec<Line> = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
     let mut col = 0usize;
@@ -2977,9 +2209,9 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> Vec<Line<'static>> {
 
 /// The search bar header line: `Search [query▒]  N matches  Enter view · …`.
 fn tree_search_line(config: &DrawConfig) -> Line<'static> {
-    let dim = Style::default().fg(to_ratatui(palette::DIM));
+    let dim = Style::default().fg(palette::DIM);
     let key_style = Style::default()
-        .fg(to_ratatui(palette::KEY))
+        .fg(palette::KEY)
         .add_modifier(Modifier::BOLD);
     let mut spans: Vec<Span> = vec![Span::styled("Search ", dim)];
 
@@ -2998,9 +2230,7 @@ fn tree_search_line(config: &DrawConfig) -> Line<'static> {
     boxed.push(' ');
     spans.push(Span::styled(
         boxed,
-        Style::default()
-            .bg(to_ratatui(palette::INPUT_BG))
-            .fg(to_ratatui(palette::INPUT_FG)),
+        Style::default().bg(palette::INPUT_BG).fg(palette::INPUT_FG),
     ));
 
     if q.is_empty() {
@@ -3025,7 +2255,10 @@ fn tree_search_line(config: &DrawConfig) -> Line<'static> {
     Line::from(spans)
 }
 
-/// One tree row as a styled [`Line`] — the Ratatui port of [`UI::draw_node`].
+/// One tree row as a styled [`Line`]: group names in the accent and dtypes amber,
+/// with the name, shape and size at full strength and only the leaf marker /
+/// storage tag dimmed; a `selected` row is drawn plain so the caller's highlight
+/// reads cleanly.
 fn tree_node_line(
     node: &TreeNode,
     depth: usize,
@@ -3153,7 +2386,7 @@ fn tree_node_line(
 
 /// A dimmed span (field labels, chrome) for the detail screen.
 fn dim_span(text: impl Into<String>) -> Span<'static> {
-    Span::styled(text.into(), Style::default().fg(to_ratatui(palette::DIM)))
+    Span::styled(text.into(), Style::default().fg(palette::DIM))
 }
 
 /// A bold bright-cyan key span (e.g. `s`, `d`) — the Ratatui equivalent of the
@@ -3162,7 +2395,7 @@ fn key_span(key: impl Into<String>) -> Span<'static> {
     Span::styled(
         key.into(),
         Style::default()
-            .fg(to_ratatui(palette::KEY))
+            .fg(palette::KEY)
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -3224,7 +2457,7 @@ fn detail_stats_summary_spans(s: &Stats) -> Vec<Span<'static>> {
     if s.nonfinite > 0 {
         spans.push(Span::styled(
             format!(" · {} non-finite", s.nonfinite),
-            Style::default().fg(to_ratatui(palette::WARN)),
+            Style::default().fg(palette::WARN),
         ));
     }
     spans.push(dim_span(format!("  ({})", fmt_duration(s.elapsed))));
@@ -3272,7 +2505,7 @@ fn detail_field_lines(
 
     lines.push(Line::from(Span::styled(
         "Tensor Details",
-        Style::default().fg(to_ratatui(palette::ACCENT)),
+        Style::default().fg(palette::ACCENT),
     )));
     lines.push(Line::from(dim_span("─".repeat(14))));
     lines.push(Line::from(vec![
@@ -3400,7 +2633,7 @@ fn detail_field_lines(
     if unindexed {
         lines.push(Line::from(Span::styled(
             format!("{UNINDEXED_MARK} on disk but not listed in model.safetensors.index.json"),
-            Style::default().fg(to_ratatui(palette::UNINDEXED)),
+            Style::default().fg(palette::UNINDEXED),
         )));
     }
     lines.push(Line::default());
@@ -3441,10 +2674,9 @@ fn detail_field_lines(
     lines
 }
 
-/// The detail screen's footer hint as wrapped [`Line`]s — the Ratatui port of the
-/// raw footer in [`UI::draw_tensor_detail`], wrapped on the ` · `-free `key
-/// label,` chips the raw line builds (here split into wrappable chunks). Mirrors
-/// the tree's [`tree_hint_lines`] wrapping at `width`.
+/// The detail screen's footer hint as wrapped [`Line`]s, split into `key label,`
+/// chips that wrap at `width` (so a chip is never broken across lines). Mirrors
+/// the tree's [`tree_hint_lines`] wrapping.
 fn detail_footer_lines(overridable: bool, width: u16) -> Vec<Line<'static>> {
     // Each chunk is a run of spans that should not be split across lines; the
     // trailing text of each (the comma + space) keeps the on-screen wording.
@@ -3530,10 +2762,7 @@ fn render_histogram(
             s.push_str(&format!(" {:.0}%", p * 100.0));
         }
         s.push_str(&format!(" ({:.1}s)", elapsed.as_secs_f64()));
-        head.push(Span::styled(
-            s,
-            Style::default().fg(to_ratatui(palette::ACCENT)),
-        ));
+        head.push(Span::styled(s, Style::default().fg(palette::ACCENT)));
     } else if !hist.elapsed.is_zero() {
         head.push(dim_span(format!("  ({})", fmt_duration(hist.elapsed))));
     }
@@ -3582,7 +2811,7 @@ fn render_histogram(
         bar_rows.saturating_sub(1).max(1)
     };
 
-    let accent = Style::default().fg(to_ratatui(palette::ACCENT));
+    let accent = Style::default().fg(palette::ACCENT);
     let bold = Style::default().add_modifier(Modifier::BOLD);
     for i in 0..shown {
         let frac = hist.counts[i] as f64 / max_count as f64;
@@ -3653,7 +2882,7 @@ fn heat_color(t: f64) -> Color {
     let r = (t * 5.0).round() as u8;
     let b = ((1.0 - t) * 5.0).round() as u8;
     let g = ((1.0 - (t - 0.5).abs() * 2.0) * 5.0).round() as u8;
-    Color::AnsiValue(16 + 36 * r + 6 * g + b)
+    Color::Indexed(16 + 36 * r + 6 * g + b)
 }
 
 /// Format an integer with thousands separators (e.g. 579133440 -> "579,133,440").
