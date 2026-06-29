@@ -1965,9 +1965,14 @@ impl Explorer {
             let mut synth: Option<KeyEvent> = None;
             if let Event::Mouse(m) = &ev {
                 let (kind, row, col) = (m.kind, m.row, m.column);
-                self.copied_flash = None;
                 match kind {
                     MouseEventKind::Down(MouseButton::Left) => {
+                        // A fresh click dismisses any lingering copy confirmation;
+                        // if it lands on a copy chip the key match below re-sets it.
+                        // (Don't clear on the button *release* or on drag/motion —
+                        // that would wipe the "Copied" a copy-chip click just set,
+                        // making it flicker.)
+                        self.copied_flash = None;
                         let hit = crate::ui::region_hit(&self.clickable.borrow(), col, row);
                         if let Some(k) = hit {
                             synth = Some(k); // clicked a hint chip / [×]
@@ -2023,9 +2028,11 @@ impl Explorer {
                     // Wheel scrolls the viewport (not the selection); the offset
                     // is clamped to range before the next draw.
                     MouseEventKind::ScrollDown => {
+                        self.copied_flash = None;
                         self.scroll_offset = self.scroll_offset.saturating_add(WHEEL_STEP)
                     }
                     MouseEventKind::ScrollUp => {
+                        self.copied_flash = None;
                         self.scroll_offset = self.scroll_offset.saturating_sub(WHEEL_STEP)
                     }
                     _ => {}
