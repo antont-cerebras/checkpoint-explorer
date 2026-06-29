@@ -1717,7 +1717,7 @@ impl Explorer {
         hist_scanning: Option<crate::ui::ScanProgress>,
         overlay: Option<&Overlay>,
     ) {
-        UI::render_detail(
+        *self.clickable.borrow_mut() = UI::render_detail(
             frame,
             tensor,
             shape,
@@ -3151,8 +3151,20 @@ impl Explorer {
             } else {
                 event::read()
             };
-            // Any key dismisses a lingering copy confirmation; `c` sets it again.
-            copied_since = None;
+            // A fresh key or click dismisses a lingering copy confirmation (`c`
+            // re-sets it below). The button *release* / drag / motion that follows
+            // a click must NOT, or the "Copied" the click set would flicker away.
+            let fresh = match &ev {
+                Ok(Event::Key(_)) => true,
+                Ok(Event::Mouse(m)) => matches!(
+                    m.kind,
+                    MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ),
+                _ => false,
+            };
+            if fresh {
+                copied_since = None;
+            }
             // While a pop-up overlay is up, any key dismisses it (Ctrl-C still
             // quits) rather than acting as a screen command; the loop then
             // redraws the detail without it.
@@ -3173,6 +3185,22 @@ impl Explorer {
                 }
                 continue;
             }
+            // A click on a footer chip / `[×]` acts like its key, routed through the
+            // match below; other mouse events (wheel, release, drag, motion) do
+            // nothing on the detail screen.
+            let ev = match ev {
+                Ok(Event::Mouse(m)) => {
+                    if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                        match crate::ui::region_hit(&self.clickable.borrow(), m.column, m.row) {
+                            Some(k) => Ok(Event::Key(k)),
+                            None => continue,
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                other => other,
+            };
             match ev {
                 Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
                 Ok(Event::Key(KeyEvent {

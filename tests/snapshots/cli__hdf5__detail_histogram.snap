@@ -2,7 +2,7 @@
 source: tests/cli.rs
 expression: "plain(&[\"--tensor\", &t, \"--histogram\"])"
 ---
-Tensor Details
+Tensor Details                                                                                                       [×]
 ──────────────
 Name: model.layers.0.block_sparse_moe.experts.down_proj.weight
 Data Type: U16 as u3×5 (unpacked)

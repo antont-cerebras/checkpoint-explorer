@@ -2,7 +2,7 @@
 source: tests/cli.rs
 expression: "plain(&[\"--tensor\", \"model.embed_tokens.weight\"])"
 ---
-Tensor Details
+Tensor Details                                                                                                       [×]
 ──────────────
 Name: model.embed_tokens.weight
 Data Type: F16

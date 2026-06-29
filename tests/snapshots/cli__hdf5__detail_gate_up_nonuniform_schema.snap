@@ -2,7 +2,7 @@
 source: tests/cli.rs
 expression: "plain(&[\"--tensor\", &t])"
 ---
-Tensor Details
+Tensor Details                                                                                                       [×]
 ──────────────
 Name: model.layers.0.block_sparse_moe.experts.gate_up_proj.weight
 Data Type: U16 as [4,3,3,6] (unpacked)
