@@ -8,9 +8,16 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, BufWriter, Write};
 use std::time::Duration;
 
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Widget};
+
 use crate::health::HealthReport;
 use crate::sample::{HistBins, Histogram, PackingSchema, Sample, SampleMode, Stats, ViewDtype};
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo, TreeNode, metadata_short};
+use crate::tui::to_ratatui;
 use crate::utils::{format_parameters, format_shape, format_size};
 
 /// A still-forming scan's progress indicator: a spinner glyph, the elapsed time,
@@ -114,6 +121,9 @@ pub struct DrawConfig<'a> {
     /// Per-tensor fused-codebook packing schemas, keyed by tensor name. A tensor
     /// with one shows its logical (unmerged) dtype and shape beside the physical.
     pub packing_schemas: &'a HashMap<String, PackingSchema>,
+    /// A transient "✓ Copied …" confirmation to flash on the bottom line (over
+    /// the secondary status), set by the tree's copy shortcuts.
+    pub copied_flash: Option<&'a str>,
 }
 
 /// How a screen should render the statistics area: not computed yet, a scan in
@@ -617,6 +627,171 @@ impl UI {
             }
         }
         Ok(())
+    }
+
+    /// Body rows visible in the tree at the given size — used to compute the
+    /// scroll offset so it stays consistent with [`Self::render_tree`]'s layout
+    /// (header = title + hint/search line(s) + rule; footer = the two status
+    /// lines).
+    pub fn tree_visible_rows(
+        width: u16,
+        height: u16,
+        search_mode: bool,
+        can_repack: bool,
+    ) -> usize {
+        let hint_rows = if search_mode {
+            1
+        } else {
+            tree_hint_lines(can_repack, width).len()
+        };
+        let header = 1 + hint_rows + 1; // title + hint(s) + rule
+        (height as usize)
+            .saturating_sub(header + TREE_FOOTER_HEIGHT)
+            .max(1)
+    }
+
+    /// Ratatui render of the tree browser: header (title, hint or search line,
+    /// rule), the visible tree rows from `config.scroll_offset`, and the bottom
+    /// two-line status bar. The Ratatui port of [`Self::draw_screen`]; shares the
+    /// same `DrawConfig`.
+    pub fn render_tree(frame: &mut Frame, config: &DrawConfig) {
+        let area = frame.area();
+        let (width, height) = (area.width, area.height);
+        if height < (TREE_FOOTER_HEIGHT as u16 + 1) {
+            return;
+        }
+
+        // --- header + tree rows (the region above the 2-line status bar) ---
+        let mut lines: Vec<Line> = Vec::new();
+
+        // Title (+ optional health warning).
+        let mut title = vec![Span::raw(format!(
+            "Checkpoint Explorer - {} ({}/{})",
+            config.current_file,
+            config.file_idx + 1,
+            config.total_files
+        ))];
+        if config.health_warning {
+            title.push(Span::styled(
+                "   ⚠ index/file mismatch — press ",
+                Style::default().fg(to_ratatui(palette::ERROR)),
+            ));
+            title.push(Span::styled(
+                "h",
+                Style::default()
+                    .fg(to_ratatui(palette::KEY))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(title));
+
+        // Hint line(s), or the search bar when searching.
+        if config.search_mode {
+            lines.push(tree_search_line(config));
+        } else {
+            lines.extend(tree_hint_lines(config.can_repack, width));
+        }
+
+        // Separator rule.
+        lines.push(Line::from(Span::styled(
+            "─".repeat(width as usize),
+            Style::default().fg(to_ratatui(palette::DIM)),
+        )));
+
+        let header_rows = lines.len();
+        let body_rows = (height as usize).saturating_sub(header_rows + TREE_FOOTER_HEIGHT);
+
+        // Visible tree rows from the (pre-computed) scroll offset.
+        if !(config.search_mode && config.tree.is_empty()) {
+            for (idx, (node, depth)) in config
+                .tree
+                .iter()
+                .enumerate()
+                .skip(config.scroll_offset)
+                .take(body_rows)
+            {
+                let selected = idx == config.selected_idx;
+                lines.push(tree_node_line(
+                    node,
+                    *depth,
+                    selected,
+                    config.unindexed,
+                    config.packing_schemas,
+                ));
+            }
+        }
+
+        let top = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: height.saturating_sub(TREE_FOOTER_HEIGHT as u16),
+        };
+        Paragraph::new(lines).render(top, frame.buffer_mut());
+
+        // --- bottom two-line status bar ---
+        let max_text = (width as usize).saturating_sub(6);
+        let row0 = if config.search_mode && config.tree.is_empty() {
+            Line::from(vec![
+                Span::raw(format!(
+                    "No results found for \"{}\" | Press ",
+                    config.search_query
+                )),
+                Span::styled(
+                    "Esc",
+                    Style::default()
+                        .fg(to_ratatui(palette::KEY))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" to exit search"),
+            ])
+        } else if !config.status_bar.is_empty() {
+            let text = truncate_keep_end(config.status_bar, max_text);
+            Line::from(Span::styled(
+                format!(" {} {text} ", config.status_icon),
+                Style::default()
+                    .bg(to_ratatui(palette::STATUS_BG))
+                    .fg(to_ratatui(palette::STATUS_FG)),
+            ))
+        } else {
+            Line::default()
+        };
+        Paragraph::new(row0).render(
+            Rect {
+                x: 0,
+                y: height.saturating_sub(2),
+                width,
+                height: 1,
+            },
+            frame.buffer_mut(),
+        );
+
+        // Second line: a copy confirmation (green) overrides the dimmed source file.
+        let row1 = if let Some(flash) = config.copied_flash {
+            Line::from(Span::styled(
+                format!("✓ Copied {flash} to the clipboard"),
+                Style::default()
+                    .fg(to_ratatui(palette::SUCCESS))
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else if !config.status_secondary.is_empty() {
+            let text = truncate_keep_end(config.status_secondary, max_text);
+            Line::from(Span::styled(
+                format!("   {text}"),
+                Style::default().fg(to_ratatui(palette::DIM)),
+            ))
+        } else {
+            Line::default()
+        };
+        Paragraph::new(row1).render(
+            Rect {
+                x: 0,
+                y: height.saturating_sub(1),
+                width,
+                height: 1,
+            },
+            frame.buffer_mut(),
+        );
     }
 
     /// A loading screen shown while the checkpoint structure is read: the same
@@ -2779,6 +2954,247 @@ fn json_styler() -> colored_json::Styler {
         nil_value: dim,
         string_include_quotation: true,
     }
+}
+
+/// One styled span for a tree row: the kind's color normally, or the selection
+/// highlight (black on white) when the row is selected (so the highlight reads
+/// cleanly over the whole row, matching the old inverse-video selection).
+fn tree_span(selected: bool, color: Color, text: impl Into<String>) -> Span<'static> {
+    let style = if selected {
+        Style::default()
+            .fg(to_ratatui(palette::SELECT_FG))
+            .bg(to_ratatui(palette::SELECT_BG))
+    } else {
+        Style::default().fg(to_ratatui(color))
+    };
+    Span::styled(text.into(), style)
+}
+
+/// The tree browser's key-hint line(s), word-wrapped to `width` on the
+/// ` · `-separated `key label` chips (the long hint spills onto a second line).
+fn tree_hint_lines(can_repack: bool, width: u16) -> Vec<Line<'static>> {
+    let mut items: Vec<(&str, &str)> = vec![
+        ("↑/↓", "navigate"),
+        ("←/→", "parent/child"),
+        ("Shift+↑/↓", "sibling"),
+        ("Enter/Space", "expand"),
+        ("E/C", "all"),
+        ("/", "search"),
+        ("l", "legend"),
+        ("c", "copy screen"),
+        ("f", "copy file"),
+        ("n", "copy name"),
+        ("y", "copy command"),
+        ("⌫/\\", "back/fwd"),
+    ];
+    if can_repack {
+        items.push(("R", "repack"));
+    }
+    items.push(("q", "quit"));
+
+    let width = width as usize;
+    let key_style = Style::default()
+        .fg(to_ratatui(palette::KEY))
+        .add_modifier(Modifier::BOLD);
+    let sep_style = Style::default().fg(to_ratatui(palette::DIM));
+    let mut lines: Vec<Line> = Vec::new();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut col = 0usize;
+    for (key, label) in items {
+        let item_w = key.chars().count() + 1 + label.chars().count();
+        let has_prev = !spans.is_empty();
+        if has_prev && col + 3 + item_w > width {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            col = 0;
+        }
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", sep_style));
+            col += 3;
+        }
+        spans.push(Span::styled(key.to_string(), key_style));
+        spans.push(Span::raw(format!(" {label}")));
+        col += item_w;
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// The search bar header line: `Search [query▒]  N matches  Enter view · …`.
+fn tree_search_line(config: &DrawConfig) -> Line<'static> {
+    let dim = Style::default().fg(to_ratatui(palette::DIM));
+    let key_style = Style::default()
+        .fg(to_ratatui(palette::KEY))
+        .add_modifier(Modifier::BOLD);
+    let mut spans: Vec<Span> = vec![Span::styled("Search ", dim)];
+
+    // Input box: leading space, the query, a caret block when the cursor is at
+    // the end, padded to a minimum width, then a trailing space.
+    let q = config.search_query;
+    let qlen = q.chars().count();
+    let mut boxed = String::from(" ");
+    boxed.push_str(q);
+    if config.search_cursor >= qlen {
+        boxed.push('█');
+    }
+    for _ in qlen..16 {
+        boxed.push(' ');
+    }
+    boxed.push(' ');
+    spans.push(Span::styled(
+        boxed,
+        Style::default()
+            .bg(to_ratatui(palette::INPUT_BG))
+            .fg(to_ratatui(palette::INPUT_FG)),
+    ));
+
+    if q.is_empty() {
+        spans.push(Span::raw("  "));
+    } else {
+        let n = config.tree.len();
+        spans.push(Span::styled(
+            format!("  {n} {}  ", if n == 1 { "match" } else { "matches" }),
+            dim,
+        ));
+    }
+    for (i, (key, label)) in [("Enter", "view"), ("Tab", "in tree"), ("Esc", "exit")]
+        .iter()
+        .enumerate()
+    {
+        if i > 0 {
+            spans.push(Span::styled(" · ", dim));
+        }
+        spans.push(Span::styled(key.to_string(), key_style));
+        spans.push(Span::raw(format!(" {label}")));
+    }
+    Line::from(spans)
+}
+
+/// One tree row as a styled [`Line`] — the Ratatui port of [`UI::draw_node`].
+fn tree_node_line(
+    node: &TreeNode,
+    depth: usize,
+    selected: bool,
+    unindexed: &HashSet<String>,
+    packing_schemas: &HashMap<String, PackingSchema>,
+) -> Line<'static> {
+    let indent = "  ".repeat(depth);
+    let plain = |t: String| tree_span(selected, Color::Reset, t);
+    let mut s: Vec<Span> = vec![tree_span(selected, Color::Reset, indent)];
+
+    match node {
+        TreeNode::Group {
+            name,
+            children,
+            expanded,
+            tensor_count,
+            params,
+            total_size,
+            stored_size,
+        } => {
+            let arrow = if *expanded { "▾" } else { "▸" };
+            let layer_prefix = match layer_count(children) {
+                Some(n) => format!("☰ {n}, "),
+                None => String::new(),
+            };
+            let size_field = if stored_size != total_size {
+                format!(
+                    "{} {SIZE_ARROW} {}",
+                    format_size(*total_size),
+                    format_size(*stored_size)
+                )
+            } else {
+                format_size(*total_size)
+            };
+            s.push(tree_span(selected, palette::ACCENT, arrow));
+            s.push(tree_span(selected, Color::Reset, " "));
+            s.push(tree_span(selected, palette::ACCENT, name.clone()));
+            let meta = if depth == 0 {
+                format!(
+                    " (▦ {tensor_count}, {} params, {size_field})",
+                    format_parameters(*params)
+                )
+            } else {
+                format!(" ({layer_prefix}▦ {tensor_count}, {size_field})")
+            };
+            s.push(plain(meta));
+        }
+        TreeNode::Tensor { info, label } => {
+            let display_name = if depth == 0 {
+                info.name.as_str()
+            } else if let Some(label) = label {
+                label.as_str()
+            } else {
+                crate::tree::last_segment(&info.name)
+            };
+            if unindexed.contains(&info.source_path) {
+                s.push(tree_span(selected, palette::UNINDEXED, UNINDEXED_MARK));
+            } else {
+                s.push(tree_span(selected, palette::DIM, "·"));
+            }
+            s.push(plain(format!(" {display_name} [")));
+            s.push(tree_span(selected, palette::DTYPE, info.dtype.clone()));
+            let schema = packing_schemas.get(&info.name);
+            if let Some(sc) = schema {
+                s.push(tree_span(selected, palette::DIM, " as "));
+                s.push(tree_span(selected, palette::DTYPE, sc.label()));
+            }
+            s.push(plain(format!(", {}", format_shape(&info.shape))));
+            if let Some(sc) = schema {
+                let logical =
+                    ViewDtype::Unpacked.logical_shape_with(&info.shape, &info.dtype, Some(sc));
+                s.push(tree_span(selected, palette::DIM, " as "));
+                s.push(plain(format_shape(&logical)));
+            }
+            s.push(plain(", ".to_string()));
+            match &info.storage {
+                Storage::Compressed {
+                    codec,
+                    stored_bytes,
+                } => {
+                    s.push(plain(format!(
+                        "{} {SIZE_ARROW} {} ",
+                        format_size(info.size_bytes),
+                        format_size(*stored_bytes)
+                    )));
+                    s.push(tree_span(
+                        selected,
+                        palette::DIM,
+                        format!("({COMPRESSED_MARK} {codec})"),
+                    ));
+                }
+                Storage::Raw => {
+                    s.push(plain(format!("{} ", format_size(info.size_bytes))));
+                    s.push(tree_span(selected, palette::DIM, UNCOMPRESSED_TAG));
+                }
+                Storage::Unknown => s.push(plain(format_size(info.size_bytes))),
+            }
+            s.push(plain("]".to_string()));
+        }
+        TreeNode::Metadata { info } => {
+            let flat = info.value.split_whitespace().collect::<Vec<_>>().join(" ");
+            let truncated_value = if flat.chars().count() > 50 {
+                let head: String = flat.chars().take(47).collect();
+                format!("{head}...")
+            } else {
+                flat
+            };
+            s.push(tree_span(selected, palette::META, "†"));
+            s.push(tree_span(selected, Color::Reset, " "));
+            s.push(tree_span(
+                selected,
+                palette::META,
+                metadata_short(&info.name),
+            ));
+            s.push(tree_span(
+                selected,
+                palette::DIM,
+                format!(" [{}]: {truncated_value}", info.value_type),
+            ));
+        }
+    }
+    Line::from(s)
 }
 
 /// If `raw` is a JSON object or array, pretty-print it with syntax highlighting
