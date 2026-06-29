@@ -40,6 +40,8 @@ half = { version = "2", optional = true }
 # Zstandard codec for the repack command (registered as an in-process HDF5
 # filter, id 32015); decode-compatible with h5py + hdf5plugin's zstd.
 zstd = { version = "0.13", optional = true }
+colored_json = "5.0.0"
+yansi = "1.0.1"
 
 [dev-dependencies]
 # Cram-like end-to-end CLI tests: run the binary in `--plain` and snapshot the

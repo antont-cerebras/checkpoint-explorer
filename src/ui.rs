@@ -973,6 +973,15 @@ impl UI {
         writeln!(stdout, "================\r")?;
         writeln!(stdout, "Key: {}\r", metadata.name)?;
         writeln!(stdout, "Type: {}\r", metadata.value_type)?;
+
+        // When the value is a JSON object/array, pretty-print it with syntax
+        // highlighting (colors keys/strings/numbers/literals); otherwise show the
+        // raw text lines.
+        let highlighted = highlight_json(&metadata.value);
+        let lines: Vec<String> = match highlighted {
+            Some(colored) => colored,
+            None => metadata.value.lines().map(str::to_string).collect(),
+        };
         writeln!(stdout, "Value:\r")?;
 
         // Show as many value lines as fit the terminal (the lines above plus a
@@ -980,13 +989,12 @@ impl UI {
         // silently — metadata values like a quant config run dozens of lines.
         let rows = terminal::size().map(|(_, h)| h as usize).unwrap_or(40);
         let budget = rows.saturating_sub(8).max(1);
-        let all: Vec<&str> = metadata.value.lines().collect();
-        let shown = all.len().min(budget);
-        for line in &all[..shown] {
+        let shown = lines.len().min(budget);
+        for line in &lines[..shown] {
             writeln!(stdout, "  {line}\r")?;
         }
-        if all.len() > shown {
-            writeln!(stdout, "  … ({} more lines)\r", all.len() - shown)?;
+        if lines.len() > shown {
+            writeln!(stdout, "  … ({} more lines)\r", lines.len() - shown)?;
         }
 
         writeln!(stdout, "\r")?;
@@ -2733,6 +2741,70 @@ fn layer_count(children: &[TreeNode]) -> Option<usize> {
     (groups > 0 && numbered == groups).then_some(numbered)
 }
 
+/// Translate a palette [`Color`] to the equivalent `yansi` color, so the JSON
+/// highlighter can be styled from the same constants as the rest of the UI.
+fn to_yansi(color: Color) -> yansi::Color {
+    use yansi::Color as Y;
+    match color {
+        Color::AnsiValue(n) => Y::Fixed(n),
+        Color::Rgb { r, g, b } => Y::Rgb(r, g, b),
+        Color::Black => Y::Black,
+        Color::DarkGrey => Y::BrightBlack,
+        Color::Red | Color::DarkRed => Y::Red,
+        Color::Green | Color::DarkGreen => Y::Green,
+        Color::Yellow | Color::DarkYellow => Y::Yellow,
+        Color::Blue | Color::DarkBlue => Y::Blue,
+        Color::Magenta | Color::DarkMagenta => Y::Magenta,
+        Color::Cyan | Color::DarkCyan => Y::Cyan,
+        Color::White | Color::Grey => Y::White,
+        _ => Y::Primary,
+    }
+}
+
+/// JSON highlighting styled from the app palette, so a metadata config reads in
+/// the same colors as the rest of the UI: keys in the structural cyan accent
+/// (like tree groups), numbers in the amber dtype color, strings green, and the
+/// brackets/colons dimmed so the structure recedes behind the values.
+fn json_styler() -> colored_json::Styler {
+    let dim = to_yansi(palette::DIM).foreground();
+    colored_json::Styler {
+        object_brackets: dim,
+        object_colon: dim,
+        array_brackets: dim,
+        key: to_yansi(palette::ACCENT).bold(),
+        string_value: to_yansi(palette::SUCCESS).foreground(),
+        integer_value: to_yansi(palette::DTYPE).foreground(),
+        float_value: to_yansi(palette::DTYPE).foreground(),
+        bool_value: to_yansi(palette::WARN).foreground(),
+        nil_value: dim,
+        string_include_quotation: true,
+    }
+}
+
+/// If `raw` is a JSON object or array, pretty-print it with syntax highlighting
+/// (via `colored_json`, styled from [`json_styler`]) and return one ANSI-colored
+/// string per line; otherwise `None`, so the caller shows the raw text. Bare
+/// scalars (a lone string/number) aren't worth reformatting, so they fall
+/// through to the raw path too.
+fn highlight_json(raw: &str) -> Option<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    if !value.is_object() && !value.is_array() {
+        return None;
+    }
+    // `colored_json` paints via yansi, whose default condition drops the ANSI
+    // codes when stdout isn't a detected TTY (which would also make the result
+    // non-deterministic). We render into our own buffer and own the terminal, so
+    // force coloring on.
+    yansi::enable();
+    let pretty = colored_json::ColoredFormatter::with_styler(
+        colored_json::PrettyFormatter::new(),
+        json_styler(),
+    )
+    .to_colored_json(&value, colored_json::ColorMode::On)
+    .ok()?;
+    Some(pretty.split('\n').map(str::to_string).collect())
+}
+
 /// Truncate `s` to at most `width` characters, keeping the END (so a path's
 /// file name stays visible) and prefixing `…` when truncated.
 fn truncate_keep_end(s: &str, width: usize) -> String {
@@ -3000,6 +3072,54 @@ fn fmt_hist_edge(x: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drop CSI escape sequences (`\x1b[…<letter>`) so a colored string can be
+    /// compared against its plain text.
+    fn strip_ansi_codes(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn highlight_json_colors_objects_and_arrays_only() {
+        // Non-JSON text and bare scalars fall through to the raw path.
+        assert!(highlight_json("just some text").is_none());
+        assert!(highlight_json("\"a lone string\"").is_none());
+        assert!(highlight_json("42").is_none());
+
+        let raw = r#"{"b":[true,null,"x"],"a":1}"#;
+        let lines = highlight_json(raw).expect("an object is highlighted");
+        let joined = lines.join("\n");
+        // Styled from the app palette: keys in the ACCENT color, numbers in the
+        // DTYPE color (256-color SGR `38;5;<n>`), not colored_json's defaults.
+        assert!(
+            joined.contains("38;5;81"),
+            "expected keys in the ACCENT color (81)"
+        );
+        assert!(
+            joined.contains("38;5;215"),
+            "expected numbers in the DTYPE color (215)"
+        );
+        // Stripping the color recovers exactly serde_json's pretty layout, so the
+        // highlighter only adds color and never alters the text itself.
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            strip_ansi_codes(&joined),
+            serde_json::to_string_pretty(&value).unwrap()
+        );
+    }
 
     #[test]
     fn num_base_parses_aliases() {
