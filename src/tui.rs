@@ -1,11 +1,9 @@
 //! Ratatui scaffolding shared by the interactive and headless render paths.
 //!
-//! The app is migrating its hand-rolled crossterm renderer to Ratatui screen by
-//! screen. This module owns the bits both the live loop and the `--plain` /
-//! screen-copy paths need: the live [`Terminal`] lifecycle (deliberately *not*
-//! using the alternate screen, so the last frame stays on exit), an in-memory
-//! [`TestBackend`] render for headless output, and a crossterm→Ratatui color
-//! shim so the existing `palette` constants keep working during the migration.
+//! This module owns the bits both the live loop and the `--plain` / screen-copy
+//! paths need: the live [`Terminal`] lifecycle (deliberately *not* using the
+//! alternate screen, so the last frame stays on exit) and an in-memory
+//! [`TestBackend`] render for headless output.
 
 use std::io::{self, Stdout};
 
@@ -22,37 +20,6 @@ use ratatui::{
 
 /// The live terminal type owned by the interactive loop.
 pub type LiveTerminal = Terminal<CrosstermBackend<Stdout>>;
-
-/// Translate a crossterm [`Color`](crossterm::style::Color) — what the `palette`
-/// constants use — into the equivalent Ratatui color, by ANSI index so the
-/// on-screen color is unchanged. Lets the palette stay crossterm-typed while
-/// screens migrate; the palette flips to native Ratatui colors once the last
-/// raw screen is gone.
-pub fn to_ratatui(color: crossterm::style::Color) -> ratatui::style::Color {
-    use crossterm::style::Color as C;
-    use ratatui::style::Color as R;
-    match color {
-        C::Reset => R::Reset,
-        C::Black => R::Indexed(0),
-        C::DarkRed => R::Indexed(1),
-        C::DarkGreen => R::Indexed(2),
-        C::DarkYellow => R::Indexed(3),
-        C::DarkBlue => R::Indexed(4),
-        C::DarkMagenta => R::Indexed(5),
-        C::DarkCyan => R::Indexed(6),
-        C::Grey => R::Indexed(7),
-        C::DarkGrey => R::Indexed(8),
-        C::Red => R::Indexed(9),
-        C::Green => R::Indexed(10),
-        C::Yellow => R::Indexed(11),
-        C::Blue => R::Indexed(12),
-        C::Magenta => R::Indexed(13),
-        C::Cyan => R::Indexed(14),
-        C::White => R::Indexed(15),
-        C::AnsiValue(n) => R::Indexed(n),
-        C::Rgb { r, g, b } => R::Rgb(r, g, b),
-    }
-}
 
 /// Set up the live terminal: raw mode, a cleared screen, hidden cursor, and a
 /// Ratatui terminal over stdout. Deliberately **no** alternate screen — quitting
@@ -90,10 +57,9 @@ pub fn restore(terminal: &mut LiveTerminal) -> Result<()> {
 }
 
 /// Render `f` once into an in-memory [`TestBackend`] of the given size and return
-/// the resulting screen as plain text — the headless replacement for the old
-/// ANSI-emulator (`plain::render`). Each row is the buffer's cell symbols with
-/// trailing spaces trimmed, and trailing blank rows are dropped, matching the
-/// shape the snapshot tests expect.
+/// the resulting screen as plain text — the headless render path. Each row is the
+/// buffer's cell symbols with trailing spaces trimmed, and trailing blank rows are
+/// dropped, matching the shape the snapshot tests expect.
 pub fn headless_render(width: u16, height: u16, f: impl FnOnce(&mut Frame)) -> Result<String> {
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
     terminal.draw(f)?;

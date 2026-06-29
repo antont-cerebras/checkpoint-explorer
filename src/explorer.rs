@@ -1238,18 +1238,12 @@ impl Explorer {
 
     /// Headless render (`--plain`): produce the requested screen once as plain
     /// text and print it — no raw mode, no alternate screen, no interactivity.
-    /// The real draw code runs into a buffer, then a tiny VT emulator
-    /// ([`crate::plain::render`]) flattens its cursor moves / clears into a
-    /// character grid, so the output matches what a terminal would show. For
+    /// Each screen renders through the same Ratatui code as the live loop, into a
+    /// fixed-size in-memory [`TestBackend`](ratatui::backend::TestBackend) flattened
+    /// to text (see [`crate::tui::headless_render`]), so the output is deterministic
+    /// regardless of the ambient terminal and matches the interactive screen. For
     /// piping, `grep`, and end-to-end tests.
     pub fn render_plain(&mut self, emit_command: bool) -> Result<()> {
-        // A fixed virtual size keeps the output deterministic regardless of the
-        // ambient terminal: force it for the draw code (which reads it via
-        // `plain::term_size`) and emulate onto a grid of the same size.
-        const COLS: usize = 120;
-        const ROWS: usize = 40;
-        crate::plain::force_size(COLS as u16, ROWS as u16);
-
         self.load_quiet()?;
 
         // `--histogram`/`--bins` and `--compute-stats` are scanned synchronously
@@ -1287,12 +1281,17 @@ impl Explorer {
             return Ok(());
         }
 
-        // The tree is migrated to Ratatui: render it via the in-memory backend,
-        // unless a `--legend` overlay is requested (the tree's legend band is
-        // still on the raw path during the migration, so fall through to compose
-        // it below).
-        if matches!(screen, Screen::Tree) && !want_legend {
-            println!("{}", self.tree_plain()?);
+        // The tree (and its `--legend` overlay) renders via the in-memory backend:
+        // draw the tree frame, then composite the legend band on top when asked —
+        // mirroring the interactive `l` path (`show_legend`).
+        if matches!(screen, Screen::Tree) {
+            let text = crate::tui::headless_render(120, 40, |f| {
+                self.render_tree_frame(f);
+                if want_legend {
+                    UI::render_legend_band(f, Legend::Tree);
+                }
+            })?;
+            println!("{text}");
             return Ok(());
         }
         // The detail screen (and its legend band) is migrated to Ratatui too:
@@ -1320,31 +1319,8 @@ impl Explorer {
             return Ok(());
         }
 
-        let mut buf: Vec<u8> = Vec::new();
-        match &screen {
-            Screen::Tree => {
-                self.draw_tree(&mut buf)?;
-            }
-            Screen::Detail { .. } => unreachable!("detail is rendered via Ratatui above"),
-            Screen::Data { .. } => unreachable!("data views are rendered via Ratatui above"),
-        }
-
-        // `--legend`: composite the screen's context-sensitive legend on top (the
-        // band is absolute-positioned, so appending it overlays it on replay).
-        if want_legend {
-            let legend = match &screen {
-                Screen::Tree => Legend::Tree,
-                // Detail / Data (and their legends) are rendered via Ratatui above.
-                Screen::Detail { .. } => {
-                    unreachable!("detail legend is rendered via Ratatui above")
-                }
-                Screen::Data { .. } => unreachable!("data legend is rendered via Ratatui above"),
-            };
-            UI::write_legend_band(&mut buf, legend)?;
-        }
-
-        println!("{}", crate::plain::render(&buf, COLS, ROWS));
-        Ok(())
+        // All three screens (tree, detail, data) render and return above.
+        unreachable!("every screen renders via the in-memory backend above");
     }
 
     /// The CLI command that reopens `screen` — what the `y` shortcut copies.
@@ -1669,45 +1645,8 @@ impl Explorer {
         Ok(())
     }
 
-    /// Render the tree browser frame into `out`, returning the (possibly
-    /// adjusted) scroll offset. Shared by the live loop and screen-copy.
-    fn draw_tree(&self, out: &mut impl Write) -> Result<usize> {
-        let title = if self.files.len() == 1 {
-            self.files[0].to_string_lossy().to_string()
-        } else {
-            "Multiple files".to_string()
-        };
-        let tree_to_display = if self.search_mode {
-            &self.filtered_tree
-        } else {
-            &self.flattened_tree
-        };
-        let (status_icon, status_bar, status_secondary) = self.status_bar();
-        let config = DrawConfig {
-            tree: tree_to_display,
-            current_file: &title,
-            file_idx: 0,
-            total_files: 1,
-            selected_idx: self.selected_idx,
-            scroll_offset: self.scroll_offset,
-            search_mode: self.search_mode,
-            search_query: &self.search_query,
-            search_cursor: self.search_cursor,
-            status_icon,
-            status_bar: &status_bar,
-            status_secondary: &status_secondary,
-            health_warning: !self.health_reports.is_empty(),
-            can_repack: self.repack_input().is_some(),
-            unindexed: &self.unindexed,
-            packing_schemas: &self.packing_schemas,
-            copied_flash: None,
-        };
-        UI::draw_screen(out, &config)
-    }
-
     /// Build the tree's [`DrawConfig`] and render it into a Ratatui frame — the
-    /// interactive and headless tree both go through this. Mirrors [`Self::draw_tree`]
-    /// but paints into a Ratatui buffer instead of emitting ANSI.
+    /// interactive and headless tree both go through this.
     fn render_tree_frame(&self, frame: &mut ratatui::Frame) {
         let title = if self.files.len() == 1 {
             self.files[0].to_string_lossy().to_string()
@@ -1831,7 +1770,19 @@ impl Explorer {
         base: NumBase,
         overlay: Option<&Overlay>,
     ) -> Result<(usize, bool, usize), String> {
-        let info = self.prepare_data_sample(tensor, repr, slice, view, mode, stats)?;
+        // Size the grid to the frame's render area — the live terminal size, or
+        // the headless `TestBackend`'s fixed size, depending on the caller.
+        let area = frame.area();
+        let info = self.prepare_data_sample(
+            tensor,
+            repr,
+            slice,
+            view,
+            mode,
+            stats,
+            area.width,
+            area.height,
+        )?;
         let cache = self.sample_cache.borrow();
         let sample = &cache.as_ref().unwrap().sample;
         match repr {
@@ -3422,10 +3373,16 @@ impl Explorer {
             // Confirm a screen copy on the bottom line while the flash is still
             // within its window — composited over the data frame in the same draw.
             let show_flash = copied_since.is_some_and(|t| t.elapsed() < COPY_FLASH);
+            // Size the grid to the live terminal (the same size the draw below
+            // renders into); fall back to a sane default if it can't be read.
+            let (cols, rows) = term
+                .size()
+                .map(|s| (s.width, s.height))
+                .unwrap_or((100, 40));
             // (slices, overridable, clamped slice) on success — sample once, then
             // draw the cached result through Ratatui (overlay composited last).
             let (slices, overridable) = match self
-                .prepare_data_sample(tensor, repr, slice, view, mode, stats_view)
+                .prepare_data_sample(tensor, repr, slice, view, mode, stats_view, cols, rows)
             {
                 Ok((slices, overridable, clamped)) => {
                     slice = clamped;
@@ -3980,11 +3937,12 @@ impl Explorer {
     }
 
     /// Sample the heatmap / numeric grid for `(slice, view)`, sizing the grid to
-    /// the terminal so the header and footer stay on screen, and leave the result
-    /// in [`Self::sample_cache`]. Returns `(slices, overridable, clamped_slice)`.
-    /// Shared by the Ratatui
+    /// the `(cols, rows)` terminal size so the header and footer stay on screen,
+    /// and leave the result in [`Self::sample_cache`]. Returns `(slices,
+    /// overridable, clamped_slice)`. Shared by the Ratatui
     /// [`Self::render_data_frame`] / [`Self::data_plain`], so all three agree on
     /// the sample (and reuse the cache between a scan's spinner-frame redraws).
+    #[allow(clippy::too_many_arguments)] // mirrors the data-view sampler's params
     fn prepare_data_sample(
         &self,
         tensor: &TensorInfo,
@@ -3993,8 +3951,9 @@ impl Explorer {
         view: ViewDtype,
         mode: SampleMode,
         stats: StatsView,
+        cols: u16,
+        rows: u16,
     ) -> Result<(usize, bool, usize), String> {
-        let (cols, rows) = crate::plain::term_size();
         let width = cols as usize;
         let heatmap = matches!(repr, Representation::Heatmap);
         // Leading-index count of the (possibly reshaped) tensor — drives whether
