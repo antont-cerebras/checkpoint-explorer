@@ -2,7 +2,7 @@
 source: tests/cli.rs
 expression: "plain(&[\"--tensor\", &t, \"--values\"])"
 ---
-Values: model.layers.0.block_sparse_moe.experts.down_proj.weight
+Values: model.layers.0.block_sparse_moe.experts.down_proj.weight                                                     [×]
 File: [FIXTURE]
 U16 as u3×5 (unpacked) (6, 3, 4) as (30, 3, 4) → edges: all 3 of 3 rows × all 4 of 4 cols (indices shown)
 mean 0.9667 · std 1.7854 · zeros 69.2%  (<time>)
