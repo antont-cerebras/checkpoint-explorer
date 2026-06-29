@@ -363,6 +363,10 @@ pub struct Explorer {
     /// status bar intact — paired with the time it was set so it clears on its
     /// own after `COPY_FLASH` (and on the next key press), like the data views.
     copied_flash: Option<(String, std::time::Instant)>,
+    /// The live Ratatui terminal, owned for the duration of the interactive loop
+    /// (`None` headlessly and before/after `run`). Screens migrated to Ratatui
+    /// render through it; the rest still write raw ANSI during the migration.
+    terminal: Option<crate::tui::LiveTerminal>,
     /// Index/file mismatches detected at startup, shown as a warning panel.
     health_reports: Vec<crate::health::HealthReport>,
     /// Per-tensor dtype reinterpretation chosen in the data views, keyed by
@@ -464,6 +468,7 @@ impl Explorer {
             search_mode: false,
             filtered_tree: Vec::new(),
             copied_flash: None,
+            terminal: None,
             health_reports,
             dtype_overrides: RefCell::new(HashMap::new()),
             packing_schemas: HashMap::new(),
@@ -1277,6 +1282,14 @@ impl Explorer {
             return Ok(());
         }
 
+        // The tree is migrated to Ratatui: render it via the in-memory backend,
+        // unless a `--legend` overlay is requested (still on the raw path during
+        // the migration, so fall through to compose the band below).
+        if matches!(screen, Screen::Tree) && !want_legend {
+            println!("{}", self.tree_plain()?);
+            return Ok(());
+        }
+
         let mut buf: Vec<u8> = Vec::new();
         match &screen {
             Screen::Tree => {
@@ -1494,27 +1507,19 @@ impl Explorer {
             return Ok(());
         }
 
-        terminal::enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, terminal::Clear(ClearType::All), cursor::Hide)?;
+        // Set up the Ratatui terminal (raw mode, cleared screen, hidden cursor,
+        // no alternate screen) and own it for the session.
+        self.terminal = Some(crate::tui::init()?);
 
         let result = self.interactive_loop();
 
-        // Leave the last rendered frame on screen — don't clear it — and drop the
-        // shell prompt onto a fresh line just below it. This keeps whatever you
-        // were looking at visible after you quit (and lets `--exit` output be
-        // read / captured). Clear from the cursor down first so no frame content
-        // lingers *below* the prompt — e.g. the grid rows beneath a mid-screen
-        // overlay such as the `y` command pop-up, which the draw didn't wipe. The
-        // newline then lands the prompt at the bottom left; disabling raw mode
-        // first so its `\n` becomes a CR+LF (column 0).
-        execute!(
-            stdout,
-            terminal::Clear(ClearType::FromCursorDown),
-            cursor::Show
-        )?;
-        terminal::disable_raw_mode()?;
-        println!();
+        // Restore the terminal: leave the last frame on screen and drop the shell
+        // prompt onto a fresh line just below it (see `tui::restore`). Keeps what
+        // you were looking at visible after quitting (and lets `--exit` output be
+        // read / captured).
+        if let Some(mut terminal) = self.terminal.take() {
+            crate::tui::restore(&mut terminal)?;
+        }
 
         result
     }
@@ -1661,16 +1666,78 @@ impl Explorer {
             can_repack: self.repack_input().is_some(),
             unindexed: &self.unindexed,
             packing_schemas: &self.packing_schemas,
+            copied_flash: None,
         };
         UI::draw_screen(out, &config)
     }
 
+    /// Build the tree's [`DrawConfig`] and render it into a Ratatui frame — the
+    /// interactive and headless tree both go through this. Mirrors [`Self::draw_tree`]
+    /// but paints into a Ratatui buffer instead of emitting ANSI.
+    fn render_tree_frame(&self, frame: &mut ratatui::Frame) {
+        let title = if self.files.len() == 1 {
+            self.files[0].to_string_lossy().to_string()
+        } else {
+            "Multiple files".to_string()
+        };
+        let tree_to_display = if self.search_mode {
+            &self.filtered_tree
+        } else {
+            &self.flattened_tree
+        };
+        let (status_icon, status_bar, status_secondary) = self.status_bar();
+        let config = DrawConfig {
+            tree: tree_to_display,
+            current_file: &title,
+            file_idx: 0,
+            total_files: 1,
+            selected_idx: self.selected_idx,
+            scroll_offset: self.scroll_offset,
+            search_mode: self.search_mode,
+            search_query: &self.search_query,
+            search_cursor: self.search_cursor,
+            status_icon,
+            status_bar: &status_bar,
+            status_secondary: &status_secondary,
+            health_warning: !self.health_reports.is_empty(),
+            can_repack: self.repack_input().is_some(),
+            unindexed: &self.unindexed,
+            packing_schemas: &self.packing_schemas,
+            copied_flash: self.copied_flash.as_ref().map(|(what, _)| what.as_str()),
+        };
+        UI::render_tree(frame, &config);
+    }
+
+    /// Render the tree to plain text via an in-memory Ratatui backend — the
+    /// headless (`--plain`) tree and the `c` screen-copy share this.
+    fn tree_plain(&self) -> Result<String> {
+        crate::tui::headless_render(120, 40, |f| self.render_tree_frame(f))
+    }
+
+    /// Recompute the scroll offset so the selected row stays visible, given the
+    /// live terminal size (so it matches [`UI::render_tree`]'s body height).
+    fn update_tree_scroll(&mut self, width: u16, height: u16) {
+        let body = UI::tree_visible_rows(
+            width,
+            height,
+            self.search_mode,
+            self.repack_input().is_some(),
+        );
+        let sel = self.selected_idx;
+        self.scroll_offset = if sel >= self.scroll_offset + body {
+            sel.saturating_sub(body - 1)
+        } else if sel < self.scroll_offset {
+            sel
+        } else {
+            self.scroll_offset
+        };
+    }
+
     /// Copy the current tree screen's text to the clipboard (the `c` shortcut).
     fn copy_tree_screen(&mut self) {
-        let text = screen_text(|buf| {
-            let _ = self.draw_tree(buf);
-        });
-        copy_to_clipboard(&text);
+        if let Ok(text) = self.tree_plain() {
+            copy_to_clipboard(&text);
+        }
         self.flash_copied("screen contents");
     }
 
@@ -1686,13 +1753,25 @@ impl Explorer {
         // The browser needs the whole checkpoint; bring it in now if a fast
         // `--tensor` open deferred the full load.
         self.ensure_full_load()?;
+        // Force a full repaint on entry, and again after any raw overlay (legend,
+        // health report, `y` command pop-up, repack) draws over the Ratatui frame
+        // — the bridge while other screens are still on the raw path.
+        let mut dirty = true;
         loop {
-            self.scroll_offset = self.draw_tree(&mut live_out())?;
-            // Overlay any copy confirmation on the bottom line, leaving the
-            // status bar's path/name visible above it.
-            if let Some((what, _)) = &self.copied_flash {
-                let _ = UI::draw_copied_flash(what);
+            // Draw the tree through the owned Ratatui terminal.
+            let mut term = self
+                .terminal
+                .take()
+                .expect("interactive loop owns the terminal");
+            if dirty {
+                term.clear()?;
+                dirty = false;
             }
+            if let Ok(sz) = term.size() {
+                self.update_tree_scroll(sz.width, sz.height);
+            }
+            term.draw(|f| self.render_tree_frame(f))?;
+            self.terminal = Some(term);
 
             // While a copy confirmation is up, wake when it expires so it clears
             // on its own after `COPY_FLASH` — not only on the next key press.
@@ -1746,18 +1825,25 @@ impl Explorer {
                         code: KeyCode::Char('y'),
                         ..
                     } if !self.search_mode => {
-                        self.copy_command(&self.command_for_tree_selection(), None)
+                        self.copy_command(&self.command_for_tree_selection(), None);
+                        dirty = true; // raw pop-up drew over the frame
                     }
                     // `h` shows the checkpoint health report (when there is one).
                     KeyEvent {
                         code: KeyCode::Char('h'),
                         ..
-                    } if !self.search_mode => self.show_health_report(),
+                    } if !self.search_mode => {
+                        self.show_health_report();
+                        dirty = true;
+                    }
                     // `l` opens the legend for the tree's glyphs.
                     KeyEvent {
                         code: KeyCode::Char('l'),
                         ..
-                    } if !self.search_mode => self.show_legend(Legend::Tree, None),
+                    } if !self.search_mode => {
+                        self.show_legend(Legend::Tree, None);
+                        dirty = true;
+                    }
                     // `E` / `C` expand / collapse every group at once.
                     KeyEvent {
                         code: KeyCode::Char('E'),
@@ -1771,7 +1857,10 @@ impl Explorer {
                     KeyEvent {
                         code: KeyCode::Char('R'),
                         ..
-                    } if !self.search_mode => self.repack_checkpoint(),
+                    } if !self.search_mode => {
+                        self.repack_checkpoint();
+                        dirty = true;
+                    }
                     KeyEvent {
                         code: KeyCode::Char('/'),
                         ..
@@ -1872,19 +1961,17 @@ impl Explorer {
                     KeyEvent {
                         code: KeyCode::Enter,
                         ..
-                    } => {
-                        if let Some(screen) = self.handle_selection() {
-                            return Ok(Nav::Open(screen));
-                        }
-                    }
+                    } => match self.handle_selection() {
+                        (Some(screen), _) => return Ok(Nav::Open(screen)),
+                        (None, drew_overlay) => dirty |= drew_overlay,
+                    },
                     KeyEvent {
                         code: KeyCode::Char(' '),
                         ..
-                    } if !self.search_mode => {
-                        if let Some(screen) = self.handle_selection() {
-                            return Ok(Nav::Open(screen));
-                        }
-                    }
+                    } if !self.search_mode => match self.handle_selection() {
+                        (Some(screen), _) => return Ok(Nav::Open(screen)),
+                        (None, drew_overlay) => dirty |= drew_overlay,
+                    },
                     // While searching, space is ignored rather than typed into the query.
                     KeyEvent {
                         code: KeyCode::Char(' '),
@@ -2198,8 +2285,10 @@ impl Explorer {
 
     /// Act on the highlighted tree row. Returns `Some(Screen::Detail)` when a
     /// tensor was selected (the navigator opens it); groups expand and metadata
-    /// opens in place, returning `None`.
-    fn handle_selection(&mut self) -> Option<Screen> {
+    /// opens in place, returning `None`. The second element is `true` when a raw
+    /// overlay was drawn over the Ratatui frame (the metadata view), so the
+    /// caller forces a full repaint on return (the migration bridge).
+    fn handle_selection(&mut self) -> (Option<Screen>, bool) {
         let tree = if self.search_mode {
             &self.filtered_tree
         } else {
@@ -2221,17 +2310,21 @@ impl Explorer {
                     }
                 }
                 TreeNode::Tensor { info, .. } => {
-                    return Some(Screen::Detail {
-                        tensor: info.name.clone(),
-                        slice: 0,
-                    });
+                    return (
+                        Some(Screen::Detail {
+                            tensor: info.name.clone(),
+                            slice: 0,
+                        }),
+                        false,
+                    );
                 }
                 TreeNode::Metadata { info } => {
                     self.show_metadata_detail(info);
+                    return (None, true); // raw full-screen drawn over the frame
                 }
             }
         }
-        None
+        (None, false)
     }
 
     /// Report a request that can't be honored. In the navigator this shows a

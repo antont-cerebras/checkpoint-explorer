@@ -4,7 +4,7 @@ expression: "plain(&[])"
 ---
 Checkpoint Explorer - [FIXTURE] (1/1)
 ↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · Enter/Space expand · E/C all · / search · l legend · c copy screen
- · f copy file · n copy name · y copy command · ⌫/\ back/fwd · q quit
+f copy file · n copy name · y copy command · ⌫/\ back/fwd · q quit
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ▾ [FIXTURE] (▦ 7, 124 params, 272 B)
   ▸ 🔧 Metadata (▦ 0, 0 B)

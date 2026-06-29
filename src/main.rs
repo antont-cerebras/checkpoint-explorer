@@ -14,6 +14,7 @@ mod npy;
 mod plain;
 mod sample;
 mod tree;
+mod tui;
 mod ui;
 mod utils;
 
