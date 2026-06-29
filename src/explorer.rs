@@ -1299,6 +1299,21 @@ impl Explorer {
             );
             return Ok(());
         }
+        // The data views (and their legend band) are migrated to Ratatui too:
+        // render the heatmap / numeric grid — overlay included — via the in-memory
+        // backend.
+        if let Screen::Data {
+            tensor,
+            repr,
+            slice,
+        } = &screen
+        {
+            println!(
+                "{}",
+                self.draw_data_plain(tensor, *repr, *slice, want_legend)?
+            );
+            return Ok(());
+        }
 
         let mut buf: Vec<u8> = Vec::new();
         match &screen {
@@ -1306,13 +1321,7 @@ impl Explorer {
                 self.draw_tree(&mut buf)?;
             }
             Screen::Detail { .. } => unreachable!("detail is rendered via Ratatui above"),
-            Screen::Data {
-                tensor,
-                repr,
-                slice,
-            } => {
-                self.draw_data_plain(&mut buf, tensor, *repr, *slice)?;
-            }
+            Screen::Data { .. } => unreachable!("data views are rendered via Ratatui above"),
         }
 
         // `--legend`: composite the screen's context-sensitive legend on top (the
@@ -1320,15 +1329,11 @@ impl Explorer {
         if want_legend {
             let legend = match &screen {
                 Screen::Tree => Legend::Tree,
-                // Detail (and its legend) is rendered via Ratatui above.
+                // Detail / Data (and their legends) are rendered via Ratatui above.
                 Screen::Detail { .. } => {
                     unreachable!("detail legend is rendered via Ratatui above")
                 }
-                Screen::Data {
-                    repr: Representation::Heatmap,
-                    ..
-                } => Legend::Heatmap,
-                Screen::Data { .. } => Legend::Values,
+                Screen::Data { .. } => unreachable!("data legend is rendered via Ratatui above"),
             };
             UI::write_legend_band(&mut buf, legend)?;
         }
@@ -1421,19 +1426,21 @@ impl Explorer {
         )
     }
 
-    /// Render a tensor's numeric / heatmap data view into `out` for
-    /// [`Self::render_plain`]. The layout (overview / edges / window) and position
-    /// come from the request's flags (applied by `open_requested`); statistics —
-    /// which set the value range and heatmap scale — are scanned synchronously.
+    /// Render a tensor's numeric / heatmap data view to plain text for
+    /// [`Self::render_plain`], via the in-memory Ratatui backend (mirrors the live
+    /// data draw). The layout (overview / edges / window) and position come from
+    /// the request's flags (applied by `open_requested`); statistics — which set
+    /// the value range and heatmap scale — are scanned synchronously. An optional
+    /// `--legend` overlay composites the (now-Ratatui) legend band on top.
     fn draw_data_plain(
         &self,
-        out: &mut impl Write,
         tensor_name: &str,
         repr: Representation,
         slice: usize,
-    ) -> Result<()> {
+        want_legend: bool,
+    ) -> Result<String> {
         let Some(tensor) = self.tensors.iter().find(|t| t.name == tensor_name).cloned() else {
-            return Ok(());
+            return Ok(String::new());
         };
         let view = self.active_view(&tensor.name);
         let mode = match self.data_view_layout.get() {
@@ -1452,10 +1459,22 @@ impl Explorer {
             Some(s) => StatsView::Ready(s),
             None => StatsView::Pending,
         };
-        if let Err(msg) = self.draw_data_view(out, &tensor, repr, slice, view, mode, stats_view) {
-            write!(out, "Data preview unavailable: {msg}")?;
-        }
-        Ok(())
+        let legend = match repr {
+            Representation::Heatmap => Legend::Heatmap,
+            Representation::Values => Legend::Values,
+        };
+        let overlay = want_legend.then_some(Overlay::Legend(legend));
+        self.data_plain(
+            &tensor,
+            repr,
+            slice,
+            view,
+            mode,
+            stats_view,
+            self.data_view_stripe.get(),
+            self.data_view_base.get(),
+            overlay.as_ref(),
+        )
     }
 
     /// Compute (and cache) exact statistics for `(tensor, view)` synchronously,
@@ -1784,6 +1803,69 @@ impl Explorer {
                 None,
                 overlay,
             )
+        })
+    }
+
+    /// Sample and render a tensor's data view (heatmap / numeric grid) into
+    /// `frame`, compositing a pop-up `overlay` (legend / copied command) last —
+    /// the Ratatui counterpart of [`Self::render_detail_frame`], shared by the
+    /// live loop and the headless render. Returns `(slices, overridable,
+    /// clamped_slice)` (or the error message [`Self::draw_data_view`] would
+    /// have), so the loop can clamp the slice and gate slice/dtype hints.
+    #[allow(clippy::too_many_arguments)] // mirrors the data-view sampler's params
+    fn render_data_frame(
+        &self,
+        frame: &mut ratatui::Frame,
+        tensor: &TensorInfo,
+        repr: Representation,
+        slice: usize,
+        view: ViewDtype,
+        mode: SampleMode,
+        stats: StatsView,
+        stripe: StripeMode,
+        base: NumBase,
+        overlay: Option<&Overlay>,
+    ) -> Result<(usize, bool, usize), String> {
+        let info = self.prepare_data_sample(tensor, repr, slice, view, mode, stats)?;
+        let cache = self.sample_cache.borrow();
+        let sample = &cache.as_ref().unwrap().sample;
+        match repr {
+            Representation::Heatmap => UI::render_heatmap(frame, tensor, sample, stats),
+            Representation::Values => UI::render_values(frame, tensor, sample, stats, stripe, base),
+        }
+        match overlay {
+            Some(Overlay::Legend(l)) => UI::render_legend_band(frame, *l),
+            Some(Overlay::Command(c)) => UI::render_command_band(frame, c),
+            None => {}
+        }
+        Ok(info)
+    }
+
+    /// Render a tensor's data view to plain text via an in-memory Ratatui backend
+    /// — the headless (`--plain`) data view and the `c` screen-copy share this.
+    /// Mirrors [`Self::detail_plain`]. On a sampling error the message is rendered
+    /// in place (matching the live "Data preview unavailable" path).
+    #[allow(clippy::too_many_arguments)] // mirrors the data-view sampler's params
+    fn data_plain(
+        &self,
+        tensor: &TensorInfo,
+        repr: Representation,
+        slice: usize,
+        view: ViewDtype,
+        mode: SampleMode,
+        stats: StatsView,
+        stripe: StripeMode,
+        base: NumBase,
+        overlay: Option<&Overlay>,
+    ) -> Result<String> {
+        crate::tui::headless_render(120, 40, |f| {
+            if let Err(msg) = self.render_data_frame(
+                f, tensor, repr, slice, view, mode, stats, stripe, base, overlay,
+            ) {
+                use ratatui::widgets::{Paragraph, Widget};
+                Paragraph::new(format!("Data preview unavailable: {msg}"))
+                    .render(f.area(), f.buffer_mut());
+            }
         })
     }
 
@@ -3152,8 +3234,33 @@ impl Explorer {
     /// screen history and any other key goes back to the detail screen. Returns
     /// the chosen [`Nav`] plus where the user left it (representation, slice) so
     /// the navigator can record it for back/forward.
+    ///
+    /// Owns the live Ratatui terminal for the screen's duration (taken out of
+    /// `self` so the immutable-borrow draw closures can coexist with it) and hands
+    /// it back — mirroring [`Self::run_detail`].
     fn run_data(
+        &mut self,
+        tensor_name: &str,
+        repr: Representation,
+        start_slice: usize,
+        interaction: Interaction,
+    ) -> (Nav, Representation, usize) {
+        let mut term = self
+            .terminal
+            .take()
+            .expect("interactive loop owns the terminal");
+        let out = self.run_data_loop(&mut term, tensor_name, repr, start_slice, interaction);
+        self.terminal = Some(term);
+        out
+    }
+
+    /// The data view's interactive loop, drawing through the borrowed live `term`.
+    /// Split out of [`Self::run_data`] so the terminal can be lent as a `&mut`
+    /// separate from `&self` (the cached-stats / sample reads go through
+    /// `RefCell`, so the loop only needs `&self`).
+    fn run_data_loop(
         &self,
+        term: &mut crate::tui::LiveTerminal,
         tensor_name: &str,
         repr: Representation,
         start_slice: usize,
@@ -3173,6 +3280,14 @@ impl Explorer {
         // Set right after `c` copies the screen; shows a confirmation on the
         // bottom line until the next key or `COPY_FLASH` elapses.
         let mut copied_since: Option<std::time::Instant> = None;
+        // A floating pop-up (legend `l` / copied command `y`) shown over the live
+        // data frame; while it's up the loop keeps redrawing and polling so a
+        // running scan animates behind it, and any key dismisses it.
+        let mut overlay: Option<Overlay> = None;
+        // Force a full repaint on entry, and again after any still-raw sub-screen
+        // (the `d`/`r`/`/` prompts, the copy-flash bottom line) draws over the
+        // Ratatui frame — the bridge while those screens are on the raw path.
+        let mut dirty = true;
         loop {
             // The data-view layout is a session-remembered preference, so it
             // sticks as you move between tensors and in/out of the preview.
@@ -3240,44 +3355,72 @@ impl Explorer {
                 }
             };
 
-            // (slices, overridable, clamped slice) on success.
-            let (slices, overridable) = match self.draw_data_view(
-                &mut live_out(),
-                tensor,
-                repr,
-                slice,
-                view,
-                mode,
-                stats_view,
-            ) {
-                Ok((slices, overridable, clamped)) => {
-                    slice = clamped;
-                    (slices, overridable)
+            let stripe = self.data_view_stripe.get();
+            let base = self.data_view_base.get();
+            // A raw sub-screen (a `d`/`r`/`/` prompt, the copy-flash) may have
+            // drawn over the frame; clear once so Ratatui fully repaints over it.
+            if dirty {
+                if term.clear().is_err() {
+                    return (Nav::Quit, repr, slice);
                 }
-                Err(msg) => {
-                    let _ = UI::draw_message("Data preview unavailable", &msg);
-                    if interaction == Interaction::Interactive
-                        && let Ok(Event::Key(key)) = event::read()
-                        && is_ctrl_c(&key)
-                    {
-                        quit_immediately();
+                dirty = false;
+            }
+            // (slices, overridable, clamped slice) on success — sample once, then
+            // draw the cached result through Ratatui (overlay composited last).
+            let (slices, overridable) =
+                match self.prepare_data_sample(tensor, repr, slice, view, mode, stats_view) {
+                    Ok((slices, overridable, clamped)) => {
+                        slice = clamped;
+                        if term
+                            .draw(|f| {
+                                let cache = self.sample_cache.borrow();
+                                let sample = &cache.as_ref().unwrap().sample;
+                                match repr {
+                                    Representation::Heatmap => {
+                                        UI::render_heatmap(f, tensor, sample, stats_view)
+                                    }
+                                    Representation::Values => UI::render_values(
+                                        f, tensor, sample, stats_view, stripe, base,
+                                    ),
+                                }
+                                match overlay.as_ref() {
+                                    Some(Overlay::Legend(l)) => UI::render_legend_band(f, *l),
+                                    Some(Overlay::Command(c)) => UI::render_command_band(f, c),
+                                    None => {}
+                                }
+                            })
+                            .is_err()
+                        {
+                            return (Nav::Quit, repr, slice);
+                        }
+                        (slices, overridable)
                     }
-                    return (
-                        Nav::Open(Screen::Detail {
-                            tensor: tensor.name.clone(),
+                    Err(msg) => {
+                        let _ = UI::draw_message("Data preview unavailable", &msg);
+                        if interaction == Interaction::Interactive
+                            && let Ok(Event::Key(key)) = event::read()
+                            && is_ctrl_c(&key)
+                        {
+                            quit_immediately();
+                        }
+                        return (
+                            Nav::Open(Screen::Detail {
+                                tensor: tensor.name.clone(),
+                                slice,
+                            }),
+                            repr,
                             slice,
-                        }),
-                        repr,
-                        slice,
-                    );
-                }
-            };
+                        );
+                    }
+                };
 
             // Confirm a screen copy on the bottom line, over the footer, while
             // the flash is still within its window (it's dismissed by the next
-            // key or by the timed poll below).
+            // key or by the timed poll below). The flash is a raw write over the
+            // frame, so mark it dirty so the next iteration repaints over it.
             if copied_since.is_some_and(|t| t.elapsed() < COPY_FLASH) {
                 let _ = UI::draw_copied_flash("screen contents");
+                dirty = true;
             }
 
             // One-shot mode (`--exit`): stats are computed above and the final
@@ -3294,7 +3437,21 @@ impl Explorer {
             // it smooth and stops the moment the key lifts. While a scan is
             // running we poll instead of blocking, so the spinner keeps ticking
             // and a finished scan is harvested promptly.
-            let mut pending = if let Some(job) = &scan {
+            let mut pending = if overlay.is_some() {
+                // A pop-up is up: never pause the scan (the pop-up does no file
+                // I/O), and poll so its progress keeps animating behind it; with
+                // no scan there's nothing to animate, so just wait for the key.
+                if let Some(job) = &scan {
+                    job.pause.store(false, Ordering::Relaxed);
+                    if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false) {
+                        event::read()
+                    } else {
+                        continue;
+                    }
+                } else {
+                    event::read()
+                }
+            } else if let Some(job) = &scan {
                 if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false) {
                     // Input pending — give the foreground priority: pause the scan
                     // (it releases the HDF5 lock between blocks) so the re-sample
@@ -3320,6 +3477,18 @@ impl Explorer {
             } else {
                 event::read()
             };
+            // While a pop-up overlay is up, any key dismisses it (Ctrl-C still
+            // quits) rather than acting as a screen command; the loop then redraws
+            // the data view without it.
+            if overlay.is_some() {
+                if let Ok(Event::Key(key)) = &pending
+                    && is_ctrl_c(key)
+                {
+                    quit_immediately();
+                }
+                overlay = None;
+                continue;
+            }
             loop {
                 match pending {
                     Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
@@ -3442,6 +3611,7 @@ impl Explorer {
                                         overrides.insert(tensor.name.clone(), chosen);
                                     }
                                 }
+                                dirty = true; // the raw dtype menu drew over the frame
                             }
                             // Reshape: reinterpret the dimensions (`r`). The new
                             // shape must have the same element count; an empty
@@ -3463,12 +3633,14 @@ impl Explorer {
                                     }
                                     ReshapeChoice::Cancel => {}
                                 }
+                                dirty = true; // the raw reshape prompt drew over the frame
                             }
                             // Jump straight to a slice by typing its index.
                             KeyCode::Char('/') if slices > 1 => {
                                 if let Some(n) = self.prompt_slice(slices) {
                                     slice = n;
                                 }
+                                dirty = true; // the raw slice prompt drew over the frame
                             }
                             // Shift + arrows jump ~5% of the slices at once (wrapping).
                             KeyCode::Right if slices > 1 && shift => {
@@ -3484,32 +3656,33 @@ impl Explorer {
                             KeyCode::Char('[') | KeyCode::Left if slices > 1 => {
                                 slice = (slice + slices - 1) % slices
                             }
-                            // Copy the data view's text to the clipboard.
+                            // Copy the data view's text to the clipboard (the same
+                            // Ratatui render the `--plain` path emits).
                             KeyCode::Char('c') => {
-                                let text = screen_text(|buf| {
-                                    let _ = self.draw_data_view(
-                                        buf, tensor, repr, slice, view, mode, stats_view,
-                                    );
-                                });
-                                copy_to_clipboard(&text);
+                                if let Ok(text) = self.data_plain(
+                                    tensor, repr, slice, view, mode, stats_view, stripe, base, None,
+                                ) {
+                                    copy_to_clipboard(&text);
+                                }
                                 copied_since = Some(std::time::Instant::now());
                             }
-                            // `y` shows and copies the CLI command that reopens
-                            // this exact view.
-                            KeyCode::Char('y') => self.copy_command(
-                                &self.command_for_data(tensor, repr, slice),
-                                scan.as_ref().map(|j| &*j.pause),
-                            ),
-                            // Open the legend for this representation, then
-                            // redraw the data view over it. The background stats
+                            // `y` copies the CLI command that reopens this exact
+                            // view and floats it over the live frame as a Ratatui
+                            // pop-up; the scan keeps running behind it.
+                            KeyCode::Char('y') => {
+                                let cmd = self.command_for_data(tensor, repr, slice);
+                                copy_to_clipboard(&cmd);
+                                overlay = Some(Overlay::Command(cmd));
+                            }
+                            // Open the legend for this representation as a pop-up
+                            // band over the live data view; the background stats
                             // scan keeps running while it's up.
-                            KeyCode::Char('l') => self.show_legend(
-                                match repr {
+                            KeyCode::Char('l') => {
+                                overlay = Some(Overlay::Legend(match repr {
                                     Representation::Heatmap => Legend::Heatmap,
                                     Representation::Values => Legend::Values,
-                                },
-                                scan.as_ref().map(|j| &*j.pause),
-                            ),
+                                }));
+                            }
                             // History navigation: Backspace back, `\` forward.
                             KeyCode::Backspace => return (Nav::Back, repr, slice),
                             KeyCode::Char('\\') => return (Nav::Forward, repr, slice),
@@ -3531,7 +3704,9 @@ impl Explorer {
                 }
                 // Drain the next buffered event without blocking; once the queue
                 // is empty, fall out to redraw exactly once for the whole burst.
-                if event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+                // A just-opened pop-up stops the drain so the next iteration shows
+                // it (and any further keys dismiss it rather than acting as commands).
+                if overlay.is_none() && event::poll(std::time::Duration::ZERO).unwrap_or(false) {
                     pending = event::read();
                 } else {
                     break;
@@ -3737,13 +3912,51 @@ impl Explorer {
     }
 
     /// Sample and draw the heatmap or numeric grid for `(slice, view)`, sized to
-    /// the terminal. Returns `(slices, overridable, clamped_slice)` on success,
-    /// or an error message for the caller to show. Shared by the data-view loop
-    /// and the dtype menu's live preview.
+    /// the terminal — the raw path, kept only for the dtype menu's live preview
+    /// behind the (still-raw) `d` menu. The interactive loop and headless render
+    /// go through Ratatui ([`Self::render_data_frame`]). Returns `(slices,
+    /// overridable, clamped_slice)` on success, or an error message to show.
     #[allow(clippy::too_many_arguments)] // a render helper; the params are all distinct
     fn draw_data_view(
         &self,
         out: &mut impl Write,
+        tensor: &TensorInfo,
+        repr: Representation,
+        slice: usize,
+        view: ViewDtype,
+        mode: SampleMode,
+        stats: StatsView,
+    ) -> Result<(usize, bool, usize), String> {
+        let info = self.prepare_data_sample(tensor, repr, slice, view, mode, stats)?;
+        let cache = self.sample_cache.borrow();
+        let sample = &cache.as_ref().unwrap().sample;
+        match repr {
+            Representation::Heatmap => {
+                UI::draw_heatmap(out, tensor, sample, stats).map_err(|e| e.to_string())?;
+            }
+            Representation::Values => {
+                UI::draw_values(
+                    out,
+                    tensor,
+                    sample,
+                    stats,
+                    self.data_view_stripe.get(),
+                    self.data_view_base.get(),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(info)
+    }
+
+    /// Sample the heatmap / numeric grid for `(slice, view)`, sizing the grid to
+    /// the terminal so the header and footer stay on screen, and leave the result
+    /// in [`Self::sample_cache`]. Returns `(slices, overridable, clamped_slice)`.
+    /// Shared by the raw [`Self::draw_data_view`] and the Ratatui
+    /// [`Self::render_data_frame`] / [`Self::data_plain`], so all three agree on
+    /// the sample (and reuse the cache between a scan's spinner-frame redraws).
+    fn prepare_data_sample(
+        &self,
         tensor: &TensorInfo,
         repr: Representation,
         slice: usize,
@@ -3866,24 +4079,7 @@ impl Explorer {
         }
         let cache = self.sample_cache.borrow();
         let sample = &cache.as_ref().unwrap().sample;
-        let info = (sample.slices, sample.overridable, sample.slice);
-        match repr {
-            Representation::Heatmap => {
-                UI::draw_heatmap(out, tensor, sample, stats).map_err(|e| e.to_string())?;
-            }
-            Representation::Values => {
-                UI::draw_values(
-                    out,
-                    tensor,
-                    sample,
-                    stats,
-                    self.data_view_stripe.get(),
-                    self.data_view_base.get(),
-                )
-                .map_err(|e| e.to_string())?;
-            }
-        }
-        Ok(info)
+        Ok((sample.slices, sample.overridable, sample.slice))
     }
 
     /// Open the dtype-selection menu with a live preview, returning the chosen
@@ -4770,59 +4966,6 @@ fn collect_source_paths(node: &TreeNode, out: &mut BTreeSet<String>) {
 /// buffering makes each frame flush atomically (no progressive paint / flicker).
 fn live_out() -> io::BufWriter<io::StdoutLock<'static>> {
     io::BufWriter::new(io::stdout().lock())
-}
-
-/// Render whatever screen is currently shown into a plain-text string (ANSI
-/// escapes stripped), for the "copy screen contents" shortcut.
-fn screen_text(render: impl FnOnce(&mut Vec<u8>)) -> String {
-    let mut buf = Vec::new();
-    render(&mut buf);
-    strip_ansi(&buf)
-}
-
-/// Strip ANSI escape sequences (CSI / OSC / charset selects) and carriage
-/// returns from terminal output, leaving the plain text the user sees.
-fn strip_ansi(bytes: &[u8]) -> String {
-    let text = String::from_utf8_lossy(bytes);
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\r' => {}
-            '\x1b' => match chars.next() {
-                // CSI: ESC [ … <final 0x40–0x7e>
-                Some('[') => {
-                    for d in chars.by_ref() {
-                        if ('\x40'..='\x7e').contains(&d) {
-                            break;
-                        }
-                    }
-                }
-                // OSC: ESC ] … terminated by BEL or ESC \
-                Some(']') => {
-                    while let Some(d) = chars.next() {
-                        if d == '\x07' {
-                            break;
-                        }
-                        if d == '\x1b' {
-                            chars.next(); // consume the trailing '\'
-                            break;
-                        }
-                    }
-                }
-                // Two-byte escapes (charset selects etc.): drop the next char.
-                Some(_) => {}
-                None => {}
-            },
-            other => out.push(other),
-        }
-    }
-    // Trim trailing whitespace on each line and drop trailing blank lines.
-    let mut lines: Vec<&str> = out.lines().map(|l| l.trim_end()).collect();
-    while lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
-    }
-    lines.join("\n")
 }
 
 /// Quote `s` as a single shell argument: left bare when it's only made of safe
