@@ -29,6 +29,23 @@ fn hint_key(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
 }
 
+/// A piece of a footer chip's key text: either a clickable glyph paired with the
+/// key it synthesizes, or a non-clickable separator (`/`, `Shift+`). The footer
+/// builders emit one [`ChipHit`] per [`Seg::Key`] at its own sub-column, so each
+/// half of a dual chip (`E/C`, `↑/↓`, `⌫/\`, …) is independently clickable.
+enum Seg {
+    Key(&'static str, KeyEvent),
+    Sep(&'static str),
+}
+
+impl Seg {
+    fn text(&self) -> &'static str {
+        match self {
+            Seg::Key(t, _) | Seg::Sep(t) => t,
+        }
+    }
+}
+
 /// Draw a `[×]` close control in the top-right corner and return its clickable
 /// region paired with the key a click should synthesize (`q` to quit the tree,
 /// `⌫` to step back from a sub-screen). No-op (empty region list) if too narrow.
@@ -2235,26 +2252,73 @@ fn tree_span(selected: bool, color: Color, text: impl Into<String>) -> Span<'sta
 /// The tree browser's key-hint line(s), word-wrapped to `width` on the
 /// ` · `-separated `key label` chips (the long hint spills onto a second line).
 fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
-    // The third field is the key a click on the chip synthesizes; `None` for the
-    // dual/directional chips (they have wheel / click / `[×]` equivalents).
-    let mut items: Vec<(&str, &str, Option<char>)> = vec![
-        ("↑/↓", "navigate", None),
-        ("←/→", "parent/child", None),
-        ("Shift+↑/↓", "sibling", None),
-        ("Enter/Space", "expand", None),
-        ("E/C", "all", None),
-        ("/", "search", Some('/')),
-        ("l", "legend", Some('l')),
-        ("c", "copy screen", Some('c')),
-        ("f", "copy file", Some('f')),
-        ("n", "copy name", Some('n')),
-        ("y", "copy command", Some('y')),
-        ("⌫/\\", "back/fwd", None),
+    use KeyCode::{Backspace, Down, Enter, Left, Right, Up};
+    let plain = KeyModifiers::NONE;
+    let shift = KeyModifiers::SHIFT;
+    // Each chip's key text is a list of segments; a `Seg::Key` glyph is clickable
+    // (and synthesizes its key), a `Seg::Sep` (`/`, `Shift+`) is not. Both halves
+    // of a dual chip are thus independently clickable.
+    let mut items: Vec<(Vec<Seg>, &str)> = vec![
+        (
+            vec![
+                Seg::Key("↑", KeyEvent::new(Up, plain)),
+                Seg::Sep("/"),
+                Seg::Key("↓", KeyEvent::new(Down, plain)),
+            ],
+            "navigate",
+        ),
+        (
+            vec![
+                Seg::Key("←", KeyEvent::new(Left, plain)),
+                Seg::Sep("/"),
+                Seg::Key("→", KeyEvent::new(Right, plain)),
+            ],
+            "parent/child",
+        ),
+        (
+            vec![
+                Seg::Sep("Shift+"),
+                Seg::Key("↑", KeyEvent::new(Up, shift)),
+                Seg::Sep("/"),
+                Seg::Key("↓", KeyEvent::new(Down, shift)),
+            ],
+            "sibling",
+        ),
+        (
+            vec![
+                Seg::Key("Enter", KeyEvent::new(Enter, plain)),
+                Seg::Sep("/"),
+                Seg::Key("Space", hint_key(' ')),
+            ],
+            "expand",
+        ),
+        (
+            vec![
+                Seg::Key("E", hint_key('E')),
+                Seg::Sep("/"),
+                Seg::Key("C", hint_key('C')),
+            ],
+            "all",
+        ),
+        (vec![Seg::Key("/", hint_key('/'))], "search"),
+        (vec![Seg::Key("l", hint_key('l'))], "legend"),
+        (vec![Seg::Key("c", hint_key('c'))], "copy screen"),
+        (vec![Seg::Key("f", hint_key('f'))], "copy file"),
+        (vec![Seg::Key("n", hint_key('n'))], "copy name"),
+        (vec![Seg::Key("y", hint_key('y'))], "copy command"),
+        (
+            vec![
+                Seg::Key("⌫", KeyEvent::new(Backspace, plain)),
+                Seg::Sep("/"),
+                Seg::Key("\\", hint_key('\\')),
+            ],
+            "back/fwd",
+        ),
     ];
     if can_repack {
-        items.push(("R", "repack", Some('R')));
+        items.push((vec![Seg::Key("R", hint_key('R'))], "repack"));
     }
-    items.push(("q", "quit", Some('q')));
+    items.push((vec![Seg::Key("q", hint_key('q'))], "quit"));
 
     let width = width as usize;
     let key_style = Style::default()
@@ -2265,8 +2329,9 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<Chi
     let mut chips: Vec<ChipHit> = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
     let mut col = 0usize;
-    for (key, label, action) in items {
-        let item_w = key.chars().count() + 1 + label.chars().count();
+    for (segs, label) in items {
+        let key_text: String = segs.iter().map(Seg::text).collect();
+        let item_w = key_text.chars().count() + 1 + label.chars().count();
         let has_prev = !spans.is_empty();
         if has_prev && col + 3 + item_w > width {
             lines.push(Line::from(std::mem::take(&mut spans)));
@@ -2276,15 +2341,21 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<Chi
             spans.push(Span::styled(" · ", sep_style));
             col += 3;
         }
-        if let Some(c) = action {
-            chips.push(ChipHit {
-                line: lines.len() as u16,
-                col: col as u16,
-                width: item_w as u16,
-                key: hint_key(c),
-            });
+        // One clickable region per `Key` glyph, at its own sub-column.
+        let mut off = 0usize;
+        for seg in &segs {
+            let n = seg.text().chars().count();
+            if let Seg::Key(_, key) = seg {
+                chips.push(ChipHit {
+                    line: lines.len() as u16,
+                    col: (col + off) as u16,
+                    width: n as u16,
+                    key: *key,
+                });
+            }
+            off += n;
         }
-        spans.push(Span::styled(key.to_string(), key_style));
+        spans.push(Span::styled(key_text, key_style));
         spans.push(Span::raw(format!(" {label}")));
         col += item_w;
     }
