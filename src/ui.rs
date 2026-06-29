@@ -2128,24 +2128,35 @@ fn data_view_footer_wrapped_lines(
     let mut pos = 0usize; // char offset into the unwrapped span run
     for (i, (key, label)) in items.iter().enumerate() {
         if i > 0 {
-            pos += 3; // " · "
+            pos += 3; // " · " (kept inert — not part of any chip)
         }
         let key_chars = key.chars().count();
-        if let Some(kev) = footer_key_event(key) {
-            chips.push(ChipHit {
-                line: (pos / w) as u16,
-                col: (pos % w) as u16,
-                width: key_chars as u16,
-                key: kev,
-            });
-        }
-        pos += if key.is_empty() {
+        let advance = if key.is_empty() {
             label.chars().count()
         } else if label.is_empty() {
             key_chars
         } else {
             key_chars + 1 + label.chars().count()
         };
+        // A single-action chip is clickable across its whole "key label" span.
+        // The footer is hard-wrapped at `w`, so the span can straddle lines —
+        // emit one region per line it covers.
+        if let Some(kev) = footer_key_event(key) {
+            let (start, end) = (pos, pos + advance);
+            let mut c = start;
+            while c < end {
+                let line = c / w;
+                let seg_end = end.min((line + 1) * w);
+                chips.push(ChipHit {
+                    line: line as u16,
+                    col: (c % w) as u16,
+                    width: (seg_end - c) as u16,
+                    key: kev,
+                });
+                c = seg_end;
+            }
+        }
+        pos += advance;
     }
     (lines, chips)
 }
@@ -2447,19 +2458,38 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<Chi
             spans.push(Span::styled(" · ", sep_style));
             col += 3;
         }
-        // One clickable region per `Key` glyph, at its own sub-column.
-        let mut off = 0usize;
-        for seg in &segs {
-            let n = seg.text().chars().count();
-            if let Seg::Key(_, key) = seg {
-                chips.push(ChipHit {
-                    line: lines.len() as u16,
-                    col: (col + off) as u16,
-                    width: n as u16,
-                    key: *key,
-                });
+        // A single-action chip is clickable across its whole "key label"; a dual
+        // chip (two keys sharing a label) keeps one region per glyph, since each
+        // glyph is a different action and the label between them is ambiguous.
+        let key_count = segs.iter().filter(|s| matches!(s, Seg::Key(..))).count();
+        if key_count == 1 {
+            let key = segs
+                .iter()
+                .find_map(|s| match s {
+                    Seg::Key(_, k) => Some(*k),
+                    Seg::Sep(_) => None,
+                })
+                .unwrap();
+            chips.push(ChipHit {
+                line: lines.len() as u16,
+                col: col as u16,
+                width: item_w as u16,
+                key,
+            });
+        } else {
+            let mut off = 0usize;
+            for seg in &segs {
+                let n = seg.text().chars().count();
+                if let Seg::Key(_, key) = seg {
+                    chips.push(ChipHit {
+                        line: lines.len() as u16,
+                        col: (col + off) as u16,
+                        width: n as u16,
+                        key: *key,
+                    });
+                }
+                off += n;
             }
-            off += n;
         }
         spans.push(Span::styled(key_text, key_style));
         spans.push(Span::raw(format!(" {label}")));
@@ -2994,15 +3024,25 @@ fn detail_footer_lines(overridable: bool, width: u16) -> (Vec<Line<'static>>, Ve
             lines.push(Line::from(std::mem::take(&mut spans)));
             col = 0;
         }
-        // This chunk starts at column `col` on line `lines.len()`; record each of
-        // its clickable glyphs at its own sub-column.
-        for (off, glyph_w, key) in keys {
+        // This chunk starts at column `col` on line `lines.len()`. A single-action
+        // chunk is clickable across its whole width (key + wording); the dual ⌫/\
+        // chunk keeps one region per glyph (the shared wording is ambiguous).
+        if keys.len() == 1 {
             chips.push(ChipHit {
                 line: lines.len() as u16,
-                col: (col + off) as u16,
-                width: glyph_w,
-                key,
+                col: col as u16,
+                width: w as u16,
+                key: keys[0].2,
             });
+        } else {
+            for (off, glyph_w, key) in keys {
+                chips.push(ChipHit {
+                    line: lines.len() as u16,
+                    col: (col + off) as u16,
+                    width: glyph_w,
+                    key,
+                });
+            }
         }
         spans.extend(chunk);
         col += w;
