@@ -1798,10 +1798,10 @@ impl Explorer {
         )?;
         let cache = self.sample_cache.borrow();
         let sample = &cache.as_ref().unwrap().sample;
-        match repr {
+        *self.clickable.borrow_mut() = match repr {
             Representation::Heatmap => UI::render_heatmap(frame, tensor, sample, stats),
             Representation::Values => UI::render_values(frame, tensor, sample, stats, stripe, base),
-        }
+        };
         match overlay {
             Some(Overlay::Legend(l)) => UI::render_legend_band(frame, *l),
             Some(Overlay::Command(c)) => UI::render_command_band(frame, c),
@@ -1828,10 +1828,12 @@ impl Explorer {
             return;
         };
         let sample = &cached.sample;
-        match repr {
+        // Drawn only as a static background behind a prompt (which runs its own
+        // input loop), so the clickable map isn't updated here.
+        let _regions = match repr {
             Representation::Heatmap => UI::render_heatmap(frame, tensor, sample, stats),
             Representation::Values => UI::render_values(frame, tensor, sample, stats, stripe, base),
-        }
+        };
     }
 
     /// Render a tensor's data view to plain text via an in-memory Ratatui backend
@@ -3566,14 +3568,14 @@ impl Explorer {
                         .draw(|f| {
                             let cache = self.sample_cache.borrow();
                             let sample = &cache.as_ref().unwrap().sample;
-                            match repr {
+                            *self.clickable.borrow_mut() = match repr {
                                 Representation::Heatmap => {
                                     UI::render_heatmap(f, tensor, sample, stats_view)
                                 }
                                 Representation::Values => {
                                     UI::render_values(f, tensor, sample, stats_view, stripe, base)
                                 }
-                            }
+                            };
                             match overlay.as_ref() {
                                 Some(Overlay::Legend(l)) => UI::render_legend_band(f, *l),
                                 Some(Overlay::Command(c)) => UI::render_command_band(f, c),
@@ -3910,8 +3912,18 @@ impl Explorer {
                             }
                         }
                     }
-                    // Mouse wheel pages through the slices (like `]` / `[`).
                     Ok(Event::Mouse(m)) => match m.kind {
+                        // A click on a footer chip / `[×]` acts like its key: feed
+                        // the synthesized key back through this match.
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let Some(k) =
+                                crate::ui::region_hit(&self.clickable.borrow(), m.column, m.row)
+                            {
+                                pending = Ok(Event::Key(k));
+                                continue;
+                            }
+                        }
+                        // The wheel pages through the slices (like `]` / `[`).
                         MouseEventKind::ScrollDown if slices > 1 => slice = (slice + 1) % slices,
                         MouseEventKind::ScrollUp if slices > 1 => {
                             slice = (slice + slices - 1) % slices

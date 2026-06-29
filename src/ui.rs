@@ -66,6 +66,35 @@ fn close_button(frame: &mut Frame, key: KeyEvent) -> Vec<(Rect, KeyEvent)> {
     vec![(rect, key)]
 }
 
+/// Translate a data view's footer [`ChipHit`]s (lines relative to `footer_top`)
+/// into absolute screen regions and append the top-right `[×]` (→ step back).
+/// Shared by the heatmap and numeric-grid renderers, which lay out identically.
+fn data_view_regions(
+    frame: &mut Frame,
+    chips: &[ChipHit],
+    footer_top: u16,
+) -> Vec<(Rect, KeyEvent)> {
+    let mut regions: Vec<(Rect, KeyEvent)> = chips
+        .iter()
+        .map(|c| {
+            (
+                Rect {
+                    x: c.col,
+                    y: footer_top + c.line,
+                    width: c.width,
+                    height: 1,
+                },
+                c.key,
+            )
+        })
+        .collect();
+    regions.extend(close_button(
+        frame,
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+    ));
+    regions
+}
+
 /// True when `(col, row)` falls inside a clickable region.
 pub fn region_hit(regions: &[(Rect, KeyEvent)], col: u16, row: u16) -> Option<KeyEvent> {
     regions
@@ -851,7 +880,7 @@ impl UI {
         tensor: &TensorInfo,
         sample: &Sample,
         stats: StatsView,
-    ) {
+    ) -> Vec<(Rect, KeyEvent)> {
         let area = frame.area();
         let width = area.width as usize;
         let mut lines: Vec<Line> = data_view_title_lines("Heatmap", tensor, width);
@@ -928,7 +957,8 @@ impl UI {
         lines.push(Line::from(legend));
 
         lines.push(Line::default());
-        lines.extend(data_view_footer_wrapped_lines(
+        let footer_top = lines.len() as u16;
+        let (footer, chips) = data_view_footer_wrapped_lines(
             sample.mode,
             sample.slices,
             true,
@@ -936,9 +966,11 @@ impl UI {
             StripeMode::Off,
             NumBase::Decimal,
             width,
-        ));
+        );
+        lines.extend(footer);
 
         Paragraph::new(lines).render(area, frame.buffer_mut());
+        data_view_regions(frame, &chips, footer_top)
     }
 
     /// Render a sampled tensor as a grid of numeric values with row/column
@@ -954,7 +986,7 @@ impl UI {
         stats: StatsView,
         stripe: StripeMode,
         base: NumBase,
-    ) {
+    ) -> Vec<(Rect, KeyEvent)> {
         let area = frame.area();
         let width = area.width as usize;
         // Cell width adapts to the data (same call the sampler uses, so the column
@@ -1143,7 +1175,8 @@ impl UI {
         }
 
         lines.push(Line::default());
-        lines.extend(data_view_footer_wrapped_lines(
+        let footer_top = lines.len() as u16;
+        let (footer, chips) = data_view_footer_wrapped_lines(
             sample.mode,
             sample.slices,
             sample.overridable,
@@ -1151,9 +1184,11 @@ impl UI {
             stripe,
             base,
             width,
-        ));
+        );
+        lines.extend(footer);
 
         Paragraph::new(lines).render(area, frame.buffer_mut());
+        data_view_regions(frame, &chips, footer_top)
     }
 
     /// The Ratatui port of [`Self::draw_dtype_menu`]: overlay a dtype-selection
@@ -2054,10 +2089,28 @@ fn hint_spans(items: &[(&str, &str)]) -> Vec<Span<'static>> {
     spans
 }
 
+/// The [`KeyEvent`] a click on a data-view footer chip synthesizes, or `None` for
+/// the non-clickable chips (the multi-arrow nav hints `← →`, `[ ]`, `Home/End`, …,
+/// and the trailing "any other key…" label). Every clickable chip is a single
+/// glyph, so it never straddles a wrap boundary.
+fn footer_key_event(key: &str) -> Option<KeyEvent> {
+    if key == "⌫" {
+        return Some(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    }
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if "mvdrezbcyl/\\".contains(c) => Some(hint_key(c)),
+        _ => None,
+    }
+}
+
 /// The data-view footer as styled [`Line`]s — the Ratatui port of
 /// [`write_view_footer`]. The raw footer is one logical line the terminal hard-
 /// wraps at the screen edge (mid-chip, even mid-word), so we hard-wrap the styled
-/// spans by character at `width` to match that exactly.
+/// spans by character at `width` to match that exactly. Also returns the clickable
+/// command chips: their char position in the unwrapped run maps to a (line, col)
+/// by the same `width` hard wrap (each clickable chip is one glyph, so it never
+/// splits across lines).
 fn data_view_footer_wrapped_lines(
     mode: SampleMode,
     slices: usize,
@@ -2066,9 +2119,35 @@ fn data_view_footer_wrapped_lines(
     stripe: StripeMode,
     base: NumBase,
     width: usize,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<ChipHit>) {
     let items = view_footer_items(mode, slices, overridable, heatmap, stripe, base);
-    wrap_spans_hard(hint_spans(&items), width)
+    let lines = wrap_spans_hard(hint_spans(&items), width);
+
+    let w = width.max(1);
+    let mut chips: Vec<ChipHit> = Vec::new();
+    let mut pos = 0usize; // char offset into the unwrapped span run
+    for (i, (key, label)) in items.iter().enumerate() {
+        if i > 0 {
+            pos += 3; // " · "
+        }
+        let key_chars = key.chars().count();
+        if let Some(kev) = footer_key_event(key) {
+            chips.push(ChipHit {
+                line: (pos / w) as u16,
+                col: (pos % w) as u16,
+                width: key_chars as u16,
+                key: kev,
+            });
+        }
+        pos += if key.is_empty() {
+            label.chars().count()
+        } else if label.is_empty() {
+            key_chars
+        } else {
+            key_chars + 1 + label.chars().count()
+        };
+    }
+    (lines, chips)
 }
 
 /// Hard-wrap a styled span run at `width` characters, splitting mid-span (and

@@ -2,7 +2,7 @@
 source: tests/cli.rs
 expression: "plain(&[\"--tensor\", \"model.layers.0.mlp.down_proj.weight\", \"--values\"])"
 ---
-Values: model.layers.0.mlp.down_proj.weight
+Values: model.layers.0.mlp.down_proj.weight                                                                          [×]
 File: [FIXTURE]
 U16 (3, 4, 5) → edges: all 4 of 4 rows × all 5 of 5 cols (indices shown)
 mean 15419.0000 · std 8901.5046 · zeros 0%  (<time>)
