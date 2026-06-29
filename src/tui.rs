@@ -9,7 +9,9 @@ use std::io::{self, Stdout};
 
 use anyhow::Result;
 use crossterm::{
-    cursor, execute,
+    cursor,
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
     terminal::{self, ClearType},
 };
 use ratatui::{
@@ -27,7 +29,15 @@ pub type LiveTerminal = Terminal<CrosstermBackend<Stdout>>;
 pub fn init() -> Result<LiveTerminal> {
     terminal::enable_raw_mode()?;
     let mut out = io::stdout();
-    execute!(out, terminal::Clear(ClearType::All), cursor::Hide)?;
+    // Capture the mouse so rows can be clicked and the wheel scrolls. (This means
+    // the terminal's own text selection needs Shift held — the `y`/`c` shortcuts
+    // and OSC-52 copy are the primary copy paths anyway.)
+    execute!(
+        out,
+        terminal::Clear(ClearType::All),
+        cursor::Hide,
+        EnableMouseCapture
+    )?;
     let terminal = Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
         TerminalOptions {
@@ -47,6 +57,7 @@ pub fn restore(terminal: &mut LiveTerminal) -> Result<()> {
     // Park the cursor at the bottom of the frame so the prompt lands below it.
     execute!(
         out,
+        DisableMouseCapture,
         cursor::MoveTo(0, height.saturating_sub(1)),
         terminal::Clear(ClearType::FromCursorDown),
         cursor::Show
