@@ -573,9 +573,10 @@ impl Explorer {
     /// Small tensors finish before the spinner ever appears.
     fn compute_stats_animated(
         &self,
+        term: &mut crate::tui::LiveTerminal,
         tensor: &TensorInfo,
         view: ViewDtype,
-        mut redraw: impl FnMut(StatsView),
+        render: impl Fn(&mut ratatui::Frame, StatsView),
     ) -> ScanOutcome {
         if self.cached_stats(tensor, view).is_some() {
             return ScanOutcome::Completed;
@@ -612,12 +613,13 @@ impl Explorer {
             // Only animate once it's clearly not instant, to avoid a flash for
             // small tensors (which return before the first frame).
             if started.elapsed() >= std::time::Duration::from_millis(120) {
-                redraw(StatsView::Computing {
+                let sv = StatsView::Computing {
                     spinner: SPINNER[frame % SPINNER.len()],
                     elapsed: started.elapsed(),
                     progress: (total > 0)
                         .then(|| (done.load(Ordering::Relaxed) as f64 / total as f64).min(1.0)),
-                });
+                };
+                let _ = term.draw(|f| render(f, sv));
                 frame += 1;
             }
             // Frame delay that also stays responsive to keys while we wait.
@@ -641,12 +643,14 @@ impl Explorer {
             }
             // Surface a failure instead of silently doing nothing.
             Ok(Err(msg)) => {
-                let _ = UI::draw_message("Statistics unavailable", &msg);
+                let _ = term.draw(|f| UI::render_message(f, "Statistics unavailable", &msg));
                 let _ = event::read();
                 ScanOutcome::Completed
             }
             Err(_) => {
-                let _ = UI::draw_message("Statistics unavailable", "the scan thread panicked");
+                let _ = term.draw(|f| {
+                    UI::render_message(f, "Statistics unavailable", "the scan thread panicked")
+                });
                 let _ = event::read();
                 ScanOutcome::Completed
             }
@@ -687,12 +691,13 @@ impl Explorer {
             if handle.is_finished() {
                 break;
             }
-            let _ = UI::draw_loading(
-                &label,
-                total,
-                STATS_SPINNER[frame % STATS_SPINNER.len()],
-                started.elapsed(),
-            );
+            // Animate through the live terminal when one is up (the interactive
+            // session); headless `--plain` uses `load_quiet` and never gets here.
+            if let Some(term) = self.terminal.as_mut() {
+                let spinner = STATS_SPINNER[frame % STATS_SPINNER.len()];
+                let elapsed = started.elapsed();
+                let _ = term.draw(|f| UI::render_loading(f, &label, total, spinner, elapsed));
+            }
             frame += 1;
         }
         let (tensors, metadata) = handle
@@ -1841,6 +1846,30 @@ impl Explorer {
         Ok(info)
     }
 
+    /// Render the data view from the *already sampled* result in
+    /// [`Self::sample_cache`] (no re-sampling), with no overlay — used as the
+    /// static background behind the reshape / slice prompts, which float over the
+    /// view that was just drawn. A no-op if the cache is somehow empty.
+    fn render_cached_data(
+        &self,
+        frame: &mut ratatui::Frame,
+        tensor: &TensorInfo,
+        repr: Representation,
+        stats: StatsView,
+        stripe: StripeMode,
+        base: NumBase,
+    ) {
+        let cache = self.sample_cache.borrow();
+        let Some(cached) = cache.as_ref() else {
+            return;
+        };
+        let sample = &cached.sample;
+        match repr {
+            Representation::Heatmap => UI::render_heatmap(frame, tensor, sample, stats),
+            Representation::Values => UI::render_values(frame, tensor, sample, stats, stripe, base),
+        }
+    }
+
     /// Render a tensor's data view to plain text via an in-memory Ratatui backend
     /// — the headless (`--plain`) data view and the `c` screen-copy share this.
     /// Mirrors [`Self::detail_plain`]. On a sampling error the message is rendered
@@ -1908,19 +1937,18 @@ impl Explorer {
         // The browser needs the whole checkpoint; bring it in now if a fast
         // `--tensor` open deferred the full load.
         self.ensure_full_load()?;
-        // Force a full repaint on entry, and again after any raw overlay (legend,
-        // health report, `y` command pop-up, repack) draws over the Ratatui frame
-        // — the bridge while other screens are still on the raw path.
-        let mut dirty = true;
+        // Force a full repaint on entry so the tree fully overwrites whatever
+        // screen (detail/data view, or the loading frame) preceded it.
+        let mut first = true;
         loop {
             // Draw the tree through the owned Ratatui terminal.
             let mut term = self
                 .terminal
                 .take()
                 .expect("interactive loop owns the terminal");
-            if dirty {
+            if first {
                 term.clear()?;
-                dirty = false;
+                first = false;
             }
             if let Ok(sz) = term.size() {
                 self.update_tree_scroll(sz.width, sz.height);
@@ -1980,24 +2008,27 @@ impl Explorer {
                         code: KeyCode::Char('y'),
                         ..
                     } if !self.search_mode => {
-                        self.copy_command(&self.command_for_tree_selection(), None);
-                        dirty = true; // raw pop-up drew over the frame
+                        let mut term = self.terminal.take().expect("interactive loop owns it");
+                        self.copy_command(&mut term, &self.command_for_tree_selection(), None);
+                        self.terminal = Some(term);
                     }
                     // `h` shows the checkpoint health report (when there is one).
                     KeyEvent {
                         code: KeyCode::Char('h'),
                         ..
                     } if !self.search_mode => {
-                        self.show_health_report();
-                        dirty = true;
+                        let mut term = self.terminal.take().expect("interactive loop owns it");
+                        self.show_health_report(&mut term);
+                        self.terminal = Some(term);
                     }
                     // `l` opens the legend for the tree's glyphs.
                     KeyEvent {
                         code: KeyCode::Char('l'),
                         ..
                     } if !self.search_mode => {
-                        self.show_legend(Legend::Tree, None);
-                        dirty = true;
+                        let mut term = self.terminal.take().expect("interactive loop owns it");
+                        self.show_legend(&mut term, Legend::Tree, None);
+                        self.terminal = Some(term);
                     }
                     // `E` / `C` expand / collapse every group at once.
                     KeyEvent {
@@ -2013,8 +2044,9 @@ impl Explorer {
                         code: KeyCode::Char('R'),
                         ..
                     } if !self.search_mode => {
-                        self.repack_checkpoint();
-                        dirty = true;
+                        let mut term = self.terminal.take().expect("interactive loop owns it");
+                        self.repack_checkpoint(&mut term);
+                        self.terminal = Some(term);
                     }
                     KeyEvent {
                         code: KeyCode::Char('/'),
@@ -2118,14 +2150,24 @@ impl Explorer {
                         ..
                     } => match self.handle_selection() {
                         (Some(screen), _) => return Ok(Nav::Open(screen)),
-                        (None, drew_overlay) => dirty |= drew_overlay,
+                        (None, Some(info)) => {
+                            let mut term = self.terminal.take().expect("interactive loop owns it");
+                            self.show_metadata_detail(&mut term, &info);
+                            self.terminal = Some(term);
+                        }
+                        (None, None) => {}
                     },
                     KeyEvent {
                         code: KeyCode::Char(' '),
                         ..
                     } if !self.search_mode => match self.handle_selection() {
                         (Some(screen), _) => return Ok(Nav::Open(screen)),
-                        (None, drew_overlay) => dirty |= drew_overlay,
+                        (None, Some(info)) => {
+                            let mut term = self.terminal.take().expect("interactive loop owns it");
+                            self.show_metadata_detail(&mut term, &info);
+                            self.terminal = Some(term);
+                        }
+                        (None, None) => {}
                     },
                     // While searching, space is ignored rather than typed into the query.
                     KeyEvent {
@@ -2439,11 +2481,11 @@ impl Explorer {
     }
 
     /// Act on the highlighted tree row. Returns `Some(Screen::Detail)` when a
-    /// tensor was selected (the navigator opens it); groups expand and metadata
-    /// opens in place, returning `None`. The second element is `true` when a raw
-    /// overlay was drawn over the Ratatui frame (the metadata view), so the
-    /// caller forces a full repaint on return (the migration bridge).
-    fn handle_selection(&mut self) -> (Option<Screen>, bool) {
+    /// tensor was selected (the navigator opens it); groups expand in place,
+    /// returning `None`. The second element is the metadata entry to open in place
+    /// (cloned out so the caller, which owns the live terminal, can draw it through
+    /// Ratatui) — `None` for groups/tensors.
+    fn handle_selection(&mut self) -> (Option<Screen>, Option<MetadataInfo>) {
         let tree = if self.search_mode {
             &self.filtered_tree
         } else {
@@ -2470,16 +2512,15 @@ impl Explorer {
                             tensor: info.name.clone(),
                             slice: 0,
                         }),
-                        false,
+                        None,
                     );
                 }
                 TreeNode::Metadata { info } => {
-                    self.show_metadata_detail(info);
-                    return (None, true); // raw full-screen drawn over the frame
+                    return (None, Some(info.clone()));
                 }
             }
         }
-        (None, false)
+        (None, None)
     }
 
     /// Report a request that can't be honored. In the navigator this shows a
@@ -2487,14 +2528,19 @@ impl Explorer {
     /// tree); the headless and one-shot modes draw nothing and rely on the
     /// returned error, which propagates to a non-zero process exit.
     fn reject_open(
-        &self,
+        &mut self,
         mode: OpenMode,
         title: &str,
         screen_detail: &str,
         error: &str,
     ) -> anyhow::Error {
-        if mode == OpenMode::Interactive {
-            let _ = UI::draw_message(title, screen_detail);
+        // Interactively, the live terminal is up (set in `run`); draw the
+        // recoverable message through it. Headless / one-shot draw nothing and
+        // rely on the returned error.
+        if mode == OpenMode::Interactive
+            && let Some(term) = self.terminal.as_mut()
+        {
+            let _ = term.draw(|f| UI::render_message(f, title, screen_detail));
             let _ = event::read();
         }
         anyhow::anyhow!("{error}")
@@ -2772,21 +2818,19 @@ impl Explorer {
                 .terminal
                 .take()
                 .expect("interactive loop owns the terminal");
-            self.compute_stats_animated(&tensor, view, |sv| {
-                let _ = term.draw(|f| {
-                    self.render_detail_frame(
-                        f,
-                        &tensor,
-                        &shape,
-                        view,
-                        overridable,
-                        unindexed,
-                        sv,
-                        None,
-                        None,
-                        None,
-                    )
-                });
+            self.compute_stats_animated(&mut term, &tensor, view, |f, sv| {
+                self.render_detail_frame(
+                    f,
+                    &tensor,
+                    &shape,
+                    view,
+                    overridable,
+                    unindexed,
+                    sv,
+                    None,
+                    None,
+                    None,
+                );
             });
             self.terminal = Some(term);
         }
@@ -2866,10 +2910,6 @@ impl Explorer {
         // Set right after `c` copies the screen; confirmed on the bottom line
         // until the next key or `COPY_FLASH` elapses.
         let mut copied_since: Option<std::time::Instant> = None;
-        // Force a full repaint on entry, and again after any raw sub-screen (the
-        // `d`/`r`/`b` prompts, the copy-flash bottom line) draws over the Ratatui
-        // frame — the bridge while those screens are still on the raw path.
-        let mut dirty = true;
         loop {
             let view = self.active_view(&tensor.name);
             let shape = self
@@ -2881,21 +2921,19 @@ impl Explorer {
             // `--compute-stats` kicks off the scan synchronously on first open,
             // animating the spinner right here; normal browsing stays fast.
             if first && stats_start == StatsStart::Auto {
-                self.compute_stats_animated(tensor, view, |sv| {
-                    let _ = term.draw(|f| {
-                        self.render_detail_frame(
-                            f,
-                            tensor,
-                            &shape,
-                            view,
-                            overridable,
-                            unindexed,
-                            sv,
-                            None,
-                            None,
-                            None,
-                        )
-                    });
+                self.compute_stats_animated(term, tensor, view, |f, sv| {
+                    self.render_detail_frame(
+                        f,
+                        tensor,
+                        &shape,
+                        view,
+                        overridable,
+                        unindexed,
+                        sv,
+                        None,
+                        None,
+                        None,
+                    );
                 });
             }
             // Stats: shown if cached, else — while warming — a live spinner for
@@ -2947,14 +2985,15 @@ impl Explorer {
                 .borrow()
                 .get(&(tensor.name.clone(), view, self.histogram_bins.get()))
                 .cloned();
-            // A raw sub-screen (a `d`/`r`/`b` prompt, the copy-flash) may have
-            // drawn over the frame; clear once so Ratatui fully repaints over it.
-            if dirty {
-                if term.clear().is_err() {
-                    return Nav::Quit;
-                }
-                dirty = false;
+            // Force a full repaint on the first frame so the detail fully
+            // overwrites whatever screen preceded it.
+            if first && term.clear().is_err() {
+                return Nav::Quit;
             }
+            // Confirm a screen copy on the bottom line while the flash is still
+            // within its window (dismissed by the next key or the timed poll) —
+            // composited over the detail frame in the same draw.
+            let show_flash = copied_since.is_some_and(|t| t.elapsed() < COPY_FLASH);
             if term
                 .draw(|f| {
                     self.render_detail_frame(
@@ -2968,19 +3007,14 @@ impl Explorer {
                         hist.as_ref(),
                         None,
                         overlay.as_ref(),
-                    )
+                    );
+                    if show_flash {
+                        UI::render_copied_flash(f, "screen contents");
+                    }
                 })
                 .is_err()
             {
                 return Nav::Quit;
-            }
-            // Confirm a screen copy on the bottom line while the flash is still
-            // within its window (dismissed by the next key or the timed poll). The
-            // flash is a raw write over the frame, so mark the frame dirty for the
-            // next iteration to repaint over it.
-            if copied_since.is_some_and(|t| t.elapsed() < COPY_FLASH) {
-                let _ = UI::draw_copied_flash("screen contents");
-                dirty = true;
             }
             // One-shot mode: leave this frame up and exit without reading keys.
             if first && interaction == Interaction::OneShot {
@@ -3076,26 +3110,40 @@ impl Explorer {
                         overridable,
                         unindexed,
                     );
-                    // A histogram-scan error path draws a raw message; repaint over it.
-                    dirty = true;
                 }
                 // Set the histogram's bucket count (then (re)compute and show it).
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('b') | KeyCode::Char('B'),
                     ..
                 })) => {
-                    let changed = match self.prompt_bins(self.histogram_bins.get()) {
-                        BinsChoice::Set(n) => {
-                            self.histogram_bins.set(Some(n));
-                            true
-                        }
-                        BinsChoice::Clear => {
-                            self.histogram_bins.set(None);
-                            true
-                        }
-                        BinsChoice::Cancel => false,
+                    // The bins prompt floats over the live detail frame; redraw it
+                    // (no overlay) as the prompt's background.
+                    let background = |f: &mut ratatui::Frame| {
+                        self.render_detail_frame(
+                            f,
+                            tensor,
+                            &shape,
+                            view,
+                            overridable,
+                            unindexed,
+                            stats_view,
+                            hist.as_ref(),
+                            None,
+                            None,
+                        );
                     };
-                    dirty = true; // the raw bins prompt drew over the frame
+                    let changed =
+                        match self.prompt_bins(term, background, self.histogram_bins.get()) {
+                            BinsChoice::Set(n) => {
+                                self.histogram_bins.set(Some(n));
+                                true
+                            }
+                            BinsChoice::Clear => {
+                                self.histogram_bins.set(None);
+                                true
+                            }
+                            BinsChoice::Cancel => false,
+                        };
                     if changed {
                         self.ensure_detail_histogram(
                             term,
@@ -3113,21 +3161,19 @@ impl Explorer {
                     code: KeyCode::Char('s') | KeyCode::Char('S'),
                     ..
                 })) => {
-                    self.compute_stats_animated(tensor, view, |sv| {
-                        let _ = term.draw(|f| {
-                            self.render_detail_frame(
-                                f,
-                                tensor,
-                                &shape,
-                                view,
-                                overridable,
-                                unindexed,
-                                sv,
-                                None,
-                                None,
-                                None,
-                            )
-                        });
+                    self.compute_stats_animated(term, tensor, view, |f, sv| {
+                        self.render_detail_frame(
+                            f,
+                            tensor,
+                            &shape,
+                            view,
+                            overridable,
+                            unindexed,
+                            sv,
+                            None,
+                            None,
+                            None,
+                        );
                     });
                 }
                 // Reinterpret the dtype from the detail screen too.
@@ -3135,7 +3181,7 @@ impl Explorer {
                     code: KeyCode::Char('d') | KeyCode::Char('D'),
                     ..
                 })) if overridable => {
-                    if let Some(chosen) = self.prompt_dtype(tensor, DtypePreview::Detail) {
+                    if let Some(chosen) = self.prompt_dtype(term, tensor, DtypePreview::Detail) {
                         let def = self.default_view(&tensor.name);
                         let mut overrides = self.dtype_overrides.borrow_mut();
                         if chosen == def {
@@ -3144,7 +3190,6 @@ impl Explorer {
                             overrides.insert(tensor.name.clone(), chosen);
                         }
                     }
-                    dirty = true; // the raw dtype menu drew over the frame
                 }
                 // Reshape (shape override) from the detail screen too.
                 Ok(Event::Key(KeyEvent {
@@ -3152,7 +3197,21 @@ impl Explorer {
                     ..
                 })) if overridable => {
                     let current = self.shape_overrides.borrow().get(&tensor.name).cloned();
-                    match self.prompt_reshape(tensor, current.as_deref()) {
+                    let background = |f: &mut ratatui::Frame| {
+                        self.render_detail_frame(
+                            f,
+                            tensor,
+                            &shape,
+                            view,
+                            overridable,
+                            unindexed,
+                            stats_view,
+                            hist.as_ref(),
+                            None,
+                            None,
+                        );
+                    };
+                    match self.prompt_reshape(term, background, tensor, current.as_deref()) {
                         ReshapeChoice::Set(s) => {
                             self.shape_overrides
                                 .borrow_mut()
@@ -3163,7 +3222,6 @@ impl Explorer {
                         }
                         ReshapeChoice::Cancel => {}
                     }
-                    dirty = true; // the raw reshape prompt drew over the frame
                 }
                 // Copy the detail screen's text to the clipboard.
                 Ok(Event::Key(KeyEvent {
@@ -3284,10 +3342,9 @@ impl Explorer {
         // data frame; while it's up the loop keeps redrawing and polling so a
         // running scan animates behind it, and any key dismisses it.
         let mut overlay: Option<Overlay> = None;
-        // Force a full repaint on entry, and again after any still-raw sub-screen
-        // (the `d`/`r`/`/` prompts, the copy-flash bottom line) draws over the
-        // Ratatui frame — the bridge while those screens are on the raw path.
-        let mut dirty = true;
+        // Force a full repaint on entry so the data view fully overwrites whatever
+        // screen preceded it.
+        let mut first = true;
         loop {
             // The data-view layout is a session-remembered preference, so it
             // sticks as you move between tensors and in/out of the preview.
@@ -3357,71 +3414,68 @@ impl Explorer {
 
             let stripe = self.data_view_stripe.get();
             let base = self.data_view_base.get();
-            // A raw sub-screen (a `d`/`r`/`/` prompt, the copy-flash) may have
-            // drawn over the frame; clear once so Ratatui fully repaints over it.
-            if dirty {
-                if term.clear().is_err() {
-                    return (Nav::Quit, repr, slice);
-                }
-                dirty = false;
+            // Force a full repaint on the first frame so the data view fully
+            // overwrites whatever screen preceded it.
+            if first && term.clear().is_err() {
+                return (Nav::Quit, repr, slice);
             }
+            // Confirm a screen copy on the bottom line while the flash is still
+            // within its window — composited over the data frame in the same draw.
+            let show_flash = copied_since.is_some_and(|t| t.elapsed() < COPY_FLASH);
             // (slices, overridable, clamped slice) on success — sample once, then
             // draw the cached result through Ratatui (overlay composited last).
-            let (slices, overridable) =
-                match self.prepare_data_sample(tensor, repr, slice, view, mode, stats_view) {
-                    Ok((slices, overridable, clamped)) => {
-                        slice = clamped;
-                        if term
-                            .draw(|f| {
-                                let cache = self.sample_cache.borrow();
-                                let sample = &cache.as_ref().unwrap().sample;
-                                match repr {
-                                    Representation::Heatmap => {
-                                        UI::render_heatmap(f, tensor, sample, stats_view)
-                                    }
-                                    Representation::Values => UI::render_values(
-                                        f, tensor, sample, stats_view, stripe, base,
-                                    ),
+            let (slices, overridable) = match self
+                .prepare_data_sample(tensor, repr, slice, view, mode, stats_view)
+            {
+                Ok((slices, overridable, clamped)) => {
+                    slice = clamped;
+                    if term
+                        .draw(|f| {
+                            let cache = self.sample_cache.borrow();
+                            let sample = &cache.as_ref().unwrap().sample;
+                            match repr {
+                                Representation::Heatmap => {
+                                    UI::render_heatmap(f, tensor, sample, stats_view)
                                 }
-                                match overlay.as_ref() {
-                                    Some(Overlay::Legend(l)) => UI::render_legend_band(f, *l),
-                                    Some(Overlay::Command(c)) => UI::render_command_band(f, c),
-                                    None => {}
+                                Representation::Values => {
+                                    UI::render_values(f, tensor, sample, stats_view, stripe, base)
                                 }
-                            })
-                            .is_err()
-                        {
-                            return (Nav::Quit, repr, slice);
-                        }
-                        (slices, overridable)
+                            }
+                            match overlay.as_ref() {
+                                Some(Overlay::Legend(l)) => UI::render_legend_band(f, *l),
+                                Some(Overlay::Command(c)) => UI::render_command_band(f, c),
+                                None => {}
+                            }
+                            if show_flash {
+                                UI::render_copied_flash(f, "screen contents");
+                            }
+                        })
+                        .is_err()
+                    {
+                        return (Nav::Quit, repr, slice);
                     }
-                    Err(msg) => {
-                        let _ = UI::draw_message("Data preview unavailable", &msg);
-                        if interaction == Interaction::Interactive
-                            && let Ok(Event::Key(key)) = event::read()
-                            && is_ctrl_c(&key)
-                        {
-                            quit_immediately();
-                        }
-                        return (
-                            Nav::Open(Screen::Detail {
-                                tensor: tensor.name.clone(),
-                                slice,
-                            }),
-                            repr,
+                    (slices, overridable)
+                }
+                Err(msg) => {
+                    let _ = term.draw(|f| UI::render_message(f, "Data preview unavailable", &msg));
+                    if interaction == Interaction::Interactive
+                        && let Ok(Event::Key(key)) = event::read()
+                        && is_ctrl_c(&key)
+                    {
+                        quit_immediately();
+                    }
+                    return (
+                        Nav::Open(Screen::Detail {
+                            tensor: tensor.name.clone(),
                             slice,
-                        );
-                    }
-                };
+                        }),
+                        repr,
+                        slice,
+                    );
+                }
+            };
 
-            // Confirm a screen copy on the bottom line, over the footer, while
-            // the flash is still within its window (it's dismissed by the next
-            // key or by the timed poll below). The flash is a raw write over the
-            // frame, so mark it dirty so the next iteration repaints over it.
-            if copied_since.is_some_and(|t| t.elapsed() < COPY_FLASH) {
-                let _ = UI::draw_copied_flash("screen contents");
-                dirty = true;
-            }
+            first = false;
 
             // One-shot mode (`--exit`): stats are computed above and the final
             // frame is now drawn, so leave it up and exit without reading keys.
@@ -3600,9 +3654,11 @@ impl Explorer {
                             // away a long computation. Picking a *different* dtype
                             // changes the view, which restarts the scan for it.
                             KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
-                                if let Some(chosen) = self
-                                    .prompt_dtype(tensor, DtypePreview::Data { repr, slice, mode })
-                                {
+                                if let Some(chosen) = self.prompt_dtype(
+                                    term,
+                                    tensor,
+                                    DtypePreview::Data { repr, slice, mode },
+                                ) {
                                     let def = self.default_view(&tensor.name);
                                     let mut overrides = self.dtype_overrides.borrow_mut();
                                     if chosen == def {
@@ -3611,7 +3667,6 @@ impl Explorer {
                                         overrides.insert(tensor.name.clone(), chosen);
                                     }
                                 }
-                                dirty = true; // the raw dtype menu drew over the frame
                             }
                             // Reshape: reinterpret the dimensions (`r`). The new
                             // shape must have the same element count; an empty
@@ -3620,7 +3675,19 @@ impl Explorer {
                             KeyCode::Char('r') | KeyCode::Char('R') if overridable => {
                                 let current =
                                     self.shape_overrides.borrow().get(&tensor.name).cloned();
-                                match self.prompt_reshape(tensor, current.as_deref()) {
+                                // The prompt floats over the current data view; redraw
+                                // it from the cached sample as the prompt's background.
+                                let background = |f: &mut ratatui::Frame| {
+                                    self.render_cached_data(
+                                        f, tensor, repr, stats_view, stripe, base,
+                                    );
+                                };
+                                match self.prompt_reshape(
+                                    term,
+                                    background,
+                                    tensor,
+                                    current.as_deref(),
+                                ) {
                                     ReshapeChoice::Set(s) => {
                                         self.shape_overrides
                                             .borrow_mut()
@@ -3633,14 +3700,17 @@ impl Explorer {
                                     }
                                     ReshapeChoice::Cancel => {}
                                 }
-                                dirty = true; // the raw reshape prompt drew over the frame
                             }
                             // Jump straight to a slice by typing its index.
                             KeyCode::Char('/') if slices > 1 => {
-                                if let Some(n) = self.prompt_slice(slices) {
+                                let background = |f: &mut ratatui::Frame| {
+                                    self.render_cached_data(
+                                        f, tensor, repr, stats_view, stripe, base,
+                                    );
+                                };
+                                if let Some(n) = self.prompt_slice(term, background, slices) {
                                     slice = n;
                                 }
-                                dirty = true; // the raw slice prompt drew over the frame
                             }
                             // Shift + arrows jump ~5% of the slices at once (wrapping).
                             KeyCode::Right if slices > 1 && shift => {
@@ -3736,21 +3806,19 @@ impl Explorer {
                 && self.cached_stats(tensor, view).is_none();
         let ready = !need_stats
             || matches!(
-                self.compute_stats_animated(tensor, view, |sv| {
-                    let _ = term.draw(|f| {
-                        self.render_detail_frame(
-                            f,
-                            tensor,
-                            shape,
-                            view,
-                            overridable,
-                            unindexed,
-                            sv,
-                            None,
-                            None,
-                            None,
-                        )
-                    });
+                self.compute_stats_animated(term, tensor, view, |f, sv| {
+                    self.render_detail_frame(
+                        f,
+                        tensor,
+                        shape,
+                        view,
+                        overridable,
+                        unindexed,
+                        sv,
+                        None,
+                        None,
+                        None,
+                    );
                 }),
                 ScanOutcome::Completed
             );
@@ -3904,55 +3972,17 @@ impl Explorer {
                 self.histogram_cache.borrow_mut().insert(key, hist);
             }
             Ok(Err(msg)) => {
-                let _ = UI::draw_message("Histogram unavailable", &msg);
+                let _ = term.draw(|f| UI::render_message(f, "Histogram unavailable", &msg));
                 let _ = event::read();
             }
             Err(_) => {}
         }
     }
 
-    /// Sample and draw the heatmap or numeric grid for `(slice, view)`, sized to
-    /// the terminal — the raw path, kept only for the dtype menu's live preview
-    /// behind the (still-raw) `d` menu. The interactive loop and headless render
-    /// go through Ratatui ([`Self::render_data_frame`]). Returns `(slices,
-    /// overridable, clamped_slice)` on success, or an error message to show.
-    #[allow(clippy::too_many_arguments)] // a render helper; the params are all distinct
-    fn draw_data_view(
-        &self,
-        out: &mut impl Write,
-        tensor: &TensorInfo,
-        repr: Representation,
-        slice: usize,
-        view: ViewDtype,
-        mode: SampleMode,
-        stats: StatsView,
-    ) -> Result<(usize, bool, usize), String> {
-        let info = self.prepare_data_sample(tensor, repr, slice, view, mode, stats)?;
-        let cache = self.sample_cache.borrow();
-        let sample = &cache.as_ref().unwrap().sample;
-        match repr {
-            Representation::Heatmap => {
-                UI::draw_heatmap(out, tensor, sample, stats).map_err(|e| e.to_string())?;
-            }
-            Representation::Values => {
-                UI::draw_values(
-                    out,
-                    tensor,
-                    sample,
-                    stats,
-                    self.data_view_stripe.get(),
-                    self.data_view_base.get(),
-                )
-                .map_err(|e| e.to_string())?;
-            }
-        }
-        Ok(info)
-    }
-
     /// Sample the heatmap / numeric grid for `(slice, view)`, sizing the grid to
     /// the terminal so the header and footer stay on screen, and leave the result
     /// in [`Self::sample_cache`]. Returns `(slices, overridable, clamped_slice)`.
-    /// Shared by the raw [`Self::draw_data_view`] and the Ratatui
+    /// Shared by the Ratatui
     /// [`Self::render_data_frame`] / [`Self::data_plain`], so all three agree on
     /// the sample (and reuse the cache between a scan's spinner-frame redraws).
     fn prepare_data_sample(
@@ -4086,7 +4116,12 @@ impl Explorer {
     /// view or `None` if cancelled. `d`/→ move forward, `D`/← back (the menu is
     /// horizontal); Enter applies, Esc cancels. Ctrl-C quits the app. The
     /// preview re-renders whichever screen the menu was opened from.
-    fn prompt_dtype(&self, tensor: &TensorInfo, preview: DtypePreview) -> Option<ViewDtype> {
+    fn prompt_dtype(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        tensor: &TensorInfo,
+        preview: DtypePreview,
+    ) -> Option<ViewDtype> {
         let options =
             crate::sample::view_options_for(&tensor.dtype, self.schema_for(&tensor.name).is_some());
         if options.is_empty() {
@@ -4101,42 +4136,56 @@ impl Explorer {
             .get(&tensor.name)
             .cloned()
             .unwrap_or_else(|| tensor.shape.clone());
+        let stripe = self.data_view_stripe.get();
+        let base = self.data_view_base.get();
         loop {
-            // Live preview of the highlighted view, then the menu overlay.
-            // Only read cached stats — navigating the menu must never trigger a scan.
+            // Live preview of the highlighted view, then the menu band over it —
+            // all in one Ratatui frame. Only read cached stats: navigating the menu
+            // must never trigger a scan.
             let stats = self.cached_stats(tensor, options[idx]);
             let stats_view = stats.as_ref().map_or(StatsView::Pending, StatsView::Ready);
-            let preview_ok = match preview {
-                DtypePreview::Detail => UI::draw_tensor_detail(
-                    &mut live_out(),
-                    tensor,
-                    &shape,
-                    options[idx],
-                    true,
-                    self.unindexed.contains(&tensor.source_path),
-                    stats_view,
-                    None,
-                    None,
-                    self.schema_for(&tensor.name),
-                    None,
-                )
-                .is_ok(),
-                DtypePreview::Data { repr, slice, mode } => self
-                    .draw_data_view(
-                        &mut live_out(),
+            let mut preview_ok = true;
+            let drew = term.draw(|f| match preview {
+                DtypePreview::Detail => {
+                    self.render_detail_frame(
+                        f,
                         tensor,
-                        repr,
-                        slice,
+                        &shape,
                         options[idx],
-                        mode,
+                        true,
+                        self.unindexed.contains(&tensor.source_path),
                         stats_view,
-                    )
-                    .is_ok(),
-            };
-            if !preview_ok {
+                        None,
+                        None,
+                        None,
+                    );
+                    UI::render_dtype_menu(f, &options, idx);
+                }
+                DtypePreview::Data { repr, slice, mode } => {
+                    if self
+                        .render_data_frame(
+                            f,
+                            tensor,
+                            repr,
+                            slice,
+                            options[idx],
+                            mode,
+                            stats_view,
+                            stripe,
+                            base,
+                            None,
+                        )
+                        .is_err()
+                    {
+                        preview_ok = false;
+                        return;
+                    }
+                    UI::render_dtype_menu(f, &options, idx);
+                }
+            });
+            if drew.is_err() || !preview_ok {
                 return None;
             }
-            let _ = UI::draw_dtype_menu(&options, idx);
             match event::read() {
                 Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
                 Ok(Event::Key(KeyEvent { code, .. })) => match code {
@@ -4163,7 +4212,13 @@ impl Explorer {
     /// (separated by `,`, space, or `x`) whose product must equal the tensor's
     /// element count. Enter on an empty entry clears any override; `Esc`
     /// cancels. Prefilled with the current override, if any.
-    fn prompt_reshape(&self, tensor: &TensorInfo, current: Option<&[usize]>) -> ReshapeChoice {
+    fn prompt_reshape(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        background: impl Fn(&mut ratatui::Frame),
+        tensor: &TensorInfo,
+        current: Option<&[usize]>,
+    ) -> ReshapeChoice {
         let mut input = current
             .map(|s| {
                 s.iter()
@@ -4174,7 +4229,17 @@ impl Explorer {
             .unwrap_or_default();
         let mut error: Option<String> = None;
         loop {
-            if UI::draw_reshape_prompt(tensor.num_elements, &tensor.shape, &input, error.as_deref())
+            if term
+                .draw(|f| {
+                    background(f);
+                    UI::render_reshape_prompt(
+                        f,
+                        tensor.num_elements,
+                        &tensor.shape,
+                        &input,
+                        error.as_deref(),
+                    )
+                })
                 .is_err()
             {
                 return ReshapeChoice::Cancel;
@@ -4211,11 +4276,22 @@ impl Explorer {
         }
     }
 
-    fn prompt_slice(&self, slices: usize) -> Option<usize> {
+    fn prompt_slice(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        background: impl Fn(&mut ratatui::Frame),
+        slices: usize,
+    ) -> Option<usize> {
         let mut input = String::new();
         let mut error: Option<String> = None;
         loop {
-            if UI::draw_slice_prompt(slices, &input, error.as_deref()).is_err() {
+            if term
+                .draw(|f| {
+                    background(f);
+                    UI::render_slice_prompt(f, slices, &input, error.as_deref());
+                })
+                .is_err()
+            {
                 return None;
             }
             match event::read() {
@@ -4244,8 +4320,11 @@ impl Explorer {
         }
     }
 
-    fn show_metadata_detail(&self, metadata: &MetadataInfo) {
-        if UI::draw_metadata_detail(metadata).is_ok() {
+    fn show_metadata_detail(&self, term: &mut crate::tui::LiveTerminal, metadata: &MetadataInfo) {
+        if term
+            .draw(|f| UI::render_metadata_detail(f, metadata))
+            .is_ok()
+        {
             // Wait for any key press (Ctrl-C quits the app).
             if let Ok(Event::Key(key)) = event::read()
                 && is_ctrl_c(&key)
@@ -4255,8 +4334,11 @@ impl Explorer {
         }
     }
 
-    fn show_health_report(&self) {
-        if !self.health_reports.is_empty() && UI::draw_health_warning(&self.health_reports).is_ok()
+    fn show_health_report(&self, term: &mut crate::tui::LiveTerminal) {
+        if !self.health_reports.is_empty()
+            && term
+                .draw(|f| UI::render_health_warning(f, &self.health_reports))
+                .is_ok()
         {
             // Wait for any key press (Ctrl-C quits the app).
             if let Ok(Event::Key(key)) = event::read()
@@ -4280,42 +4362,53 @@ impl Explorer {
 
     /// Repack the current HDF5 checkpoint into a new file: prompt for the output
     /// name, then run the conversion with a progress screen.
-    fn repack_checkpoint(&self) {
+    fn repack_checkpoint(&self, term: &mut crate::tui::LiveTerminal) {
         let Some(input) = self.repack_input() else {
-            let _ = UI::draw_message(
-                "Repack unavailable",
-                "Repacking is available only for a single HDF5 checkpoint (.h5/.hdf5).",
-            );
+            let _ = term.draw(|f| {
+                UI::render_message(
+                    f,
+                    "Repack unavailable",
+                    "Repacking is available only for a single HDF5 checkpoint (.h5/.hdf5).",
+                )
+            });
             let _ = event::read();
             return;
         };
         let default = default_repacked_name(&input);
-        let Some(output) = self.prompt_output_path(&default) else {
+        let Some(output) = self.prompt_output_path(term, &default) else {
             return;
         };
-        let Some(codec) = self.prompt_codec() else {
+        let Some(codec) = self.prompt_codec(term) else {
             return;
         };
-        if !self.confirm_same_codec(&input, codec) {
+        if !self.confirm_same_codec(term, &input, codec) {
             return;
         }
-        let Some(buffer_bytes) = self.prompt_buffer() else {
+        let Some(buffer_bytes) = self.prompt_buffer(term) else {
             return;
         };
-        self.run_repack(&input, &output, codec, buffer_bytes);
+        self.run_repack(term, &input, &output, codec, buffer_bytes);
     }
 
     /// If the source already uses `codec`, ask whether to re-encode anyway
     /// (a plain copy would be equivalent). Returns `true` to proceed.
     #[cfg(feature = "hdf5")]
-    fn confirm_same_codec(&self, input: &Path, codec: crate::codec::Codec) -> bool {
+    fn confirm_same_codec(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        input: &Path,
+        codec: crate::codec::Codec,
+    ) -> bool {
         if crate::convert::source_codec(input) != Some(codec) {
             return true;
         }
         let title = format!("Source is already {} — re-encode it anyway?", codec.label());
         let mut idx = 0; // 0 = repack anyway, 1 = cancel
         loop {
-            if UI::draw_choice_menu(&title, &["Repack anyway", "Cancel"], idx).is_err() {
+            if term
+                .draw(|f| UI::render_choice_menu(f, &title, &["Repack anyway", "Cancel"], idx))
+                .is_err()
+            {
                 return false;
             }
             match event::read() {
@@ -4333,18 +4426,26 @@ impl Explorer {
     }
 
     #[cfg(not(feature = "hdf5"))]
-    fn confirm_same_codec(&self, _input: &Path, _codec: crate::codec::Codec) -> bool {
+    fn confirm_same_codec(
+        &self,
+        _term: &mut crate::tui::LiveTerminal,
+        _input: &Path,
+        _codec: crate::codec::Codec,
+    ) -> bool {
         true
     }
 
     /// Pick the output compression codec from a menu. Returns `None` if cancelled.
-    fn prompt_codec(&self) -> Option<crate::codec::Codec> {
+    fn prompt_codec(&self, term: &mut crate::tui::LiveTerminal) -> Option<crate::codec::Codec> {
         use crate::codec::Codec;
         let codecs = [Codec::Gzip, Codec::Zstd, Codec::Lz4, Codec::Uncompressed];
         let labels: Vec<&str> = codecs.iter().map(|c| c.label()).collect();
         let mut idx = 0;
         loop {
-            if UI::draw_choice_menu("Repack — compression codec", &labels, idx).is_err() {
+            if term
+                .draw(|f| UI::render_choice_menu(f, "Repack — compression codec", &labels, idx))
+                .is_err()
+            {
                 return None;
             }
             match event::read() {
@@ -4366,16 +4467,26 @@ impl Explorer {
     /// a default. Returns the size in bytes, or `None` if cancelled.
     /// Prompt for the histogram bucket count, pre-filled with the current count.
     /// An empty entry returns to the automatic count; `Esc` leaves it unchanged.
-    fn prompt_bins(&self, current: Option<usize>) -> BinsChoice {
+    fn prompt_bins(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        background: impl Fn(&mut ratatui::Frame),
+        current: Option<usize>,
+    ) -> BinsChoice {
         let mut input = current.map(|n| n.to_string()).unwrap_or_default();
         let mut error: Option<String> = None;
         loop {
-            if UI::draw_text_prompt(
-                "Histogram bin count (1–512, empty for automatic)",
-                &input,
-                error.as_deref(),
-            )
-            .is_err()
+            if term
+                .draw(|f| {
+                    background(f);
+                    UI::render_text_prompt(
+                        f,
+                        "Histogram bin count (1–512, empty for automatic)",
+                        &input,
+                        error.as_deref(),
+                    );
+                })
+                .is_err()
             {
                 return BinsChoice::Cancel;
             }
@@ -4413,16 +4524,20 @@ impl Explorer {
         }
     }
 
-    fn prompt_buffer(&self) -> Option<usize> {
+    fn prompt_buffer(&self, term: &mut crate::tui::LiveTerminal) -> Option<usize> {
         let mut input = "256M".to_string();
         let mut error: Option<String> = None;
         loop {
-            if UI::draw_text_prompt(
-                "Streaming buffer size (e.g. 64M, 256M, 1G)",
-                &input,
-                error.as_deref(),
-            )
-            .is_err()
+            if term
+                .draw(|f| {
+                    UI::render_text_prompt(
+                        f,
+                        "Streaming buffer size (e.g. 64M, 256M, 1G)",
+                        &input,
+                        error.as_deref(),
+                    )
+                })
+                .is_err()
             {
                 return None;
             }
@@ -4453,11 +4568,23 @@ impl Explorer {
 
     /// Prompt for the repack output path, pre-filled with `default`, rejecting an
     /// empty name or an existing file. Returns `None` if cancelled.
-    fn prompt_output_path(&self, default: &Path) -> Option<PathBuf> {
+    fn prompt_output_path(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        default: &Path,
+    ) -> Option<PathBuf> {
         let mut input = default.to_string_lossy().into_owned();
         let mut error: Option<String> = None;
         loop {
-            if UI::draw_text_prompt("Save repacked checkpoint as", &input, error.as_deref())
+            if term
+                .draw(|f| {
+                    UI::render_text_prompt(
+                        f,
+                        "Save repacked checkpoint as",
+                        &input,
+                        error.as_deref(),
+                    )
+                })
                 .is_err()
             {
                 return None;
@@ -4494,7 +4621,14 @@ impl Explorer {
     }
 
     #[cfg(feature = "hdf5")]
-    fn run_repack(&self, input: &Path, output: &Path, codec: crate::codec::Codec, buffer: usize) {
+    fn run_repack(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        input: &Path,
+        output: &Path,
+        codec: crate::codec::Codec,
+        buffer: usize,
+    ) {
         let level = codec.clamp_level(codec.default_level());
         let opts = crate::convert::Options {
             codec,
@@ -4502,9 +4636,11 @@ impl Explorer {
             buffer_bytes: buffer,
         };
         let title = format!("Repacking → {} ({})", output.display(), codec.label());
-        let _ = UI::draw_progress(&title, 0, 1, "starting…");
+        let _ = term.draw(|f| UI::render_progress(f, &title, 0, 1, "starting…"));
+        // The conversion drives this callback per dataset; redraw the progress bar
+        // through the live terminal each step (`term` is borrowed for the duration).
         let result = crate::convert::convert_hdf5(input, output, &opts, |done, total, name| {
-            let _ = UI::draw_progress(&title, done, total, name);
+            let _ = term.draw(|f| UI::render_progress(f, &title, done, total, name));
         });
         let level_note = if codec.uses_level() {
             format!(", level {level}")
@@ -4518,22 +4654,26 @@ impl Explorer {
             ),
             Err(e) => ("Repack failed", format!("{e:#}")),
         };
-        let _ = UI::draw_message(heading, &body);
+        let _ = term.draw(|f| UI::render_message(f, heading, &body));
         let _ = event::read();
     }
 
     #[cfg(not(feature = "hdf5"))]
     fn run_repack(
         &self,
+        term: &mut crate::tui::LiveTerminal,
         _input: &Path,
         _output: &Path,
         _codec: crate::codec::Codec,
         _buffer: usize,
     ) {
-        let _ = UI::draw_message(
-            "Repack unavailable",
-            "Rebuild with `--features hdf5` to enable repacking.",
-        );
+        let _ = term.draw(|f| {
+            UI::render_message(
+                f,
+                "Repack unavailable",
+                "Rebuild with `--features hdf5` to enable repacking.",
+            )
+        });
         let _ = event::read();
     }
 
@@ -4545,11 +4685,23 @@ impl Explorer {
     /// this keypress (or `None`). The overlay does no file I/O, so we clear it to
     /// let the scan keep computing while the legend is up — its result is
     /// harvested when the caller redraws — instead of stalling it until dismissal.
-    fn show_legend(&self, legend: Legend, resume: Option<&AtomicBool>) {
+    fn show_legend(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        legend: Legend,
+        resume: Option<&AtomicBool>,
+    ) {
         if let Some(pause) = resume {
             pause.store(false, Ordering::Relaxed);
         }
-        if UI::draw_legend(legend).is_ok()
+        // Float the legend band over a fresh tree frame (the band composites last
+        // so the tree stays visible behind it).
+        if term
+            .draw(|f| {
+                self.render_tree_frame(f);
+                UI::render_legend_band(f, legend);
+            })
+            .is_ok()
             && let Ok(Event::Key(key)) = event::read()
             && is_ctrl_c(&key)
         {
@@ -4562,12 +4714,24 @@ impl Explorer {
     /// (the `y` shortcut). Any key returns; Ctrl-C still quits. `resume` keeps a
     /// caller-paused background scan running while the box is up (see
     /// [`Self::show_legend`]).
-    fn copy_command(&self, command: &str, resume: Option<&AtomicBool>) {
+    fn copy_command(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        command: &str,
+        resume: Option<&AtomicBool>,
+    ) {
         copy_to_clipboard(command);
         if let Some(pause) = resume {
             pause.store(false, Ordering::Relaxed);
         }
-        if UI::draw_command(command).is_ok()
+        // Float the CLI-command band over a fresh tree frame (composited last so
+        // the tree stays visible behind it).
+        if term
+            .draw(|f| {
+                self.render_tree_frame(f);
+                UI::render_command_band(f, command);
+            })
+            .is_ok()
             && let Ok(Event::Key(key)) = event::read()
             && is_ctrl_c(&key)
         {
@@ -4960,12 +5124,6 @@ fn collect_source_paths(node: &TreeNode, out: &mut BTreeSet<String>) {
         }
         TreeNode::Metadata { .. } => {}
     }
-}
-
-/// A buffered writer over the live stdout for the screen-draw functions. The
-/// buffering makes each frame flush atomically (no progressive paint / flicker).
-fn live_out() -> io::BufWriter<io::StdoutLock<'static>> {
-    io::BufWriter::new(io::stdout().lock())
 }
 
 /// Quote `s` as a single shell argument: left bare when it's only made of safe
