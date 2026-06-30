@@ -714,15 +714,54 @@ fn diff_only_tensors_drops_metadata_section_and_exit() {
     let (out, code) = run_diff(&[DIFF_OLD, DIFF_META]);
     assert_eq!(code, 1, "a metadata-only difference should exit 1; {out}");
     assert!(out.contains("metadata:"), "{out}");
-    // ...but `--only-tensors` removes the section *and* the difference, so the
-    // otherwise-identical checkpoints compare equal (exit 0).
+    // ...but `--only-tensors` drops it from the diff *and* the exit code, so the
+    // otherwise-identical checkpoints compare equal (exit 0), with a clear note.
     let (out2, code2) = run_diff(&[DIFF_OLD, DIFF_META, "--only-tensors"]);
     assert_eq!(
         code2, 0,
         "ignoring the only difference should exit 0; {out2}"
     );
     assert!(
-        !out2.contains("metadata"),
-        "section should be omitted; {out2}"
+        out2.contains("metadata: not compared (--only-tensors)"),
+        "{out2}"
+    );
+    assert!(
+        !out2.contains("  ~ note"),
+        "no per-entry metadata lines; {out2}"
+    );
+}
+
+#[test]
+fn diff_values_detects_value_only_change() {
+    ensure_diff_fixtures();
+    // mlp.weight has the same dtype+shape but different bytes (seed 0 vs 7).
+    // Structural diff calls it unchanged...
+    let (plain, _) = run_diff(&[DIFF_OLD, DIFF_NEW]);
+    assert!(!plain.contains("mlp.weight"), "{plain}");
+    // ...but `--values` reads the data and flags it (4 of 4 bytes differ by 7).
+    let (out, code) = run_diff(&[DIFF_OLD, DIFF_NEW, "--values"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("~ model.layers.0.mlp.weight  [U8 (4)]  (values differ)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("values: 4 of 4 differ  (max |Δ| 7, mean |Δ| 7)"),
+        "{out}"
+    );
+    // A shape change can't be compared element-wise.
+    assert!(
+        out.contains("values: not compared (shapes differ)"),
+        "{out}"
+    );
+    // Composes with --only-tensors (value diff kept; metadata noted as skipped).
+    let (both, _) = run_diff(&[DIFF_OLD, DIFF_NEW, "--values", "--only-tensors"]);
+    assert!(
+        both.contains("mlp.weight  [U8 (4)]  (values differ)"),
+        "{both}"
+    );
+    assert!(
+        both.contains("metadata: not compared (--only-tensors)"),
+        "{both}"
     );
 }

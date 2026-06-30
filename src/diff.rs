@@ -30,6 +30,9 @@ pub struct DiffOpts {
     /// Collapse entries sharing a name template + the same change into one line
     /// with a count and index range (off under `--full`).
     pub group: bool,
+    /// Element values were compared (`--values`): show per-change value stats and
+    /// note when a change's values weren't compared.
+    pub values: bool,
 }
 
 /// Wrap `text` in an ANSI colour `code` when `on`, else return it unchanged.
@@ -201,6 +204,79 @@ fn count_suffix(count: usize) -> String {
     }
 }
 
+/// A collapsed run of changed tensors sharing a template and the same dtype/shape
+/// change, with their value comparisons aggregated across the run.
+struct ChangedGroup {
+    template: String,
+    indices: Vec<Vec<String>>,
+    count: usize,
+    old: TensorSig,
+    new: TensorSig,
+    values: Option<ValueDiff>,
+}
+
+/// Combine two value comparisons: counts sum, `max_abs` is the max, `mean_abs` is
+/// the element-weighted mean — so a group's aggregate reads like one comparison.
+fn merge_values(acc: Option<ValueDiff>, next: Option<ValueDiff>) -> Option<ValueDiff> {
+    match (acc, next) {
+        (None, x) | (x, None) => x,
+        (Some(a), Some(b)) => {
+            let elements = a.elements + b.elements;
+            let mean_abs = if elements > 0 {
+                (a.mean_abs * a.elements as f64 + b.mean_abs * b.elements as f64) / elements as f64
+            } else {
+                0.0
+            };
+            Some(ValueDiff {
+                elements,
+                differing: a.differing + b.differing,
+                max_abs: a.max_abs.max(b.max_abs),
+                mean_abs,
+                nonfinite_mismatch: a.nonfinite_mismatch + b.nonfinite_mismatch,
+            })
+        }
+    }
+}
+
+/// Group changed tensors by `(template, old_sig, new_sig)` in first-seen order
+/// (aggregating their value comparisons), or one group per tensor when `!group`.
+fn group_changed(items: &[TensorChange], group: bool) -> Vec<ChangedGroup> {
+    use std::collections::HashMap;
+    let mut index: HashMap<(String, TensorSig, TensorSig), usize> = HashMap::new();
+    let mut groups: Vec<ChangedGroup> = Vec::new();
+    for c in items {
+        let (template, idx) = templatize(&c.name);
+        // `!group` keeps every entry distinct: key on the unique name too.
+        let bucket = if group {
+            (template.clone(), c.old.clone(), c.new.clone())
+        } else {
+            (c.name.clone(), c.old.clone(), c.new.clone())
+        };
+        let gi = match index.get(&bucket) {
+            Some(&i) => i,
+            None => {
+                index.insert(bucket, groups.len());
+                groups.push(ChangedGroup {
+                    template,
+                    indices: vec![Vec::new(); idx.len()],
+                    count: 0,
+                    old: c.old.clone(),
+                    new: c.new.clone(),
+                    values: None,
+                });
+                groups.len() - 1
+            }
+        };
+        let g = &mut groups[gi];
+        g.count += 1;
+        for (p, v) in idx.into_iter().enumerate() {
+            g.indices[p].push(v);
+        }
+        g.values = merge_values(g.values, c.values);
+    }
+    groups
+}
+
 /// A tensor's compared identity: dtype + shape. Two tensors with the same name
 /// are "changed" when these differ (data bytes are not part of the comparison).
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -254,24 +330,18 @@ impl CheckpointSummary {
     /// checkpoint can list a name in more than one file; the last one wins (the
     /// same name+shape is expected across shards, so this only matters if they
     /// genuinely disagree, which a diff can't meaningfully represent anyway).
-    pub fn from_loaded(tensors: Vec<TensorInfo>, metadata: Vec<MetadataInfo>) -> Self {
+    pub fn from_loaded(tensors: &[TensorInfo], metadata: &[MetadataInfo]) -> Self {
         let mut t = BTreeMap::new();
         for ti in tensors {
-            t.insert(
-                ti.name,
-                TensorSig {
-                    dtype: ti.dtype,
-                    shape: ti.shape,
-                },
-            );
+            t.insert(ti.name.clone(), TensorSig::of(ti));
         }
         let mut m = BTreeMap::new();
         for mi in metadata {
             m.insert(
-                mi.name,
+                mi.name.clone(),
                 MetaVal {
-                    value: mi.value,
-                    value_type: mi.value_type,
+                    value: mi.value.clone(),
+                    value_type: mi.value_type.clone(),
                 },
             );
         }
@@ -282,11 +352,15 @@ impl CheckpointSummary {
     }
 }
 
-/// A tensor present in both checkpoints whose dtype and/or shape differ.
+/// A tensor present in both checkpoints that differs — by dtype/shape, or (with
+/// `--values`) by element values even when the signature is unchanged.
 pub struct TensorChange {
     pub name: String,
     pub old: TensorSig,
     pub new: TensorSig,
+    /// The element-value comparison, when `--values` ran it (`None` otherwise, or
+    /// when the shapes differ so an element-wise comparison isn't defined).
+    pub values: Option<ValueDiff>,
 }
 
 /// A metadata entry present in both checkpoints whose value and/or type differ.
@@ -375,24 +449,34 @@ impl DiffReport {
                 count_suffix(g.count)
             );
         }
-        let changed: Vec<(String, (TensorSig, TensorSig))> = self
-            .tensors_changed
-            .iter()
-            .map(|c| (c.name.clone(), (c.old.clone(), c.new.clone())))
-            .collect();
-        let changed_groups = if opts.group {
-            group_entries(&changed)
-        } else {
-            singletons(&changed)
-        };
-        for g in &changed_groups {
-            let (old, new) = render_change(&g.key.0, &g.key.1, opts.color);
-            let _ = writeln!(
-                s,
-                "  ~ {}  [{old}] → [{new}]{}",
-                display_name(&g.template, &g.indices),
-                count_suffix(g.count),
-            );
+        for g in group_changed(&self.tensors_changed, opts.group) {
+            let name = display_name(&g.template, &g.indices);
+            let suffix = count_suffix(g.count);
+            if g.old == g.new {
+                // Same dtype & shape — a values-only change (only seen with --values).
+                let _ = writeln!(
+                    s,
+                    "  ~ {name}  [{}]  (values differ){suffix}",
+                    g.old.render()
+                );
+            } else {
+                let (old, new) = render_change(&g.old, &g.new, opts.color);
+                let _ = writeln!(s, "  ~ {name}  [{old}] → [{new}]{suffix}");
+            }
+            if opts.values {
+                match &g.values {
+                    Some(vd) if vd.differing > 0 => {
+                        let _ = writeln!(s, "{}", value_line(vd));
+                    }
+                    Some(_) => {
+                        let _ = writeln!(s, "    values: identical");
+                    }
+                    // --values requested but a shape change made it undefined.
+                    None => {
+                        let _ = writeln!(s, "    values: not compared (shapes differ)");
+                    }
+                }
+            }
         }
 
         if opts.metadata {
@@ -468,25 +552,57 @@ impl DiffReport {
                     );
                 }
             }
+        } else {
+            // Make it obvious the metadata was deliberately left out, rather than
+            // silently showing only the tensors section.
+            let _ = writeln!(s, "\nmetadata: not compared (--only-tensors)");
         }
         s
     }
 }
 
-/// Compare two checkpoint summaries (old → new) into a [`DiffReport`].
+/// Structural comparison of two checkpoint summaries (old → new). Tensor values
+/// are not read; see [`compare_with_values`].
 pub fn compare(old: &CheckpointSummary, new: &CheckpointSummary) -> DiffReport {
+    compare_inner(old, new, |_| None)
+}
+
+/// Like [`compare`] but also compares element values: `value_fn(name)` returns the
+/// value comparison for a tensor present in both checkpoints (`None` when not
+/// comparable, e.g. mismatched shapes). A tensor counts as changed when its dtype
+/// or shape differs *or* its values differ, so a values-only change surfaces.
+pub fn compare_with_values(
+    old: &CheckpointSummary,
+    new: &CheckpointSummary,
+    value_fn: impl Fn(&str) -> Option<ValueDiff>,
+) -> DiffReport {
+    compare_inner(old, new, value_fn)
+}
+
+fn compare_inner(
+    old: &CheckpointSummary,
+    new: &CheckpointSummary,
+    value_fn: impl Fn(&str) -> Option<ValueDiff>,
+) -> DiffReport {
     let mut tensors_removed = Vec::new();
     let mut tensors_changed = Vec::new();
     let mut tensors_unchanged = 0usize;
     for (name, osig) in &old.tensors {
-        match new.tensors.get(name) {
-            None => tensors_removed.push((name.clone(), osig.clone())),
-            Some(nsig) if nsig == osig => tensors_unchanged += 1,
-            Some(nsig) => tensors_changed.push(TensorChange {
+        let Some(nsig) = new.tensors.get(name) else {
+            tensors_removed.push((name.clone(), osig.clone()));
+            continue;
+        };
+        let values = value_fn(name);
+        let values_differ = values.is_some_and(|v| v.differing > 0);
+        if nsig != osig || values_differ {
+            tensors_changed.push(TensorChange {
                 name: name.clone(),
                 old: osig.clone(),
                 new: nsig.clone(),
-            }),
+                values,
+            });
+        } else {
+            tensors_unchanged += 1;
         }
     }
     let tensors_added: Vec<_> = new
@@ -770,21 +886,98 @@ mod tests {
     }
 
     #[test]
-    fn render_omits_metadata_when_excluded() {
+    fn render_notes_when_metadata_excluded() {
         let old = summary(&[("w", sig("F16", &[2, 2]))], &[("k", mv("a", "string"))]);
         let new = summary(&[("w", sig("F16", &[2, 2]))], &[("k", mv("b", "string"))]);
         let r = compare(&old, &new);
-        assert!(r.render("o", "n", PLAIN).contains("metadata:"));
+        // Default: the metadata change is shown.
+        assert!(r.render("o", "n", PLAIN).contains("metadata: -0 +0 ~1"));
+        // --only-tensors: a clear note instead, and no per-entry metadata lines.
+        let without = r.render(
+            "o",
+            "n",
+            DiffOpts {
+                metadata: false,
+                ..PLAIN
+            },
+        );
         assert!(
-            !r.render(
-                "o",
-                "n",
-                DiffOpts {
-                    metadata: false,
-                    ..PLAIN
-                }
-            )
-            .contains("metadata")
+            without.contains("metadata: not compared (--only-tensors)"),
+            "{without}"
+        );
+        assert!(!without.contains("  ~ k"), "{without}");
+    }
+
+    #[test]
+    fn full_value_diff_promotes_values_only_change() {
+        // Same dtype & shape on both sides; a value comparison says they differ.
+        let old = summary(&[("model.layers.0.w", sig("U8", &[4]))], &[]);
+        let new = summary(&[("model.layers.0.w", sig("U8", &[4]))], &[]);
+        let r = compare_with_values(&old, &new, |_| {
+            Some(ValueDiff {
+                elements: 4,
+                differing: 2,
+                max_abs: 7.0,
+                mean_abs: 3.5,
+                nonfinite_mismatch: 0,
+            })
+        });
+        // The structurally-identical tensor is now a change.
+        assert_eq!(r.tensors_changed.len(), 1);
+        assert_eq!(r.tensors_unchanged, 0);
+        let out = r.render(
+            "o",
+            "n",
+            DiffOpts {
+                values: true,
+                ..PLAIN
+            },
+        );
+        assert!(
+            out.contains("~ model.layers.0.w  [U8 (4)]  (values differ)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("values: 2 of 4 differ  (max |Δ| 7, mean |Δ| 3.5)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn full_value_diff_aggregates_within_a_group() {
+        // Two layers, each a values-only change → collapse, stats aggregated.
+        let names = ["model.layers.0.w", "model.layers.1.w"];
+        let mk = || CheckpointSummary {
+            tensors: names
+                .iter()
+                .map(|n| (n.to_string(), sig("U8", &[4])))
+                .collect(),
+            metadata: Default::default(),
+        };
+        let per = ValueDiff {
+            elements: 4,
+            differing: 1,
+            max_abs: 2.0,
+            mean_abs: 0.5,
+            nonfinite_mismatch: 0,
+        };
+        let r = compare_with_values(&mk(), &mk(), |_| Some(per));
+        let out = r.render(
+            "o",
+            "n",
+            DiffOpts {
+                values: true,
+                ..PLAIN
+            },
+        );
+        // One collapsed line with the aggregate (8 elements, 2 differing, max 2).
+        assert!(
+            out.contains("~ model.layers.{0-1}.w  [U8 (4)]  (values differ)  (×2)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("values: 2 of 8 differ  (max |Δ| 2, mean |Δ| 0.5)"),
+            "{out}"
         );
     }
 
@@ -892,6 +1085,7 @@ mod tests {
         color: false,
         metadata: true,
         group: true,
+        values: false,
     };
 
     fn vd(differing: u64, elements: u64, max_abs: f64, mean_abs: f64) -> ValueDiff {
