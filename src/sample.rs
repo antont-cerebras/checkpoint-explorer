@@ -1404,71 +1404,126 @@ struct DiffAcc {
     sum_abs: f64,
 }
 
-/// How one side's stored container decodes to `f64`: its byte width and primitive.
-#[derive(Clone, Copy)]
-struct Decoder {
+/// How one side's stored containers decode to `f64` under a chosen [`ViewDtype`].
+/// Each container yields `subs` logical values: 1 for `Stored`/`As`, the nibble
+/// count for `U4`/`I4`, or the packing-schema field count for `Unpacked`.
+struct Decoder<'a> {
     item: usize,
-    prim: Prim,
+    subs: usize,
+    view: ViewDtype,
+    dtype: String,
+    schema: Option<&'a PackingSchema>,
+    /// Precomputed primitive for the 1-value-per-container views (`Stored`/`As`),
+    /// so the common path skips re-parsing the dtype per element.
+    prim: Option<Prim>,
 }
 
-impl Decoder {
-    /// Decode element `e` from a block of this side's bytes.
-    fn at(&self, bytes: &[u8], e: usize) -> f64 {
-        decode_prim(self.prim, &bytes[e * self.item..e * self.item + self.item])
+impl<'a> Decoder<'a> {
+    fn new(
+        t: &TensorInfo,
+        view: ViewDtype,
+        schema: Option<&'a PackingSchema>,
+    ) -> Result<Self, String> {
+        let item =
+            item_size(&t.dtype).ok_or_else(|| format!("dtype {} not comparable", t.dtype))?;
+        let (subs, prim) = match view {
+            ViewDtype::Stored => (
+                1,
+                Some(
+                    parse_prim(&t.dtype)
+                        .ok_or_else(|| format!("dtype {} not comparable", t.dtype))?,
+                ),
+            ),
+            ViewDtype::As(dt) => (
+                1,
+                Some(parse_prim(dt).ok_or_else(|| format!("dtype {dt} not comparable"))?),
+            ),
+            ViewDtype::Unpacked => {
+                let s = schema.ok_or_else(|| format!("no packing schema for {}", t.name))?;
+                (s.len_p(), None)
+            }
+            _ => (view.packing(item), None), // U4 / I4
+        };
+        Ok(Self {
+            item,
+            subs,
+            view,
+            dtype: t.dtype.clone(),
+            schema,
+            prim,
+        })
+    }
+
+    /// Decode logical value `sub` of container `c` from this side's block bytes.
+    fn at(&self, bytes: &[u8], c: usize, sub: usize) -> f64 {
+        let container = &bytes[c * self.item..c * self.item + self.item];
+        if let Some(prim) = self.prim {
+            return decode_prim(prim, container);
+        }
+        match (self.view, self.schema) {
+            (ViewDtype::Unpacked, Some(s)) => s.extract(container_word(container), sub) as f64,
+            _ => decode_view(self.view, &self.dtype, container, sub),
+        }
     }
 }
 
 impl DiffAcc {
-    /// Compare `n` elements from a matching block of each tensor, decoding side
-    /// `a` with `da` and side `b` with `db`.
-    fn add_block(&mut self, a: &[u8], b: &[u8], da: Decoder, db: Decoder, n: usize) {
-        for e in 0..n {
-            let va = da.at(a, e);
-            let vb = db.at(b, e);
-            self.elements += 1;
-            // Bit-equal, or both NaN — treat as unchanged.
-            if va == vb || (va.is_nan() && vb.is_nan()) {
-                continue;
-            }
-            self.differing += 1;
-            if va.is_finite() && vb.is_finite() {
-                let d = (va - vb).abs();
-                if d > self.max_abs {
-                    self.max_abs = d;
+    /// Compare `containers` matching containers from each side's block, decoding
+    /// `da.subs` (== `db.subs`) logical values from each.
+    fn add_block(&mut self, a: &[u8], b: &[u8], da: &Decoder, db: &Decoder, containers: usize) {
+        for c in 0..containers {
+            for sub in 0..da.subs {
+                let va = da.at(a, c, sub);
+                let vb = db.at(b, c, sub);
+                self.elements += 1;
+                // Bit-equal, or both NaN — treat as unchanged.
+                if va == vb || (va.is_nan() && vb.is_nan()) {
+                    continue;
                 }
-                self.sum_abs += d;
-            } else {
-                self.nonfinite_mismatch += 1;
+                self.differing += 1;
+                if va.is_finite() && vb.is_finite() {
+                    let d = (va - vb).abs();
+                    if d > self.max_abs {
+                        self.max_abs = d;
+                    }
+                    self.sum_abs += d;
+                } else {
+                    self.nonfinite_mismatch += 1;
+                }
             }
         }
     }
 }
 
-/// Compare two tensors' values element-by-element. Requires equal shapes; dtypes
-/// may differ (each side is decoded by its own dtype, so this also measures
-/// requantization drift, e.g. F16 → BF16). Streams matching row-blocks via
+/// Compare two tensors' values element-by-element, decoding both under `view`
+/// (with each side's `*_schema` for `Unpacked`). Requires equal stored shapes;
+/// stored dtypes may differ (so it measures requantization drift, e.g. F16 → BF16,
+/// or compares the unpacked 3-bit fields). Streams matching row-blocks via
 /// [`TensorReader::read_region`], so memory stays bounded regardless of size.
-pub(crate) fn compare_values(a: &TensorInfo, b: &TensorInfo) -> Result<ValueDiff, String> {
+pub(crate) fn compare_values(
+    a: &TensorInfo,
+    a_schema: Option<&PackingSchema>,
+    b: &TensorInfo,
+    b_schema: Option<&PackingSchema>,
+    view: ViewDtype,
+) -> Result<ValueDiff, String> {
     let ra = open_reader(a)?;
     let rb = open_reader(b)?;
     if ra.shape() != rb.shape() {
         return Err("shapes differ".to_string());
     }
-    let da = Decoder {
-        prim: parse_prim(&a.dtype).ok_or_else(|| format!("dtype {} not comparable", a.dtype))?,
-        item: item_size(&a.dtype).unwrap(),
-    };
-    let db = Decoder {
-        prim: parse_prim(&b.dtype).ok_or_else(|| format!("dtype {} not comparable", b.dtype))?,
-        item: item_size(&b.dtype).unwrap(),
-    };
+    let da = Decoder::new(a, view, a_schema)?;
+    let db = Decoder::new(b, view, b_schema)?;
+    if da.subs != db.subs {
+        return Err("incompatible packing".to_string());
+    }
     let shape = ra.shape().to_vec();
 
     let mut acc = DiffAcc::default();
     if shape.is_empty() {
         let ba = ra.read_region(&[])?;
         let bb = rb.read_region(&[])?;
-        acc.add_block(&ba, &bb, da, db, 1);
+        acc.add_block(&ba, &bb, &da, &db, 1);
     } else {
         let inner: usize = shape[1..].iter().product::<usize>().max(1);
         let outer = shape[0];
@@ -1481,7 +1536,7 @@ pub(crate) fn compare_values(a: &TensorInfo, b: &TensorInfo) -> Result<ValueDiff
             ranges.extend(shape[1..].iter().map(|&d| 0..d));
             let ba = ra.read_region(&ranges)?;
             let bb = rb.read_region(&ranges)?;
-            acc.add_block(&ba, &bb, da, db, (hi - i) * inner);
+            acc.add_block(&ba, &bb, &da, &db, (hi - i) * inner);
             i = hi;
         }
     }

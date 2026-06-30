@@ -20,6 +20,7 @@ mod utils;
 
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -280,6 +281,11 @@ enum Command {
         /// checkpoint, so it's slower than the default structural diff.
         #[arg(long)]
         values: bool,
+        /// Decode values under this view before comparing (with --values or
+        /// --tensor): stored, u4, i4, unpacked (3-bit codebook, via the packing
+        /// schema), f16, bf16, i16, u16, f32, i32, u32, f64, i64, u64, i8, u8.
+        #[arg(long, value_name = "DTYPE", value_parser = sample::parse_view_dtype)]
+        dtype: Option<sample::ViewDtype>,
         /// List every changed entry instead of collapsing ones that share a name
         /// template and the same change (e.g. the same per-layer dtype change) into
         /// one line with a count and index range.
@@ -311,6 +317,7 @@ fn main() -> Result<()> {
             tensor,
             only_tensors,
             values,
+            dtype,
             full,
             no_color,
         }) => {
@@ -322,7 +329,15 @@ fn main() -> Result<()> {
                 group: !full,
                 values,
             };
-            std::process::exit(run_diff(&old, &new, recursive, tensor.as_deref(), opts))
+            let view = dtype.unwrap_or(sample::ViewDtype::Stored);
+            std::process::exit(run_diff(
+                &old,
+                &new,
+                recursive,
+                tensor.as_deref(),
+                view,
+                opts,
+            ))
         }
         None => run_explore(cli.explore),
     }
@@ -337,11 +352,20 @@ fn color_enabled(no_color: bool) -> bool {
     !no_color && std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
 }
 
+/// The decode view and each side's packing schemas (for the `unpacked` view),
+/// used by the `--values` / `--tensor` element comparison.
+struct ValueCtx<'a> {
+    view: sample::ViewDtype,
+    old_schemas: &'a HashMap<String, sample::PackingSchema>,
+    new_schemas: &'a HashMap<String, sample::PackingSchema>,
+}
+
 fn run_diff(
     old: &Path,
     new: &Path,
     recursive: bool,
     tensor: Option<&str>,
+    view: sample::ViewDtype,
     opts: diff::DiffOpts,
 ) -> i32 {
     let load = |path: &Path| -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
@@ -368,9 +392,28 @@ fn run_diff(
 
     let (old_label, new_label) = (old.display().to_string(), new.display().to_string());
 
+    // Packing schemas (for the `unpacked` view) come from the full metadata —
+    // independent of `--only-tensors`, which only hides the metadata *diff*. Only
+    // needed when values are compared.
+    let (old_schemas, new_schemas) = if opts.values || tensor.is_some() {
+        (
+            sample::parse_packing_schemas(&old_t, &old_m),
+            sample::parse_packing_schemas(&new_t, &new_m),
+        )
+    } else {
+        (HashMap::new(), HashMap::new())
+    };
+    let ctx = ValueCtx {
+        view,
+        old_schemas: &old_schemas,
+        new_schemas: &new_schemas,
+    };
+
     // `--tensor NAME`: focus on one tensor and also compare its element values.
     if let Some(name) = tensor {
-        return run_diff_tensor(&old_label, &new_label, name, &old_t, &new_t, opts.color);
+        return run_diff_tensor(
+            &old_label, &new_label, name, &old_t, &new_t, &ctx, opts.color,
+        );
     }
 
     // `--only-tensors` (opts.metadata == false): drop metadata so it affects
@@ -384,7 +427,6 @@ fn run_diff(
 
     let report = if opts.values {
         // `--values`: compare each common tensor's elements (skip shape mismatches).
-        use std::collections::HashMap;
         let old_map: HashMap<&str, &TensorInfo> =
             old_t.iter().map(|t| (t.name.as_str(), t)).collect();
         let new_map: HashMap<&str, &TensorInfo> =
@@ -394,7 +436,14 @@ fn run_diff(
             if a.shape != b.shape {
                 return None; // element-wise comparison needs matching shapes
             }
-            sample::compare_values(a, b).ok()
+            sample::compare_values(
+                a,
+                ctx.old_schemas.get(name),
+                b,
+                ctx.new_schemas.get(name),
+                ctx.view,
+            )
+            .ok()
         };
         diff::compare_with_values(&old_sum, &new_sum, value_of)
     } else {
@@ -412,6 +461,7 @@ fn run_diff_tensor(
     name: &str,
     old_t: &[TensorInfo],
     new_t: &[TensorInfo],
+    ctx: &ValueCtx,
     color: bool,
 ) -> i32 {
     let old_info = old_t.iter().find(|t| t.name == name);
@@ -425,7 +475,7 @@ fn run_diff_tensor(
     let new_sig = new_info.map(diff::TensorSig::of);
     // Compare values only when the tensor is in both checkpoints.
     let values = match (old_info, new_info) {
-        (Some(a), Some(b)) => Some(value_cmp(a, b)),
+        (Some(a), Some(b)) => Some(value_cmp(a, b, ctx)),
         _ => None,
     };
 
@@ -451,11 +501,17 @@ fn run_diff_tensor(
 /// Compare two tensors' values, mapping the result into a [`diff::ValueCmp`].
 /// Shapes must match for an element-wise comparison; a mismatch (or a read /
 /// dtype error) is reported as skipped rather than failing the whole diff.
-fn value_cmp(a: &TensorInfo, b: &TensorInfo) -> diff::ValueCmp {
+fn value_cmp(a: &TensorInfo, b: &TensorInfo, ctx: &ValueCtx) -> diff::ValueCmp {
     if a.shape != b.shape {
         return diff::ValueCmp::Skipped("shapes differ".to_string());
     }
-    match sample::compare_values(a, b) {
+    match sample::compare_values(
+        a,
+        ctx.old_schemas.get(&a.name),
+        b,
+        ctx.new_schemas.get(&b.name),
+        ctx.view,
+    ) {
         Ok(vd) if vd.differing == 0 => diff::ValueCmp::Identical,
         Ok(vd) => diff::ValueCmp::Differ(vd),
         Err(e) => diff::ValueCmp::Skipped(e),

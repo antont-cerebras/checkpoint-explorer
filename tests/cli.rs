@@ -765,3 +765,23 @@ fn diff_values_detects_value_only_change() {
         "{both}"
     );
 }
+
+#[test]
+fn diff_tensor_dtype_view_changes_decode() {
+    ensure_diff_fixtures();
+    // mlp.weight is U8 [4]; under the u4 view each byte is two nibbles, so the
+    // value comparison sees 8 logical values, not 4 — proving --dtype is applied.
+    let (out, code) = run_diff(&[
+        DIFF_OLD,
+        DIFF_NEW,
+        "--tensor",
+        "model.layers.0.mlp.weight",
+        "--dtype",
+        "u4",
+    ]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("of 8 differ"),
+        "u4 view should double the count; {out}"
+    );
+}
