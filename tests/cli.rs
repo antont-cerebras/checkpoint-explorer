@@ -661,6 +661,51 @@ fn diff_tensor_missing_exits_2() {
     assert_eq!(code, 2, "an absent tensor should exit 2");
 }
 
+const DIFF_GROUP_OLD: &str = "tests/fixtures/diff_group_old.safetensors";
+const DIFF_GROUP_NEW: &str = "tests/fixtures/diff_group_new.safetensors";
+
+/// A 4-layer checkpoint whose per-layer expert weight changes dtype identically
+/// across every layer — the case `diff` collapses into one line.
+fn ensure_group_fixtures() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let specs = |dt: Dtype| -> Vec<(&'static str, Dtype, Vec<usize>, u8)> {
+            let names = [
+                "model.layers.0.block_sparse_moe.experts.down_proj.weight",
+                "model.layers.1.block_sparse_moe.experts.down_proj.weight",
+                "model.layers.2.block_sparse_moe.experts.down_proj.weight",
+                "model.layers.3.block_sparse_moe.experts.down_proj.weight",
+            ];
+            names
+                .into_iter()
+                .map(|n| (n, dt, vec![2, 5, 3], 0u8))
+                .collect()
+        };
+        write_st(DIFF_GROUP_OLD, &specs(Dtype::U16), &[]);
+        write_st(DIFF_GROUP_NEW, &specs(Dtype::F16), &[]);
+    });
+}
+
+#[test]
+fn diff_groups_repeated_layer_changes() {
+    ensure_group_fixtures();
+    // Default: the four per-layer changes collapse to one line with a range + count.
+    let (out, code) = run_diff(&[DIFF_GROUP_OLD, DIFF_GROUP_NEW]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains(
+            "~ model.layers.{0-3}.block_sparse_moe.experts.down_proj.weight  [U16 (2, 5, 3)] → [F16 (2, 5, 3)]  (×4)"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("tensors: -0 +0 ~4"), "counts stay raw; {out}");
+
+    // `--full` lists every layer and drops the count suffix.
+    let (full, _) = run_diff(&[DIFF_GROUP_OLD, DIFF_GROUP_NEW, "--full"]);
+    assert_eq!(full.matches(".down_proj.weight").count(), 4, "{full}");
+    assert!(!full.contains("(×"), "{full}");
+}
+
 #[test]
 fn diff_only_tensors_drops_metadata_section_and_exit() {
     ensure_diff_fixtures();

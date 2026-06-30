@@ -21,10 +21,15 @@ const RESET: &str = "\x1b[0m";
 
 /// Rendering options for the diff output.
 #[derive(Clone, Copy)]
-pub struct Style {
-    /// Colorize the diff with ANSI escapes (removed in red, added in green, and
-    /// for a changed tensor just the dtype/shape token that differs).
+pub struct DiffOpts {
+    /// Colorize with ANSI escapes (removed in red, added in green; for a changed
+    /// tensor only the dtype/shape token that differs).
     pub color: bool,
+    /// Include the metadata section (off under `--only-tensors`).
+    pub metadata: bool,
+    /// Collapse entries sharing a name template + the same change into one line
+    /// with a count and index range (off under `--full`).
+    pub group: bool,
 }
 
 /// Wrap `text` in an ANSI colour `code` when `on`, else return it unchanged.
@@ -38,25 +43,167 @@ fn paint(text: &str, on: bool, code: &str) -> String {
 
 /// Render a changed tensor's `old` and `new` signatures, colouring only the token
 /// (dtype and/or shape) that actually differs — the old side red, the new green —
-/// so the eye lands on what changed. No colour when `style.color` is off.
-fn render_change(old: &TensorSig, new: &TensorSig, style: Style) -> (String, String) {
+/// so the eye lands on what changed. No colour when `color` is off.
+fn render_change(old: &TensorSig, new: &TensorSig, color: bool) -> (String, String) {
     let dtype_changed = old.dtype != new.dtype;
     let shape_changed = old.shape != new.shape;
     let one = |sig: &TensorSig, code: &str| {
-        let dtype = paint(&sig.dtype, style.color && dtype_changed, code);
-        let shape = paint(
-            &format_shape(&sig.shape),
-            style.color && shape_changed,
-            code,
-        );
+        let dtype = paint(&sig.dtype, color && dtype_changed, code);
+        let shape = paint(&format_shape(&sig.shape), color && shape_changed, code);
         format!("{dtype} {shape}")
     };
     (one(old, RED), one(new, GREEN))
 }
 
+/// Split a name into a template (each run of digits → a `{}` placeholder) and the
+/// digit-run values, so entries differing only by an index — a layer number, an
+/// expert id — share a template and can be collapsed.
+fn templatize(name: &str) -> (String, Vec<String>) {
+    let mut template = String::new();
+    let mut indices = Vec::new();
+    let mut digits = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+        } else {
+            if !digits.is_empty() {
+                template.push_str("{}");
+                indices.push(std::mem::take(&mut digits));
+            }
+            template.push(ch);
+        }
+    }
+    if !digits.is_empty() {
+        template.push_str("{}");
+        indices.push(digits);
+    }
+    (template, indices)
+}
+
+/// One collapsed run of entries: the shared `template`, the index values seen at
+/// each placeholder, the member `count`, and the (identical) change `key`.
+struct Group<K> {
+    template: String,
+    indices: Vec<Vec<String>>,
+    count: usize,
+    key: K,
+}
+
+/// Group `(name, change-key)` entries by `(template, key)` in first-seen order, so
+/// only entries with the same structure *and* the same change merge.
+fn group_entries<K: Clone + Eq + std::hash::Hash>(items: &[(String, K)]) -> Vec<Group<K>> {
+    use std::collections::HashMap;
+    let mut index: HashMap<(String, K), usize> = HashMap::new();
+    let mut groups: Vec<Group<K>> = Vec::new();
+    for (name, key) in items {
+        let (template, idx) = templatize(name);
+        let gi = match index.get(&(template.clone(), key.clone())) {
+            Some(&i) => i,
+            None => {
+                index.insert((template.clone(), key.clone()), groups.len());
+                groups.push(Group {
+                    template,
+                    indices: vec![Vec::new(); idx.len()],
+                    count: 0,
+                    key: key.clone(),
+                });
+                groups.len() - 1
+            }
+        };
+        let g = &mut groups[gi];
+        g.count += 1;
+        for (p, v) in idx.into_iter().enumerate() {
+            g.indices[p].push(v);
+        }
+    }
+    groups
+}
+
+/// Render each entry as its own group (no collapsing) — for `--full`. Each
+/// placeholder gets its single value back, so the displayed name is the original.
+fn singletons<K: Clone>(items: &[(String, K)]) -> Vec<Group<K>> {
+    items
+        .iter()
+        .map(|(name, key)| {
+            let (template, idx) = templatize(name);
+            Group {
+                template,
+                indices: idx.into_iter().map(|v| vec![v]).collect(),
+                count: 1,
+                key: key.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Reconstruct a group's display name: fill each `{}` with its index — the single
+/// value when constant across the group, else `{lo-hi,…}` for the range.
+fn display_name(template: &str, indices: &[Vec<String>]) -> String {
+    let mut out = String::new();
+    for (i, part) in template.split("{}").enumerate() {
+        out.push_str(part);
+        if let Some(vals) = indices.get(i) {
+            out.push_str(&summarize_indices(vals));
+        }
+    }
+    out
+}
+
+/// One placeholder's index values as a compact string: the lone value when they're
+/// all equal, else `{0-47}` / `{0-3,5}` (integer ranges) or `{a,b}` (sorted list).
+fn summarize_indices(values: &[String]) -> String {
+    use std::collections::BTreeSet;
+    let distinct: BTreeSet<&str> = values.iter().map(String::as_str).collect();
+    if distinct.len() == 1 {
+        return values[0].clone();
+    }
+    match distinct
+        .iter()
+        .map(|s| s.parse::<i64>().ok())
+        .collect::<Option<Vec<i64>>>()
+    {
+        Some(mut nums) => {
+            nums.sort_unstable();
+            format!("{{{}}}", compact_int_ranges(&nums))
+        }
+        None => format!("{{{}}}", distinct.into_iter().collect::<Vec<_>>().join(",")),
+    }
+}
+
+/// Collapse a sorted integer list into comma-separated runs: `[0,1,2,5]` → `0-2,5`.
+fn compact_int_ranges(sorted: &[i64]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let mut j = i;
+        while j + 1 < sorted.len() && sorted[j + 1] == sorted[j] + 1 {
+            j += 1;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        if j == i {
+            let _ = write!(out, "{}", sorted[i]);
+        } else {
+            let _ = write!(out, "{}-{}", sorted[i], sorted[j]);
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// The `  (×N)` suffix for a collapsed group (empty for a single entry).
+fn count_suffix(count: usize) -> String {
+    if count > 1 {
+        format!("  (×{count})")
+    } else {
+        String::new()
+    }
+}
+
 /// A tensor's compared identity: dtype + shape. Two tensors with the same name
 /// are "changed" when these differ (data bytes are not part of the comparison).
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct TensorSig {
     pub dtype: String,
     pub shape: Vec<usize>,
@@ -89,7 +236,7 @@ pub enum ValueCmp {
 }
 
 /// A metadata entry's compared value: its string value + declared type.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct MetaVal {
     pub value: String,
     pub value_type: String,
@@ -177,15 +324,19 @@ impl DiffReport {
 
     /// Render the report as plain text: a `---`/`+++` header naming the two sides,
     /// then a counts line and a `- removed / + added / ~ changed` list for tensors,
-    /// then the same for metadata (unless `include_metadata` is false, e.g. under
-    /// `--only-tensors`). Sorted by name; colourised per `style`.
-    pub fn render(
-        &self,
-        old_label: &str,
-        new_label: &str,
-        include_metadata: bool,
-        style: Style,
-    ) -> String {
+    /// then the same for metadata (unless `opts.metadata` is false). Entries are
+    /// collapsed by name template + change when `opts.group`; colourised per
+    /// `opts.color`. The counts lines always report raw entry totals.
+    pub fn render(&self, old_label: &str, new_label: &str, opts: DiffOpts) -> String {
+        // `--full` (no grouping) renders each entry as its own singleton group.
+        let grouped = |items: &[(String, TensorSig)]| {
+            if opts.group {
+                group_entries(items)
+            } else {
+                singletons(items)
+            }
+        };
+
         let mut s = String::new();
         let _ = writeln!(s, "--- {old_label}");
         let _ = writeln!(s, "+++ {new_label}");
@@ -198,20 +349,53 @@ impl DiffReport {
             self.tensors_changed.len(),
             self.tensors_unchanged,
         );
-        for (name, sig) in &self.tensors_removed {
-            let line = format!("- {name}  [{}]", sig.render());
-            let _ = writeln!(s, "  {}", paint(&line, style.color, RED));
+        for g in grouped(&self.tensors_removed) {
+            let line = format!(
+                "- {}  [{}]",
+                display_name(&g.template, &g.indices),
+                g.key.render()
+            );
+            let _ = writeln!(
+                s,
+                "  {}{}",
+                paint(&line, opts.color, RED),
+                count_suffix(g.count)
+            );
         }
-        for (name, sig) in &self.tensors_added {
-            let line = format!("+ {name}  [{}]", sig.render());
-            let _ = writeln!(s, "  {}", paint(&line, style.color, GREEN));
+        for g in grouped(&self.tensors_added) {
+            let line = format!(
+                "+ {}  [{}]",
+                display_name(&g.template, &g.indices),
+                g.key.render()
+            );
+            let _ = writeln!(
+                s,
+                "  {}{}",
+                paint(&line, opts.color, GREEN),
+                count_suffix(g.count)
+            );
         }
-        for c in &self.tensors_changed {
-            let (old, new) = render_change(&c.old, &c.new, style);
-            let _ = writeln!(s, "  ~ {}  [{old}] → [{new}]", c.name);
+        let changed: Vec<(String, (TensorSig, TensorSig))> = self
+            .tensors_changed
+            .iter()
+            .map(|c| (c.name.clone(), (c.old.clone(), c.new.clone())))
+            .collect();
+        let changed_groups = if opts.group {
+            group_entries(&changed)
+        } else {
+            singletons(&changed)
+        };
+        for g in &changed_groups {
+            let (old, new) = render_change(&g.key.0, &g.key.1, opts.color);
+            let _ = writeln!(
+                s,
+                "  ~ {}  [{old}] → [{new}]{}",
+                display_name(&g.template, &g.indices),
+                count_suffix(g.count),
+            );
         }
 
-        if include_metadata {
+        if opts.metadata {
             let _ = writeln!(
                 s,
                 "\nmetadata: -{} +{} ~{} ({} unchanged)",
@@ -220,31 +404,67 @@ impl DiffReport {
                 self.meta_changed.len(),
                 self.meta_unchanged,
             );
-            for (name, v) in &self.meta_removed {
-                let line = format!("- {name} = {}", quote_trunc(&v.value));
-                let _ = writeln!(s, "  {}", paint(&line, style.color, RED));
+            let meta_grouped = |items: &[(String, MetaVal)]| {
+                if opts.group {
+                    group_entries(items)
+                } else {
+                    singletons(items)
+                }
+            };
+            for g in meta_grouped(&self.meta_removed) {
+                let line = format!(
+                    "- {} = {}",
+                    display_name(&g.template, &g.indices),
+                    quote_trunc(&g.key.value)
+                );
+                let _ = writeln!(
+                    s,
+                    "  {}{}",
+                    paint(&line, opts.color, RED),
+                    count_suffix(g.count)
+                );
             }
-            for (name, v) in &self.meta_added {
-                let line = format!("+ {name} = {}", quote_trunc(&v.value));
-                let _ = writeln!(s, "  {}", paint(&line, style.color, GREEN));
+            for g in meta_grouped(&self.meta_added) {
+                let line = format!(
+                    "+ {} = {}",
+                    display_name(&g.template, &g.indices),
+                    quote_trunc(&g.key.value)
+                );
+                let _ = writeln!(
+                    s,
+                    "  {}{}",
+                    paint(&line, opts.color, GREEN),
+                    count_suffix(g.count)
+                );
             }
-            for c in &self.meta_changed {
-                if c.old.value != c.new.value {
+            let mchanged: Vec<(String, (MetaVal, MetaVal))> = self
+                .meta_changed
+                .iter()
+                .map(|c| (c.name.clone(), (c.old.clone(), c.new.clone())))
+                .collect();
+            let mchanged_groups = if opts.group {
+                group_entries(&mchanged)
+            } else {
+                singletons(&mchanged)
+            };
+            for g in &mchanged_groups {
+                let (old, new) = (&g.key.0, &g.key.1);
+                let name = display_name(&g.template, &g.indices);
+                let suffix = count_suffix(g.count);
+                if old.value != new.value {
                     let _ = writeln!(
                         s,
-                        "  ~ {} = {} → {}",
-                        c.name,
-                        paint(&quote_trunc(&c.old.value), style.color, RED),
-                        paint(&quote_trunc(&c.new.value), style.color, GREEN),
+                        "  ~ {name} = {} → {}{suffix}",
+                        paint(&quote_trunc(&old.value), opts.color, RED),
+                        paint(&quote_trunc(&new.value), opts.color, GREEN),
                     );
                 } else {
                     // Same value, different declared type.
                     let _ = writeln!(
                         s,
-                        "  ~ {} (type {} → {})",
-                        c.name,
-                        paint(&c.old.value_type, style.color, RED),
-                        paint(&c.new.value_type, style.color, GREEN),
+                        "  ~ {name} (type {} → {}){suffix}",
+                        paint(&old.value_type, opts.color, RED),
+                        paint(&new.value_type, opts.color, GREEN),
                     );
                 }
             }
@@ -335,7 +555,7 @@ pub fn render_tensor_focus(
     old: Option<&TensorSig>,
     new: Option<&TensorSig>,
     values: Option<&ValueCmp>,
-    style: Style,
+    color: bool,
 ) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "--- {old_label}");
@@ -344,11 +564,11 @@ pub fn render_tensor_focus(
     match (old, new) {
         (Some(o), None) => {
             let line = format!("- {name}  [{}]  (only in old)", o.render());
-            let _ = writeln!(s, "  {}", paint(&line, style.color, RED));
+            let _ = writeln!(s, "  {}", paint(&line, color, RED));
         }
         (None, Some(n)) => {
             let line = format!("+ {name}  [{}]  (only in new)", n.render());
-            let _ = writeln!(s, "  {}", paint(&line, style.color, GREEN));
+            let _ = writeln!(s, "  {}", paint(&line, color, GREEN));
         }
         (Some(o), Some(n)) if o == n => {
             // Same dtype & shape: the only possible difference is in the values.
@@ -368,7 +588,7 @@ pub fn render_tensor_focus(
         }
         (Some(o), Some(n)) => {
             // dtype and/or shape changed.
-            let (orender, nrender) = render_change(o, n, style);
+            let (orender, nrender) = render_change(o, n, color);
             let _ = writeln!(s, "  ~ {name}  [{orender}] → [{nrender}]");
             match values {
                 Some(ValueCmp::Differ(vd)) => {
@@ -544,7 +764,7 @@ mod tests {
         assert_eq!(changed, ["typed", "v"]);
         assert_eq!(r.meta_unchanged, 1);
         // The type-only change renders as a "(type … → …)" note, not a value diff.
-        let out = r.render("old", "new", true, NOCOLOR);
+        let out = r.render("old", "new", PLAIN);
         assert!(out.contains("~ typed (type int → float)"), "{out}");
         assert!(out.contains("~ v = \"0.4\" → \"0.5\""), "{out}");
     }
@@ -554,8 +774,18 @@ mod tests {
         let old = summary(&[("w", sig("F16", &[2, 2]))], &[("k", mv("a", "string"))]);
         let new = summary(&[("w", sig("F16", &[2, 2]))], &[("k", mv("b", "string"))]);
         let r = compare(&old, &new);
-        assert!(r.render("o", "n", true, NOCOLOR).contains("metadata:"));
-        assert!(!r.render("o", "n", false, NOCOLOR).contains("metadata"));
+        assert!(r.render("o", "n", PLAIN).contains("metadata:"));
+        assert!(
+            !r.render(
+                "o",
+                "n",
+                DiffOpts {
+                    metadata: false,
+                    ..PLAIN
+                }
+            )
+            .contains("metadata")
+        );
     }
 
     #[test]
@@ -563,11 +793,81 @@ mod tests {
         // dtype changed, shape same → colour the dtype, not the shape.
         let old = summary(&[("w", sig("F16", &[2, 2]))], &[]);
         let new = summary(&[("w", sig("BF16", &[2, 2]))], &[]);
-        let out = compare(&old, &new).render("o", "n", true, Style { color: true });
+        let out = compare(&old, &new).render(
+            "o",
+            "n",
+            DiffOpts {
+                color: true,
+                ..PLAIN
+            },
+        );
         assert!(out.contains(&format!("{RED}F16{RESET}")), "{out:?}");
         assert!(out.contains(&format!("{GREEN}BF16{RESET}")), "{out:?}");
         // The unchanged shape isn't wrapped in a colour code.
         assert!(!out.contains(&format!("{RED}(2, 2){RESET}")), "{out:?}");
+    }
+
+    #[test]
+    fn groups_repeated_per_index_changes() {
+        // The same dtype change across layers 0..=3 collapses to one line.
+        let mk = |dt: &str| {
+            (0..4)
+                .map(|n| (format!("model.layers.{n}.mlp.weight"), sig(dt, &[8])))
+                .collect::<Vec<_>>()
+        };
+        let old = CheckpointSummary {
+            tensors: mk("F16").into_iter().collect(),
+            metadata: Default::default(),
+        };
+        let new = CheckpointSummary {
+            tensors: mk("BF16").into_iter().collect(),
+            metadata: Default::default(),
+        };
+        let r = compare(&old, &new);
+        // Grouped (default): one collapsed line with the range and ×count.
+        let grouped = r.render("o", "n", PLAIN);
+        assert!(
+            grouped.contains("~ model.layers.{0-3}.mlp.weight  [F16 (8)] → [BF16 (8)]  (×4)"),
+            "{grouped}"
+        );
+        assert_eq!(
+            grouped.matches(".mlp.weight").count(),
+            1,
+            "should be one line:\n{grouped}"
+        );
+        // The counts line still reports the true total (4 changed).
+        assert!(grouped.contains("tensors: -0 +0 ~4"), "{grouped}");
+
+        // `--full` (group off): every layer listed, no count suffix.
+        let full = r.render(
+            "o",
+            "n",
+            DiffOpts {
+                group: false,
+                ..PLAIN
+            },
+        );
+        assert_eq!(
+            full.matches(".mlp.weight").count(),
+            4,
+            "should list all four:\n{full}"
+        );
+        assert!(full.contains("~ model.layers.0.mlp.weight"), "{full}");
+        assert!(!full.contains("(×"), "no count suffix when full:\n{full}");
+    }
+
+    #[test]
+    fn compact_int_ranges_merges_runs() {
+        assert_eq!(compact_int_ranges(&[0, 1, 2, 3]), "0-3");
+        assert_eq!(compact_int_ranges(&[0, 1, 2, 5, 7, 8]), "0-2,5,7-8");
+        assert_eq!(compact_int_ranges(&[4]), "4");
+    }
+
+    #[test]
+    fn templatize_replaces_digit_runs() {
+        let (t, idx) = templatize("model.layers.12.experts.3.weight");
+        assert_eq!(t, "model.layers.{}.experts.{}.weight");
+        assert_eq!(idx, ["12", "3"]);
     }
 
     #[test]
@@ -588,7 +888,11 @@ mod tests {
         assert_eq!(fmt_delta(1e-8), "1.000e-8");
     }
 
-    const NOCOLOR: Style = Style { color: false };
+    const PLAIN: DiffOpts = DiffOpts {
+        color: false,
+        metadata: true,
+        group: true,
+    };
 
     fn vd(differing: u64, elements: u64, max_abs: f64, mean_abs: f64) -> ValueDiff {
         ValueDiff {
@@ -636,7 +940,7 @@ mod tests {
             Some(&a),
             Some(&a),
             Some(&ValueCmp::Differ(vd(4, 4, 7.0, 7.0))),
-            NOCOLOR,
+            false,
         );
         assert!(out.contains("~ w  [U8 (4)]  (values differ)"), "{out}");
         assert!(
@@ -655,11 +959,11 @@ mod tests {
             Some(&a),
             Some(&a),
             Some(&ValueCmp::Identical),
-            NOCOLOR,
+            false,
         );
         assert!(ident.contains("= w  [F32 (4)]  (identical)"), "{ident}");
 
-        let added = render_tensor_focus("o", "n", "w", None, Some(&a), None, NOCOLOR);
+        let added = render_tensor_focus("o", "n", "w", None, Some(&a), None, false);
         assert!(added.contains("+ w  [F32 (4)]  (only in new)"), "{added}");
 
         let b = sig("F32", &[8]);
@@ -670,7 +974,7 @@ mod tests {
             Some(&a),
             Some(&b),
             Some(&ValueCmp::Skipped("shapes differ".to_string())),
-            NOCOLOR,
+            false,
         );
         assert!(reshape.contains("~ w  [F32 (4)] → [F32 (8)]"), "{reshape}");
         assert!(
