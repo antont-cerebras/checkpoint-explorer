@@ -527,29 +527,32 @@ fn write_st(path: &str, specs: &[(&str, Dtype, Vec<usize>, u8)], metadata: &[(&s
 
 const DIFF_OLD: &str = "tests/fixtures/diff_old.safetensors";
 const DIFF_NEW: &str = "tests/fixtures/diff_new.safetensors";
+const DIFF_META: &str = "tests/fixtures/diff_meta.safetensors";
 
-/// Two checkpoints differing by one removed, one added, and two changed tensors
-/// (a dtype change and a shape change), plus one added and one changed metadata
-/// entry. `input_layernorm.weight` is identical in both; `mlp.weight` has the
-/// same dtype+shape but different bytes (`seed` 0 vs 7) — i.e. a values-only
-/// change, used to exercise `--tensor`.
+/// Three checkpoints. OLD vs NEW differ by one removed, one added, and two changed
+/// tensors (a dtype change and a shape change), plus one added and one changed
+/// metadata entry; `input_layernorm.weight` is identical and `mlp.weight` has the
+/// same dtype+shape but different bytes (`seed` 0 vs 7, a values-only change for
+/// `--tensor`). META has OLD's exact tensors but different metadata — so OLD vs
+/// META differ *only* in metadata, for `--only-tensors`.
 fn ensure_diff_fixtures() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
+        let old_tensors: &[(&str, Dtype, Vec<usize>, u8)] = &[
+            ("lm_head.weight", Dtype::F16, vec![2, 2], 0),
+            ("model.embed_tokens.weight", Dtype::F16, vec![6, 4], 0),
+            ("model.norm.weight", Dtype::F32, vec![4], 0),
+            (
+                "model.layers.0.input_layernorm.weight",
+                Dtype::F32,
+                vec![4],
+                0,
+            ),
+            ("model.layers.0.mlp.weight", Dtype::U8, vec![4], 0),
+        ];
         write_st(
             DIFF_OLD,
-            &[
-                ("lm_head.weight", Dtype::F16, vec![2, 2], 0),
-                ("model.embed_tokens.weight", Dtype::F16, vec![6, 4], 0),
-                ("model.norm.weight", Dtype::F32, vec![4], 0),
-                (
-                    "model.layers.0.input_layernorm.weight",
-                    Dtype::F32,
-                    vec![4],
-                    0,
-                ),
-                ("model.layers.0.mlp.weight", Dtype::U8, vec![4], 0),
-            ],
+            old_tensors,
             &[("format", "pt"), ("note", "original")],
         );
         write_st(
@@ -567,6 +570,12 @@ fn ensure_diff_fixtures() {
                 ("model.rotary_emb.inv_freq", Dtype::F32, vec![16], 0),
             ],
             &[("format", "pt"), ("note", "edited"), ("extra", "x")],
+        );
+        // Same tensors as OLD, only the metadata differs.
+        write_st(
+            DIFF_META,
+            old_tensors,
+            &[("format", "pt"), ("note", "changed")],
         );
     });
 }
@@ -650,4 +659,25 @@ fn diff_tensor_missing_exits_2() {
     ensure_diff_fixtures();
     let (_out, code) = run_diff(&[DIFF_OLD, DIFF_NEW, "--tensor", "no.such.tensor"]);
     assert_eq!(code, 2, "an absent tensor should exit 2");
+}
+
+#[test]
+fn diff_only_tensors_drops_metadata_section_and_exit() {
+    ensure_diff_fixtures();
+    // OLD vs META differ only in metadata: by default that's a difference (exit 1)
+    // and the section is shown...
+    let (out, code) = run_diff(&[DIFF_OLD, DIFF_META]);
+    assert_eq!(code, 1, "a metadata-only difference should exit 1; {out}");
+    assert!(out.contains("metadata:"), "{out}");
+    // ...but `--only-tensors` removes the section *and* the difference, so the
+    // otherwise-identical checkpoints compare equal (exit 0).
+    let (out2, code2) = run_diff(&[DIFF_OLD, DIFF_META, "--only-tensors"]);
+    assert_eq!(
+        code2, 0,
+        "ignoring the only difference should exit 0; {out2}"
+    );
+    assert!(
+        !out2.contains("metadata"),
+        "section should be omitted; {out2}"
+    );
 }

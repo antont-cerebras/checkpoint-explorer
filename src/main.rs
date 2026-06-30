@@ -271,6 +271,13 @@ enum Command {
         /// structurally.
         #[arg(long, value_name = "NAME")]
         tensor: Option<String>,
+        /// Compare only tensors — skip the checkpoints' metadata entirely.
+        #[arg(long = "only-tensors")]
+        only_tensors: bool,
+        /// Never colorize the output (also off automatically when stdout isn't a
+        /// terminal, or when `NO_COLOR` is set).
+        #[arg(long = "no-color")]
+        no_color: bool,
     },
 }
 
@@ -291,10 +298,22 @@ fn main() -> Result<()> {
             new,
             recursive,
             tensor,
+            only_tensors,
+            no_color,
         }) => {
             // `diff`-style exit codes (0 same / 1 differ / 2 trouble) don't map to
             // the `Result` convention `main` uses elsewhere, so exit explicitly.
-            std::process::exit(run_diff(&old, &new, recursive, tensor.as_deref()))
+            let style = diff::Style {
+                color: color_enabled(no_color),
+            };
+            std::process::exit(run_diff(
+                &old,
+                &new,
+                recursive,
+                tensor.as_deref(),
+                only_tensors,
+                style,
+            ))
         }
         None => run_explore(cli.explore),
     }
@@ -302,7 +321,21 @@ fn main() -> Result<()> {
 
 /// Compare two checkpoints' structure and print the summary. Returns the process
 /// exit code: `0` identical, `1` differences found, `2` trouble (unreadable path).
-fn run_diff(old: &Path, new: &Path, recursive: bool, tensor: Option<&str>) -> i32 {
+/// Whether to colorize the diff: off when `--no-color`, when `NO_COLOR` is set
+/// (https://no-color.org), or when stdout isn't a terminal (so pipes stay clean).
+fn color_enabled(no_color: bool) -> bool {
+    use std::io::IsTerminal;
+    !no_color && std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+}
+
+fn run_diff(
+    old: &Path,
+    new: &Path,
+    recursive: bool,
+    tensor: Option<&str>,
+    only_tensors: bool,
+    style: diff::Style,
+) -> i32 {
     let load = |path: &Path| -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
         let (files, _health) =
             collect_safetensors_files(std::slice::from_ref(&path.to_path_buf()), recursive, true)?;
@@ -329,14 +362,20 @@ fn run_diff(old: &Path, new: &Path, recursive: bool, tensor: Option<&str>) -> i3
 
     // `--tensor NAME`: focus on one tensor and also compare its element values.
     if let Some(name) = tensor {
-        return run_diff_tensor(&old_label, &new_label, name, &old_t, &new_t);
+        return run_diff_tensor(&old_label, &new_label, name, &old_t, &new_t, style);
     }
 
+    // `--only-tensors`: drop metadata so it affects neither the report nor the
+    // exit code, and omit its section from the output.
+    let meta_of = |m: Vec<MetadataInfo>| if only_tensors { Vec::new() } else { m };
     let report = diff::compare(
-        &diff::CheckpointSummary::from_loaded(old_t, old_m),
-        &diff::CheckpointSummary::from_loaded(new_t, new_m),
+        &diff::CheckpointSummary::from_loaded(old_t, meta_of(old_m)),
+        &diff::CheckpointSummary::from_loaded(new_t, meta_of(new_m)),
     );
-    print!("{}", report.render(&old_label, &new_label));
+    print!(
+        "{}",
+        report.render(&old_label, &new_label, !only_tensors, style)
+    );
     i32::from(report.has_differences())
 }
 
@@ -348,6 +387,7 @@ fn run_diff_tensor(
     name: &str,
     old_t: &[TensorInfo],
     new_t: &[TensorInfo],
+    style: diff::Style,
 ) -> i32 {
     let old_info = old_t.iter().find(|t| t.name == name);
     let new_info = new_t.iter().find(|t| t.name == name);
@@ -373,6 +413,7 @@ fn run_diff_tensor(
             old_sig.as_ref(),
             new_sig.as_ref(),
             values.as_ref(),
+            style,
         )
     );
     i32::from(diff::tensor_focus_differs(

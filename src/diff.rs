@@ -15,6 +15,45 @@ use crate::sample::ValueDiff;
 use crate::tree::{MetadataInfo, TensorInfo};
 use crate::utils::format_shape;
 
+const RED: &str = "\x1b[31m";
+const GREEN: &str = "\x1b[32m";
+const RESET: &str = "\x1b[0m";
+
+/// Rendering options for the diff output.
+#[derive(Clone, Copy)]
+pub struct Style {
+    /// Colorize the diff with ANSI escapes (removed in red, added in green, and
+    /// for a changed tensor just the dtype/shape token that differs).
+    pub color: bool,
+}
+
+/// Wrap `text` in an ANSI colour `code` when `on`, else return it unchanged.
+fn paint(text: &str, on: bool, code: &str) -> String {
+    if on {
+        format!("{code}{text}{RESET}")
+    } else {
+        text.to_string()
+    }
+}
+
+/// Render a changed tensor's `old` and `new` signatures, colouring only the token
+/// (dtype and/or shape) that actually differs — the old side red, the new green —
+/// so the eye lands on what changed. No colour when `style.color` is off.
+fn render_change(old: &TensorSig, new: &TensorSig, style: Style) -> (String, String) {
+    let dtype_changed = old.dtype != new.dtype;
+    let shape_changed = old.shape != new.shape;
+    let one = |sig: &TensorSig, code: &str| {
+        let dtype = paint(&sig.dtype, style.color && dtype_changed, code);
+        let shape = paint(
+            &format_shape(&sig.shape),
+            style.color && shape_changed,
+            code,
+        );
+        format!("{dtype} {shape}")
+    };
+    (one(old, RED), one(new, GREEN))
+}
+
 /// A tensor's compared identity: dtype + shape. Two tensors with the same name
 /// are "changed" when these differ (data bytes are not part of the comparison).
 #[derive(Clone, PartialEq, Eq)]
@@ -138,8 +177,15 @@ impl DiffReport {
 
     /// Render the report as plain text: a `---`/`+++` header naming the two sides,
     /// then a counts line and a `- removed / + added / ~ changed` list for tensors,
-    /// then the same for metadata. Pipe-friendly (no colour, sorted by name).
-    pub fn render(&self, old_label: &str, new_label: &str) -> String {
+    /// then the same for metadata (unless `include_metadata` is false, e.g. under
+    /// `--only-tensors`). Sorted by name; colourised per `style`.
+    pub fn render(
+        &self,
+        old_label: &str,
+        new_label: &str,
+        include_metadata: bool,
+        style: Style,
+    ) -> String {
         let mut s = String::new();
         let _ = writeln!(s, "--- {old_label}");
         let _ = writeln!(s, "+++ {new_label}");
@@ -153,51 +199,54 @@ impl DiffReport {
             self.tensors_unchanged,
         );
         for (name, sig) in &self.tensors_removed {
-            let _ = writeln!(s, "  - {name}  [{}]", sig.render());
+            let line = format!("- {name}  [{}]", sig.render());
+            let _ = writeln!(s, "  {}", paint(&line, style.color, RED));
         }
         for (name, sig) in &self.tensors_added {
-            let _ = writeln!(s, "  + {name}  [{}]", sig.render());
+            let line = format!("+ {name}  [{}]", sig.render());
+            let _ = writeln!(s, "  {}", paint(&line, style.color, GREEN));
         }
         for c in &self.tensors_changed {
-            let _ = writeln!(
-                s,
-                "  ~ {}  [{}] → [{}]",
-                c.name,
-                c.old.render(),
-                c.new.render()
-            );
+            let (old, new) = render_change(&c.old, &c.new, style);
+            let _ = writeln!(s, "  ~ {}  [{old}] → [{new}]", c.name);
         }
 
-        let _ = writeln!(
-            s,
-            "\nmetadata: -{} +{} ~{} ({} unchanged)",
-            self.meta_removed.len(),
-            self.meta_added.len(),
-            self.meta_changed.len(),
-            self.meta_unchanged,
-        );
-        for (name, v) in &self.meta_removed {
-            let _ = writeln!(s, "  - {name} = {}", quote_trunc(&v.value));
-        }
-        for (name, v) in &self.meta_added {
-            let _ = writeln!(s, "  + {name} = {}", quote_trunc(&v.value));
-        }
-        for c in &self.meta_changed {
-            if c.old.value != c.new.value {
-                let _ = writeln!(
-                    s,
-                    "  ~ {} = {} → {}",
-                    c.name,
-                    quote_trunc(&c.old.value),
-                    quote_trunc(&c.new.value)
-                );
-            } else {
-                // Same value, different declared type.
-                let _ = writeln!(
-                    s,
-                    "  ~ {} (type {} → {})",
-                    c.name, c.old.value_type, c.new.value_type
-                );
+        if include_metadata {
+            let _ = writeln!(
+                s,
+                "\nmetadata: -{} +{} ~{} ({} unchanged)",
+                self.meta_removed.len(),
+                self.meta_added.len(),
+                self.meta_changed.len(),
+                self.meta_unchanged,
+            );
+            for (name, v) in &self.meta_removed {
+                let line = format!("- {name} = {}", quote_trunc(&v.value));
+                let _ = writeln!(s, "  {}", paint(&line, style.color, RED));
+            }
+            for (name, v) in &self.meta_added {
+                let line = format!("+ {name} = {}", quote_trunc(&v.value));
+                let _ = writeln!(s, "  {}", paint(&line, style.color, GREEN));
+            }
+            for c in &self.meta_changed {
+                if c.old.value != c.new.value {
+                    let _ = writeln!(
+                        s,
+                        "  ~ {} = {} → {}",
+                        c.name,
+                        paint(&quote_trunc(&c.old.value), style.color, RED),
+                        paint(&quote_trunc(&c.new.value), style.color, GREEN),
+                    );
+                } else {
+                    // Same value, different declared type.
+                    let _ = writeln!(
+                        s,
+                        "  ~ {} (type {} → {})",
+                        c.name,
+                        paint(&c.old.value_type, style.color, RED),
+                        paint(&c.new.value_type, style.color, GREEN),
+                    );
+                }
             }
         }
         s
@@ -286,6 +335,7 @@ pub fn render_tensor_focus(
     old: Option<&TensorSig>,
     new: Option<&TensorSig>,
     values: Option<&ValueCmp>,
+    style: Style,
 ) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "--- {old_label}");
@@ -293,10 +343,12 @@ pub fn render_tensor_focus(
     let _ = writeln!(s);
     match (old, new) {
         (Some(o), None) => {
-            let _ = writeln!(s, "  - {name}  [{}]  (only in old)", o.render());
+            let line = format!("- {name}  [{}]  (only in old)", o.render());
+            let _ = writeln!(s, "  {}", paint(&line, style.color, RED));
         }
         (None, Some(n)) => {
-            let _ = writeln!(s, "  + {name}  [{}]  (only in new)", n.render());
+            let line = format!("+ {name}  [{}]  (only in new)", n.render());
+            let _ = writeln!(s, "  {}", paint(&line, style.color, GREEN));
         }
         (Some(o), Some(n)) if o == n => {
             // Same dtype & shape: the only possible difference is in the values.
@@ -316,7 +368,8 @@ pub fn render_tensor_focus(
         }
         (Some(o), Some(n)) => {
             // dtype and/or shape changed.
-            let _ = writeln!(s, "  ~ {name}  [{}] → [{}]", o.render(), n.render());
+            let (orender, nrender) = render_change(o, n, style);
+            let _ = writeln!(s, "  ~ {name}  [{orender}] → [{nrender}]");
             match values {
                 Some(ValueCmp::Differ(vd)) => {
                     let _ = writeln!(s, "{}", value_line(vd));
@@ -491,9 +544,30 @@ mod tests {
         assert_eq!(changed, ["typed", "v"]);
         assert_eq!(r.meta_unchanged, 1);
         // The type-only change renders as a "(type … → …)" note, not a value diff.
-        let out = r.render("old", "new");
+        let out = r.render("old", "new", true, NOCOLOR);
         assert!(out.contains("~ typed (type int → float)"), "{out}");
         assert!(out.contains("~ v = \"0.4\" → \"0.5\""), "{out}");
+    }
+
+    #[test]
+    fn render_omits_metadata_when_excluded() {
+        let old = summary(&[("w", sig("F16", &[2, 2]))], &[("k", mv("a", "string"))]);
+        let new = summary(&[("w", sig("F16", &[2, 2]))], &[("k", mv("b", "string"))]);
+        let r = compare(&old, &new);
+        assert!(r.render("o", "n", true, NOCOLOR).contains("metadata:"));
+        assert!(!r.render("o", "n", false, NOCOLOR).contains("metadata"));
+    }
+
+    #[test]
+    fn color_highlights_only_the_changed_token() {
+        // dtype changed, shape same → colour the dtype, not the shape.
+        let old = summary(&[("w", sig("F16", &[2, 2]))], &[]);
+        let new = summary(&[("w", sig("BF16", &[2, 2]))], &[]);
+        let out = compare(&old, &new).render("o", "n", true, Style { color: true });
+        assert!(out.contains(&format!("{RED}F16{RESET}")), "{out:?}");
+        assert!(out.contains(&format!("{GREEN}BF16{RESET}")), "{out:?}");
+        // The unchanged shape isn't wrapped in a colour code.
+        assert!(!out.contains(&format!("{RED}(2, 2){RESET}")), "{out:?}");
     }
 
     #[test]
@@ -513,6 +587,8 @@ mod tests {
         assert_eq!(fmt_delta(0.001953125), "0.001953");
         assert_eq!(fmt_delta(1e-8), "1.000e-8");
     }
+
+    const NOCOLOR: Style = Style { color: false };
 
     fn vd(differing: u64, elements: u64, max_abs: f64, mean_abs: f64) -> ValueDiff {
         ValueDiff {
@@ -560,6 +636,7 @@ mod tests {
             Some(&a),
             Some(&a),
             Some(&ValueCmp::Differ(vd(4, 4, 7.0, 7.0))),
+            NOCOLOR,
         );
         assert!(out.contains("~ w  [U8 (4)]  (values differ)"), "{out}");
         assert!(
@@ -578,10 +655,11 @@ mod tests {
             Some(&a),
             Some(&a),
             Some(&ValueCmp::Identical),
+            NOCOLOR,
         );
         assert!(ident.contains("= w  [F32 (4)]  (identical)"), "{ident}");
 
-        let added = render_tensor_focus("o", "n", "w", None, Some(&a), None);
+        let added = render_tensor_focus("o", "n", "w", None, Some(&a), None, NOCOLOR);
         assert!(added.contains("+ w  [F32 (4)]  (only in new)"), "{added}");
 
         let b = sig("F32", &[8]);
@@ -592,6 +670,7 @@ mod tests {
             Some(&a),
             Some(&b),
             Some(&ValueCmp::Skipped("shapes differ".to_string())),
+            NOCOLOR,
         );
         assert!(reshape.contains("~ w  [F32 (4)] → [F32 (8)]"), "{reshape}");
         assert!(
