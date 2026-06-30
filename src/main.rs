@@ -24,6 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::explorer::{DataLayout, Explorer, OpenRequest, OpenView};
+use crate::tree::{MetadataInfo, TensorInfo};
 
 #[derive(Parser)]
 #[command(name = "checkpoint-explorer")]
@@ -264,6 +265,12 @@ enum Command {
         /// Recursively search directories for checkpoint files.
         #[arg(short, long)]
         recursive: bool,
+        /// Compare only this one tensor (exact name) and, when it's present in
+        /// both, also compare its element *values* (max/mean |Δ|), not just its
+        /// dtype and shape. Without it, all tensors and metadata are compared
+        /// structurally.
+        #[arg(long, value_name = "NAME")]
+        tensor: Option<String>,
     },
 }
 
@@ -283,10 +290,11 @@ fn main() -> Result<()> {
             old,
             new,
             recursive,
+            tensor,
         }) => {
             // `diff`-style exit codes (0 same / 1 differ / 2 trouble) don't map to
             // the `Result` convention `main` uses elsewhere, so exit explicitly.
-            std::process::exit(run_diff(&old, &new, recursive))
+            std::process::exit(run_diff(&old, &new, recursive, tensor.as_deref()))
         }
         None => run_explore(cli.explore),
     }
@@ -294,36 +302,98 @@ fn main() -> Result<()> {
 
 /// Compare two checkpoints' structure and print the summary. Returns the process
 /// exit code: `0` identical, `1` differences found, `2` trouble (unreadable path).
-fn run_diff(old: &Path, new: &Path, recursive: bool) -> i32 {
-    let load = |path: &Path| -> Result<diff::CheckpointSummary> {
+fn run_diff(old: &Path, new: &Path, recursive: bool, tensor: Option<&str>) -> i32 {
+    let load = |path: &Path| -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
         let (files, _health) =
             collect_safetensors_files(std::slice::from_ref(&path.to_path_buf()), recursive, true)?;
         if files.is_empty() {
             anyhow::bail!("no checkpoint files found at {}", path.display());
         }
-        let (tensors, metadata) = Explorer::gather_checkpoint(&files)?;
-        Ok(diff::CheckpointSummary::from_loaded(tensors, metadata))
+        Explorer::gather_checkpoint(&files)
     };
 
-    let report = match load(old)
-        .with_context(|| format!("reading {}", old.display()))
-        .and_then(|o| {
-            load(new)
-                .with_context(|| format!("reading {}", new.display()))
-                .map(|n| diff::compare(&o, &n))
-        }) {
-        Ok(report) => report,
+    let load_both = || -> Result<_> {
+        let o = load(old).with_context(|| format!("reading {}", old.display()))?;
+        let n = load(new).with_context(|| format!("reading {}", new.display()))?;
+        Ok((o, n))
+    };
+    let ((old_t, old_m), (new_t, new_m)) = match load_both() {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("checkpoint-explorer diff: {e:#}");
             return 2;
         }
     };
 
+    let (old_label, new_label) = (old.display().to_string(), new.display().to_string());
+
+    // `--tensor NAME`: focus on one tensor and also compare its element values.
+    if let Some(name) = tensor {
+        return run_diff_tensor(&old_label, &new_label, name, &old_t, &new_t);
+    }
+
+    let report = diff::compare(
+        &diff::CheckpointSummary::from_loaded(old_t, old_m),
+        &diff::CheckpointSummary::from_loaded(new_t, new_m),
+    );
+    print!("{}", report.render(&old_label, &new_label));
+    i32::from(report.has_differences())
+}
+
+/// The `diff --tensor NAME` path: compare one tensor's signature and, when it's
+/// in both checkpoints, its element values. Exits 2 if the name is in neither.
+fn run_diff_tensor(
+    old_label: &str,
+    new_label: &str,
+    name: &str,
+    old_t: &[TensorInfo],
+    new_t: &[TensorInfo],
+) -> i32 {
+    let old_info = old_t.iter().find(|t| t.name == name);
+    let new_info = new_t.iter().find(|t| t.name == name);
+    if old_info.is_none() && new_info.is_none() {
+        eprintln!("checkpoint-explorer diff: tensor '{name}' not found in either checkpoint");
+        return 2;
+    }
+
+    let old_sig = old_info.map(diff::TensorSig::of);
+    let new_sig = new_info.map(diff::TensorSig::of);
+    // Compare values only when the tensor is in both checkpoints.
+    let values = match (old_info, new_info) {
+        (Some(a), Some(b)) => Some(value_cmp(a, b)),
+        _ => None,
+    };
+
     print!(
         "{}",
-        report.render(&old.display().to_string(), &new.display().to_string())
+        diff::render_tensor_focus(
+            old_label,
+            new_label,
+            name,
+            old_sig.as_ref(),
+            new_sig.as_ref(),
+            values.as_ref(),
+        )
     );
-    i32::from(report.has_differences())
+    i32::from(diff::tensor_focus_differs(
+        old_sig.as_ref(),
+        new_sig.as_ref(),
+        values.as_ref(),
+    ))
+}
+
+/// Compare two tensors' values, mapping the result into a [`diff::ValueCmp`].
+/// Shapes must match for an element-wise comparison; a mismatch (or a read /
+/// dtype error) is reported as skipped rather than failing the whole diff.
+fn value_cmp(a: &TensorInfo, b: &TensorInfo) -> diff::ValueCmp {
+    if a.shape != b.shape {
+        return diff::ValueCmp::Skipped("shapes differ".to_string());
+    }
+    match sample::compare_values(a, b) {
+        Ok(vd) if vd.differing == 0 => diff::ValueCmp::Identical,
+        Ok(vd) => diff::ValueCmp::Differ(vd),
+        Err(e) => diff::ValueCmp::Skipped(e),
+    }
 }
 
 /// Parse a `ROW,COL` pair of non-negative integers (the `--window` top-left).
