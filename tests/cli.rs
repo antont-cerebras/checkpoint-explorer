@@ -486,3 +486,106 @@ mod hdf5 {
         settings().bind(|| insta::assert_snapshot!(out));
     }
 }
+
+// ---- `diff` subcommand ----
+
+/// Write a safetensors file from (name, dtype, shape) specs + string metadata —
+/// a parametric sibling of `write_fixture`, used to build the diff fixtures.
+fn write_st(path: &str, specs: &[(&str, Dtype, Vec<usize>)], metadata: &[(&str, &str)]) {
+    let buffers: Vec<Vec<u8>> = specs
+        .iter()
+        .map(|(_, dt, shape)| {
+            let bytes = shape.iter().product::<usize>() * dtype_size(*dt);
+            (0..bytes).map(|i| (i % 251) as u8).collect()
+        })
+        .collect();
+    let data: HashMap<String, TensorView> = specs
+        .iter()
+        .zip(&buffers)
+        .map(|((name, dt, shape), buf)| {
+            (
+                name.to_string(),
+                TensorView::new(*dt, shape.clone(), buf).expect("valid tensor view"),
+            )
+        })
+        .collect();
+    let meta = Some(
+        metadata
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<HashMap<_, _>>(),
+    );
+    if let Some(parent) = Path::new(path).parent() {
+        std::fs::create_dir_all(parent).expect("create fixtures dir");
+    }
+    safetensors::serialize_to_file(&data, &meta, Path::new(path)).expect("write fixture");
+}
+
+const DIFF_OLD: &str = "tests/fixtures/diff_old.safetensors";
+const DIFF_NEW: &str = "tests/fixtures/diff_new.safetensors";
+
+/// Two checkpoints differing by one removed, one added, and two changed tensors
+/// (a dtype change and a shape change), plus one added and one changed metadata
+/// entry — and one tensor + one metadata entry identical in both.
+fn ensure_diff_fixtures() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        write_st(
+            DIFF_OLD,
+            &[
+                ("lm_head.weight", Dtype::F16, vec![2, 2]),
+                ("model.embed_tokens.weight", Dtype::F16, vec![6, 4]),
+                ("model.norm.weight", Dtype::F32, vec![4]),
+                ("model.layers.0.input_layernorm.weight", Dtype::F32, vec![4]),
+            ],
+            &[("format", "pt"), ("note", "original")],
+        );
+        write_st(
+            DIFF_NEW,
+            &[
+                ("model.embed_tokens.weight", Dtype::BF16, vec![6, 4]),
+                ("model.norm.weight", Dtype::F32, vec![8]),
+                ("model.layers.0.input_layernorm.weight", Dtype::F32, vec![4]),
+                ("model.rotary_emb.inv_freq", Dtype::F32, vec![16]),
+            ],
+            &[("format", "pt"), ("note", "edited"), ("extra", "x")],
+        );
+    });
+}
+
+/// Run `diff OLD NEW` (relative paths, so the header is checkout-independent) and
+/// return its stdout plus exit code.
+fn run_diff(old: &str, new: &str) -> (String, i32) {
+    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
+        .args(["diff", old, new])
+        .output()
+        .expect("run diff");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn diff_lists_changes_and_exits_1() {
+    ensure_diff_fixtures();
+    let (out, code) = run_diff(DIFF_OLD, DIFF_NEW);
+    assert_eq!(code, 1, "differences should exit 1; stdout:\n{out}");
+    insta::assert_snapshot!(out);
+}
+
+#[test]
+fn diff_identical_exits_0() {
+    ensure_diff_fixtures();
+    let (out, code) = run_diff(DIFF_OLD, DIFF_OLD);
+    assert_eq!(code, 0, "identical should exit 0; stdout:\n{out}");
+    assert!(out.contains("tensors: -0 +0 ~0"), "{out}");
+    assert!(out.contains("metadata: -0 +0 ~0"), "{out}");
+}
+
+#[test]
+fn diff_unreadable_path_exits_2() {
+    ensure_diff_fixtures();
+    let (_out, code) = run_diff(DIFF_OLD, "tests/fixtures/does_not_exist.safetensors");
+    assert_eq!(code, 2, "an unreadable path should exit 2");
+}

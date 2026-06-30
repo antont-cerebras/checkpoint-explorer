@@ -1,6 +1,7 @@
 mod codec;
 #[cfg(feature = "hdf5")]
 mod convert;
+mod diff;
 mod explorer;
 mod gguf;
 #[cfg(feature = "hdf5")]
@@ -248,6 +249,22 @@ enum Command {
         #[arg(short, long)]
         force: bool,
     },
+
+    /// Compare two checkpoints and summarize their structural differences:
+    /// tensors (by name, dtype, shape) and metadata (by name, value) that were
+    /// added, removed, or changed. Tensor data/values are not compared.
+    ///
+    /// Exit status follows `diff`: 0 = structurally identical, 1 = differences
+    /// found, 2 = trouble (a path couldn't be read).
+    Diff {
+        /// The baseline ("old") checkpoint — a file, directory, or glob.
+        old: PathBuf,
+        /// The checkpoint to compare against the baseline ("new").
+        new: PathBuf,
+        /// Recursively search directories for checkpoint files.
+        #[arg(short, long)]
+        recursive: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -262,8 +279,51 @@ fn main() -> Result<()> {
             buffer,
             force,
         }) => run_convert(&input, &output, codec, level, &buffer, force),
+        Some(Command::Diff {
+            old,
+            new,
+            recursive,
+        }) => {
+            // `diff`-style exit codes (0 same / 1 differ / 2 trouble) don't map to
+            // the `Result` convention `main` uses elsewhere, so exit explicitly.
+            std::process::exit(run_diff(&old, &new, recursive))
+        }
         None => run_explore(cli.explore),
     }
+}
+
+/// Compare two checkpoints' structure and print the summary. Returns the process
+/// exit code: `0` identical, `1` differences found, `2` trouble (unreadable path).
+fn run_diff(old: &Path, new: &Path, recursive: bool) -> i32 {
+    let load = |path: &Path| -> Result<diff::CheckpointSummary> {
+        let (files, _health) =
+            collect_safetensors_files(std::slice::from_ref(&path.to_path_buf()), recursive, true)?;
+        if files.is_empty() {
+            anyhow::bail!("no checkpoint files found at {}", path.display());
+        }
+        let (tensors, metadata) = Explorer::gather_checkpoint(&files)?;
+        Ok(diff::CheckpointSummary::from_loaded(tensors, metadata))
+    };
+
+    let report = match load(old)
+        .with_context(|| format!("reading {}", old.display()))
+        .and_then(|o| {
+            load(new)
+                .with_context(|| format!("reading {}", new.display()))
+                .map(|n| diff::compare(&o, &n))
+        }) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("checkpoint-explorer diff: {e:#}");
+            return 2;
+        }
+    };
+
+    print!(
+        "{}",
+        report.render(&old.display().to_string(), &new.display().to_string())
+    );
+    i32::from(report.has_differences())
 }
 
 /// Parse a `ROW,COL` pair of non-negative integers (the `--window` top-left).
