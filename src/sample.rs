@@ -1555,6 +1555,92 @@ pub(crate) fn compare_values(
     })
 }
 
+/// Two tensors' value histograms over the *same* bin layout (so the bins align),
+/// for `diff --histogram`. `bins`/`n` describe the shared layout; `old`/`new` are
+/// the per-bin counts.
+pub struct HistogramDiff {
+    pub bins: HistBins,
+    pub n: usize,
+    pub old: Vec<u64>,
+    pub new: Vec<u64>,
+    pub old_total: u64,
+    pub new_total: u64,
+    pub old_nonfinite: u64,
+    pub new_nonfinite: u64,
+}
+
+impl HistogramDiff {
+    /// Total variation distance of the two normalized distributions, in `[0, 1]`:
+    /// half the summed absolute difference of the per-bin fractions. `0` = same
+    /// shape; `1` = disjoint. A compact "how much did the distribution move".
+    pub fn tvd(&self) -> f64 {
+        match (self.old_total, self.new_total) {
+            (0, 0) => 0.0,
+            (0, _) | (_, 0) => 1.0,
+            (ot, nt) => {
+                let (ot, nt) = (ot as f64, nt as f64);
+                0.5 * self
+                    .old
+                    .iter()
+                    .zip(&self.new)
+                    .map(|(&o, &n)| (o as f64 / ot - n as f64 / nt).abs())
+                    .sum::<f64>()
+            }
+        }
+    }
+
+    /// Whether the two histograms differ at all (any bin count, or the totals).
+    pub fn differs(&self) -> bool {
+        self.old != self.new || self.old_total != self.new_total
+    }
+}
+
+/// Compare two tensors' value *distributions*: bin both under `view` into one
+/// shared layout (spanning the combined value range) and return the per-bin
+/// counts. `bins` requests a bucket count (else the defaults). Reuses the
+/// statistics + histogram scans, so it honours `unpacked` etc.
+pub(crate) fn histogram_diff(
+    a: &TensorInfo,
+    a_schema: Option<&PackingSchema>,
+    b: &TensorInfo,
+    b_schema: Option<&PackingSchema>,
+    view: ViewDtype,
+    bins: Option<usize>,
+) -> Result<HistogramDiff, String> {
+    let cancel = AtomicBool::new(false);
+    let pause = AtomicBool::new(false);
+
+    // A range is only needed for the data-range layouts (floats, wide ints,
+    // unpacked); the 4-bit views' range is intrinsic. Compute it from both sides
+    // so the shared bins span the union.
+    let range = if histogram_bins(view, &a.dtype, None, bins).is_none() {
+        let sa = tensor_stats(a, view, a_schema, &cancel, &pause, None)?;
+        let sb = tensor_stats(b, view, b_schema, &cancel, &pause, None)?;
+        Some((sa.min.min(sb.min), sa.max.max(sb.max)))
+    } else {
+        None
+    };
+    let (hbins, n) = histogram_bins(view, &a.dtype, range, bins)
+        .ok_or_else(|| "no value range for a histogram".to_string())?;
+
+    let sa = HistShared::new(n);
+    tensor_histogram_into(a, view, a_schema, hbins, n, &sa, &cancel, &pause, None)?;
+    let sb = HistShared::new(n);
+    tensor_histogram_into(b, view, b_schema, hbins, n, &sb, &cancel, &pause, None)?;
+    let (ha, hb) = (sa.snapshot(hbins), sb.snapshot(hbins));
+
+    Ok(HistogramDiff {
+        bins: hbins,
+        n,
+        old: ha.counts,
+        new: hb.counts,
+        old_total: ha.total,
+        new_total: hb.total,
+        old_nonfinite: ha.nonfinite,
+        new_nonfinite: hb.nonfinite,
+    })
+}
+
 /// How a value histogram's bins are laid out.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HistBins {
