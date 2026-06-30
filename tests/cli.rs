@@ -785,3 +785,47 @@ fn diff_tensor_dtype_view_changes_decode() {
         "u4 view should double the count; {out}"
     );
 }
+
+#[test]
+fn diff_tensor_histogram_table() {
+    ensure_diff_fixtures();
+    // mlp.weight U8 [4]: old bytes 0..3, new 7..10 — disjoint distributions (TVD 1).
+    let (out, code) = run_diff(&[
+        DIFF_OLD,
+        DIFF_NEW,
+        "--tensor",
+        "model.layers.0.mlp.weight",
+        "--histogram",
+    ]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("histogram of model.layers.0.mlp.weight"),
+        "{out}"
+    );
+    assert!(
+        out.contains("TVD 1"),
+        "disjoint distributions → TVD 1; {out}"
+    );
+    assert!(
+        out.contains("-1"),
+        "a bin only the old side fills → -1; {out}"
+    );
+}
+
+#[test]
+fn diff_histogram_whole_checkpoint_reports_tvd() {
+    ensure_diff_fixtures();
+    let (out, code) = run_diff(&[DIFF_OLD, DIFF_NEW, "--histogram"]);
+    assert_eq!(code, 1, "{out}");
+    // mlp.weight: same dtype+shape, disjoint distribution → a distribution change.
+    assert!(
+        out.contains("~ model.layers.0.mlp.weight  [U8 (4)]  (distribution differs)"),
+        "{out}"
+    );
+    assert!(out.contains("histogram: TVD 1"), "{out}");
+    // A shape change can't be binned into a shared layout.
+    assert!(
+        out.contains("histogram: not compared (shapes differ)"),
+        "{out}"
+    );
+}

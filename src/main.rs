@@ -281,11 +281,21 @@ enum Command {
         /// checkpoint, so it's slower than the default structural diff.
         #[arg(long)]
         values: bool,
-        /// Decode values under this view before comparing (with --values or
-        /// --tensor): stored, u4, i4, unpacked (3-bit codebook, via the packing
-        /// schema), f16, bf16, i16, u16, f32, i32, u32, f64, i64, u64, i8, u8.
+        /// Decode values under this view before comparing (with --values,
+        /// --histogram, or --tensor): stored, u4, i4, unpacked (3-bit codebook, via
+        /// the packing schema), f16, bf16, i16, u16, f32, i32, u32, f64, i64, u64,
+        /// i8, u8.
         #[arg(long, value_name = "DTYPE", value_parser = sample::parse_view_dtype)]
         dtype: Option<sample::ViewDtype>,
+        /// Compare value distributions: bin each common tensor's values (old & new
+        /// over a shared layout) and report the total variation distance. With
+        /// --tensor, prints the full bin-by-bin table. Reads the whole checkpoint.
+        #[arg(long)]
+        histogram: bool,
+        /// Histogram bucket count (1–512) for --histogram; default picks a sensible
+        /// count per dtype.
+        #[arg(long, value_name = "N", value_parser = parse_bins)]
+        bins: Option<usize>,
         /// List every changed entry instead of collapsing ones that share a name
         /// template and the same change (e.g. the same per-layer dtype change) into
         /// one line with a count and index range.
@@ -318,6 +328,8 @@ fn main() -> Result<()> {
             only_tensors,
             values,
             dtype,
+            histogram,
+            bins,
             full,
             no_color,
         }) => {
@@ -328,6 +340,7 @@ fn main() -> Result<()> {
                 metadata: !only_tensors,
                 group: !full,
                 values,
+                histogram,
             };
             let view = dtype.unwrap_or(sample::ViewDtype::Stored);
             std::process::exit(run_diff(
@@ -336,6 +349,7 @@ fn main() -> Result<()> {
                 recursive,
                 tensor.as_deref(),
                 view,
+                bins,
                 opts,
             ))
         }
@@ -352,10 +366,11 @@ fn color_enabled(no_color: bool) -> bool {
     !no_color && std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
 }
 
-/// The decode view and each side's packing schemas (for the `unpacked` view),
-/// used by the `--values` / `--tensor` element comparison.
+/// The decode view, requested histogram bucket count, and each side's packing
+/// schemas (for the `unpacked` view) used by the value / distribution comparison.
 struct ValueCtx<'a> {
     view: sample::ViewDtype,
+    bins: Option<usize>,
     old_schemas: &'a HashMap<String, sample::PackingSchema>,
     new_schemas: &'a HashMap<String, sample::PackingSchema>,
 }
@@ -366,6 +381,7 @@ fn run_diff(
     recursive: bool,
     tensor: Option<&str>,
     view: sample::ViewDtype,
+    bins: Option<usize>,
     opts: diff::DiffOpts,
 ) -> i32 {
     let load = |path: &Path| -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
@@ -394,8 +410,9 @@ fn run_diff(
 
     // Packing schemas (for the `unpacked` view) come from the full metadata —
     // independent of `--only-tensors`, which only hides the metadata *diff*. Only
-    // needed when values are compared.
-    let (old_schemas, new_schemas) = if opts.values || tensor.is_some() {
+    // needed when values / distributions are compared.
+    let compares_data = opts.values || opts.histogram || tensor.is_some();
+    let (old_schemas, new_schemas) = if compares_data {
         (
             sample::parse_packing_schemas(&old_t, &old_m),
             sample::parse_packing_schemas(&new_t, &new_m),
@@ -405,15 +422,14 @@ fn run_diff(
     };
     let ctx = ValueCtx {
         view,
+        bins,
         old_schemas: &old_schemas,
         new_schemas: &new_schemas,
     };
 
     // `--tensor NAME`: focus on one tensor and also compare its element values.
     if let Some(name) = tensor {
-        return run_diff_tensor(
-            &old_label, &new_label, name, &old_t, &new_t, &ctx, opts.color,
-        );
+        return run_diff_tensor(&old_label, &new_label, name, &old_t, &new_t, &ctx, opts);
     }
 
     // `--only-tensors` (opts.metadata == false): drop metadata so it affects
@@ -425,32 +441,62 @@ fn run_diff(
     let old_sum = diff::CheckpointSummary::from_loaded(&old_t, old_meta);
     let new_sum = diff::CheckpointSummary::from_loaded(&new_t, new_meta);
 
-    let report = if opts.values {
-        // `--values`: compare each common tensor's elements (skip shape mismatches).
+    let report = if opts.values || opts.histogram {
+        // Read each common same-shape tensor and compare values and/or distribution.
         let old_map: HashMap<&str, &TensorInfo> =
             old_t.iter().map(|t| (t.name.as_str(), t)).collect();
         let new_map: HashMap<&str, &TensorInfo> =
             new_t.iter().map(|t| (t.name.as_str(), t)).collect();
-        let value_of = |name: &str| -> Option<sample::ValueDiff> {
-            let (a, b) = (old_map.get(name)?, new_map.get(name)?);
+        let extras_of = |name: &str| -> diff::TensorExtras {
+            let (Some(a), Some(b)) = (old_map.get(name), new_map.get(name)) else {
+                return diff::TensorExtras::default();
+            };
             if a.shape != b.shape {
-                return None; // element-wise comparison needs matching shapes
+                return diff::TensorExtras::default(); // needs matching shapes
             }
-            sample::compare_values(
-                a,
-                ctx.old_schemas.get(name),
-                b,
-                ctx.new_schemas.get(name),
-                ctx.view,
-            )
-            .ok()
+            diff::TensorExtras {
+                values: opts.values.then(|| tensor_values(a, b, &ctx)).flatten(),
+                histogram: opts
+                    .histogram
+                    .then(|| tensor_histogram(a, b, &ctx))
+                    .flatten(),
+            }
         };
-        diff::compare_with_values(&old_sum, &new_sum, value_of)
+        diff::compare_with(&old_sum, &new_sum, extras_of)
     } else {
         diff::compare(&old_sum, &new_sum)
     };
     print!("{}", report.render(&old_label, &new_label, opts));
     i32::from(report.has_differences())
+}
+
+/// `compare_values` for two same-shape tensors under `ctx`, as an `Option`.
+fn tensor_values(a: &TensorInfo, b: &TensorInfo, ctx: &ValueCtx) -> Option<sample::ValueDiff> {
+    sample::compare_values(
+        a,
+        ctx.old_schemas.get(&a.name),
+        b,
+        ctx.new_schemas.get(&b.name),
+        ctx.view,
+    )
+    .ok()
+}
+
+/// `histogram_diff` for two same-shape tensors under `ctx`, summarized to a shift.
+fn tensor_histogram(a: &TensorInfo, b: &TensorInfo, ctx: &ValueCtx) -> Option<diff::HistShift> {
+    let hd = sample::histogram_diff(
+        a,
+        ctx.old_schemas.get(&a.name),
+        b,
+        ctx.new_schemas.get(&b.name),
+        ctx.view,
+        ctx.bins,
+    )
+    .ok()?;
+    Some(diff::HistShift {
+        tvd: hd.tvd(),
+        bins: hd.n,
+    })
 }
 
 /// The `diff --tensor NAME` path: compare one tensor's signature and, when it's
@@ -462,7 +508,7 @@ fn run_diff_tensor(
     old_t: &[TensorInfo],
     new_t: &[TensorInfo],
     ctx: &ValueCtx,
-    color: bool,
+    opts: diff::DiffOpts,
 ) -> i32 {
     let old_info = old_t.iter().find(|t| t.name == name);
     let new_info = new_t.iter().find(|t| t.name == name);
@@ -488,14 +534,36 @@ fn run_diff_tensor(
             old_sig.as_ref(),
             new_sig.as_ref(),
             values.as_ref(),
-            color,
+            opts.color,
         )
     );
-    i32::from(diff::tensor_focus_differs(
-        old_sig.as_ref(),
-        new_sig.as_ref(),
-        values.as_ref(),
-    ))
+
+    // `--histogram`: append the full bin-by-bin distribution table when the tensor
+    // is in both with a matching shape.
+    let mut hist_differs = false;
+    if opts.histogram
+        && let (Some(a), Some(b)) = (old_info, new_info)
+        && a.shape == b.shape
+    {
+        match sample::histogram_diff(
+            a,
+            ctx.old_schemas.get(&a.name),
+            b,
+            ctx.new_schemas.get(&b.name),
+            ctx.view,
+            ctx.bins,
+        ) {
+            Ok(hd) => {
+                hist_differs = hd.differs();
+                print!("{}", diff::render_histogram_table(name, &hd, opts.color));
+            }
+            Err(e) => eprintln!("checkpoint-explorer diff: histogram: {e}"),
+        }
+    }
+
+    let differs = diff::tensor_focus_differs(old_sig.as_ref(), new_sig.as_ref(), values.as_ref())
+        || hist_differs;
+    i32::from(differs)
 }
 
 /// Compare two tensors' values, mapping the result into a [`diff::ValueCmp`].

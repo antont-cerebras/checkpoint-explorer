@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-use crate::sample::ValueDiff;
+use crate::sample::{HistBins, HistogramDiff, ValueDiff};
 use crate::tree::{MetadataInfo, TensorInfo};
 use crate::utils::format_shape;
 
@@ -33,6 +33,33 @@ pub struct DiffOpts {
     /// Element values were compared (`--values`): show per-change value stats and
     /// note when a change's values weren't compared.
     pub values: bool,
+    /// Value distributions were compared (`--histogram`): show a per-change
+    /// total-variation-distance summary.
+    pub histogram: bool,
+}
+
+/// A tensor's distribution shift for `diff --histogram`: total variation distance
+/// (`0` = same shape, `1` = disjoint) and the bin count it was measured over.
+#[derive(Clone, Copy)]
+pub struct HistShift {
+    pub tvd: f64,
+    pub bins: usize,
+}
+
+/// Per-tensor element / distribution comparison attached to a change — filled by
+/// `--values` / `--histogram`, empty for a pure structural diff.
+#[derive(Default)]
+pub struct TensorExtras {
+    pub values: Option<ValueDiff>,
+    pub histogram: Option<HistShift>,
+}
+
+impl TensorExtras {
+    /// Whether the extras themselves indicate a difference (so a structurally
+    /// identical tensor still counts as changed).
+    fn differ(&self) -> bool {
+        self.values.is_some_and(|v| v.differing > 0) || self.histogram.is_some_and(|h| h.tvd > 0.0)
+    }
 }
 
 /// Wrap `text` in an ANSI colour `code` when `on`, else return it unchanged.
@@ -213,6 +240,10 @@ struct ChangedGroup {
     old: TensorSig,
     new: TensorSig,
     values: Option<ValueDiff>,
+    /// Each member's histogram TVD (empty when `--histogram` wasn't run), plus the
+    /// shared bin count — so the group can report max & mean shift.
+    hist_tvds: Vec<f64>,
+    hist_bins: usize,
 }
 
 /// Combine two value comparisons: counts sum, `max_abs` is the max, `mean_abs` is
@@ -263,6 +294,8 @@ fn group_changed(items: &[TensorChange], group: bool) -> Vec<ChangedGroup> {
                     old: c.old.clone(),
                     new: c.new.clone(),
                     values: None,
+                    hist_tvds: Vec::new(),
+                    hist_bins: 0,
                 });
                 groups.len() - 1
             }
@@ -273,6 +306,10 @@ fn group_changed(items: &[TensorChange], group: bool) -> Vec<ChangedGroup> {
             g.indices[p].push(v);
         }
         g.values = merge_values(g.values, c.values);
+        if let Some(h) = c.histogram {
+            g.hist_tvds.push(h.tvd);
+            g.hist_bins = h.bins;
+        }
     }
     groups
 }
@@ -361,6 +398,8 @@ pub struct TensorChange {
     /// The element-value comparison, when `--values` ran it (`None` otherwise, or
     /// when the shapes differ so an element-wise comparison isn't defined).
     pub values: Option<ValueDiff>,
+    /// The distribution shift, when `--histogram` ran it.
+    pub histogram: Option<HistShift>,
 }
 
 /// A metadata entry present in both checkpoints whose value and/or type differ.
@@ -453,12 +492,13 @@ impl DiffReport {
             let name = display_name(&g.template, &g.indices);
             let suffix = count_suffix(g.count);
             if g.old == g.new {
-                // Same dtype & shape — a values-only change (only seen with --values).
-                let _ = writeln!(
-                    s,
-                    "  ~ {name}  [{}]  (values differ){suffix}",
-                    g.old.render()
-                );
+                // Same dtype & shape — only the values / distribution changed.
+                let reason = if g.values.is_some_and(|v| v.differing > 0) {
+                    "values differ"
+                } else {
+                    "distribution differs"
+                };
+                let _ = writeln!(s, "  ~ {name}  [{}]  ({reason}){suffix}", g.old.render());
             } else {
                 let (old, new) = render_change(&g.old, &g.new, opts.color);
                 let _ = writeln!(s, "  ~ {name}  [{old}] → [{new}]{suffix}");
@@ -476,6 +516,9 @@ impl DiffReport {
                         let _ = writeln!(s, "    values: not compared (shapes differ)");
                     }
                 }
+            }
+            if opts.histogram {
+                let _ = writeln!(s, "{}", histogram_line(&g.hist_tvds, g.hist_bins));
             }
         }
 
@@ -562,27 +605,20 @@ impl DiffReport {
 }
 
 /// Structural comparison of two checkpoint summaries (old → new). Tensor values
-/// are not read; see [`compare_with_values`].
+/// are not read; see [`compare_with`].
 pub fn compare(old: &CheckpointSummary, new: &CheckpointSummary) -> DiffReport {
-    compare_inner(old, new, |_| None)
+    compare_with(old, new, |_| TensorExtras::default())
 }
 
-/// Like [`compare`] but also compares element values: `value_fn(name)` returns the
-/// value comparison for a tensor present in both checkpoints (`None` when not
-/// comparable, e.g. mismatched shapes). A tensor counts as changed when its dtype
-/// or shape differs *or* its values differ, so a values-only change surfaces.
-pub fn compare_with_values(
+/// Like [`compare`] but also runs `extras_fn(name)` for each tensor present in
+/// both checkpoints — its element-value (`--values`) and/or distribution
+/// (`--histogram`) comparison. A tensor counts as changed when its dtype or shape
+/// differs *or* its extras indicate a difference, so a values-only / distribution
+/// change surfaces even when the signature is unchanged.
+pub fn compare_with(
     old: &CheckpointSummary,
     new: &CheckpointSummary,
-    value_fn: impl Fn(&str) -> Option<ValueDiff>,
-) -> DiffReport {
-    compare_inner(old, new, value_fn)
-}
-
-fn compare_inner(
-    old: &CheckpointSummary,
-    new: &CheckpointSummary,
-    value_fn: impl Fn(&str) -> Option<ValueDiff>,
+    extras_fn: impl Fn(&str) -> TensorExtras,
 ) -> DiffReport {
     let mut tensors_removed = Vec::new();
     let mut tensors_changed = Vec::new();
@@ -592,14 +628,14 @@ fn compare_inner(
             tensors_removed.push((name.clone(), osig.clone()));
             continue;
         };
-        let values = value_fn(name);
-        let values_differ = values.is_some_and(|v| v.differing > 0);
-        if nsig != osig || values_differ {
+        let extras = extras_fn(name);
+        if nsig != osig || extras.differ() {
             tensors_changed.push(TensorChange {
                 name: name.clone(),
                 old: osig.clone(),
                 new: nsig.clone(),
-                values,
+                values: extras.values,
+                histogram: extras.histogram,
             });
         } else {
             tensors_unchanged += 1;
@@ -722,6 +758,90 @@ pub fn render_tensor_focus(
         (None, None) => {}
     }
     s
+}
+
+/// The indented `histogram:` summary line for a group's distribution shift(s):
+/// the total variation distance (max & mean across the group).
+fn histogram_line(tvds: &[f64], bins: usize) -> String {
+    if tvds.is_empty() {
+        return "    histogram: not compared (shapes differ)".to_string();
+    }
+    let max = tvds.iter().copied().fold(0.0_f64, f64::max);
+    if tvds.len() == 1 {
+        format!("    histogram: TVD {} ({bins} bins)", fmt_delta(max))
+    } else {
+        let mean = tvds.iter().sum::<f64>() / tvds.len() as f64;
+        format!(
+            "    histogram: TVD max {} mean {} ({bins} bins)",
+            fmt_delta(max),
+            fmt_delta(mean)
+        )
+    }
+}
+
+/// The full per-tensor histogram comparison table for `diff --tensor --histogram`:
+/// one row per shared bin with its label and the old / new counts and delta. Only
+/// bins where at least one side is non-empty are shown.
+pub fn render_histogram_table(name: &str, hd: &HistogramDiff, color: bool) -> String {
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "  histogram of {name}  ({} bins, TVD {})",
+        hd.n,
+        fmt_delta(hd.tvd())
+    );
+    let _ = writeln!(
+        s,
+        "    {:>18}  {:>12}  {:>12}  {:>12}",
+        "bin", "old", "new", "Δ"
+    );
+    for i in 0..hd.n {
+        let (o, n) = (
+            hd.old.get(i).copied().unwrap_or(0),
+            hd.new.get(i).copied().unwrap_or(0),
+        );
+        if o == 0 && n == 0 {
+            continue;
+        }
+        let delta = n as i64 - o as i64;
+        let delta_s = match delta.cmp(&0) {
+            std::cmp::Ordering::Greater => paint(&format!("+{delta}"), color, GREEN),
+            std::cmp::Ordering::Less => paint(&format!("{delta}"), color, RED),
+            std::cmp::Ordering::Equal => "0".to_string(),
+        };
+        let _ = writeln!(
+            s,
+            "    {:>18}  {o:>12}  {n:>12}  {delta_s:>12}",
+            bin_label(hd.bins, i, hd.n)
+        );
+    }
+    if hd.old_nonfinite > 0 || hd.new_nonfinite > 0 {
+        let _ = writeln!(
+            s,
+            "    {:>18}  {:>12}  {:>12}",
+            "non-finite", hd.old_nonfinite, hd.new_nonfinite
+        );
+    }
+    s
+}
+
+/// A short label for histogram bin `i` of `n`: the integer (or integer range) for
+/// `IntBins`, or the `[lo, hi)` interval for `Range`.
+fn bin_label(bins: HistBins, i: usize, n: usize) -> String {
+    match bins {
+        HistBins::IntBins { start, step } => {
+            let lo = start + i as i64 * step;
+            if step == 1 {
+                format!("{lo}")
+            } else {
+                format!("{lo}..{}", lo + step - 1)
+            }
+        }
+        HistBins::Range { lo, hi } => {
+            let w = if n > 0 { (hi - lo) / n as f64 } else { 0.0 };
+            fmt_delta(lo + i as f64 * w)
+        }
+    }
 }
 
 /// The indented `values:` summary line for a value difference.
@@ -913,14 +1033,15 @@ mod tests {
         // Same dtype & shape on both sides; a value comparison says they differ.
         let old = summary(&[("model.layers.0.w", sig("U8", &[4]))], &[]);
         let new = summary(&[("model.layers.0.w", sig("U8", &[4]))], &[]);
-        let r = compare_with_values(&old, &new, |_| {
-            Some(ValueDiff {
+        let r = compare_with(&old, &new, |_| TensorExtras {
+            values: Some(ValueDiff {
                 elements: 4,
                 differing: 2,
                 max_abs: 7.0,
                 mean_abs: 3.5,
                 nonfinite_mismatch: 0,
-            })
+            }),
+            histogram: None,
         });
         // The structurally-identical tensor is now a change.
         assert_eq!(r.tensors_changed.len(), 1);
@@ -961,7 +1082,10 @@ mod tests {
             mean_abs: 0.5,
             nonfinite_mismatch: 0,
         };
-        let r = compare_with_values(&mk(), &mk(), |_| Some(per));
+        let r = compare_with(&mk(), &mk(), |_| TensorExtras {
+            values: Some(per),
+            histogram: None,
+        });
         let out = r.render(
             "o",
             "n",
@@ -1086,6 +1210,7 @@ mod tests {
         metadata: true,
         group: true,
         values: false,
+        histogram: false,
     };
 
     fn vd(differing: u64, elements: u64, max_abs: f64, mean_abs: f64) -> ValueDiff {
