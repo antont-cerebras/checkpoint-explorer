@@ -1376,6 +1376,129 @@ pub fn tensor_stats(
     Ok(stats)
 }
 
+/// Element-wise comparison of two equal-shape tensors, each decoded to `f64`.
+/// Used by `diff --tensor`.
+pub struct ValueDiff {
+    /// Total elements compared.
+    pub elements: u64,
+    /// Elements whose values differ (two NaNs in the same slot count as equal).
+    pub differing: u64,
+    /// Largest `|a - b|` over slots where both values are finite.
+    pub max_abs: f64,
+    /// Mean `|a - b|` over all elements (finite-pair differences summed, then
+    /// divided by `elements`).
+    pub mean_abs: f64,
+    /// Differing slots where one side is non-finite (NaN/±Inf) and the other
+    /// isn't, so `|a - b|` isn't meaningful (excluded from `max_abs`/`mean_abs`).
+    pub nonfinite_mismatch: u64,
+}
+
+/// Running accumulator for [`compare_values`].
+#[derive(Default)]
+struct DiffAcc {
+    elements: u64,
+    differing: u64,
+    nonfinite_mismatch: u64,
+    max_abs: f64,
+    sum_abs: f64,
+}
+
+/// How one side's stored container decodes to `f64`: its byte width and primitive.
+#[derive(Clone, Copy)]
+struct Decoder {
+    item: usize,
+    prim: Prim,
+}
+
+impl Decoder {
+    /// Decode element `e` from a block of this side's bytes.
+    fn at(&self, bytes: &[u8], e: usize) -> f64 {
+        decode_prim(self.prim, &bytes[e * self.item..e * self.item + self.item])
+    }
+}
+
+impl DiffAcc {
+    /// Compare `n` elements from a matching block of each tensor, decoding side
+    /// `a` with `da` and side `b` with `db`.
+    fn add_block(&mut self, a: &[u8], b: &[u8], da: Decoder, db: Decoder, n: usize) {
+        for e in 0..n {
+            let va = da.at(a, e);
+            let vb = db.at(b, e);
+            self.elements += 1;
+            // Bit-equal, or both NaN — treat as unchanged.
+            if va == vb || (va.is_nan() && vb.is_nan()) {
+                continue;
+            }
+            self.differing += 1;
+            if va.is_finite() && vb.is_finite() {
+                let d = (va - vb).abs();
+                if d > self.max_abs {
+                    self.max_abs = d;
+                }
+                self.sum_abs += d;
+            } else {
+                self.nonfinite_mismatch += 1;
+            }
+        }
+    }
+}
+
+/// Compare two tensors' values element-by-element. Requires equal shapes; dtypes
+/// may differ (each side is decoded by its own dtype, so this also measures
+/// requantization drift, e.g. F16 → BF16). Streams matching row-blocks via
+/// [`TensorReader::read_region`], so memory stays bounded regardless of size.
+pub(crate) fn compare_values(a: &TensorInfo, b: &TensorInfo) -> Result<ValueDiff, String> {
+    let ra = open_reader(a)?;
+    let rb = open_reader(b)?;
+    if ra.shape() != rb.shape() {
+        return Err("shapes differ".to_string());
+    }
+    let da = Decoder {
+        prim: parse_prim(&a.dtype).ok_or_else(|| format!("dtype {} not comparable", a.dtype))?,
+        item: item_size(&a.dtype).unwrap(),
+    };
+    let db = Decoder {
+        prim: parse_prim(&b.dtype).ok_or_else(|| format!("dtype {} not comparable", b.dtype))?,
+        item: item_size(&b.dtype).unwrap(),
+    };
+    let shape = ra.shape().to_vec();
+
+    let mut acc = DiffAcc::default();
+    if shape.is_empty() {
+        let ba = ra.read_region(&[])?;
+        let bb = rb.read_region(&[])?;
+        acc.add_block(&ba, &bb, da, db, 1);
+    } else {
+        let inner: usize = shape[1..].iter().product::<usize>().max(1);
+        let outer = shape[0];
+        let block = (STATS_BLOCK_ELEMS / inner).max(1);
+        let mut i = 0;
+        while i < outer {
+            let hi = (i + block).min(outer);
+            let mut ranges: Vec<Range<usize>> = Vec::with_capacity(shape.len());
+            ranges.push(i..hi);
+            ranges.extend(shape[1..].iter().map(|&d| 0..d));
+            let ba = ra.read_region(&ranges)?;
+            let bb = rb.read_region(&ranges)?;
+            acc.add_block(&ba, &bb, da, db, (hi - i) * inner);
+            i = hi;
+        }
+    }
+
+    let mean_abs = if acc.elements > 0 {
+        acc.sum_abs / acc.elements as f64
+    } else {
+        0.0
+    };
+    Ok(ValueDiff {
+        elements: acc.elements,
+        differing: acc.differing,
+        max_abs: acc.max_abs,
+        mean_abs,
+        nonfinite_mismatch: acc.nonfinite_mismatch,
+    })
+}
+
 /// How a value histogram's bins are laid out.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HistBins {

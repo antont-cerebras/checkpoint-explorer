@@ -489,20 +489,24 @@ mod hdf5 {
 
 // ---- `diff` subcommand ----
 
-/// Write a safetensors file from (name, dtype, shape) specs + string metadata —
-/// a parametric sibling of `write_fixture`, used to build the diff fixtures.
-fn write_st(path: &str, specs: &[(&str, Dtype, Vec<usize>)], metadata: &[(&str, &str)]) {
+/// Write a safetensors file from (name, dtype, shape, seed) specs + string
+/// metadata — a parametric sibling of `write_fixture` for the diff fixtures. The
+/// payload is a byte ramp offset by `seed`, so two files can give a tensor the
+/// same bytes (equal seed) or differing values (different seed).
+fn write_st(path: &str, specs: &[(&str, Dtype, Vec<usize>, u8)], metadata: &[(&str, &str)]) {
     let buffers: Vec<Vec<u8>> = specs
         .iter()
-        .map(|(_, dt, shape)| {
+        .map(|(_, dt, shape, seed)| {
             let bytes = shape.iter().product::<usize>() * dtype_size(*dt);
-            (0..bytes).map(|i| (i % 251) as u8).collect()
+            (0..bytes)
+                .map(|i| ((i + *seed as usize) % 251) as u8)
+                .collect()
         })
         .collect();
     let data: HashMap<String, TensorView> = specs
         .iter()
         .zip(&buffers)
-        .map(|((name, dt, shape), buf)| {
+        .map(|((name, dt, shape, _), buf)| {
             (
                 name.to_string(),
                 TensorView::new(*dt, shape.clone(), buf).expect("valid tensor view"),
@@ -526,38 +530,54 @@ const DIFF_NEW: &str = "tests/fixtures/diff_new.safetensors";
 
 /// Two checkpoints differing by one removed, one added, and two changed tensors
 /// (a dtype change and a shape change), plus one added and one changed metadata
-/// entry — and one tensor + one metadata entry identical in both.
+/// entry. `input_layernorm.weight` is identical in both; `mlp.weight` has the
+/// same dtype+shape but different bytes (`seed` 0 vs 7) — i.e. a values-only
+/// change, used to exercise `--tensor`.
 fn ensure_diff_fixtures() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         write_st(
             DIFF_OLD,
             &[
-                ("lm_head.weight", Dtype::F16, vec![2, 2]),
-                ("model.embed_tokens.weight", Dtype::F16, vec![6, 4]),
-                ("model.norm.weight", Dtype::F32, vec![4]),
-                ("model.layers.0.input_layernorm.weight", Dtype::F32, vec![4]),
+                ("lm_head.weight", Dtype::F16, vec![2, 2], 0),
+                ("model.embed_tokens.weight", Dtype::F16, vec![6, 4], 0),
+                ("model.norm.weight", Dtype::F32, vec![4], 0),
+                (
+                    "model.layers.0.input_layernorm.weight",
+                    Dtype::F32,
+                    vec![4],
+                    0,
+                ),
+                ("model.layers.0.mlp.weight", Dtype::U8, vec![4], 0),
             ],
             &[("format", "pt"), ("note", "original")],
         );
         write_st(
             DIFF_NEW,
             &[
-                ("model.embed_tokens.weight", Dtype::BF16, vec![6, 4]),
-                ("model.norm.weight", Dtype::F32, vec![8]),
-                ("model.layers.0.input_layernorm.weight", Dtype::F32, vec![4]),
-                ("model.rotary_emb.inv_freq", Dtype::F32, vec![16]),
+                ("model.embed_tokens.weight", Dtype::BF16, vec![6, 4], 0),
+                ("model.norm.weight", Dtype::F32, vec![8], 0),
+                (
+                    "model.layers.0.input_layernorm.weight",
+                    Dtype::F32,
+                    vec![4],
+                    0,
+                ),
+                ("model.layers.0.mlp.weight", Dtype::U8, vec![4], 7),
+                ("model.rotary_emb.inv_freq", Dtype::F32, vec![16], 0),
             ],
             &[("format", "pt"), ("note", "edited"), ("extra", "x")],
         );
     });
 }
 
-/// Run `diff OLD NEW` (relative paths, so the header is checkout-independent) and
-/// return its stdout plus exit code.
-fn run_diff(old: &str, new: &str) -> (String, i32) {
+/// Run `diff` with `args` (relative paths, so the header is checkout-independent)
+/// and return its stdout plus exit code.
+fn run_diff(args: &[&str]) -> (String, i32) {
+    let mut full = vec!["diff"];
+    full.extend_from_slice(args);
     let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
-        .args(["diff", old, new])
+        .args(&full)
         .output()
         .expect("run diff");
     (
@@ -569,7 +589,9 @@ fn run_diff(old: &str, new: &str) -> (String, i32) {
 #[test]
 fn diff_lists_changes_and_exits_1() {
     ensure_diff_fixtures();
-    let (out, code) = run_diff(DIFF_OLD, DIFF_NEW);
+    // Full diff is structural: mlp.weight (same dtype+shape, different bytes) is
+    // "unchanged" here — value differences only surface under `--tensor`.
+    let (out, code) = run_diff(&[DIFF_OLD, DIFF_NEW]);
     assert_eq!(code, 1, "differences should exit 1; stdout:\n{out}");
     insta::assert_snapshot!(out);
 }
@@ -577,7 +599,7 @@ fn diff_lists_changes_and_exits_1() {
 #[test]
 fn diff_identical_exits_0() {
     ensure_diff_fixtures();
-    let (out, code) = run_diff(DIFF_OLD, DIFF_OLD);
+    let (out, code) = run_diff(&[DIFF_OLD, DIFF_OLD]);
     assert_eq!(code, 0, "identical should exit 0; stdout:\n{out}");
     assert!(out.contains("tensors: -0 +0 ~0"), "{out}");
     assert!(out.contains("metadata: -0 +0 ~0"), "{out}");
@@ -586,6 +608,46 @@ fn diff_identical_exits_0() {
 #[test]
 fn diff_unreadable_path_exits_2() {
     ensure_diff_fixtures();
-    let (_out, code) = run_diff(DIFF_OLD, "tests/fixtures/does_not_exist.safetensors");
+    let (_out, code) = run_diff(&[DIFF_OLD, "tests/fixtures/does_not_exist.safetensors"]);
     assert_eq!(code, 2, "an unreadable path should exit 2");
+}
+
+#[test]
+fn diff_tensor_values_differ_and_exits_1() {
+    ensure_diff_fixtures();
+    // U8 [4]: bytes 0..3 vs 7..10 → all four differ, each by 7.
+    let (out, code) = run_diff(&[DIFF_OLD, DIFF_NEW, "--tensor", "model.layers.0.mlp.weight"]);
+    assert_eq!(code, 1, "a value change should exit 1; stdout:\n{out}");
+    insta::assert_snapshot!(out);
+}
+
+#[test]
+fn diff_tensor_identical_values_exits_0() {
+    ensure_diff_fixtures();
+    let (out, code) = run_diff(&[
+        DIFF_OLD,
+        DIFF_NEW,
+        "--tensor",
+        "model.layers.0.input_layernorm.weight",
+    ]);
+    assert_eq!(code, 0, "identical values should exit 0; stdout:\n{out}");
+    assert!(out.contains("(identical)"), "{out}");
+}
+
+#[test]
+fn diff_tensor_shape_change_skips_values() {
+    ensure_diff_fixtures();
+    let (out, code) = run_diff(&[DIFF_OLD, DIFF_NEW, "--tensor", "model.norm.weight"]);
+    assert_eq!(code, 1, "a shape change should exit 1; stdout:\n{out}");
+    assert!(
+        out.contains("values: not compared (shapes differ)"),
+        "{out}"
+    );
+}
+
+#[test]
+fn diff_tensor_missing_exits_2() {
+    ensure_diff_fixtures();
+    let (_out, code) = run_diff(&[DIFF_OLD, DIFF_NEW, "--tensor", "no.such.tensor"]);
+    assert_eq!(code, 2, "an absent tensor should exit 2");
 }

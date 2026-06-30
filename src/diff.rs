@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
+use crate::sample::ValueDiff;
 use crate::tree::{MetadataInfo, TensorInfo};
 use crate::utils::format_shape;
 
@@ -23,9 +24,29 @@ pub struct TensorSig {
 }
 
 impl TensorSig {
+    /// The signature of a loaded tensor.
+    pub fn of(t: &TensorInfo) -> Self {
+        Self {
+            dtype: t.dtype.clone(),
+            shape: t.shape.clone(),
+        }
+    }
+
     fn render(&self) -> String {
         format!("{} {}", self.dtype, format_shape(&self.shape))
     }
+}
+
+/// The element-value comparison outcome for the focused (`--tensor`) diff, when
+/// the tensor exists on both sides.
+pub enum ValueCmp {
+    /// All elements are equal (bit-equal, or NaN in the same slots).
+    Identical,
+    /// Some elements differ; carries the diff statistics.
+    Differ(ValueDiff),
+    /// Values weren't compared — the reason (e.g. "shapes differ", an unreadable
+    /// dtype, or an I/O error).
+    Skipped(String),
 }
 
 /// A metadata entry's compared value: its string value + declared type.
@@ -239,6 +260,112 @@ pub fn compare(old: &CheckpointSummary, new: &CheckpointSummary) -> DiffReport {
     }
 }
 
+/// Whether the focused (`--tensor`) diff counts as a difference — drives exit `1`
+/// vs `0`. The tensor differs if it's present on only one side, its signature
+/// changed, or (same signature) its values changed.
+pub fn tensor_focus_differs(
+    old: Option<&TensorSig>,
+    new: Option<&TensorSig>,
+    values: Option<&ValueCmp>,
+) -> bool {
+    match (old, new) {
+        (Some(o), Some(n)) => o != n || matches!(values, Some(ValueCmp::Differ(_))),
+        // Present on only one side (the both-absent case is handled as "not found"
+        // by the caller, which exits 2 before reaching here).
+        _ => true,
+    }
+}
+
+/// Render the focused single-tensor diff: the `[old] → [new]` signature line (or
+/// added/removed/identical), then an indented `values:` line from the element
+/// comparison when both sides exist.
+pub fn render_tensor_focus(
+    old_label: &str,
+    new_label: &str,
+    name: &str,
+    old: Option<&TensorSig>,
+    new: Option<&TensorSig>,
+    values: Option<&ValueCmp>,
+) -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "--- {old_label}");
+    let _ = writeln!(s, "+++ {new_label}");
+    let _ = writeln!(s);
+    match (old, new) {
+        (Some(o), None) => {
+            let _ = writeln!(s, "  - {name}  [{}]  (only in old)", o.render());
+        }
+        (None, Some(n)) => {
+            let _ = writeln!(s, "  + {name}  [{}]  (only in new)", n.render());
+        }
+        (Some(o), Some(n)) if o == n => {
+            // Same dtype & shape: the only possible difference is in the values.
+            match values {
+                Some(ValueCmp::Differ(vd)) => {
+                    let _ = writeln!(s, "  ~ {name}  [{}]  (values differ)", o.render());
+                    let _ = writeln!(s, "{}", value_line(vd));
+                }
+                Some(ValueCmp::Skipped(why)) => {
+                    let _ = writeln!(s, "  = {name}  [{}]", o.render());
+                    let _ = writeln!(s, "    values: not compared ({why})");
+                }
+                _ => {
+                    let _ = writeln!(s, "  = {name}  [{}]  (identical)", o.render());
+                }
+            }
+        }
+        (Some(o), Some(n)) => {
+            // dtype and/or shape changed.
+            let _ = writeln!(s, "  ~ {name}  [{}] → [{}]", o.render(), n.render());
+            match values {
+                Some(ValueCmp::Differ(vd)) => {
+                    let _ = writeln!(s, "{}", value_line(vd));
+                }
+                Some(ValueCmp::Identical) => {
+                    let _ = writeln!(s, "    values: identical");
+                }
+                Some(ValueCmp::Skipped(why)) => {
+                    let _ = writeln!(s, "    values: not compared ({why})");
+                }
+                None => {}
+            }
+        }
+        (None, None) => {}
+    }
+    s
+}
+
+/// The indented `values:` summary line for a value difference.
+fn value_line(vd: &ValueDiff) -> String {
+    let mut line = format!(
+        "    values: {} of {} differ  (max |Δ| {}, mean |Δ| {})",
+        vd.differing,
+        vd.elements,
+        fmt_delta(vd.max_abs),
+        fmt_delta(vd.mean_abs),
+    );
+    if vd.nonfinite_mismatch > 0 {
+        let _ = write!(line, "  [{} non-finite mismatch]", vd.nonfinite_mismatch);
+    }
+    line
+}
+
+/// Format a difference magnitude compactly: fixed-point with trailing zeros
+/// trimmed for everyday magnitudes, scientific for very small/large ones.
+fn fmt_delta(x: f64) -> String {
+    if x == 0.0 {
+        return "0".to_string();
+    }
+    let a = x.abs();
+    if (1e-3..1e6).contains(&a) {
+        let fixed = format!("{x:.6}");
+        let trimmed = fixed.trim_end_matches('0').trim_end_matches('.');
+        trimmed.to_string()
+    } else {
+        format!("{x:.3e}")
+    }
+}
+
 /// Quote a metadata value for one-line display: flatten newlines to spaces and
 /// truncate to a readable length (multi-line JSON blobs are common).
 fn quote_trunc(v: &str) -> String {
@@ -376,5 +503,100 @@ mod tests {
         let q = quote_trunc(&long);
         assert!(q.starts_with('"') && q.ends_with("…\""));
         assert_eq!(q.chars().count(), 60 + 3); // 60 chars + ellipsis + 2 quotes
+    }
+
+    #[test]
+    fn fmt_delta_trims_and_switches_to_scientific() {
+        assert_eq!(fmt_delta(0.0), "0");
+        assert_eq!(fmt_delta(7.0), "7");
+        assert_eq!(fmt_delta(0.5), "0.5");
+        assert_eq!(fmt_delta(0.001953125), "0.001953");
+        assert_eq!(fmt_delta(1e-8), "1.000e-8");
+    }
+
+    fn vd(differing: u64, elements: u64, max_abs: f64, mean_abs: f64) -> ValueDiff {
+        ValueDiff {
+            elements,
+            differing,
+            max_abs,
+            mean_abs,
+            nonfinite_mismatch: 0,
+        }
+    }
+
+    #[test]
+    fn focus_differs_predicate() {
+        let a = sig("F16", &[2, 2]);
+        let b = sig("BF16", &[2, 2]);
+        // same sig, identical values → not a difference
+        assert!(!tensor_focus_differs(
+            Some(&a),
+            Some(&a),
+            Some(&ValueCmp::Identical)
+        ));
+        // same sig, values differ → a difference
+        assert!(tensor_focus_differs(
+            Some(&a),
+            Some(&a),
+            Some(&ValueCmp::Differ(vd(1, 4, 0.5, 0.1)))
+        ));
+        // differing sig → a difference regardless of values
+        assert!(tensor_focus_differs(
+            Some(&a),
+            Some(&b),
+            Some(&ValueCmp::Identical)
+        ));
+        // present on one side only → a difference
+        assert!(tensor_focus_differs(Some(&a), None, None));
+    }
+
+    #[test]
+    fn focus_render_same_sig_values_differ() {
+        let a = sig("U8", &[4]);
+        let out = render_tensor_focus(
+            "old",
+            "new",
+            "w",
+            Some(&a),
+            Some(&a),
+            Some(&ValueCmp::Differ(vd(4, 4, 7.0, 7.0))),
+        );
+        assert!(out.contains("~ w  [U8 (4)]  (values differ)"), "{out}");
+        assert!(
+            out.contains("values: 4 of 4 differ  (max |Δ| 7, mean |Δ| 7)"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn focus_render_identical_and_added_and_shape_skip() {
+        let a = sig("F32", &[4]);
+        let ident = render_tensor_focus(
+            "o",
+            "n",
+            "w",
+            Some(&a),
+            Some(&a),
+            Some(&ValueCmp::Identical),
+        );
+        assert!(ident.contains("= w  [F32 (4)]  (identical)"), "{ident}");
+
+        let added = render_tensor_focus("o", "n", "w", None, Some(&a), None);
+        assert!(added.contains("+ w  [F32 (4)]  (only in new)"), "{added}");
+
+        let b = sig("F32", &[8]);
+        let reshape = render_tensor_focus(
+            "o",
+            "n",
+            "w",
+            Some(&a),
+            Some(&b),
+            Some(&ValueCmp::Skipped("shapes differ".to_string())),
+        );
+        assert!(reshape.contains("~ w  [F32 (4)] → [F32 (8)]"), "{reshape}");
+        assert!(
+            reshape.contains("values: not compared (shapes differ)"),
+            "{reshape}"
+        );
     }
 }

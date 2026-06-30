@@ -1,0 +1,9 @@
+---
+source: tests/cli.rs
+expression: out
+---
+--- tests/fixtures/diff_old.safetensors
++++ tests/fixtures/diff_new.safetensors
+
+  ~ model.layers.0.mlp.weight  [U8 (4)]  (values differ)
+    values: 4 of 4 differ  (max |Δ| 7, mean |Δ| 7)
