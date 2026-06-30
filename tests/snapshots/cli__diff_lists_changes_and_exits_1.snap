@@ -1,0 +1,16 @@
+---
+source: tests/cli.rs
+expression: out
+---
+--- tests/fixtures/diff_old.safetensors
++++ tests/fixtures/diff_new.safetensors
+
+tensors: -1 +1 ~2 (1 unchanged)
+  - lm_head.weight  [F16 (2, 2)]
+  + model.rotary_emb.inv_freq  [F32 (16)]
+  ~ model.embed_tokens.weight  [F16 (6, 4)] → [BF16 (6, 4)]
+  ~ model.norm.weight  [F32 (4)] → [F32 (8)]
+
+metadata: -0 +1 ~1 (1 unchanged)
+  + extra = "x"
+  ~ note = "original" → "edited"

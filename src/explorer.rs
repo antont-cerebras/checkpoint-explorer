@@ -1091,8 +1091,11 @@ impl Explorer {
 
     /// Read every file's top-level structure (tensors + metadata) into owned
     /// vectors. A free function (no `&self`) so it can run on a worker thread
-    /// while the UI animates a loading spinner.
-    fn gather_checkpoint(files: &[PathBuf]) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+    /// while the UI animates a loading spinner, and so the `diff` subcommand can
+    /// load a checkpoint's structure headlessly.
+    pub(crate) fn gather_checkpoint(
+        files: &[PathBuf],
+    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
         let mut tensors: Vec<TensorInfo> = Vec::new();
         let mut metadata: Vec<MetadataInfo> = Vec::new();
         for file_path in files {
