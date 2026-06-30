@@ -1377,7 +1377,8 @@ pub fn tensor_stats(
 }
 
 /// Element-wise comparison of two equal-shape tensors, each decoded to `f64`.
-/// Used by `diff --tensor`.
+/// Used by `diff --tensor` and the full-checkpoint `diff --values`.
+#[derive(Clone, Copy)]
 pub struct ValueDiff {
     /// Total elements compared.
     pub elements: u64,

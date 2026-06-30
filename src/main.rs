@@ -274,6 +274,12 @@ enum Command {
         /// Compare only tensors — skip the checkpoints' metadata entirely.
         #[arg(long = "only-tensors")]
         only_tensors: bool,
+        /// Also compare element values: read each tensor present in both (with a
+        /// matching shape) and report max/mean |Δ| — turning a values-only change
+        /// (same dtype & shape, different data) into a difference. Reads the whole
+        /// checkpoint, so it's slower than the default structural diff.
+        #[arg(long)]
+        values: bool,
         /// List every changed entry instead of collapsing ones that share a name
         /// template and the same change (e.g. the same per-layer dtype change) into
         /// one line with a count and index range.
@@ -304,6 +310,7 @@ fn main() -> Result<()> {
             recursive,
             tensor,
             only_tensors,
+            values,
             full,
             no_color,
         }) => {
@@ -313,6 +320,7 @@ fn main() -> Result<()> {
                 color: color_enabled(no_color),
                 metadata: !only_tensors,
                 group: !full,
+                values,
             };
             std::process::exit(run_diff(&old, &new, recursive, tensor.as_deref(), opts))
         }
@@ -366,12 +374,32 @@ fn run_diff(
     }
 
     // `--only-tensors` (opts.metadata == false): drop metadata so it affects
-    // neither the report nor the exit code, and omit its section from the output.
-    let meta_of = |m: Vec<MetadataInfo>| if opts.metadata { m } else { Vec::new() };
-    let report = diff::compare(
-        &diff::CheckpointSummary::from_loaded(old_t, meta_of(old_m)),
-        &diff::CheckpointSummary::from_loaded(new_t, meta_of(new_m)),
-    );
+    // neither the report nor the exit code (its section becomes a "not compared"
+    // note in the output).
+    let empty: Vec<MetadataInfo> = Vec::new();
+    let old_meta: &[MetadataInfo] = if opts.metadata { &old_m } else { &empty };
+    let new_meta: &[MetadataInfo] = if opts.metadata { &new_m } else { &empty };
+    let old_sum = diff::CheckpointSummary::from_loaded(&old_t, old_meta);
+    let new_sum = diff::CheckpointSummary::from_loaded(&new_t, new_meta);
+
+    let report = if opts.values {
+        // `--values`: compare each common tensor's elements (skip shape mismatches).
+        use std::collections::HashMap;
+        let old_map: HashMap<&str, &TensorInfo> =
+            old_t.iter().map(|t| (t.name.as_str(), t)).collect();
+        let new_map: HashMap<&str, &TensorInfo> =
+            new_t.iter().map(|t| (t.name.as_str(), t)).collect();
+        let value_of = |name: &str| -> Option<sample::ValueDiff> {
+            let (a, b) = (old_map.get(name)?, new_map.get(name)?);
+            if a.shape != b.shape {
+                return None; // element-wise comparison needs matching shapes
+            }
+            sample::compare_values(a, b).ok()
+        };
+        diff::compare_with_values(&old_sum, &new_sum, value_of)
+    } else {
+        diff::compare(&old_sum, &new_sum)
+    };
     print!("{}", report.render(&old_label, &new_label, opts));
     i32::from(report.has_differences())
 }
