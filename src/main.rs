@@ -274,6 +274,11 @@ enum Command {
         /// Compare only tensors — skip the checkpoints' metadata entirely.
         #[arg(long = "only-tensors")]
         only_tensors: bool,
+        /// List every changed entry instead of collapsing ones that share a name
+        /// template and the same change (e.g. the same per-layer dtype change) into
+        /// one line with a count and index range.
+        #[arg(long)]
+        full: bool,
         /// Never colorize the output (also off automatically when stdout isn't a
         /// terminal, or when `NO_COLOR` is set).
         #[arg(long = "no-color")]
@@ -299,21 +304,17 @@ fn main() -> Result<()> {
             recursive,
             tensor,
             only_tensors,
+            full,
             no_color,
         }) => {
             // `diff`-style exit codes (0 same / 1 differ / 2 trouble) don't map to
             // the `Result` convention `main` uses elsewhere, so exit explicitly.
-            let style = diff::Style {
+            let opts = diff::DiffOpts {
                 color: color_enabled(no_color),
+                metadata: !only_tensors,
+                group: !full,
             };
-            std::process::exit(run_diff(
-                &old,
-                &new,
-                recursive,
-                tensor.as_deref(),
-                only_tensors,
-                style,
-            ))
+            std::process::exit(run_diff(&old, &new, recursive, tensor.as_deref(), opts))
         }
         None => run_explore(cli.explore),
     }
@@ -333,8 +334,7 @@ fn run_diff(
     new: &Path,
     recursive: bool,
     tensor: Option<&str>,
-    only_tensors: bool,
-    style: diff::Style,
+    opts: diff::DiffOpts,
 ) -> i32 {
     let load = |path: &Path| -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
         let (files, _health) =
@@ -362,20 +362,17 @@ fn run_diff(
 
     // `--tensor NAME`: focus on one tensor and also compare its element values.
     if let Some(name) = tensor {
-        return run_diff_tensor(&old_label, &new_label, name, &old_t, &new_t, style);
+        return run_diff_tensor(&old_label, &new_label, name, &old_t, &new_t, opts.color);
     }
 
-    // `--only-tensors`: drop metadata so it affects neither the report nor the
-    // exit code, and omit its section from the output.
-    let meta_of = |m: Vec<MetadataInfo>| if only_tensors { Vec::new() } else { m };
+    // `--only-tensors` (opts.metadata == false): drop metadata so it affects
+    // neither the report nor the exit code, and omit its section from the output.
+    let meta_of = |m: Vec<MetadataInfo>| if opts.metadata { m } else { Vec::new() };
     let report = diff::compare(
         &diff::CheckpointSummary::from_loaded(old_t, meta_of(old_m)),
         &diff::CheckpointSummary::from_loaded(new_t, meta_of(new_m)),
     );
-    print!(
-        "{}",
-        report.render(&old_label, &new_label, !only_tensors, style)
-    );
+    print!("{}", report.render(&old_label, &new_label, opts));
     i32::from(report.has_differences())
 }
 
@@ -387,7 +384,7 @@ fn run_diff_tensor(
     name: &str,
     old_t: &[TensorInfo],
     new_t: &[TensorInfo],
-    style: diff::Style,
+    color: bool,
 ) -> i32 {
     let old_info = old_t.iter().find(|t| t.name == name);
     let new_info = new_t.iter().find(|t| t.name == name);
@@ -413,7 +410,7 @@ fn run_diff_tensor(
             old_sig.as_ref(),
             new_sig.as_ref(),
             values.as_ref(),
-            style,
+            color,
         )
     );
     i32::from(diff::tensor_focus_differs(
