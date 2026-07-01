@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{LineGauge, Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, LineGauge, Padding, Paragraph, Widget};
 
 use crate::health::HealthReport;
 use crate::sample::{HistBins, Histogram, PackingSchema, Sample, SampleMode, Stats, ViewDtype};
@@ -155,6 +155,12 @@ mod palette {
     /// over the main screen while staying within the dark theme. Light/accent
     /// foregrounds keep their contrast; dim text stays legible.
     pub const PANEL_BG: Color = Color::Indexed(236);
+
+    /// Backdrop behind a full-frame message screen ([`Backdrop::Fill`]): one shade
+    /// darker than [`PANEL_BG`], so the box reads as a raised card over an even,
+    /// dark field. (Floating pop-ups like the legend keep the live screen behind
+    /// them and don't use this.)
+    pub const SCRIM: Color = Color::Indexed(234);
 }
 
 /// Marks a tensor that's on disk but not listed in the index (an "extra"),
@@ -709,55 +715,49 @@ impl UI {
     }
 
     /// Composite the context-sensitive glyph legend over the live frame as a
-    /// floating, panel-backed band centred vertically, drawn last so the screen
-    /// behind keeps animating. Shared by every screen's `l` overlay and by
-    /// `--plain --legend`.
+    /// centred, rounded [`Block`] pop-up (its context is the box title), drawn last
+    /// so the screen behind keeps animating. Shared by every screen's `l` overlay
+    /// and by `--plain --legend`.
     pub fn render_legend_band(frame: &mut Frame, legend: Legend) {
-        let content = legend_band_lines(legend);
-        // Band = a blank margin row, the content, a blank margin row; centred.
-        let mut band: Vec<Line> = vec![Line::default()];
-        band.extend(content);
-        band.push(Line::default());
-        render_panel_band(frame, band);
+        render_popup_box(
+            frame,
+            legend_title(legend),
+            legend_band_lines(legend),
+            Backdrop::Float,
+        );
     }
 
-    /// Composite the copied-CLI-command pop-up over the live frame — a centred,
-    /// panel-backed band (blank, title, rule, the wrapped command, rule, footer,
-    /// blank).
+    /// Composite the copied-CLI-command pop-up over the live frame — a full-width
+    /// [`render_titled_bar`] (label + copied confirmation ride the top border) with
+    /// the wrapped command flush at column 0 so it stays cleanly selectable, then a
+    /// dismiss hint.
     pub fn render_command_band(frame: &mut Frame, command: &str) {
         let term_w = frame.area().width as usize;
-        let rule_color = Style::default().fg(palette::ACCENT);
-        let rule = "─".repeat(term_w);
-
-        // blank, header, rule, command(rows), rule, footer, blank.
-        let mut band: Vec<Line> = vec![Line::default()];
-        // Header: title + copied confirmation.
-        band.push(Line::from(vec![
+        let title = Line::from(vec![
             Span::styled(
-                "CLI command",
+                " CLI command ",
                 Style::default()
                     .fg(palette::KEY)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "   ✓ copied to the clipboard",
+                "✓ copied to the clipboard ",
                 Style::default().fg(palette::SUCCESS),
             ),
-        ]));
-        band.push(Line::from(Span::styled(rule.clone(), rule_color)));
-        // The command, soft-wrapped at full width onto its own line(s).
+        ]);
+        // The command, soft-wrapped at full width onto its own line(s), flush at
+        // column 0 so it can still be selected cleanly by hand when the OSC-52
+        // copy doesn't reach the terminal.
         let chars: Vec<char> = command.chars().collect();
         let cmd_rows = chars.len().div_ceil(term_w.max(1)).max(1);
-        for r in 0..cmd_rows {
-            let seg: String = chars.iter().skip(r * term_w).take(term_w).collect();
-            band.push(Line::from(Span::raw(seg)));
-        }
-        band.push(Line::from(Span::styled(rule, rule_color)));
-        band.push(Line::from(dim_span(
-            "copied to the clipboard · click or press any key to dismiss",
-        )));
-        band.push(Line::default());
-        render_panel_band(frame, band);
+        let mut content: Vec<Line> = (0..cmd_rows)
+            .map(|r| {
+                let seg: String = chars.iter().skip(r * term_w).take(term_w).collect();
+                Line::from(Span::raw(seg))
+            })
+            .collect();
+        content.push(Line::from(dim_span("click or press any key to dismiss")));
+        render_titled_bar(frame, title, content);
     }
 
     /// The Ratatui port of [`Self::draw_loading`]: the tree browser's title + rule
@@ -1436,23 +1436,16 @@ impl UI {
     /// The Ratatui port of [`Self::draw_message`]: a simple full-screen message
     /// (title, underline rule, body, footer) over the pop-up panel surface.
     pub fn render_message(frame: &mut Frame, title: &str, message: &str) {
-        let area = frame.area();
-        let panel = Style::default().bg(palette::PANEL_BG);
-        // Fill the whole screen with the panel surface first, like the raw path's
-        // `Clear(All)` over a set background.
-        Paragraph::new("")
-            .style(panel)
-            .render(area, frame.buffer_mut());
-        let lines: Vec<Line> = vec![
-            Line::from(Span::raw(title.to_string())),
-            Line::from(Span::raw("=".repeat(title.len().max(10)))),
-            Line::from(Span::raw(message.to_string())),
-            Line::default(),
-            Line::from(Span::raw("Click or press any key to return...")),
-        ];
-        Paragraph::new(lines)
-            .style(panel)
-            .render(area, frame.buffer_mut());
+        render_popup_box(
+            frame,
+            title,
+            vec![
+                Line::from(Span::raw(message.to_string())),
+                Line::default(),
+                Line::from(dim_span("Click or press any key to return...")),
+            ],
+            Backdrop::Fill,
+        );
     }
 
     /// Draw the copied CLI command as a borderless pop-up *over* the current
@@ -1637,41 +1630,103 @@ fn legend_row_line(color: Option<Color>, symbol: &str, desc: &str, desc_col: u16
     Line::from(spans)
 }
 
-/// Composite `lines` as a floating, panel-backed band centred vertically over the
-/// frame — shared by [`UI::render_legend_band`] and [`UI::render_command_band`].
-/// Every band row is padded to the full width with panel-background spaces so it
-/// fully overwrites the screen beneath (symbols *and* colour), reading as a raised
-/// pop-up — the Ratatui equivalent of the raw bands' full-width line clears.
-fn render_panel_band(frame: &mut Frame, lines: Vec<Line<'static>>) {
-    use unicode_width::UnicodeWidthStr;
-    let area = frame.area();
-    let width = area.width as usize;
-    let panel = Style::default().bg(palette::PANEL_BG);
-    let band_h = lines.len() as u16;
-    let start = area.height.saturating_sub(band_h) / 2;
+/// How a centred pop-up box treats the frame around it.
+enum Backdrop {
+    /// Leave the live frame intact around the box, clearing only the box's own
+    /// rect — for a true pop-up (the legend `l`) that floats over a still-visible
+    /// tree / detail view.
+    Float,
+    /// Wipe the whole frame to the [`palette::SCRIM`] first — for standalone
+    /// message screens that own the frame (nothing is drawn beneath), so no
+    /// terminal default background shows around the box.
+    Fill,
+}
 
-    // Pad each line to the full width with panel-styled spaces so the cells under
-    // the band (the live frame's symbols) are overwritten, not just recoloured.
-    let padded: Vec<Line> = lines
-        .into_iter()
-        .map(|mut line| {
-            let used: usize = line.spans.iter().map(|s| s.content.width()).sum();
-            if used < width {
-                line.spans
-                    .push(Span::styled(" ".repeat(width - used), panel));
-            }
-            line.style(panel)
-        })
-        .collect();
-    Paragraph::new(padded).style(panel).render(
-        Rect {
-            x: 0,
-            y: start,
-            width: area.width,
-            height: band_h.min(area.height.saturating_sub(start)),
-        },
-        frame.buffer_mut(),
-    );
+/// A centred, content-sized pop-up over the frame: a rounded [`Block`] (accent
+/// border, `title` on the top edge, panel background) wrapping `content`. With
+/// [`Backdrop::Float`] the surrounding frame is left untouched (only the box rect
+/// is cleared) so the screen behind stays visible — a real pop-up; with
+/// [`Backdrop::Fill`] the whole frame is wiped to the scrim first, for standalone
+/// message screens. Shared by the legend pop-up and message screens.
+fn render_popup_box(
+    frame: &mut Frame,
+    title: &str,
+    content: Vec<Line<'static>>,
+    backdrop: Backdrop,
+) {
+    let area = frame.area();
+    let inner_w = content
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(0)
+        .max(title.chars().count() + 2);
+    let box_w = ((inner_w + 4) as u16).min(area.width); // 2 borders + 2 padding
+    let box_h = ((content.len() + 2) as u16).min(area.height); // 2 borders
+    let rect = Rect {
+        x: area.width.saturating_sub(box_w) / 2,
+        y: area.height.saturating_sub(box_h) / 2,
+        width: box_w,
+        height: box_h,
+    };
+    match backdrop {
+        // Float over the live frame: clear only the box's own rect so the block
+        // paints on a clean surface, while the screen behind stays visible around it.
+        Backdrop::Float => Clear.render(rect, frame.buffer_mut()),
+        // Own the frame: wipe every glyph, then paint the scrim, so nothing shows
+        // through around the box.
+        Backdrop::Fill => {
+            Clear.render(area, frame.buffer_mut());
+            Block::default()
+                .style(Style::default().bg(palette::SCRIM))
+                .render(area, frame.buffer_mut());
+        }
+    }
+
+    let panel = Style::default().bg(palette::PANEL_BG);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(palette::ACCENT))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default()
+                .fg(palette::KEY)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .padding(Padding::horizontal(1))
+        .style(panel);
+    let inner = block.inner(rect);
+    block.render(rect, frame.buffer_mut());
+    Paragraph::new(content)
+        .style(panel)
+        .render(inner, frame.buffer_mut());
+}
+
+/// A full-width pop-up framed with only top+bottom borders (the `title` rides the
+/// top rule) over the live frame, centred vertically. Its body rows stay flush at
+/// column 0 — used by the copied-command pop-up so the command can still be
+/// selected cleanly by hand when the OSC-52 copy doesn't reach the terminal.
+fn render_titled_bar(frame: &mut Frame, title: Line<'static>, content: Vec<Line<'static>>) {
+    let area = frame.area();
+    let box_h = ((content.len() + 2) as u16).min(area.height);
+    let rect = Rect {
+        x: 0,
+        y: area.height.saturating_sub(box_h) / 2,
+        width: area.width,
+        height: box_h,
+    };
+    let panel = Style::default().bg(palette::PANEL_BG);
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(palette::ACCENT))
+        .title(title)
+        .style(panel);
+    let inner = block.inner(rect);
+    Clear.render(rect, frame.buffer_mut());
+    block.render(rect, frame.buffer_mut());
+    Paragraph::new(content)
+        .style(panel)
+        .render(inner, frame.buffer_mut());
 }
 
 /// Composite a bottom-pinned two-row prompt (`prompt` on the second-to-last row,
@@ -1768,24 +1823,19 @@ fn health_section_lines(
     lines.push(Line::default());
 }
 
-/// Build the context-sensitive legend body as styled [`Line`]s for
-/// [`UI::render_legend_band`]. Title, rule, blank, the per-screen rows, then the
-/// closing blank + "Press any key to close." footer.
-fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
-    let title = match legend {
+/// The legend pop-up's box title, one per screen.
+fn legend_title(legend: Legend) -> &'static str {
+    match legend {
         Legend::Tree => "Legend — checkpoint tree",
         Legend::Detail => "Legend — tensor details",
         Legend::Heatmap => "Legend — heatmap",
         Legend::Values => "Legend — numeric values",
-    };
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            title.to_string(),
-            Style::default().fg(palette::ACCENT),
-        )),
-        Line::from(dim_span("─".repeat(title.chars().count()))),
-        Line::default(),
-    ];
+    }
+}
+
+/// The legend pop-up's body rows (the framing title comes from [`legend_title`]).
+fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
 
     match legend {
         Legend::Tree => {
@@ -1810,7 +1860,7 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
                 ),
                 (
                     None,
-                    "☰ N",
+                    "≡ N",
                     "number of layers (numbered sub-groups) in the group",
                 ),
                 (None, "▦ N", "number of tensors in the group / checkpoint"),
@@ -2688,7 +2738,7 @@ fn tree_node_line(
         } => {
             let arrow = if *expanded { "▾" } else { "▸" };
             let layer_prefix = match layer_count(children) {
-                Some(n) => format!("☰ {n}, "),
+                Some(n) => format!("≡ {n}, "),
                 None => String::new(),
             };
             let size_field = if stored_size != total_size {
