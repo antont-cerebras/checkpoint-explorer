@@ -1,5 +1,6 @@
 ---
 source: tests/cli.rs
+assertion_line: 413
 expression: "plain(&[\"--tensor\", &t, \"--legend\"])"
 ---
 Tensor Details                                                                                                       [×]
@@ -15,16 +16,16 @@ File: [FIXTURE]
 
 Statistics: press s to scan the full tensor
 
-Legend — tensor details
-───────────────────────
-
-  ⇩ lz4   on-disk compression codec; the N× beside it is the ratio (logical ÷ stored)
-  as      the active dtype reinterpretation (press d), e.g. 'BF16 as u4'
-  A – B   a byte range within the file (the tensor's data offsets)
-  ·       separates fields on a line
-  ✚       this tensor is an extra: on disk but not listed in the index (model.safetensors.index.json)
-  ⠋       a statistics scan is running (press s to start; any key cancels)
-
-  Statistics:  zeros = fraction of exactly-zero values · non-finite = count of NaN/∞
-
-Click or press any key to close.
+Press m for a heatmap, v for numeric values, h for a histogram, b to set its bin count, d to reinterpret the dtype,
+r to re╭ Legend — tensor details ──────────────────────────────────────────────────────────────────────────────╮
+⌫ / \ t│   ⇩ lz4   on-disk compression codec; the N× beside it is the ratio (logical ÷ stored)                 │
+       │   as      the active dtype reinterpretation (press d), e.g. 'BF16 as u4'                              │
+       │   A – B   a byte range within the file (the tensor's data offsets)                                    │
+       │   ·       separates fields on a line                                                                  │
+       │   ✚       this tensor is an extra: on disk but not listed in the index (model.safetensors.index.json) │
+       │   ⠋       a statistics scan is running (press s to start; any key cancels)                            │
+       │                                                                                                       │
+       │   Statistics:  zeros = fraction of exactly-zero values · non-finite = count of NaN/∞                  │
+       │                                                                                                       │
+       │ Click or press any key to close.                                                                      │
+       ╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯

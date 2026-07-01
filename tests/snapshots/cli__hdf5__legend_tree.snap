@@ -1,5 +1,6 @@
 ---
 source: tests/cli.rs
+assertion_line: 407
 expression: "plain(&[\"--legend\"])"
 ---
 Checkpoint Explorer - [FIXTURE] (1/1)                                                                 [×]
@@ -11,25 +12,25 @@ f copy file · n copy name · y copy command · ⌫/\ back/fwd · R repack · q 
   · lm_head.weight [F16, (10, 4), 80 B → 27 B (⇩ gzip)]
   ▾ model (▦ 22, 2.0 KiB → 1.2 KiB)
     · embed_tokens.weight [F16, (10, 4), 80 B → 27 B (⇩ gzip)]
-    ▸ layers (☰ 3, ▦ 19, 1.9 KiB → 1.2 KiB)
-
-Legend — checkpoint tree
-────────────────────────
-
-  ▾ ▸             a group, expanded / collapsed (Enter or Space toggles it)
-  ·               a tensor (a stored array)
-  ✚               an extra tensor on disk but not listed in the index (model.safetensors.index.json)
-  †               a metadata entry (shown beside its tensor, or in the Metadata group)
-  ☰ N             number of layers (numbered sub-groups) in the group
-  ▦ N             number of tensors in the group / checkpoint
-  A → B           logical size → on-disk size (shown only when they differ)
-  ⇩ lz4           compressed on disk; the codec is named after the glyph
-  (uncompressed)  stored uncompressed on disk
-
-  I16             the tensor's data type is tinted (warm amber)
-  ▪ ▸             status bar: a single source file / a directory of shards
-
-Click or press any key to close.
+    ▸ layers (≡ 3, ▦ 19, 1.9 KiB → 1.2 KiB)
+    · norm.weight [F32, (4), 16 B (uncompressed)]
+    · scale.i8 [I8, (8), 8 B → 16 B (⇩ gzip)]
+        ╭ Legend — checkpoint tree ────────────────────────────────────────────────────────────────────────────╮
+        │   ▾ ▸             a group, expanded / collapsed (Enter or Space toggles it)                          │
+        │   ·               a tensor (a stored array)                                                          │
+        │   ✚               an extra tensor on disk but not listed in the index (model.safetensors.index.json) │
+        │   †               a metadata entry (shown beside its tensor, or in the Metadata group)               │
+        │   ≡ N             number of layers (numbered sub-groups) in the group                                │
+        │   ▦ N             number of tensors in the group / checkpoint                                        │
+        │   A → B           logical size → on-disk size (shown only when they differ)                          │
+        │   ⇩ lz4           compressed on disk; the codec is named after the glyph                             │
+        │   (uncompressed)  stored uncompressed on disk                                                        │
+        │                                                                                                      │
+        │   I16             the tensor's data type is tinted (warm amber)                                      │
+        │   ▪ ▸             status bar: a single source file / a directory of shards                           │
+        │                                                                                                      │
+        │ Click or press any key to close.                                                                     │
+        ╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
 
 
 

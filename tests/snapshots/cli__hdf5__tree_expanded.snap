@@ -15,7 +15,7 @@ f copy file · n copy name · y copy command · ⌫/\ back/fwd · R repack · q 
   · lm_head.weight [F16, (10, 4), 80 B → 27 B (⇩ gzip)]
   ▾ model (▦ 22, 2.0 KiB → 1.2 KiB)
     · embed_tokens.weight [F16, (10, 4), 80 B → 27 B (⇩ gzip)]
-    ▾ layers (☰ 3, ▦ 19, 1.9 KiB → 1.2 KiB)
+    ▾ layers (≡ 3, ▦ 19, 1.9 KiB → 1.2 KiB)
       ▾ 0 (▦ 7, 664 B → 421 B)
         ▾ block_sparse_moe.experts (▦ 4, 544 B → 322 B)
           ▾ down_proj (▦ 3, 400 B → 188 B)

@@ -431,7 +431,7 @@ Checkpoint Explorer - model.safetensors (1/1)
 
 ▾ model.safetensors (▦ 342, 1.5B params, 1.2 GiB)
   ▾ transformer (▦ 123, 1.2 GiB)
-    ▾ h (☰ 32, ▦ 120, 1.1 GiB)
+    ▾ h (≡ 32, ▦ 120, 1.1 GiB)
       ▾ 0 (▦ 5, 45.2 MiB)
         · attn.c_attn.weight [Float16, (4096, 3072), 25.2 MiB]
         · attn.c_proj.weight [Float16, (1024, 4096), 8.4 MiB]
@@ -448,7 +448,7 @@ Checkpoint Explorer - model.safetensors (1/1)
 /path/to/model.safetensors
 ```
 
-A group's parens summarise what it contains: `☰` marks the number of layers
+A group's parens summarise what it contains: `≡` marks the number of layers
 (sub-groups) and `▦` the number of tensors; compressed tensors also show their
 codec after a `⇩` glyph (e.g. `[I16, (201088, 2880), 1.1 GiB → 1.1 GiB (⇩ lz4)]`).
 The **root** node summarises the whole checkpoint (tensor count, parameters and
