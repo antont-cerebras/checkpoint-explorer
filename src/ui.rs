@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{LineGauge, Paragraph, Widget};
 
 use crate::health::HealthReport;
 use crate::sample::{HistBins, Histogram, PackingSchema, Sample, SampleMode, Stats, ViewDtype};
@@ -601,7 +601,8 @@ impl UI {
         let area = frame.area();
         let (width, height) = (area.width, area.height);
 
-        let header = detail_field_lines(tensor, shape, view, unindexed, stats, schema);
+        let (header, stats_gauge_row) =
+            detail_field_lines(tensor, shape, view, unindexed, stats, schema);
         let (footer, chips) = detail_footer_lines(overridable, width);
         let header_len = header.len();
         let footer_len = footer.len();
@@ -657,6 +658,23 @@ impl UI {
             let mut lines = header;
             lines.extend(footer);
             Paragraph::new(lines).render(area, frame.buffer_mut());
+        }
+
+        // The header rows sit at `y = index` in both layouts, so overlay the stats
+        // progress bar (native LineGauge) on its reserved row.
+        if let (Some(row), Some((ratio, label))) = (stats_gauge_row, computing_gauge(stats)) {
+            render_line_gauge(
+                frame,
+                Rect {
+                    x: 0,
+                    y: row as u16,
+                    width,
+                    height: 1,
+                },
+                label,
+                ratio,
+                Some(30),
+            );
         }
 
         // Clickable regions: each footer chip (made absolute via the footer's
@@ -915,9 +933,18 @@ impl UI {
         )));
         lines.push(Line::from(dtype_line));
 
-        if let Some(stats_line) = data_stats_view_line(stats) {
-            lines.push(stats_line);
-        }
+        // A computing-with-fraction stats row is a native progress bar: reserve a
+        // blank line and render a `LineGauge` over it after the paragraph.
+        let stats_gauge_row = if computing_gauge(stats).is_some() {
+            let row = lines.len();
+            lines.push(Line::default());
+            Some(row)
+        } else {
+            if let Some(stats_line) = data_stats_view_line(stats) {
+                lines.push(stats_line);
+            }
+            None
+        };
         if sample.slices > 1 {
             lines.push(slice_header_line(sample));
         }
@@ -970,6 +997,20 @@ impl UI {
         lines.extend(footer);
 
         Paragraph::new(lines).render(area, frame.buffer_mut());
+        if let (Some(row), Some((ratio, label))) = (stats_gauge_row, computing_gauge(stats)) {
+            render_line_gauge(
+                frame,
+                Rect {
+                    x: 0,
+                    y: row as u16,
+                    width: area.width,
+                    height: 1,
+                },
+                label,
+                ratio,
+                Some(30),
+            );
+        }
         data_view_regions(frame, &chips, footer_top)
     }
 
@@ -1025,9 +1066,18 @@ impl UI {
         }));
         lines.push(Line::from(dtype_line));
 
-        if let Some(stats_line) = data_stats_view_line(stats) {
-            lines.push(stats_line);
-        }
+        // A computing-with-fraction stats row is a native progress bar (see
+        // `render_heatmap`).
+        let stats_gauge_row = if computing_gauge(stats).is_some() {
+            let row = lines.len();
+            lines.push(Line::default());
+            Some(row)
+        } else {
+            if let Some(stats_line) = data_stats_view_line(stats) {
+                lines.push(stats_line);
+            }
+            None
+        };
         if sample.slices > 1 {
             lines.push(slice_header_line(sample));
         }
@@ -1188,6 +1238,20 @@ impl UI {
         lines.extend(footer);
 
         Paragraph::new(lines).render(area, frame.buffer_mut());
+        if let (Some(row), Some((ratio, label))) = (stats_gauge_row, computing_gauge(stats)) {
+            render_line_gauge(
+                frame,
+                Rect {
+                    x: 0,
+                    y: row as u16,
+                    width: area.width,
+                    height: 1,
+                },
+                label,
+                ratio,
+                Some(30),
+            );
+        }
         data_view_regions(frame, &chips, footer_top)
     }
 
@@ -1329,27 +1393,44 @@ impl UI {
         total: usize,
         detail: &str,
     ) {
-        const WIDTH: usize = 40;
         let frac = if total > 0 {
             done as f64 / total as f64
         } else {
             0.0
         };
-        let filled = (frac * WIDTH as f64).round() as usize;
-        let bar = Line::from(vec![
-            Span::raw("["),
-            Span::styled("█".repeat(filled), Style::default().fg(palette::KEY)),
-            dim_span("░".repeat(WIDTH.saturating_sub(filled))),
-            Span::raw(format!("] {done}/{total}")),
-        ]);
-        let lines: Vec<Line> = vec![
+        let area = frame.area();
+        // Title + rule on rows 0–1; a blank row 2; the gauge on row 3; the detail
+        // line on row 4 — same layout as before, but the bar is a native LineGauge.
+        Paragraph::new(vec![
             Line::from(Span::raw(title.to_string())),
             Line::from(Span::raw("=".repeat(title.len().max(10)))),
-            Line::default(),
-            bar,
-            Line::from(dim_span(detail.to_string())),
-        ];
-        Paragraph::new(lines).render(frame.area(), frame.buffer_mut());
+        ])
+        .render(area, frame.buffer_mut());
+        if area.height > 3 {
+            render_line_gauge(
+                frame,
+                Rect {
+                    x: 0,
+                    y: 3,
+                    width: area.width,
+                    height: 1,
+                },
+                Line::from(format!("{done}/{total}")),
+                frac,
+                None,
+            );
+        }
+        if area.height > 4 {
+            Paragraph::new(Line::from(dim_span(detail.to_string()))).render(
+                Rect {
+                    x: 0,
+                    y: 4,
+                    width: area.width,
+                    height: 1,
+                },
+                frame.buffer_mut(),
+            );
+        }
     }
 
     /// The Ratatui port of [`Self::draw_message`]: a simple full-screen message
@@ -2792,6 +2873,64 @@ fn detail_stats_summary_spans(s: &Stats) -> Vec<Span<'static>> {
 /// The "scan in progress" stats segment as styled spans — Ratatui port of
 /// [`write_computing`]: an accent spinner, a dimmed label, a progress bar with a
 /// percentage (when the fraction is known), and the running elapsed time.
+/// Render a native ratatui [`LineGauge`] into `area`: `label` at the left, then a
+/// thick line filled to `ratio` — accent for the done part, dim for the rest. The
+/// one progress-bar primitive, shared by the full-screen repack bar and the inline
+/// "computing…" statistics line.
+/// `max_line` caps the gauge *line* to that many cells (the widget draws the label
+/// then the line): the inline "computing…" bar passes `Some(30)` so it doesn't
+/// stretch across the whole screen; the full-screen bar passes `None` (full width).
+fn render_line_gauge(
+    frame: &mut Frame,
+    area: Rect,
+    label: Line<'static>,
+    ratio: f64,
+    max_line: Option<usize>,
+) {
+    let area = match max_line {
+        // LineGauge lays out `label` then a space then the line, so bound the width
+        // to the label plus the wanted line length (clamped to what's available).
+        Some(cells) => Rect {
+            width: ((label.width() + 1 + cells) as u16).min(area.width),
+            ..area
+        },
+        None => area,
+    };
+    LineGauge::default()
+        .line_set(ratatui::symbols::line::THICK)
+        .filled_style(
+            Style::default()
+                .fg(palette::KEY)
+                .add_modifier(Modifier::BOLD),
+        )
+        .unfilled_style(Style::default().fg(palette::DIM))
+        .label(label)
+        .ratio(ratio.clamp(0.0, 1.0))
+        .render(area, frame.buffer_mut());
+}
+
+/// When statistics are computing *with a known fraction*, the `(ratio, label)` for
+/// a [`render_line_gauge`] row; otherwise `None` (the caller shows the normal stats
+/// text — the spinner-only "computing…", the finished stats, or the "press s" hint).
+fn computing_gauge(stats: StatsView) -> Option<(f64, Line<'static>)> {
+    match stats {
+        StatsView::Computing {
+            spinner,
+            elapsed,
+            progress: Some(frac),
+        } => {
+            let frac = frac.clamp(0.0, 1.0);
+            let label = Line::from(format!(
+                "{spinner} computing statistics… {:>3.0}% · {} ",
+                frac * 100.0,
+                fmt_duration(elapsed)
+            ));
+            Some((frac, label))
+        }
+        _ => None,
+    }
+}
+
 fn detail_computing_spans(
     spinner: char,
     elapsed: Duration,
@@ -2825,7 +2964,7 @@ fn detail_field_lines(
     unindexed: bool,
     stats: StatsView,
     schema: Option<&PackingSchema>,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Option<usize>) {
     let mut lines: Vec<Line> = Vec::new();
 
     lines.push(Line::from(Span::styled(
@@ -2963,40 +3102,51 @@ fn detail_field_lines(
     }
     lines.push(Line::default());
 
-    // Exact whole-tensor statistics: shown once computed, else a hint.
-    let stats_line: Vec<Span> = match stats {
-        StatsView::Ready(s) => {
-            let integer = view.is_integer(&tensor.dtype);
-            let mut spans = vec![
-                dim_span("Statistics: "),
-                Span::raw(format!(
-                    "min {} · max {} · ",
-                    fmt_value(s.min, integer),
-                    fmt_value(s.max, integer)
-                )),
-            ];
-            spans.extend(detail_stats_summary_spans(s));
-            spans
-        }
-        StatsView::Computing {
-            spinner,
-            elapsed,
-            progress,
-        } => {
-            let mut spans = vec![dim_span("Statistics: ")];
-            spans.extend(detail_computing_spans(spinner, elapsed, progress));
-            spans
-        }
-        StatsView::Pending => vec![
-            dim_span("Statistics: press "),
-            key_span("s"),
-            dim_span(" to scan the full tensor"),
-        ],
+    // Exact whole-tensor statistics: shown once computed, else a hint. While a
+    // scan reports a fraction, the row is a native progress bar — reserve a blank
+    // line here and hand the caller its index to render a `LineGauge` over.
+    let stats_gauge_row = if computing_gauge(stats).is_some() {
+        let row = lines.len();
+        lines.push(Line::default());
+        Some(row)
+    } else {
+        let stats_line: Vec<Span> = match stats {
+            StatsView::Ready(s) => {
+                let integer = view.is_integer(&tensor.dtype);
+                let mut spans = vec![
+                    dim_span("Statistics: "),
+                    Span::raw(format!(
+                        "min {} · max {} · ",
+                        fmt_value(s.min, integer),
+                        fmt_value(s.max, integer)
+                    )),
+                ];
+                spans.extend(detail_stats_summary_spans(s));
+                spans
+            }
+            // Only the fraction-less "computing…" reaches here (the gauge handles
+            // the case with a fraction above).
+            StatsView::Computing {
+                spinner,
+                elapsed,
+                progress,
+            } => {
+                let mut spans = vec![dim_span("Statistics: ")];
+                spans.extend(detail_computing_spans(spinner, elapsed, progress));
+                spans
+            }
+            StatsView::Pending => vec![
+                dim_span("Statistics: press "),
+                key_span("s"),
+                dim_span(" to scan the full tensor"),
+            ],
+        };
+        lines.push(Line::from(stats_line));
+        None
     };
-    lines.push(Line::from(stats_line));
     lines.push(Line::default());
 
-    lines
+    (lines, stats_gauge_row)
 }
 
 /// The detail screen's footer hint as wrapped [`Line`]s, split into `key label,`
