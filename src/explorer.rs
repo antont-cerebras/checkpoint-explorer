@@ -1926,6 +1926,9 @@ impl Explorer {
         // snap the viewport to keep it visible; when it's unchanged we leave the
         // scroll offset alone so the wheel can scroll freely past the selection.
         let mut last_sel = usize::MAX;
+        // A wrong-keyboard-layout hint to flash on the next frame (see
+        // `wrong_layout_char`); cleared as soon as the next input arrives.
+        let mut layout_hint: Option<char> = None;
         loop {
             // Draw the tree through the owned Ratatui terminal.
             let mut term = self
@@ -1948,7 +1951,13 @@ impl Explorer {
                 let total = self.current_tree_len();
                 self.scroll_offset = self.scroll_offset.min(total.saturating_sub(body));
             }
-            term.draw(|f| self.render_tree_frame(f))?;
+            let hint = layout_hint;
+            term.draw(|f| {
+                self.render_tree_frame(f);
+                if let Some(c) = hint {
+                    UI::render_notice(f, &layout_hint_msg(c));
+                }
+            })?;
             self.terminal = Some(term);
 
             // While a copy confirmation is up, wake when it expires so it clears
@@ -1963,6 +1972,9 @@ impl Explorer {
             } else {
                 event::read()?
             };
+            // Any input clears a prior layout hint; a fresh wrong-layout key re-sets
+            // it below.
+            layout_hint = None;
 
             // Mouse: a click on a footer hint chip or the `[×]` acts like its key
             // (routed through the key match below); a click on a tree row selects
@@ -2060,6 +2072,14 @@ impl Explorer {
             {
                 // Any key also dismisses the copy confirmation.
                 self.copied_flash = None;
+                // A non-Latin key (wrong layout) can't match a shortcut; outside
+                // search, flash a hint instead of silently ignoring it.
+                if !self.search_mode
+                    && let Some(c) = wrong_layout_char(&key_event)
+                {
+                    layout_hint = Some(c);
+                    continue;
+                }
                 match key_event {
                     // `q` quits only outside search; while searching it is a
                     // normal character (typed via the search Char(c) arm below),
@@ -3006,6 +3026,9 @@ impl Explorer {
         // Set right after `c` copies the screen; confirmed on the bottom line
         // until the next key or `COPY_FLASH` elapses.
         let mut copied_since: Option<std::time::Instant> = None;
+        // A wrong-keyboard-layout hint to flash on the next frame; cleared on the
+        // next input.
+        let mut layout_hint: Option<char> = None;
         loop {
             let view = self.active_view(&tensor.name);
             let shape = self
@@ -3090,6 +3113,7 @@ impl Explorer {
             // within its window (dismissed by the next key or the timed poll) —
             // composited over the detail frame in the same draw.
             let show_flash = copied_since.is_some_and(|t| t.elapsed() < COPY_FLASH);
+            let hint = layout_hint;
             if term
                 .draw(|f| {
                     self.render_detail_frame(
@@ -3106,6 +3130,9 @@ impl Explorer {
                     );
                     if show_flash {
                         UI::render_copied_flash(f, "screen contents");
+                    }
+                    if let Some(c) = hint {
+                        UI::render_notice(f, &layout_hint_msg(c));
                     }
                 })
                 .is_err()
@@ -3206,6 +3233,16 @@ impl Explorer {
                 }
                 other => other,
             };
+            // Any input clears a prior layout hint; a non-Latin key (wrong layout)
+            // flashes the hint instead of being treated as "any other key" (which
+            // would navigate back to the tree).
+            layout_hint = None;
+            if let Ok(Event::Key(k)) = &ev
+                && let Some(c) = wrong_layout_char(k)
+            {
+                layout_hint = Some(c);
+                continue;
+            }
             match ev {
                 Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
                 Ok(Event::Key(KeyEvent {
@@ -3477,6 +3514,9 @@ impl Explorer {
         // Force a full repaint on entry so the data view fully overwrites whatever
         // screen preceded it.
         let mut first = true;
+        // A wrong-keyboard-layout hint to flash on the next frame; cleared on the
+        // next input.
+        let mut layout_hint: Option<char> = None;
         loop {
             // The data-view layout is a session-remembered preference, so it
             // sticks as you move between tensors and in/out of the preview.
@@ -3554,6 +3594,7 @@ impl Explorer {
             // Confirm a screen copy on the bottom line while the flash is still
             // within its window — composited over the data frame in the same draw.
             let show_flash = copied_since.is_some_and(|t| t.elapsed() < COPY_FLASH);
+            let hint = layout_hint;
             // Size the grid to the live terminal (the same size the draw below
             // renders into); fall back to a sane default if it can't be read.
             let (cols, rows) = term
@@ -3586,6 +3627,9 @@ impl Explorer {
                             }
                             if show_flash {
                                 UI::render_copied_flash(f, "screen contents");
+                            }
+                            if let Some(c) = hint {
+                                UI::render_notice(f, &layout_hint_msg(c));
                             }
                         })
                         .is_err()
@@ -3690,8 +3734,17 @@ impl Explorer {
                 continue;
             }
             loop {
+                // Any input clears a prior layout hint; a fresh wrong-layout key
+                // re-sets it below.
+                layout_hint = None;
                 match pending {
                     Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+                    // A non-Latin key (wrong layout) can't match a shortcut; flash a
+                    // hint instead of treating it as "any other key" (→ back to detail).
+                    Ok(Event::Key(key)) if wrong_layout_char(&key).is_some() => {
+                        layout_hint = wrong_layout_char(&key);
+                        break;
+                    }
                     Ok(Event::Key(KeyEvent {
                         code, modifiers, ..
                     })) => {
@@ -5230,6 +5283,31 @@ fn is_ctrl_c(key: &KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+/// A keypress that looks like the wrong keyboard layout: a plain non-ASCII *letter*
+/// (e.g. Cyrillic/Greek produced by a non-Latin layout when the user meant a Latin
+/// shortcut like `m`/`v`/`l`), with no Ctrl/Alt. Such a key can never match a
+/// shortcut, so the loops surface a hint instead of silently doing nothing (or, on
+/// the detail/data screens, treating it as "any other key" and navigating away).
+/// Returns the character, to show it in the hint. Only meaningful outside text
+/// input (search / prompts), where a non-ASCII character is legitimate.
+fn wrong_layout_char(key: &KeyEvent) -> Option<char> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(c) if !c.is_ascii() && c.is_alphabetic() => Some(c),
+        _ => None,
+    }
+}
+
+/// The bottom-line hint shown when [`wrong_layout_char`] fires.
+fn layout_hint_msg(c: char) -> String {
+    format!("⚠ '{c}' is not a shortcut — a non-US/Latin keyboard layout may be active")
+}
+
 /// Restore the terminal (leave raw mode, show the cursor) and exit the process
 /// immediately, leaving the last frame on screen with the prompt just below it.
 /// Used for Ctrl-C from any of the detail/data sub-screens so it quits outright
@@ -5333,6 +5411,19 @@ fn copy_to_clipboard(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrong_layout_char_flags_only_plain_non_latin_letters() {
+        let k = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        assert_eq!(wrong_layout_char(&k('м')), Some('м')); // Cyrillic (RU 'v')
+        assert_eq!(wrong_layout_char(&k('ん')), Some('ん')); // Japanese
+        assert_eq!(wrong_layout_char(&k('m')), None); // ASCII shortcut
+        assert_eq!(wrong_layout_char(&k('/')), None); // ASCII punctuation
+        assert_eq!(wrong_layout_char(&k('5')), None); // digit
+        // Ctrl/Alt combinations are intentional, not layout mistakes.
+        let ctrl_cyrillic = KeyEvent::new(KeyCode::Char('м'), KeyModifiers::CONTROL);
+        assert_eq!(wrong_layout_char(&ctrl_cyrillic), None);
+    }
 
     #[test]
     fn parse_slice_input_handles_indices_percentages_and_errors() {

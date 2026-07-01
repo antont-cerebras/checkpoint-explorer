@@ -1420,6 +1420,37 @@ impl UI {
         );
     }
 
+    /// Flash a transient warning `msg` on the bottom line (over whatever the view
+    /// drew there), until the next redraw clears it — e.g. the wrong-keyboard-layout
+    /// hint. Bold yellow, clamped to the width so it never wraps.
+    pub fn render_notice(frame: &mut Frame, msg: &str) {
+        let area = frame.area();
+        let width = area.width as usize;
+        let text: String = if msg.chars().count() > width {
+            msg.chars()
+                .take(width.saturating_sub(1))
+                .chain(std::iter::once('…'))
+                .collect()
+        } else {
+            msg.to_string()
+        };
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(palette::WARN)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .render(
+            Rect {
+                x: 0,
+                y: area.height.saturating_sub(1),
+                width: area.width,
+                height: 1,
+            },
+            frame.buffer_mut(),
+        );
+    }
+
     /// The Ratatui port of [`Self::draw_health_warning`]: a full-screen warning
     /// panel summarising checkpoint health issues. Each category is capped so the
     /// panel stays small; missing items are red, extra items yellow.
