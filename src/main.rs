@@ -20,7 +20,7 @@ mod utils;
 
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -305,6 +305,34 @@ enum Command {
         /// terminal, or when `NO_COLOR` is set).
         #[arg(long = "no-color")]
         no_color: bool,
+        /// Only diff tensors whose name matches this glob (e.g.
+        /// '*.mlp.down_proj.weight', 'model.layers.*'). Repeatable — a tensor
+        /// passes if it matches ANY. Scopes the whole diff (structural + values)
+        /// to the matching subset; metadata is not compared.
+        #[arg(long = "name", value_name = "GLOB")]
+        name: Vec<String>,
+        /// Only diff these exact tensor names (comma-separated). Combine with
+        /// --names-from; a tensor passes if it's in either list.
+        #[arg(long = "names", value_name = "A,B,C")]
+        names: Option<String>,
+        /// Only diff the tensor names listed in this file (one per line; blank
+        /// lines and '#' comments ignored).
+        #[arg(long = "names-from", value_name = "FILE")]
+        names_from: Option<PathBuf>,
+        /// Only diff tensors whose stored dtype matches this glob, e.g. 'BF16',
+        /// 'F*' (F16/F32/…). Case-insensitive.
+        #[arg(long = "dtype-is", value_name = "GLOB")]
+        dtype_is: Option<String>,
+        /// Only diff tensors whose shape matches this glob. Dims are comma- or
+        /// x-separated; '*' wildcards one dimension, '**' any number — e.g.
+        /// '768,2048', '768,*', '*,2048', '768,**', '**,2048'.
+        #[arg(long = "shape-is", value_name = "DIMS")]
+        shape_is: Option<String>,
+        /// Compare up to N tensors in parallel with --values / --histogram
+        /// (default: number of logical CPUs; 1 = sequential). Reading tensor data
+        /// is I/O-bound, so overlapping tensors speeds the whole run up.
+        #[arg(short = 'j', long = "jobs", value_name = "N")]
+        jobs: Option<usize>,
     },
 }
 
@@ -332,18 +360,48 @@ fn main() -> Result<()> {
             bins,
             full,
             no_color,
+            name,
+            names,
+            names_from,
+            dtype_is,
+            shape_is,
+            jobs,
         }) => {
             // `diff`-style exit codes (0 same / 1 differ / 2 trouble) don't map to
             // the `Result` convention `main` uses elsewhere, so exit explicitly.
+            let filter = match build_tensor_filter(
+                &name,
+                names.as_deref(),
+                names_from.as_deref(),
+                dtype_is.as_deref(),
+                shape_is.as_deref(),
+            ) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("checkpoint-explorer diff: {e:#}");
+                    std::process::exit(2);
+                }
+            };
+            let filtered = filter.is_active();
             let opts = diff::DiffOpts {
                 color: color_enabled(no_color),
-                metadata: !only_tensors,
+                // A tensor filter scopes the diff to a subset, so metadata isn't
+                // compared (like --only-tensors, but for a filtered run).
+                metadata: !only_tensors && !filtered,
                 group: !full,
                 values,
                 histogram,
+                filtered,
             };
             let view = dtype.unwrap_or(sample::ViewDtype::Stored);
-            std::process::exit(run_diff(
+            // Default parallelism = logical CPUs; `--jobs 0` is treated as 1.
+            let jobs = jobs.filter(|&j| j > 0).unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            });
+            let started = std::time::Instant::now();
+            let code = run_diff(
                 &old,
                 &new,
                 recursive,
@@ -351,7 +409,18 @@ fn main() -> Result<()> {
                 view,
                 bins,
                 opts,
-            ))
+                &filter,
+                jobs,
+            );
+            // Report how long it took, by default (on stderr, so a piped diff on
+            // stdout stays clean). Skip on trouble (exit 2) — the error already said.
+            if code != 2 {
+                eprintln!(
+                    "checkpoint-explorer diff: done in {}",
+                    format_elapsed(started.elapsed())
+                );
+            }
+            std::process::exit(code)
         }
         None => run_explore(cli.explore),
     }
@@ -375,6 +444,267 @@ struct ValueCtx<'a> {
     new_schemas: &'a HashMap<String, sample::PackingSchema>,
 }
 
+/// Build a [`diff::TensorFilter`] from the `diff` selection flags: compile each
+/// `--name`/`--dtype-is`/`--shape-is` glob and merge `--names` + `--names-from`
+/// into the exact-name set. `--shape-is` dims are comma/`x`-separated and joined
+/// with `/` so the shape glob's `*`/`**` act per-dimension. Errors (bad glob or
+/// unreadable names file) bubble up to a `2` exit.
+fn build_tensor_filter(
+    name: &[String],
+    names: Option<&str>,
+    names_from: Option<&Path>,
+    dtype_is: Option<&str>,
+    shape_is: Option<&str>,
+) -> Result<diff::TensorFilter> {
+    use glob::Pattern;
+
+    let name_globs = name
+        .iter()
+        .map(|g| Pattern::new(g).with_context(|| format!("invalid --name glob {g:?}")))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut exact: HashSet<String> = HashSet::new();
+    if let Some(list) = names {
+        exact.extend(
+            list.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        );
+    }
+    if let Some(path) = names_from {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("reading --names-from {}", path.display()))?;
+        exact.extend(
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string),
+        );
+    }
+    let names_exact = (names.is_some() || names_from.is_some()).then_some(exact);
+
+    let dtype = dtype_is
+        .map(|d| {
+            Pattern::new(&d.to_uppercase())
+                .with_context(|| format!("invalid --dtype-is glob {d:?}"))
+        })
+        .transpose()?;
+
+    let shape = shape_is
+        .map(|s| {
+            let path: String = s
+                .chars()
+                .map(|c| if matches!(c, ',' | 'x' | 'X') { '/' } else { c })
+                .collect();
+            Pattern::new(&path).with_context(|| format!("invalid --shape-is pattern {s:?}"))
+        })
+        .transpose()?;
+
+    Ok(diff::TensorFilter {
+        name_globs,
+        names_exact,
+        dtype,
+        shape,
+    })
+}
+
+/// Braille spinner frames (matches the interactive stats scan).
+const DIFF_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Shared state between the value-comparison workers and the spinner thread.
+struct CompareState {
+    /// Tensors currently being compared (one entry per in-flight worker).
+    inflight: std::sync::Mutex<Vec<String>>,
+    done: std::sync::atomic::AtomicUsize,
+    total: usize,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+/// Live progress for `diff --values` / `--histogram`: reading tensor data is the
+/// slow part, so — only in an interactive terminal — a background thread renders
+/// a spinner plus **every tensor currently being compared** (one per line) on
+/// **stderr** (stdout stays a clean diff), cleared when done. Workers call
+/// [`Self::track`] for an RAII guard that keeps a tensor listed while it's being
+/// compared. A no-op when stderr isn't a TTY (piped / headless) or nothing will
+/// be compared.
+struct CompareProgress {
+    state: Option<std::sync::Arc<CompareState>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// RAII marker: a tensor is being compared while this is alive; on drop it leaves
+/// the in-flight list and bumps the done count.
+struct InFlight<'a> {
+    state: Option<&'a CompareState>,
+    name: String,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        if let Some(st) = self.state {
+            if let Ok(mut v) = st.inflight.lock()
+                && let Some(i) = v.iter().position(|n| n == &self.name)
+            {
+                v.swap_remove(i);
+            }
+            st.done.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl CompareProgress {
+    fn start(total: usize) -> Self {
+        use std::io::IsTerminal;
+        if total == 0 || !std::io::stderr().is_terminal() {
+            return Self {
+                state: None,
+                handle: None,
+            };
+        }
+        let state = std::sync::Arc::new(CompareState {
+            inflight: std::sync::Mutex::new(Vec::new()),
+            done: std::sync::atomic::AtomicUsize::new(0),
+            total,
+            stop: std::sync::atomic::AtomicBool::new(false),
+        });
+        let worker = std::sync::Arc::clone(&state);
+        let handle = std::thread::spawn(move || compare_spinner_loop(worker));
+        Self {
+            state: Some(state),
+            handle: Some(handle),
+        }
+    }
+
+    /// Mark `name` as being compared until the returned guard drops.
+    fn track(&self, name: &str) -> InFlight<'_> {
+        if let Some(st) = &self.state
+            && let Ok(mut v) = st.inflight.lock()
+        {
+            v.push(name.to_string());
+        }
+        InFlight {
+            state: self.state.as_deref(),
+            name: name.to_string(),
+        }
+    }
+
+    /// Stop the spinner thread (which erases its block on exit) and join it.
+    fn finish(mut self) {
+        use std::sync::atomic::Ordering;
+        if let Some(st) = &self.state {
+            st.stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// The spinner thread body: ~10×/s redraw a block — a header plus one line per
+/// in-flight tensor — in place on stderr until told to stop, then erase it.
+fn compare_spinner_loop(st: std::sync::Arc<CompareState>) {
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+    let (width, height) = match crossterm::terminal::size() {
+        Ok((c, r)) if c > 0 && r > 0 => (c as usize, r as usize),
+        _ => (100, 24),
+    };
+    let mut prev_lines = 0usize;
+    let mut frame = 0usize;
+    while !st.stop.load(Ordering::Relaxed) {
+        let mut names = st.inflight.lock().map(|v| v.clone()).unwrap_or_default();
+        names.sort_unstable();
+        let done = st.done.load(Ordering::Relaxed);
+        let block = compare_progress_block(frame, done, st.total, &names, width, height);
+        draw_block(&block, &mut prev_lines);
+        frame += 1;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    erase_block(prev_lines);
+    let _ = std::io::stderr().flush();
+}
+
+/// The progress block: a spinner + `done/total` header, then one indented line
+/// per in-flight tensor (capped to the terminal height, name tails kept).
+fn compare_progress_block(
+    frame: usize,
+    done: usize,
+    total: usize,
+    names: &[String],
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let spin = DIFF_SPINNER[frame % DIFF_SPINNER.len()];
+    let mut lines = vec![format!(
+        "{spin} comparing tensors ({done}/{total}, {} in flight):",
+        names.len()
+    )];
+    let indent = "    ";
+    let max_rows = height.saturating_sub(2).max(1); // keep the block on screen
+    let shown = names.len().min(max_rows);
+    for name in &names[..shown] {
+        let budget = width.saturating_sub(indent.chars().count());
+        lines.push(format!("{indent}{}", truncate_tail(name, budget)));
+    }
+    if names.len() > shown {
+        lines.push(format!("{indent}… and {} more", names.len() - shown));
+    }
+    lines
+}
+
+/// Redraw `lines` in place: move back to the previous block's top, clear
+/// downward, and reprint. Leaves the cursor on the line just below the block.
+fn draw_block(lines: &[String], prev_lines: &mut usize) {
+    use std::io::Write;
+    let mut out = String::new();
+    if *prev_lines > 0 {
+        out.push_str(&format!("\x1b[{prev_lines}A")); // up to the block's first line
+    }
+    out.push_str("\r\x1b[0J"); // column 0, clear to end of screen
+    out.push_str(&lines.join("\n"));
+    out.push('\n'); // rest on the line below, so the count is stable frame-to-frame
+    eprint!("{out}");
+    let _ = std::io::stderr().flush();
+    *prev_lines = lines.len();
+}
+
+/// Erase a previously drawn block (on finish), leaving the cursor at its top.
+fn erase_block(prev_lines: usize) {
+    if prev_lines > 0 {
+        eprint!("\x1b[{prev_lines}A\r\x1b[0J");
+    }
+}
+
+/// Human-readable elapsed time: `850ms`, `12.3s`, or `2m3s`.
+fn format_elapsed(d: std::time::Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 1.0 {
+        format!("{}ms", d.as_millis())
+    } else if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        let mins = d.as_secs() / 60;
+        format!("{mins}m{}s", d.as_secs() % 60)
+    }
+}
+
+/// Keep the tail of `s` (a tensor name's informative end) within `max` columns,
+/// prefixing `…` when truncated.
+fn truncate_tail(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let tail: String = s.chars().skip(n - (max - 1)).collect();
+    format!("…{tail}")
+}
+
+#[allow(clippy::too_many_arguments)] // a CLI entry point; each arg is a distinct flag
 fn run_diff(
     old: &Path,
     new: &Path,
@@ -383,6 +713,8 @@ fn run_diff(
     view: sample::ViewDtype,
     bins: Option<usize>,
     opts: diff::DiffOpts,
+    filter: &diff::TensorFilter,
+    jobs: usize,
 ) -> i32 {
     let load = |path: &Path| -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
         let (files, _health) =
@@ -428,26 +760,51 @@ fn run_diff(
     };
 
     // `--tensor NAME`: focus on one tensor and also compare its element values.
+    // (This single-tensor mode is its own selection; the subset filters apply to
+    // the whole-checkpoint diff below, so note if both were given.)
     if let Some(name) = tensor {
+        if filter.is_active() {
+            eprintln!("checkpoint-explorer diff: --tensor takes precedence; filters ignored");
+        }
         return run_diff_tensor(&old_label, &new_label, name, &old_t, &new_t, &ctx, opts);
     }
 
-    // `--only-tensors` (opts.metadata == false): drop metadata so it affects
-    // neither the report nor the exit code (its section becomes a "not compared"
-    // note in the output).
+    // `--only-tensors` / an active filter (opts.metadata == false): drop metadata
+    // so it affects neither the report nor the exit code (its section becomes a
+    // "not compared" note in the output).
     let empty: Vec<MetadataInfo> = Vec::new();
     let old_meta: &[MetadataInfo] = if opts.metadata { &old_m } else { &empty };
     let new_meta: &[MetadataInfo] = if opts.metadata { &new_m } else { &empty };
-    let old_sum = diff::CheckpointSummary::from_loaded(&old_t, old_meta);
-    let new_sum = diff::CheckpointSummary::from_loaded(&new_t, new_meta);
+    let mut old_sum = diff::CheckpointSummary::from_loaded(&old_t, old_meta);
+    let mut new_sum = diff::CheckpointSummary::from_loaded(&new_t, new_meta);
+    // Total distinct tensors across both sides *before* filtering, so the filter's
+    // match line can show "matched M of N" (context for whether M looks right).
+    let total_tensors = old_sum
+        .tensors
+        .keys()
+        .chain(new_sum.tensors.keys())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    // Scope the diff to the selected subset (no-op when no filter was given).
+    filter.apply(&mut old_sum, &mut new_sum);
 
     let report = if opts.values || opts.histogram {
+        use rayon::prelude::*;
         // Read each common same-shape tensor and compare values and/or distribution.
         let old_map: HashMap<&str, &TensorInfo> =
             old_t.iter().map(|t| (t.name.as_str(), t)).collect();
         let new_map: HashMap<&str, &TensorInfo> =
             new_t.iter().map(|t| (t.name.as_str(), t)).collect();
-        let extras_of = |name: &str| -> diff::TensorExtras {
+        // The tensors present on both sides — the ones we actually read/compare.
+        let common: Vec<&str> = old_sum
+            .tensors
+            .keys()
+            .filter(|k| new_sum.tensors.contains_key(*k))
+            .map(String::as_str)
+            .collect();
+        let progress = CompareProgress::start(common.len());
+        let compute = |name: &str| -> diff::TensorExtras {
+            let _tracked = progress.track(name);
             let (Some(a), Some(b)) = (old_map.get(name), new_map.get(name)) else {
                 return diff::TensorExtras::default();
             };
@@ -462,10 +819,69 @@ fn run_diff(
                     .flatten(),
             }
         };
-        diff::compare_with(&old_sum, &new_sum, extras_of)
+        // Reading tensor data is I/O-bound, so compare up to `jobs` tensors at
+        // once (the results are order-independent). `jobs == 1` stays sequential.
+        let pairs: Vec<(&str, diff::TensorExtras)> = if jobs <= 1 {
+            common.iter().map(|&n| (n, compute(n))).collect()
+        } else {
+            match rayon::ThreadPoolBuilder::new().num_threads(jobs).build() {
+                Ok(pool) => pool.install(|| common.par_iter().map(|&n| (n, compute(n))).collect()),
+                Err(_) => common.iter().map(|&n| (n, compute(n))).collect(),
+            }
+        };
+        progress.finish();
+        // Feed the precomputed extras into the (pure) comparison. Each common name
+        // is requested exactly once, so `remove` moves the value out (no clone).
+        let extras: std::cell::RefCell<HashMap<&str, diff::TensorExtras>> =
+            std::cell::RefCell::new(pairs.into_iter().collect());
+        diff::compare_with(&old_sum, &new_sum, |name| {
+            extras.borrow_mut().remove(name).unwrap_or_default()
+        })
     } else {
         diff::compare(&old_sum, &new_sum)
     };
+    // When a filter scoped the diff, say what it selected on stderr (so the diff
+    // on stdout stays clean for piping): the match count — disambiguating an empty
+    // diff caused by "0 matched" from "all identical" — plus the matched names
+    // collapsed into their index-templated schema, so it's clear which layers /
+    // experts the filter actually covered.
+    if let Some(desc) = filter.describe() {
+        // The matched set is the union of both sides (so it includes structurally
+        // unchanged tensors, which the report only counts, not names).
+        let mut names: Vec<&str> = old_sum
+            .tensors
+            .keys()
+            .chain(new_sum.tensors.keys())
+            .map(String::as_str)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        if names.is_empty() {
+            eprintln!(
+                "checkpoint-explorer diff: filter [{desc}] matched 0 of {total_tensors} tensor(s)"
+            );
+        } else {
+            eprintln!(
+                "checkpoint-explorer diff: filter [{desc}] matched {} of {total_tensors} tensor(s):",
+                names.len()
+            );
+            let schema = diff::name_schema(&names);
+            const MAX_SCHEMA_LINES: usize = 40;
+            for (tmpl, count) in schema.iter().take(MAX_SCHEMA_LINES) {
+                if *count > 1 {
+                    eprintln!("    {tmpl}  (×{count})");
+                } else {
+                    eprintln!("    {tmpl}");
+                }
+            }
+            if schema.len() > MAX_SCHEMA_LINES {
+                eprintln!(
+                    "    … and {} more template(s)",
+                    schema.len() - MAX_SCHEMA_LINES
+                );
+            }
+        }
+    }
     print!("{}", report.render(&old_label, &new_label, opts));
     i32::from(report.has_differences())
 }
@@ -991,6 +1407,27 @@ fn parse_safetensors_index(index_path: &PathBuf) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn format_elapsed_scales() {
+        use std::time::Duration;
+        assert_eq!(format_elapsed(Duration::from_millis(850)), "850ms");
+        assert_eq!(format_elapsed(Duration::from_millis(1500)), "1.5s");
+        assert_eq!(format_elapsed(Duration::from_secs(125)), "2m5s");
+    }
+
+    #[test]
+    fn truncate_tail_keeps_the_end() {
+        assert_eq!(truncate_tail("short", 10), "short"); // fits
+        assert_eq!(truncate_tail("abcdefgh", 8), "abcdefgh"); // exact
+        assert_eq!(truncate_tail("abcdefgh", 4), "…fgh"); // …+tail, total == max
+        assert_eq!(truncate_tail("abcdefgh", 1), "…");
+        // A long tensor name keeps its most-specific tail within the budget.
+        let name = "model.layers.0.block_sparse_moe.experts.down_proj.weight";
+        let t = truncate_tail(name, 20);
+        assert_eq!(t.chars().count(), 20);
+        assert!(t.starts_with('…') && t.ends_with("down_proj.weight"), "{t}");
+    }
 
     /// A directory whose index lists only some of the `.safetensors` on disk (a
     /// partially-stale index) must still surface the extra files — the bug where

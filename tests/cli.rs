@@ -767,6 +767,139 @@ fn diff_values_detects_value_only_change() {
 }
 
 #[test]
+fn diff_filter_by_name_scopes_to_subset() {
+    ensure_diff_fixtures();
+    // A name glob scopes the whole diff to matching tensors; metadata is dropped.
+    let (out, code) = run_diff(&[DIFF_OLD, DIFF_NEW, "--name", "*.norm.weight"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("~ model.norm.weight  [F32 (4)] → [F32 (8)]"),
+        "{out}"
+    );
+    // Nothing else from the full diff leaks in, and metadata is noted as skipped.
+    assert!(!out.contains("lm_head"), "{out}");
+    assert!(!out.contains("embed_tokens"), "{out}");
+    assert!(
+        out.contains("metadata: not compared (filtered subset)"),
+        "{out}"
+    );
+}
+
+#[test]
+fn diff_filter_dtype_matches_either_side() {
+    ensure_diff_fixtures();
+    // --dtype-is globs the stored dtype and matches EITHER side, so it catches
+    // embed_tokens (F16 → BF16) as well as the removed F16 lm_head, but not the
+    // F32-only norm.
+    let (out, code) = run_diff(&[DIFF_OLD, DIFF_NEW, "--dtype-is", "F16"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("- lm_head.weight"), "{out}");
+    assert!(
+        out.contains("~ model.embed_tokens.weight  [F16 (6, 4)] → [BF16 (6, 4)]"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("norm.weight"),
+        "F32-only tensor excluded; {out}"
+    );
+}
+
+#[test]
+fn diff_filter_shape_wildcards() {
+    ensure_diff_fixtures();
+    // `*` matches exactly one dimension: `6,*` selects only the 2-D (6, 4) tensor.
+    let (two_d, _) = run_diff(&[DIFF_OLD, DIFF_NEW, "--shape-is", "6,*"]);
+    assert!(two_d.contains("model.embed_tokens.weight"), "{two_d}");
+    assert!(
+        !two_d.contains("norm.weight"),
+        "1-D excluded by `6,*`; {two_d}"
+    );
+    // `*` alone = exactly-1-D tensors (norm changed shape 4 → 8); 2-D is excluded.
+    let (one_d, _) = run_diff(&[DIFF_OLD, DIFF_NEW, "--shape-is", "*"]);
+    assert!(one_d.contains("model.norm.weight"), "{one_d}");
+    assert!(
+        !one_d.contains("embed_tokens"),
+        "2-D excluded by `*`; {one_d}"
+    );
+}
+
+#[test]
+fn diff_filter_values_on_subset() {
+    ensure_diff_fixtures();
+    // A values-only change is normally structural-"unchanged"; `--values` scoped
+    // to the mlp.weight subset promotes it to a difference — and nothing else.
+    let (out, code) = run_diff(&[DIFF_OLD, DIFF_NEW, "--values", "--name", "*.mlp.weight"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("~ model.layers.0.mlp.weight  [U8 (4)]  (values differ)"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("norm.weight"),
+        "only the subset compared; {out}"
+    );
+}
+
+#[test]
+fn diff_filter_no_match_exits_0() {
+    ensure_diff_fixtures();
+    // An empty subset has no differences (and the stderr note — not captured here
+    // — reports "0 tensors matched").
+    let (out, code) = run_diff(&[DIFF_OLD, DIFF_NEW, "--name", "*.does_not_exist"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("tensors: -0 +0 ~0 (0 unchanged)"), "{out}");
+}
+
+#[test]
+fn diff_filter_bad_glob_exits_2() {
+    ensure_diff_fixtures();
+    let (_out, code) = run_diff(&[DIFF_OLD, DIFF_NEW, "--name", "[bad"]);
+    assert_eq!(code, 2, "an invalid glob is a usage error");
+}
+
+#[test]
+fn diff_parallel_matches_sequential_and_reports_time() {
+    ensure_diff_fixtures();
+    // The result is identical regardless of --jobs (parallelism is order-free).
+    let (seq, _) = run_diff(&[DIFF_OLD, DIFF_NEW, "--values", "--jobs", "1"]);
+    let (par, _) = run_diff(&[DIFF_OLD, DIFF_NEW, "--values", "--jobs", "4"]);
+    assert_eq!(seq, par, "parallel diff must match sequential");
+    // Elapsed time is reported by default (on stderr, so stdout stays clean).
+    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
+        .args(["diff", DIFF_OLD, DIFF_NEW, "--values"])
+        .output()
+        .expect("run diff");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("done in "),
+        "stderr should report elapsed time:\n{err}"
+    );
+}
+
+#[test]
+fn diff_filter_reports_matched_schema_on_stderr() {
+    ensure_group_fixtures();
+    // The filter context goes to stderr: "matched M of N" plus the matched names
+    // collapsed into their index-templated schema (which layers/experts matched).
+    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
+        .args([
+            "diff",
+            DIFF_GROUP_OLD,
+            DIFF_GROUP_NEW,
+            "--name",
+            "*.down_proj.weight",
+        ])
+        .output()
+        .expect("run diff");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("matched 4 of 4 tensor(s):"), "stderr:\n{err}");
+    assert!(
+        err.contains("model.layers.{0-3}.block_sparse_moe.experts.down_proj.weight  (×4)"),
+        "stderr:\n{err}"
+    );
+}
+
+#[test]
 fn diff_tensor_dtype_view_changes_decode() {
     ensure_diff_fixtures();
     // mlp.weight is U8 [4]; under the u4 view each byte is two nibbles, so the
