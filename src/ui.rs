@@ -6,7 +6,10 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, LineGauge, Padding, Paragraph, Widget};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, LineGauge, Padding, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
+};
 
 use crate::health::HealthReport;
 use crate::sample::{HistBins, Histogram, PackingSchema, Sample, SampleMode, Stats, ViewDtype};
@@ -213,6 +216,10 @@ pub struct DrawConfig<'a> {
     /// A transient "✓ Copied …" confirmation to flash on the bottom line (over
     /// the secondary status), set by the tree's copy shortcuts.
     pub copied_flash: Option<&'a str>,
+    /// Whether this frame is drawn to the live, interactive terminal. Gates the
+    /// scroll bar: a headless `--plain` / screen-copy render is a static text
+    /// dump with no viewport, so it shows no bar (see [`UI::tree_scrollbar`]).
+    pub interactive: bool,
 }
 
 /// How a screen should render the statistics area: not computed yet, a scan in
@@ -373,6 +380,39 @@ const TREE_HEADER_HEIGHT: usize = 3;
 /// Rows of chrome below the tree list: the two-line status bar.
 const TREE_FOOTER_HEIGHT: usize = 2;
 
+/// Where the tree's vertical scroll bar sits and how a pointer over it maps to a
+/// scroll offset. Built by [`UI::tree_scrollbar`]; consumed by the renderer (to
+/// draw the bar) and the mouse handler (to scrub on click / drag).
+pub struct TreeScrollbar {
+    /// Rightmost terminal column, reserved for the bar.
+    pub col: u16,
+    /// First body row (the terminal row just below the header).
+    pub top: u16,
+    /// Track height in rows — the number of visible tree rows.
+    pub rows: u16,
+    /// The largest valid scroll offset (`total - visible`).
+    pub max_offset: usize,
+}
+
+impl TreeScrollbar {
+    /// The scroll offset a pointer at terminal `row` scrubs to: the top of the
+    /// track maps to offset 0 and the bottom to `max_offset`, proportionally
+    /// (rows above/below the track clamp to the ends).
+    pub fn offset_at(&self, row: u16) -> usize {
+        if self.rows <= 1 {
+            return 0;
+        }
+        let rel = row.saturating_sub(self.top).min(self.rows - 1);
+        let frac = f64::from(rel) / f64::from(self.rows - 1);
+        (frac * self.max_offset as f64).round() as usize
+    }
+
+    /// Whether the terminal cell `(col, row)` lands on the scroll bar.
+    pub fn hit(&self, col: u16, row: u16) -> bool {
+        col == self.col && row >= self.top && row < self.top + self.rows
+    }
+}
+
 pub struct UI;
 
 impl UI {
@@ -411,6 +451,30 @@ impl UI {
             tree_hint_lines(can_repack, width).0.len()
         };
         1 + hint_rows + 1 // title + hint(s) + rule
+    }
+
+    /// Geometry of the tree's vertical scroll bar for this terminal size and a
+    /// tree of `total` rows, or `None` when the whole tree fits the viewport (so
+    /// no bar is drawn and no column reserved). Shared by [`Self::render_tree`]
+    /// and the mouse handler, so click / drag hit-testing lines up with what's
+    /// drawn. The bar rides the rightmost column of the body region.
+    pub fn tree_scrollbar(
+        width: u16,
+        height: u16,
+        search_mode: bool,
+        can_repack: bool,
+        total: usize,
+    ) -> Option<TreeScrollbar> {
+        let rows = Self::tree_visible_rows(width, height, search_mode, can_repack);
+        if width < 2 || total <= rows {
+            return None; // nothing to scroll (or no room for a bar + content)
+        }
+        Some(TreeScrollbar {
+            col: width - 1,
+            top: Self::tree_header_rows(width, search_mode, can_repack) as u16,
+            rows: rows as u16,
+            max_offset: total - rows,
+        })
     }
 
     /// Ratatui render of the tree browser: header (title, hint or search line,
@@ -467,8 +531,38 @@ impl UI {
         let header_rows = lines.len();
         let body_rows = (height as usize).saturating_sub(header_rows + TREE_FOOTER_HEIGHT);
 
-        // Visible tree rows from the (pre-computed) scroll offset.
+        // A vertical scroll bar rides the rightmost column when the tree
+        // overflows the viewport — but only in the live TUI; a headless
+        // `--plain` / screen-copy render is a static dump with no viewport.
+        let scrollbar = if config.interactive {
+            Self::tree_scrollbar(
+                width,
+                height,
+                config.search_mode,
+                config.can_repack,
+                config.tree.len(),
+            )
+        } else {
+            None
+        };
+        // Reserve the bar's column so long tree rows don't underlap it.
+        let body_width = width.saturating_sub(if scrollbar.is_some() { 1 } else { 0 });
+
+        // Header (title, hint(s), rule) spans the full width.
+        Paragraph::new(lines).render(
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: header_rows as u16,
+            },
+            frame.buffer_mut(),
+        );
+
+        // Visible tree rows from the (pre-computed) scroll offset, clipped to
+        // `body_width` so the reserved scroll-bar column stays clear.
         if !(config.search_mode && config.tree.is_empty()) {
+            let mut body: Vec<Line> = Vec::with_capacity(body_rows);
             for (idx, (node, depth)) in config
                 .tree
                 .iter()
@@ -477,7 +571,7 @@ impl UI {
                 .take(body_rows)
             {
                 let selected = idx == config.selected_idx;
-                lines.push(tree_node_line(
+                body.push(tree_node_line(
                     node,
                     *depth,
                     selected,
@@ -485,15 +579,42 @@ impl UI {
                     config.packing_schemas,
                 ));
             }
+            Paragraph::new(body).render(
+                Rect {
+                    x: 0,
+                    y: header_rows as u16,
+                    width: body_width,
+                    height: body_rows as u16,
+                },
+                frame.buffer_mut(),
+            );
         }
 
-        let top = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height: height.saturating_sub(TREE_FOOTER_HEIGHT as u16),
-        };
-        Paragraph::new(lines).render(top, frame.buffer_mut());
+        // The scroll bar itself, over its reserved column. `content_length` is
+        // the number of scroll positions (`max_offset + 1`) so the thumb reaches
+        // the very bottom exactly when scrolled to the last row.
+        if let Some(sb) = &scrollbar {
+            let mut state = ScrollbarState::new(sb.max_offset + 1)
+                .position(config.scroll_offset)
+                .viewport_content_length(body_rows);
+            StatefulWidget::render(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .track_symbol(Some("│"))
+                    .thumb_symbol("█")
+                    .track_style(Style::default().fg(palette::DIM))
+                    .thumb_style(Style::default().fg(palette::ACCENT)),
+                Rect {
+                    x: sb.col,
+                    y: sb.top,
+                    width: 1,
+                    height: sb.rows,
+                },
+                frame.buffer_mut(),
+                &mut state,
+            );
+        }
 
         // --- bottom two-line status bar ---
         let max_text = (width as usize).saturating_sub(6);
@@ -3580,5 +3701,105 @@ mod tests {
         assert_eq!(NumBase::Hex.digits(8), 2);
         assert_eq!(NumBase::Hex.digits(4), 1);
         assert_eq!(NumBase::Octal.digits(8), 3);
+    }
+
+    #[test]
+    fn tree_scrollbar_geometry_and_mapping() {
+        // Everything fits the viewport → no bar.
+        assert!(UI::tree_scrollbar(80, 40, false, false, 5).is_none());
+        // Too narrow for a bar plus content → no bar.
+        assert!(UI::tree_scrollbar(1, 40, false, false, 999).is_none());
+
+        // Overflow → a bar in the rightmost column, tracking the visible rows.
+        let visible = UI::tree_visible_rows(80, 20, false, false);
+        let sb =
+            UI::tree_scrollbar(80, 20, false, false, visible + 50).expect("overflow shows bar");
+        assert_eq!(sb.col, 79);
+        assert_eq!(sb.rows as usize, visible);
+        assert_eq!(sb.max_offset, 50);
+        assert_eq!(sb.top as usize, UI::tree_header_rows(80, false, false));
+
+        // Track top → offset 0, track bottom → max_offset; outside the track clamps.
+        assert_eq!(sb.offset_at(sb.top), 0);
+        assert_eq!(sb.offset_at(sb.top + sb.rows - 1), sb.max_offset);
+        assert_eq!(sb.offset_at(0), 0);
+        assert_eq!(sb.offset_at(sb.top + sb.rows + 99), sb.max_offset);
+        let mid = sb.offset_at(sb.top + (sb.rows - 1) / 2);
+        assert!((mid as i64 - 25).abs() <= 1, "midpoint offset {mid} ≈ 25");
+
+        // Hit-testing: only the bar's own column, within the track rows.
+        assert!(sb.hit(79, sb.top));
+        assert!(sb.hit(79, sb.top + sb.rows - 1));
+        assert!(!sb.hit(78, sb.top)); // wrong column
+        assert!(!sb.hit(79, sb.top + sb.rows)); // just past the track
+        assert!(!sb.hit(79, sb.top - 1)); // header row above the track
+    }
+
+    #[test]
+    fn tree_scrollbar_drawn_only_when_interactive() {
+        // A helper config over `nodes`, differing only in the `interactive` gate.
+        fn cfg<'a>(
+            nodes: &'a [(TreeNode, usize)],
+            unindexed: &'a HashSet<String>,
+            schemas: &'a HashMap<String, PackingSchema>,
+            interactive: bool,
+        ) -> DrawConfig<'a> {
+            DrawConfig {
+                tree: nodes,
+                current_file: "f",
+                file_idx: 0,
+                total_files: 1,
+                selected_idx: 0,
+                scroll_offset: 0,
+                search_mode: false,
+                search_query: "",
+                search_cursor: 0,
+                status_icon: "▪",
+                status_bar: "",
+                status_secondary: "",
+                health_warning: false,
+                can_repack: false,
+                unindexed,
+                packing_schemas: schemas,
+                copied_flash: None,
+                interactive,
+            }
+        }
+
+        // 40 rows into a 20-row terminal → the tree overflows the viewport.
+        let nodes: Vec<(TreeNode, usize)> = (0..40)
+            .map(|i| {
+                (
+                    TreeNode::Metadata {
+                        info: MetadataInfo {
+                            name: format!("entry_{i}"),
+                            value: "v".to_string(),
+                            value_type: "str".to_string(),
+                        },
+                    },
+                    0usize,
+                )
+            })
+            .collect();
+        let unindexed = HashSet::new();
+        let schemas = HashMap::new();
+
+        // Interactive: the bar (thumb █ over a │ track) rides the right edge.
+        let live = crate::tui::headless_render(80, 20, |f| {
+            UI::render_tree(f, &cfg(&nodes, &unindexed, &schemas, true));
+        })
+        .unwrap();
+        assert!(live.contains('█'), "expected a thumb:\n{live}");
+        assert!(live.contains('│'), "expected a track:\n{live}");
+
+        // Non-interactive (headless dump): no bar anywhere.
+        let plain = crate::tui::headless_render(80, 20, |f| {
+            UI::render_tree(f, &cfg(&nodes, &unindexed, &schemas, false));
+        })
+        .unwrap();
+        assert!(
+            !plain.contains('█') && !plain.contains('│'),
+            "headless dump must show no scroll bar:\n{plain}"
+        );
     }
 }
