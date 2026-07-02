@@ -1936,7 +1936,14 @@ impl Explorer {
         // subsequent drag events keep scrubbing the viewport.
         let mut scrollbar_drag = false;
         loop {
-            // Draw the tree through the owned Ratatui terminal.
+            // Skip the (relatively expensive) repaint whenever more input is
+            // already queued. A burst of mouse-wheel or motion events would
+            // otherwise trigger one full redraw *each*, and those repaints back
+            // the input queue up: scrolling lags behind, and later key presses —
+            // Ctrl-C included — are stuck behind the pile of pending redraws. By
+            // draining the whole burst first and painting only once it settles,
+            // scrolling stays snappy and the keyboard stays responsive.
+            let input_pending = event::poll(std::time::Duration::ZERO).unwrap_or(false);
             let mut term = self
                 .terminal
                 .take()
@@ -1946,24 +1953,30 @@ impl Explorer {
                 first = false;
             }
             let size = term.size().ok();
-            if let Some(sz) = size {
-                if self.selected_idx != last_sel {
-                    self.update_tree_scroll(sz.width, sz.height); // snap to the moved selection
-                    last_sel = self.selected_idx;
+            if !input_pending {
+                if let Some(sz) = size {
+                    if self.selected_idx != last_sel {
+                        self.update_tree_scroll(sz.width, sz.height); // snap to the moved selection
+                        last_sel = self.selected_idx;
+                    }
+                    // Clamp the (possibly wheel-scrolled) offset to the valid range.
+                    let body = UI::tree_visible_rows(
+                        sz.width,
+                        sz.height,
+                        self.search_mode,
+                        self.can_repack(),
+                    );
+                    let total = self.current_tree_len();
+                    self.scroll_offset = self.scroll_offset.min(total.saturating_sub(body));
                 }
-                // Clamp the (possibly wheel-scrolled) offset to the valid range.
-                let body =
-                    UI::tree_visible_rows(sz.width, sz.height, self.search_mode, self.can_repack());
-                let total = self.current_tree_len();
-                self.scroll_offset = self.scroll_offset.min(total.saturating_sub(body));
+                let hint = layout_hint;
+                term.draw(|f| {
+                    self.render_tree_frame(f, true);
+                    if let Some(c) = hint {
+                        UI::render_notice(f, &layout_hint_msg(c));
+                    }
+                })?;
             }
-            let hint = layout_hint;
-            term.draw(|f| {
-                self.render_tree_frame(f, true);
-                if let Some(c) = hint {
-                    UI::render_notice(f, &layout_hint_msg(c));
-                }
-            })?;
             self.terminal = Some(term);
 
             // While a copy confirmation is up, wake when it expires so it clears
