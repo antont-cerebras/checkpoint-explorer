@@ -8,8 +8,10 @@
 //! `diff`-style exit code ([`DiffReport::has_differences`]) are separate so the
 //! logic is testable without any I/O.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write;
+
+use glob::{MatchOptions, Pattern};
 
 use crate::sample::{HistBins, HistogramDiff, ValueDiff};
 use crate::tree::{MetadataInfo, TensorInfo};
@@ -36,6 +38,10 @@ pub struct DiffOpts {
     /// Value distributions were compared (`--histogram`): show a per-change
     /// total-variation-distance summary.
     pub histogram: bool,
+    /// A [`TensorFilter`] scoped the diff to a subset of tensors — the metadata
+    /// section's "not compared" note names this (rather than `--only-tensors`) so
+    /// it's clear why the whole checkpoint wasn't diffed.
+    pub filtered: bool,
 }
 
 /// A tensor's distribution shift for `diff --histogram`: total variation distance
@@ -147,6 +153,20 @@ fn group_entries<K: Clone + Eq + std::hash::Hash>(items: &[(String, K)]) -> Vec<
         }
     }
     groups
+}
+
+/// Collapse tensor `names` into their index-templated schema: names sharing a
+/// template (each run of digits — a layer number, an expert id — becomes a range
+/// placeholder) merge into one `(display_name, count)`, e.g.
+/// `model.layers.{0-47}.…experts.{0-3}.down_proj.weight` → count 192. Ordered by
+/// first appearance (alphabetical when `names` is sorted). Used to summarize which
+/// tensors a `diff` filter matched.
+pub fn name_schema(names: &[&str]) -> Vec<(String, usize)> {
+    let items: Vec<(String, ())> = names.iter().map(|n| ((*n).to_string(), ())).collect();
+    group_entries(&items)
+        .into_iter()
+        .map(|g| (display_name(&g.template, &g.indices), g.count))
+        .collect()
 }
 
 /// Render each entry as its own group (no collapsing) — for `--full`. Each
@@ -389,6 +409,128 @@ impl CheckpointSummary {
     }
 }
 
+/// A tensor's shape as a glob-matchable path, `dim/dim/…` (empty for a scalar) —
+/// so a shape pattern can wildcard one dimension with `*` and any number with
+/// `**`, matched with [`shape_match_opts`] (a literal `/` separates dims).
+fn shape_key(shape: &[usize]) -> String {
+    shape
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Glob options for matching a [`shape_key`]: `/` is a real separator, so `*`
+/// matches within one dimension and only `**` spans several — mirroring how a
+/// filesystem glob treats path components.
+fn shape_match_opts() -> MatchOptions {
+    MatchOptions {
+        require_literal_separator: true,
+        ..MatchOptions::new()
+    }
+}
+
+/// A CLI-driven selection of which tensors to diff (`--name` / `--names` /
+/// `--names-from` / `--dtype-is` / `--shape-is`). The constraints compose with
+/// **AND** — a tensor is kept only if it satisfies every constraint that was
+/// given; an unset constraint always passes. Names, dtypes and shapes are matched
+/// with the same [`glob`] engine, so `*`/`**`/`?`/`[…]` work everywhere (shapes
+/// via [`shape_key`], dtypes case-insensitively).
+#[derive(Default)]
+pub struct TensorFilter {
+    /// Name globs; a tensor passes if it matches **any** (empty = unconstrained).
+    pub name_globs: Vec<Pattern>,
+    /// Exact names (union of `--names` and `--names-from`); `None` = unconstrained.
+    pub names_exact: Option<HashSet<String>>,
+    /// A dtype glob, matched against the UPPERCASED dtype; `None` = unconstrained.
+    pub dtype: Option<Pattern>,
+    /// A shape glob, matched against the [`shape_key`]; `None` = unconstrained.
+    pub shape: Option<Pattern>,
+}
+
+impl TensorFilter {
+    /// Whether any constraint is set (so the diff is scoped to a subset).
+    pub fn is_active(&self) -> bool {
+        !self.name_globs.is_empty()
+            || self.names_exact.is_some()
+            || self.dtype.is_some()
+            || self.shape.is_some()
+    }
+
+    /// Whether `name` — with its old and/or new signature (either may be absent
+    /// when the tensor is only on one side) — passes every constraint. A dtype /
+    /// shape constraint matches if **either** side matches, so a tensor whose
+    /// dtype or shape changed is still selected.
+    fn matches(&self, name: &str, old: Option<&TensorSig>, new: Option<&TensorSig>) -> bool {
+        if !self.name_globs.is_empty() && !self.name_globs.iter().any(|p| p.matches(name)) {
+            return false;
+        }
+        if self
+            .names_exact
+            .as_ref()
+            .is_some_and(|set| !set.contains(name))
+        {
+            return false;
+        }
+        if let Some(pat) = &self.dtype {
+            let hit = |s: &TensorSig| pat.matches(&s.dtype.to_uppercase());
+            if !old.is_some_and(hit) && !new.is_some_and(hit) {
+                return false;
+            }
+        }
+        if let Some(pat) = &self.shape {
+            let opts = shape_match_opts();
+            let hit = |s: &TensorSig| pat.matches_with(&shape_key(&s.shape), opts);
+            if !old.is_some_and(hit) && !new.is_some_and(hit) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Restrict both summaries to the tensors that pass the filter. The union of
+    /// names is tested, so a tensor present on only one side is kept iff it
+    /// matches (and still shows as added/removed). No-op when inactive.
+    pub fn apply(&self, old: &mut CheckpointSummary, new: &mut CheckpointSummary) {
+        if !self.is_active() {
+            return;
+        }
+        let keep: HashSet<String> = old
+            .tensors
+            .keys()
+            .chain(new.tensors.keys())
+            .filter(|n| self.matches(n, old.tensors.get(*n), new.tensors.get(*n)))
+            .cloned()
+            .collect();
+        old.tensors.retain(|k, _| keep.contains(k));
+        new.tensors.retain(|k, _| keep.contains(k));
+    }
+
+    /// A one-line, human-readable summary of the active constraints (for the
+    /// "diff: …" context line), or `None` when inactive.
+    pub fn describe(&self) -> Option<String> {
+        if !self.is_active() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if !self.name_globs.is_empty() {
+            let globs: Vec<&str> = self.name_globs.iter().map(Pattern::as_str).collect();
+            parts.push(format!("name~{}", globs.join("|")));
+        }
+        if let Some(set) = &self.names_exact {
+            parts.push(format!("names({})", set.len()));
+        }
+        if let Some(p) = &self.dtype {
+            parts.push(format!("dtype~{}", p.as_str()));
+        }
+        if let Some(p) = &self.shape {
+            // Show dims comma-separated, as the user wrote them.
+            parts.push(format!("shape~{}", p.as_str().replace('/', ",")));
+        }
+        Some(parts.join(", "))
+    }
+}
+
 /// A tensor present in both checkpoints that differs — by dtype/shape, or (with
 /// `--values`) by element values even when the signature is unchanged.
 pub struct TensorChange {
@@ -597,8 +739,13 @@ impl DiffReport {
             }
         } else {
             // Make it obvious the metadata was deliberately left out, rather than
-            // silently showing only the tensors section.
-            let _ = writeln!(s, "\nmetadata: not compared (--only-tensors)");
+            // silently showing only the tensors section, and say why.
+            let reason = if opts.filtered {
+                "filtered subset"
+            } else {
+                "--only-tensors"
+            };
+            let _ = writeln!(s, "\nmetadata: not compared ({reason})");
         }
         s
     }
@@ -1211,6 +1358,7 @@ mod tests {
         group: true,
         values: false,
         histogram: false,
+        filtered: false,
     };
 
     fn vd(differing: u64, elements: u64, max_abs: f64, mean_abs: f64) -> ValueDiff {
@@ -1300,5 +1448,173 @@ mod tests {
             reshape.contains("values: not compared (shapes differ)"),
             "{reshape}"
         );
+    }
+
+    // ---- TensorFilter ----
+
+    fn glob(p: &str) -> Pattern {
+        Pattern::new(p).unwrap()
+    }
+
+    #[test]
+    fn filter_name_glob_matches_any() {
+        let f = TensorFilter {
+            name_globs: vec![glob("*.mlp.*.weight"), glob("*.norm.weight")],
+            ..Default::default()
+        };
+        assert!(f.is_active());
+        let s = sig("F16", &[4, 4]);
+        assert!(f.matches("model.layers.0.mlp.down_proj.weight", Some(&s), Some(&s)));
+        assert!(f.matches("model.norm.weight", Some(&s), None));
+        assert!(!f.matches("model.embed_tokens.weight", Some(&s), Some(&s)));
+    }
+
+    #[test]
+    fn filter_names_exact() {
+        let f = TensorFilter {
+            names_exact: Some(["a.w", "b.w"].iter().map(|s| s.to_string()).collect()),
+            ..Default::default()
+        };
+        let s = sig("F16", &[2]);
+        assert!(f.matches("a.w", Some(&s), Some(&s)));
+        assert!(!f.matches("c.w", Some(&s), Some(&s)));
+    }
+
+    #[test]
+    fn filter_dtype_glob_is_case_insensitive_and_either_side() {
+        let f = TensorFilter {
+            dtype: Some(glob("F*")),
+            ..Default::default()
+        };
+        assert!(f.matches("w", Some(&sig("F16", &[2])), Some(&sig("F16", &[2]))));
+        assert!(f.matches("w", Some(&sig("f32", &[2])), None)); // lowercase stored dtype
+        assert!(!f.matches("w", Some(&sig("BF16", &[2])), Some(&sig("I8", &[2]))));
+        // dtype changed F16 → BF16 still matches: the OLD side is F16.
+        assert!(f.matches("w", Some(&sig("F16", &[2])), Some(&sig("BF16", &[2]))));
+    }
+
+    #[test]
+    fn filter_shape_glob_star_one_dim_starstar_any() {
+        // `*` matches exactly one dimension (of any size).
+        let one = TensorFilter {
+            shape: Some(glob("768/*")),
+            ..Default::default()
+        };
+        assert!(one.matches("w", Some(&sig("F16", &[768, 2048])), None));
+        assert!(!one.matches("w", Some(&sig("F16", &[768, 2048, 4])), None)); // rank 3
+        assert!(!one.matches("w", Some(&sig("F16", &[768])), None)); // rank 1
+
+        // `**` matches any number of dimensions.
+        let any = TensorFilter {
+            shape: Some(glob("768/**")),
+            ..Default::default()
+        };
+        assert!(any.matches("w", Some(&sig("F16", &[768, 2048])), None));
+        assert!(any.matches("w", Some(&sig("F16", &[768, 2048, 4])), None));
+
+        // Trailing dimension at any rank.
+        let tail = TensorFilter {
+            shape: Some(glob("**/2048")),
+            ..Default::default()
+        };
+        assert!(tail.matches("w", Some(&sig("F16", &[768, 2048])), None));
+        assert!(tail.matches("w", Some(&sig("F16", &[6, 3, 2048])), None));
+        assert!(!tail.matches("w", Some(&sig("F16", &[2048, 6])), None));
+    }
+
+    #[test]
+    fn filter_constraints_compose_with_and() {
+        let f = TensorFilter {
+            name_globs: vec![glob("*.down_proj.weight")],
+            dtype: Some(glob("BF16")),
+            ..Default::default()
+        };
+        let bf = sig("BF16", &[2048, 768]);
+        let f16 = sig("F16", &[2048, 768]);
+        assert!(f.matches("model.layers.0.mlp.down_proj.weight", Some(&bf), Some(&bf)));
+        assert!(!f.matches(
+            "model.layers.0.mlp.down_proj.weight",
+            Some(&f16),
+            Some(&f16)
+        )); // dtype fails
+        assert!(!f.matches("model.layers.0.mlp.gate_proj.weight", Some(&bf), Some(&bf))); // name fails
+    }
+
+    #[test]
+    fn filter_apply_restricts_both_sides_and_keeps_add_remove() {
+        let mut old = summary(
+            &[
+                ("keep.down_proj.weight", sig("BF16", &[8, 4])),
+                ("skip.gate_proj.weight", sig("BF16", &[8, 4])),
+                ("only_old.down_proj.weight", sig("BF16", &[8, 4])),
+            ],
+            &[],
+        );
+        let mut new = summary(
+            &[
+                ("keep.down_proj.weight", sig("BF16", &[8, 4])),
+                ("skip.gate_proj.weight", sig("BF16", &[8, 4])),
+                ("only_new.down_proj.weight", sig("BF16", &[8, 4])),
+            ],
+            &[],
+        );
+        let f = TensorFilter {
+            name_globs: vec![glob("*.down_proj.weight")],
+            ..Default::default()
+        };
+        f.apply(&mut old, &mut new);
+        assert_eq!(
+            old.tensors.keys().cloned().collect::<Vec<_>>(),
+            vec!["keep.down_proj.weight", "only_old.down_proj.weight"]
+        );
+        assert_eq!(
+            new.tensors.keys().cloned().collect::<Vec<_>>(),
+            vec!["keep.down_proj.weight", "only_new.down_proj.weight"]
+        );
+        // The diff over the filtered subset: one unchanged, one removed, one added.
+        let r = compare(&old, &new);
+        assert_eq!(r.tensors_unchanged, 1);
+        assert_eq!(r.tensors_removed.len(), 1);
+        assert_eq!(r.tensors_added.len(), 1);
+    }
+
+    #[test]
+    fn name_schema_collapses_layers_and_experts() {
+        let mut names = Vec::new();
+        for l in 0..3 {
+            for e in 0..2 {
+                names.push(format!("model.layers.{l}.experts.{e}.down_proj.weight"));
+                names.push(format!("model.layers.{l}.experts.{e}.gate_proj.weight"));
+            }
+        }
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let schema = name_schema(&refs);
+        // Two templates (down / gate), each covering 3 layers × 2 experts = 6.
+        assert_eq!(schema.len(), 2);
+        assert!(
+            schema.contains(&(
+                "model.layers.{0-2}.experts.{0-1}.down_proj.weight".to_string(),
+                6
+            )),
+            "{schema:?}"
+        );
+        assert!(
+            schema.contains(&(
+                "model.layers.{0-2}.experts.{0-1}.gate_proj.weight".to_string(),
+                6
+            )),
+            "{schema:?}"
+        );
+    }
+
+    #[test]
+    fn filter_inactive_is_noop() {
+        let f = TensorFilter::default();
+        assert!(!f.is_active());
+        assert_eq!(f.describe(), None);
+        let mut a = summary(&[("w", sig("F16", &[2]))], &[]);
+        let mut b = summary(&[("w", sig("F16", &[2]))], &[]);
+        f.apply(&mut a, &mut b);
+        assert_eq!(a.tensors.len(), 1); // untouched
     }
 }

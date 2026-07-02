@@ -422,6 +422,51 @@ On completion it reports how the on-disk size changed — e.g.
 refuses to write over its own input, and warns if the chosen codec is the one
 the source already uses (a re-encode, where a plain copy would do).
 
+### Comparing checkpoints (`diff`)
+
+```bash
+# Structural diff: which tensors (name/dtype/shape) and metadata were added,
+# removed, or changed. Fast — tensor data is not read. Exit 0 = identical,
+# 1 = differences, 2 = trouble (like the `diff` utility).
+checkpoint-explorer diff old.safetensors new.safetensors
+
+# Also compare element values (not just dtype/shape): promotes a values-only
+# change to a difference and reports max/mean |Δ|. Reads the data.
+checkpoint-explorer diff old.safetensors new.safetensors --values
+```
+
+**Comparing a subset of tensors.** Any of the filters below scopes the whole
+diff (structural *and* `--values`/`--histogram`) to the matching tensors, so you
+only read and compare what you care about. They **compose with AND** — a tensor
+is kept only if it matches every filter given — and metadata isn't compared in a
+filtered run (a note says so). Names, dtypes, and shapes all use the same glob
+engine (`*`, `**`, `?`, `[…]`):
+
+| Flag | Selects |
+|------|---------|
+| `--name <GLOB>` | Tensors whose name matches the glob, e.g. `'*.mlp.down_proj.weight'`, `'model.layers.*'`. Repeatable — matches ANY given. |
+| `--names <A,B,C>` | Exact names (comma-separated). |
+| `--names-from <FILE>` | Exact names from a file (one per line; `#` comments allowed). |
+| `--dtype-is <GLOB>` | Tensors whose stored dtype matches, e.g. `BF16`, `'F*'` (F16/F32/…). Case-insensitive; matches either side, so it catches a dtype change. |
+| `--shape-is <DIMS>` | Tensors whose shape matches. Dims are comma- or `x`-separated; `*` wildcards **one** dimension and `**` **any number** — e.g. `768,2048`, `768,*`, `*,2048`, `768,**`, `**,2048`. |
+
+```bash
+# Value-compare just the down_proj weights across every layer
+checkpoint-explorer diff old/ new/ --values --name '*.down_proj.weight'
+
+# Only the BF16 tensors whose shape ends in 2048
+checkpoint-explorer diff old/ new/ --dtype-is BF16 --shape-is '**,2048'
+
+# A specific set of tensors listed in a file
+checkpoint-explorer diff old/ new/ --values --names-from tensors.txt
+```
+
+Related flags: `--tensor <NAME>` focuses one tensor (with a bin-by-bin
+`--histogram` table); `--histogram` compares value *distributions* (total
+variation distance); `--dtype <VIEW>` decodes under a view (e.g. `u4`,
+`unpacked`) before comparing; `--only-tensors` skips metadata; `--full` lists
+every entry instead of collapsing per-layer runs; `--no-color` disables colour.
+
 ## Example Output
 
 ```
