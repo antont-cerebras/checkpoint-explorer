@@ -1302,7 +1302,7 @@ impl Explorer {
         // mirroring the interactive `l` path (`show_legend`).
         if matches!(screen, Screen::Tree) {
             let text = crate::tui::headless_render(120, 40, |f| {
-                self.render_tree_frame(f);
+                self.render_tree_frame(f, false); // headless: no scroll bar
                 if want_legend {
                     UI::render_legend_band(f, Legend::Tree);
                 }
@@ -1662,8 +1662,10 @@ impl Explorer {
     }
 
     /// Build the tree's [`DrawConfig`] and render it into a Ratatui frame — the
-    /// interactive and headless tree both go through this.
-    fn render_tree_frame(&self, frame: &mut ratatui::Frame) {
+    /// interactive and headless tree both go through this. `interactive` is true
+    /// only for the live TUI (it gates the scroll bar; a headless `--plain` /
+    /// screen-copy render passes false so its static dump shows no bar).
+    fn render_tree_frame(&self, frame: &mut ratatui::Frame, interactive: bool) {
         let title = if self.files.len() == 1 {
             self.files[0].to_string_lossy().to_string()
         } else {
@@ -1693,6 +1695,7 @@ impl Explorer {
             unindexed: &self.unindexed,
             packing_schemas: &self.packing_schemas,
             copied_flash: self.copied_flash.as_ref().map(|(what, _)| what.as_str()),
+            interactive,
         };
         *self.clickable.borrow_mut() = UI::render_tree(frame, &config);
     }
@@ -1700,7 +1703,7 @@ impl Explorer {
     /// Render the tree to plain text via an in-memory Ratatui backend — the
     /// headless (`--plain`) tree and the `c` screen-copy share this.
     fn tree_plain(&self) -> Result<String> {
-        crate::tui::headless_render(120, 40, |f| self.render_tree_frame(f))
+        crate::tui::headless_render(120, 40, |f| self.render_tree_frame(f, false))
     }
 
     /// Build the detail-screen draw config and render it into `frame` — the
@@ -1929,6 +1932,9 @@ impl Explorer {
         // A wrong-keyboard-layout hint to flash on the next frame (see
         // `wrong_layout_char`); cleared as soon as the next input arrives.
         let mut layout_hint: Option<char> = None;
+        // True while the left button is held after pressing on the scroll bar, so
+        // subsequent drag events keep scrubbing the viewport.
+        let mut scrollbar_drag = false;
         loop {
             // Draw the tree through the owned Ratatui terminal.
             let mut term = self
@@ -1953,7 +1959,7 @@ impl Explorer {
             }
             let hint = layout_hint;
             term.draw(|f| {
-                self.render_tree_frame(f);
+                self.render_tree_frame(f, true);
                 if let Some(c) = hint {
                     UI::render_notice(f, &layout_hint_msg(c));
                 }
@@ -1990,6 +1996,24 @@ impl Explorer {
                         // that would wipe the "Copied" a copy-chip click just set,
                         // making it flicker.)
                         self.copied_flash = None;
+                        // A press on the scroll bar scrubs the viewport (like the
+                        // wheel — the selection stays put); holding the button then
+                        // drags it. Checked before rows/chips so its column wins.
+                        scrollbar_drag = false;
+                        if let Some(sz) = size
+                            && let Some(sb) = UI::tree_scrollbar(
+                                sz.width,
+                                sz.height,
+                                self.search_mode,
+                                self.can_repack(),
+                                self.current_tree_len(),
+                            )
+                            && sb.hit(col, row)
+                        {
+                            self.scroll_offset = sb.offset_at(row);
+                            scrollbar_drag = true;
+                            continue;
+                        }
                         let hit = crate::ui::region_hit(&self.clickable.borrow(), col, row);
                         if let Some(k) = hit {
                             synth = Some(k); // clicked a hint chip / [×]
@@ -2042,6 +2066,23 @@ impl Explorer {
                             }
                         }
                     }
+                    // Dragging after a press on the scroll bar keeps scrubbing the
+                    // viewport to wherever the pointer is (clamped to the track).
+                    MouseEventKind::Drag(MouseButton::Left) if scrollbar_drag => {
+                        if let Some(sz) = size
+                            && let Some(sb) = UI::tree_scrollbar(
+                                sz.width,
+                                sz.height,
+                                self.search_mode,
+                                self.can_repack(),
+                                self.current_tree_len(),
+                            )
+                        {
+                            self.scroll_offset = sb.offset_at(row);
+                        }
+                    }
+                    // Releasing ends any scroll-bar drag.
+                    MouseEventKind::Up(MouseButton::Left) => scrollbar_drag = false,
                     // Wheel scrolls the viewport (not the selection); the offset
                     // is clamped to range before the next draw.
                     MouseEventKind::ScrollDown => {
@@ -4908,7 +4949,7 @@ impl Explorer {
         // so the tree stays visible behind it).
         if term
             .draw(|f| {
-                self.render_tree_frame(f);
+                self.render_tree_frame(f, true);
                 UI::render_legend_band(f, legend);
             })
             .is_ok()
@@ -4936,7 +4977,7 @@ impl Explorer {
         // the tree stays visible behind it).
         if term
             .draw(|f| {
-                self.render_tree_frame(f);
+                self.render_tree_frame(f, true);
                 UI::render_command_band(f, command);
             })
             .is_ok()
