@@ -46,6 +46,12 @@ ratatui = "0.29"
 unicode-width = "=0.2.0"
 ansi-to-tui = "7.0.0"
 
+# Unix only: flush the tty input buffer on exit (discard mouse-wheel reports
+# still queued when quitting mid-scroll) so the shell doesn't echo them as
+# garbage. crossterm already pulls libc in transitively.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Cram-like end-to-end CLI tests: run the binary in `--plain` and snapshot the
 # rendered screen. Golden files live in tests/snapshots/ and are regenerated with

@@ -173,6 +173,7 @@ dependencies = [
  "hdf5-metno",
  "hdf5-metno-sys",
  "insta",
+ "libc",
  "lz4_flex",
  "memmap2",
  "ndarray",
