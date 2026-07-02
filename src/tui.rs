@@ -62,6 +62,47 @@ pub fn restore(terminal: &mut LiveTerminal) -> Result<()> {
         terminal::Clear(ClearType::FromCursorDown),
         cursor::Show
     )?;
+    // Discard input still arriving before we hand the (cooked, echoing) terminal
+    // back to the shell. Quitting mid-scroll (e.g. Ctrl-C during a mouse-wheel
+    // burst) leaves a tail of unread SGR mouse reports in the buffer — plus, over
+    // a laggy/remote link, more still in flight and any the terminal emits during
+    // the round-trip before it processes `DisableMouseCapture` above. Left there,
+    // they'd be echoed as `^[[<…M` garbage across the shell prompt. A single flush
+    // only clears what's buffered *now*, so instead stay in raw mode (no echo) and
+    // read+discard until the stream has been quiet for a short gap (outlasting the
+    // disable's round-trip), capped so exit can't stall; then a final flush.
+    #[cfg(unix)]
+    // SAFETY: poll/read/tcflush operate only on our own stdin fd, reading into a
+    // local buffer we own; errors (e.g. stdin isn't a tty) are handled by bailing.
+    unsafe {
+        use std::time::{Duration, Instant};
+        let fd = libc::STDIN_FILENO;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Always wait out a quiet window rather than checking "is something
+        // queued right now" — at teardown the buffer is often momentarily empty
+        // between arriving reports, and skipping the wait lets the next ones leak.
+        let start = Instant::now();
+        let mut buf = [0u8; 8192];
+        loop {
+            pfd.revents = 0;
+            // A short gap with no input means the terminal has settled (the
+            // disable took hold and the link drained); then we're done.
+            if libc::poll(&mut pfd, 1, 60) <= 0 {
+                break;
+            }
+            if libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) <= 0 {
+                break;
+            }
+            if start.elapsed() > Duration::from_millis(1200) {
+                break; // cap: never stall exit, even under a relentless stream
+            }
+        }
+        libc::tcflush(fd, libc::TCIFLUSH);
+    }
     terminal::disable_raw_mode()?;
     println!();
     Ok(())
