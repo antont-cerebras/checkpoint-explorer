@@ -42,6 +42,9 @@ half = { version = "2", optional = true }
 zstd = { version = "0.13", optional = true }
 colored_json = "5.0.0"
 yansi = "1.0.1"
+# Encode the heatmap as a PNG (for `--png` / inline terminal images). Pure-Rust,
+# minimal (no C deps); pairs with the built-in base64 for the iTerm2 escape.
+png = "0.17"
 ratatui = "0.29"
 unicode-width = "=0.2.0"
 ansi-to-tui = "7.0.0"

@@ -14,11 +14,12 @@ fused-codebook MoE) so they show their true values; and ships a scriptable
 ## Highlights
 
 - 🔬 **See the data, not just the shape.** From any tensor, open an ASCII
-  [**heatmap**](#tensor-data-preview), a [**numeric grid**](#tensor-data-preview)
-  of real values, a [**value histogram**](#value-histogram-h), and exact
-  whole-tensor [**statistics**](#statistics) (min/max, mean, std, % zeros,
-  NaN/Inf) — computed by streaming the tensor in bounded blocks, so it works on
-  **multi-GB** tensors without loading them into RAM.
+  [**heatmap**](#tensor-data-preview) (or a **real inline image** on iTerm2, and
+  export it to **PNG**), a [**numeric grid**](#tensor-data-preview) of real
+  values, a [**value histogram**](#value-histogram-h), and exact whole-tensor
+  [**statistics**](#statistics) (min/max, mean, std, % zeros, NaN/Inf) — computed
+  by streaming the tensor in bounded blocks, so it works on **multi-GB** tensors
+  without loading them into RAM.
 - 🧩 **Quantized weights, decoded.** [Reinterpret packed dtypes](#dtype-override)
   on the fly — 4-bit `u4`/`i4` nibbles, or fused-codebook **MoE experts**
   (`unpacked`, e.g. `u3×5`) — so quantized checkpoints show their true values and
@@ -167,6 +168,9 @@ without `--tensor` is reported as ambiguous.
 | `--base <dec\|hex\|oct\|bin>` | Numeral base for the numeric grid; non-decimal shows each element's raw stored bits |
 | `--slice <INDEX>` | Starting slice for a 3D tensor: an index (`12`) or a percentage (`50%`) |
 | `--compute-stats` | Start the statistics scan immediately on the detail view (data views always compute them) |
+| `--png <PATH>` | Render the opened tensor's heatmap to a PNG file and exit (the `p` key) |
+| `--image` | Render the opened tensor's heatmap as an inline terminal image (iTerm2, like `imgcat`) and exit (the `i` key) |
+| `--image-size <PX>` | Longer-side pixel resolution of the saved heatmap PNG (`--png`; default 1600). The inline image (`i` / `--image`) auto-fits the terminal |
 | `--exit` | Render the requested view once and exit, without entering interactive navigation |
 
 Dismissing the opened screen drops you into the normal tree browser, so you can
@@ -239,7 +243,17 @@ those, so a tensor stored as e.g. `(128, 3088, 1, 748)` previews as the 3D
 
 - `m` — an **ASCII heatmap**: each sampled element is a colored block on a
   blue→green→red scale, with a min/max legend. Each character row packs two
-  data rows (upper/lower half-block) for higher vertical resolution.
+  data rows (upper/lower half-block) for higher vertical resolution. On a
+  terminal that supports inline images (**iTerm2**, like `imgcat`), press `i` to
+  render the heatmap as a **real image** — the same view you see (same header and
+  orientation), sized to fill the terminal with the aspect ratio preserved, and
+  the colour scale on its own line below; press `y` in the viewer to copy the
+  reopen command, or `p` to save it as a self-contained **PNG** (legend baked in).
+  Both are also available headlessly — `--image` emits the inline image and exits,
+  `--png <PATH>` writes the file (honoring `--dtype`/`--shape`/`--slice` and the
+  layout). The image works over **tmux** too, including iTerm2's `-CC` mode (the
+  payload is chunked so it doesn't overrun tmux's passthrough buffer).
+  `--image-size <PX>` sets the saved PNG's resolution.
 - `v` — a **numeric grid** of sampled values with row/column indices, including
   the edges. Column width adapts to the *actual* values (from the exact stats),
   so a tensor of small numbers packs many more columns onto the screen — even a

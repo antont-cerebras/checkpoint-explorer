@@ -11,6 +11,7 @@ mod hdf5_lz4;
 #[cfg(feature = "hdf5")]
 mod hdf5_zstd;
 mod health;
+mod img;
 mod npy;
 mod sample;
 mod tree;
@@ -225,6 +226,26 @@ struct ExploreArgs {
         help = "Print the CLI command that reopens the requested view (what `y` copies) and exit, instead of rendering"
     )]
     emit_command: bool,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Render the opened tensor's heatmap to a PNG file and exit (the `p` key). Honors --dtype/--shape/--slice and the layout flags"
+    )]
+    png: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "Render the opened tensor's heatmap as an inline terminal image (iTerm2, like imgcat) and exit (the `i` key)"
+    )]
+    image: bool,
+
+    #[arg(
+        long,
+        value_name = "PX",
+        help = "Longer-side pixel resolution of the saved heatmap PNG (--png / p). Default 1600. The inline image (i / --image) auto-fits the terminal, aspect preserved"
+    )]
+    image_size: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -1137,7 +1158,9 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         || args.tree_state.is_some()
         || args.search.is_some()
         || args.legend
-        || args.exit;
+        || args.exit
+        || args.png.is_some()
+        || args.image;
     let open = wants_open.then_some(OpenRequest {
         tensor: args.tensor,
         metadata: args.metadata,
@@ -1160,7 +1183,13 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
     });
 
     let mut explorer = Explorer::new(files, health_reports, open, !args.no_preload);
-    if args.emit_command {
+    if let Some(px) = args.image_size {
+        explorer.set_image_size(px);
+    }
+    if args.png.is_some() || args.image {
+        // Headless heatmap image: save a PNG and/or emit an inline terminal image.
+        explorer.render_image(args.png.as_deref(), args.image)
+    } else if args.emit_command {
         explorer.render_plain(true)
     } else if args.plain {
         explorer.render_plain(false)

@@ -372,6 +372,8 @@ pub enum Overlay {
     Legend(Legend),
     /// The copied CLI command box (`y`); holds the command to display.
     Command(String),
+    /// A transient status message (e.g. "saved heatmap → …" after `p`).
+    Notice(String),
 }
 
 /// Rows of chrome above the tree list: the title, the search/hint line, and the
@@ -830,6 +832,7 @@ impl UI {
         match overlay {
             Some(Overlay::Legend(l)) => Self::render_legend_band(frame, *l),
             Some(Overlay::Command(c)) => Self::render_command_band(frame, c),
+            Some(Overlay::Notice(m)) => Self::render_notice_band(frame, m),
             None => {}
         }
         regions
@@ -878,6 +881,23 @@ impl UI {
             })
             .collect();
         content.push(Line::from(dim_span("click or press any key to dismiss")));
+        render_titled_bar(frame, title, content);
+    }
+
+    /// A transient framed status message (e.g. "saved heatmap → …" after `p`, or a
+    /// hint that inline images need iTerm2), drawn over the live frame like the
+    /// command box and dismissed by any key.
+    pub fn render_notice_band(frame: &mut Frame, msg: &str) {
+        let title = Line::from(Span::styled(
+            " Info ",
+            Style::default()
+                .fg(palette::KEY)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let content = vec![
+            Line::from(Span::raw(msg.to_string())),
+            Line::from(dim_span("click or press any key to dismiss")),
+        ];
         render_titled_bar(frame, title, content);
     }
 
@@ -2163,6 +2183,13 @@ fn view_footer_items(
         ("m", "heatmap")
     };
     let mut items = vec![switch];
+    // The heatmap can be shown as a real inline image (iTerm2) or saved as a PNG —
+    // kept near the front so the hints stay on the first footer line even when the
+    // terminal is narrow.
+    if heatmap {
+        items.push(("i", "image"));
+        items.push(("p", "png"));
+    }
     let edges = matches!(mode, SampleMode::Edges { .. });
     let window = matches!(mode, SampleMode::Window { .. });
     // In the edges view the arrows rebalance first vs. last (Shift snaps to one

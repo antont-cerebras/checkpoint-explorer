@@ -185,6 +185,17 @@ const HDR_GRID_GAP_ROW: usize = 1;
 /// The column-index row (the numeric grid only; the heatmap has none).
 const HDR_COLINDEX_ROW: usize = 1;
 
+/// The heatmap draws a colour-scale legend — a spacer line plus the `low ██ high`
+/// bar — between the grid and the footer. Reserve it (in place of the numeric
+/// grid's column-index row) so the footer/key-hints aren't pushed off the bottom.
+const HDR_HEATMAP_LEGEND_ROWS: usize = 2;
+
+/// Default / min / max target longer-side pixel size for the heatmap image
+/// ([`Explorer::image_size`], `--image-size`, the `+`/`-` keys).
+const IMAGE_SIZE_DEFAULT: usize = 1600;
+const IMAGE_SIZE_MIN: usize = 128;
+const IMAGE_SIZE_MAX: usize = 4096;
+
 /// How long the "✓ Copied …" confirmation stays on screen after `c` before it
 /// auto-dismisses (it also clears on the next key press).
 const COPY_FLASH: std::time::Duration = std::time::Duration::from_secs(2);
@@ -400,6 +411,10 @@ pub struct Explorer {
     /// Requested histogram bucket count (the `b` key / `--bins`); `None` lets the
     /// layout pick automatically. Session-wide, like the other view toggles.
     histogram_bins: Cell<Option<usize>>,
+    /// Target longer-side pixel size for the heatmap image (`i` / `p` / `--image`
+    /// / `--png`), tunable with `--image-size` and the `+`/`-` keys in the inline
+    /// viewer. Session-scoped like the other view toggles.
+    image_size: Cell<usize>,
     /// Which layout the data views use (overview / edges / window). Session-
     /// scoped: remembered as you move between tensors and in/out of the preview.
     data_view_layout: Cell<DataLayout>,
@@ -489,6 +504,7 @@ impl Explorer {
             stats_cache: RefCell::new(HashMap::new()),
             histogram_cache: RefCell::new(HashMap::new()),
             histogram_bins: Cell::new(None),
+            image_size: Cell::new(IMAGE_SIZE_DEFAULT),
             data_view_layout: Cell::new(DataLayout::default()),
             data_view_row_tail: Cell::new(0.5),
             data_view_col_tail: Cell::new(0.5),
@@ -1461,6 +1477,8 @@ impl Explorer {
             Representation::Values => Legend::Values,
         };
         let overlay = want_legend.then_some(Overlay::Legend(legend));
+        // Headless `--plain`: a fixed, checkout-independent size (matches the
+        // tree/detail plain renders and the snapshot tests).
         self.data_plain(
             &tensor,
             repr,
@@ -1471,7 +1489,251 @@ impl Explorer {
             self.data_view_stripe.get(),
             self.data_view_base.get(),
             overlay.as_ref(),
+            120,
+            40,
         )
+    }
+
+    /// Rasterize the **currently sampled** heatmap grid to PNG bytes — for `i` /
+    /// `p` / `--image` / `--png`. Reads the on-screen sample from
+    /// [`Self::sample_cache`] (the headless path populates it via
+    /// [`Self::draw_data_plain`] first), so the image matches the ASCII heatmap
+    /// exactly — same orientation and aspect, just at pixel resolution with 24-bit
+    /// colour. `range` sets the colour scale (the exact whole-tensor stats when
+    /// known), falling back to the sampled range; `legend` bakes a colour-scale bar
+    /// into the image (for the saved file). `None` if no sample is cached.
+    fn render_heatmap_image_bytes(
+        &self,
+        range: Option<(f64, f64)>,
+        target_px: usize,
+        legend: bool,
+    ) -> Option<Vec<u8>> {
+        let cache = self.sample_cache.borrow();
+        let sample = &cache.as_ref()?.sample;
+        let (rmin, rmax) = range.unwrap_or((sample.min, sample.max));
+        let png = crate::img::heatmap_png(&sample.values, rmin, rmax, target_px, legend);
+        (!png.is_empty()).then_some(png)
+    }
+
+    /// The plain-text header the ASCII heatmap shows above its grid (title, file,
+    /// dtype/shape → sampled `R×C` + value range, and a 3D slice/expert line) —
+    /// rendered via [`Self::data_plain`] at `cols`×`rows` and sliced off before the
+    /// coloured block rows, so the image can carry the *same* header. Side effect:
+    /// leaves that sample in [`Self::sample_cache`], which the image then reuses.
+    fn heatmap_header_lines(
+        &self,
+        tensor: &TensorInfo,
+        slice: usize,
+        view: ViewDtype,
+        cols: u16,
+        rows: u16,
+    ) -> Vec<String> {
+        let mode = match self.data_view_layout.get() {
+            DataLayout::Edges => SampleMode::Edges {
+                row_tail: self.data_view_row_tail.get(),
+                col_tail: self.data_view_col_tail.get(),
+            },
+            DataLayout::Overview => SampleMode::Grid,
+            DataLayout::Window => SampleMode::Window {
+                row_off: self.data_view_win_row.get(),
+                col_off: self.data_view_win_col.get(),
+            },
+        };
+        let stats = self.compute_stats_sync(tensor, view);
+        let stats_view = match &stats {
+            Some(s) => StatsView::Ready(s),
+            None => StatsView::Pending,
+        };
+        let text = self
+            .data_plain(
+                tensor,
+                Representation::Heatmap,
+                slice,
+                view,
+                mode,
+                stats_view,
+                self.data_view_stripe.get(),
+                self.data_view_base.get(),
+                None,
+                cols,
+                rows,
+            )
+            .unwrap_or_default();
+        // Everything before the first coloured block row (`▀`) is the header.
+        text.lines()
+            .take_while(|l| !l.contains('▀'))
+            .map(|l| l.trim_end().to_string())
+            .collect()
+    }
+
+    /// Headless heatmap image: save a PNG (`--png PATH`) and/or emit an inline
+    /// terminal image (`--image`, iTerm2 / `imgcat`). Forces the heatmap view over
+    /// the opened tensor, defaulting to the overview layout (a full, evenly-sampled
+    /// picture) unless a specific layout was requested.
+    pub fn render_image(&mut self, png_path: Option<&Path>, inline: bool) -> Result<()> {
+        self.load_quiet()?;
+        let screen = match self.open.take() {
+            Some(mut req) => {
+                req.view = OpenView::Heatmap;
+                req.layout = req.layout.or(Some(DataLayout::Overview));
+                req.histogram = false;
+                req.bins = None;
+                req.legend = false;
+                req.exit_after = false;
+                self.open_requested(req, OpenMode::Headless)?
+                    .unwrap_or(Screen::Tree)
+            }
+            None => Screen::Tree,
+        };
+        let Screen::Data { tensor, slice, .. } = &screen else {
+            anyhow::bail!(
+                "--png/--image needs a tensor with previewable data — name one with --tensor NAME"
+            );
+        };
+        let Some(t) = self.tensors.iter().find(|t| &t.name == tensor).cloned() else {
+            anyhow::bail!("tensor not found: {tensor}");
+        };
+        let view = self.active_view(&t.name);
+        let range = self.compute_stats_sync(&t, view).map(|s| (s.min, s.max));
+        // Saved file: deterministic, checkout-independent grid (the `--plain` 120×40
+        // heatmap), with the legend baked in so the PNG is self-contained.
+        if let Some(path) = png_path {
+            self.draw_data_plain(tensor, Representation::Heatmap, *slice, false)?;
+            let png = self
+                .render_heatmap_image_bytes(range, self.image_size.get(), true)
+                .ok_or_else(|| anyhow::anyhow!("could not render a heatmap for {tensor}"))?;
+            std::fs::write(path, &png).with_context(|| format!("writing {}", path.display()))?;
+            eprintln!(
+                "checkpoint-explorer: wrote {} ({} KiB)",
+                path.display(),
+                png.len() / 1024
+            );
+        }
+        if inline {
+            // Inline: the same header the ASCII heatmap shows, then the image sized
+            // to fill the terminal (aspect preserved), then the colour-scale legend
+            // on its own line. Just emit it like `imgcat` — no terminal sniffing.
+            use std::io::Write;
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+            let header = self.heatmap_header_lines(&t, *slice, view, cols, rows);
+            let png = self
+                .render_heatmap_image_bytes(range, self.image_size.get(), false)
+                .ok_or_else(|| anyhow::anyhow!("could not render a heatmap for {tensor}"))?;
+            let (rmin, rmax) = range
+                .or_else(|| self.heatmap_image_range(&None))
+                .unwrap_or((0.0, 1.0));
+            let avail_rows = (rows as usize).saturating_sub(header.len() + 2).max(1);
+            let fit = Some(((cols as usize).max(1), avail_rows));
+            let mut out = std::io::stdout();
+            for line in &header {
+                let _ = writeln!(out, "{line}");
+            }
+            let _ = writeln!(
+                out,
+                "{}",
+                crate::img::iterm2_inline(&png, Some(tensor), fit)
+            );
+            let _ = writeln!(out, "  {}", crate::img::ansi_legend(rmin, rmax));
+            let _ = out.flush();
+        }
+        Ok(())
+    }
+
+    /// The current heatmap's colour range for the `i` / `p` image: the exact
+    /// whole-tensor stats when ready, else the on-screen sampled range — so the
+    /// image's scale matches what's displayed (and never triggers a blocking scan).
+    fn heatmap_image_range(&self, stats: &Option<Stats>) -> Option<(f64, f64)> {
+        match stats {
+            Some(s) => Some((s.min, s.max)),
+            None => self
+                .sample_cache
+                .borrow()
+                .as_ref()
+                .map(|c| (c.sample.min, c.sample.max)),
+        }
+    }
+
+    /// Show the on-screen heatmap as an inline terminal image (iTerm2): print the
+    /// same header the ASCII heatmap shows, then the image sized to fill the
+    /// terminal (aspect preserved — as big as fits), then the colour-scale legend on
+    /// its own line. `y` copies the reopen command; any other key or a click
+    /// returns; Ctrl-C quits. The caller forces a full repaint afterwards.
+    fn show_heatmap_image(
+        &self,
+        tensor: &TensorInfo,
+        slice: usize,
+        view: ViewDtype,
+        range: Option<(f64, f64)>,
+    ) {
+        use std::io::Write;
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        // Same header as the ASCII heatmap (also (re)populates the sample cache the
+        // image reuses, at this exact size).
+        let header = self.heatmap_header_lines(tensor, slice, view, cols, rows);
+        let (rmin, rmax) = range
+            .or_else(|| {
+                let c = self.sample_cache.borrow();
+                c.as_ref().map(|c| (c.sample.min, c.sample.max))
+            })
+            .unwrap_or((0.0, 1.0));
+        let Some(png) = self.render_heatmap_image_bytes(range, self.image_size.get(), false) else {
+            return;
+        };
+        // Reserve rows for the header, the legend line and the prompt line; the
+        // image fills the rest (iTerm2 preserves aspect within that cell box).
+        let avail_rows = (rows as usize).saturating_sub(header.len() + 2).max(1);
+        let fit = Some(((cols as usize).max(1), avail_rows));
+        let mut note = String::new(); // transient status appended to the prompt
+        'outer: loop {
+            let mut out = std::io::stdout();
+            let _ = write!(out, "\x1b[2J\x1b[H");
+            for line in &header {
+                let _ = write!(out, "{line}\r\n");
+            }
+            let _ = write!(
+                out,
+                "{}\r\n  {}\r\n  y copy cmd{} · any other key to return ",
+                crate::img::iterm2_inline(&png, Some(&tensor.name), fit),
+                crate::img::ansi_legend(rmin, rmax),
+                note,
+            );
+            let _ = out.flush();
+            note.clear(); // transient — shown once, then gone on the next redraw
+            // Read until we re-render (`y` copy → `continue 'outer`) or return. Ignore
+            // mouse motion / drag / wheel: capture is on, so those stream in and
+            // would otherwise close the image the instant the mouse twitches.
+            loop {
+                match event::read() {
+                    Ok(Event::Key(key)) => {
+                        if is_ctrl_c(&key) {
+                            quit_immediately();
+                        }
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                copy_to_clipboard(&self.command_for_data(
+                                    tensor,
+                                    Representation::Heatmap,
+                                    slice,
+                                ));
+                                note.push_str(" · ✓ copied");
+                                continue 'outer;
+                            }
+                            _ => return,
+                        }
+                    }
+                    Ok(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => return,
+                    Ok(_) => {} // motion / drag / wheel / resize — keep the image up
+                    Err(_) => return,
+                }
+            }
+        }
+    }
+
+    /// Set the heatmap image size from `--image-size` (clamped to the allowed
+    /// range), so `--image` / `--png` and the interactive `i` / `p` all honor it.
+    pub fn set_image_size(&self, px: usize) {
+        self.image_size
+            .set(px.clamp(IMAGE_SIZE_MIN, IMAGE_SIZE_MAX));
     }
 
     /// Compute (and cache) exact statistics for `(tensor, view)` synchronously,
@@ -1811,6 +2073,7 @@ impl Explorer {
         match overlay {
             Some(Overlay::Legend(l)) => UI::render_legend_band(frame, *l),
             Some(Overlay::Command(c)) => UI::render_command_band(frame, c),
+            Some(Overlay::Notice(m)) => UI::render_notice_band(frame, m),
             None => {}
         }
         Ok(info)
@@ -1847,6 +2110,7 @@ impl Explorer {
     /// Mirrors [`Self::detail_plain`]. On a sampling error the message is rendered
     /// in place (matching the live "Data preview unavailable" path).
     #[allow(clippy::too_many_arguments)] // mirrors the data-view sampler's params
+    #[allow(clippy::too_many_arguments)] // one render call; each arg is distinct view state
     fn data_plain(
         &self,
         tensor: &TensorInfo,
@@ -1858,8 +2122,10 @@ impl Explorer {
         stripe: StripeMode,
         base: NumBase,
         overlay: Option<&Overlay>,
+        width: u16,
+        height: u16,
     ) -> Result<String> {
-        crate::tui::headless_render(120, 40, |f| {
+        crate::tui::headless_render(width, height, |f| {
             if let Err(msg) = self.render_data_frame(
                 f, tensor, repr, slice, view, mode, stats, stripe, base, overlay,
             ) {
@@ -3677,6 +3943,7 @@ impl Explorer {
                             match overlay.as_ref() {
                                 Some(Overlay::Legend(l)) => UI::render_legend_band(f, *l),
                                 Some(Overlay::Command(c)) => UI::render_command_band(f, c),
+                                Some(Overlay::Notice(m)) => UI::render_notice_band(f, m),
                                 None => {}
                             }
                             if show_flash {
@@ -3857,6 +4124,45 @@ impl Explorer {
                             KeyCode::Char('b') | KeyCode::Char('B') => {
                                 self.data_view_base.set(self.data_view_base.get().next())
                             }
+                            // `i` shows the on-screen heatmap as a real inline
+                            // terminal image (iTerm2 / imgcat); `p` saves it as a
+                            // PNG. Both rasterize the sample that's currently drawn.
+                            KeyCode::Char('i') | KeyCode::Char('I') => {
+                                // Just emit the image (like `imgcat`) — no terminal
+                                // sniffing; tmux -CC masks the markers anyway.
+                                let range = self.heatmap_image_range(&stats);
+                                self.show_heatmap_image(tensor, slice, view, range);
+                                first = true; // repaint over the image
+                            }
+                            KeyCode::Char('p') | KeyCode::Char('P') => {
+                                let range = self.heatmap_image_range(&stats);
+                                // Saved file is self-contained: bake in the legend.
+                                if let Some(png) = self.render_heatmap_image_bytes(
+                                    range,
+                                    self.image_size.get(),
+                                    true,
+                                ) {
+                                    let default = PathBuf::from(format!(
+                                        "{}.heatmap.png",
+                                        tensor.name.replace('/', "_")
+                                    ));
+                                    if let Some(path) = self.prompt_output_path(
+                                        term,
+                                        &default,
+                                        "Save heatmap PNG as",
+                                    ) {
+                                        overlay = Some(match std::fs::write(&path, &png) {
+                                            Ok(()) => Overlay::Notice(format!(
+                                                "Saved heatmap → {} ({} KiB)",
+                                                path.display(),
+                                                png.len() / 1024
+                                            )),
+                                            Err(e) => Overlay::Notice(format!("Save failed: {e}")),
+                                        });
+                                    }
+                                    first = true; // the prompt drew over the frame
+                                }
+                            }
                             // In the edges view the arrows move the divider between
                             // the first and last blocks (Shift pushes it fully to one
                             // end): e.g. `→` slides the column divider right, growing
@@ -3982,8 +4288,11 @@ impl Explorer {
                             // Copy the data view's text to the clipboard (the same
                             // Ratatui render the `--plain` path emits).
                             KeyCode::Char('c') => {
+                                // Copy at the *live* terminal size so the text
+                                // matches exactly what's on screen (not a fixed size).
                                 if let Ok(text) = self.data_plain(
-                                    tensor, repr, slice, view, mode, stats_view, stripe, base, None,
+                                    tensor, repr, slice, view, mode, stats_view, stripe, base,
+                                    None, cols, rows,
                                 ) {
                                     copy_to_clipboard(&text);
                                 }
@@ -4297,7 +4606,9 @@ impl Explorer {
             + HDR_STATS_ROW
             + HDR_GRID_GAP_ROW
             + if slices > 1 { HDR_SLICE_ROW } else { 0 }
-            + if heatmap { 0 } else { HDR_COLINDEX_ROW };
+            // Heatmap: reserve its colour-scale legend; numeric grid: its column-
+            // index row. Both sit between the grid and the footer.
+            + if heatmap { HDR_HEATMAP_LEGEND_ROWS } else { HDR_COLINDEX_ROW };
         let footer = crate::ui::data_view_footer_lines(
             mode,
             slices,
@@ -4639,7 +4950,8 @@ impl Explorer {
             return;
         };
         let default = default_repacked_name(&input);
-        let Some(output) = self.prompt_output_path(term, &default) else {
+        let Some(output) = self.prompt_output_path(term, &default, "Save repacked checkpoint as")
+        else {
             return;
         };
         let Some(codec) = self.prompt_codec(term) else {
@@ -4836,19 +5148,13 @@ impl Explorer {
         &self,
         term: &mut crate::tui::LiveTerminal,
         default: &Path,
+        title: &str,
     ) -> Option<PathBuf> {
         let mut input = default.to_string_lossy().into_owned();
         let mut error: Option<String> = None;
         loop {
             if term
-                .draw(|f| {
-                    UI::render_text_prompt(
-                        f,
-                        "Save repacked checkpoint as",
-                        &input,
-                        error.as_deref(),
-                    )
-                })
+                .draw(|f| UI::render_text_prompt(f, title, &input, error.as_deref()))
                 .is_err()
             {
                 return None;
@@ -5183,6 +5489,15 @@ impl Explorer {
             if base != NumBase::Decimal {
                 parts.push("--base".to_string());
                 parts.push(base.label().to_string());
+            }
+        }
+        // The heatmap image size, only when tuned away from the default (it drives
+        // `i` / `p` / `--image` / `--png`, so it round-trips with the view).
+        if matches!(repr, Representation::Heatmap) {
+            let size = self.image_size.get();
+            if size != IMAGE_SIZE_DEFAULT {
+                parts.push("--image-size".to_string());
+                parts.push(size.to_string());
             }
         }
         // Slice 0 is the default, so only name a non-zero starting slice.
