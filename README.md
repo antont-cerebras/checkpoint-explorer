@@ -1,36 +1,46 @@
 # Checkpoint Explorer
 
-An interactive terminal-based explorer for [`safetensors`](https://huggingface.co/docs/safetensors), [GGUF](https://huggingface.co/docs/hub/gguf), and NumPy (`.npy` / `.npz`) files, designed to help you visualize and navigate the structure of machine learning models.
+A fast terminal UI for looking **inside** model checkpoints — not just the tree
+of tensor names and shapes, but the **actual data**: heatmaps, grids of real
+values, histograms, and exact statistics, computed right in your terminal on
+tensors of *any* size. It reads [`safetensors`](https://huggingface.co/docs/safetensors),
+[GGUF](https://huggingface.co/docs/hub/gguf), NumPy (`.npy` / `.npz`), and (opt-in)
+HDF5 (`.h5` / `.hdf5`) checkpoints; decodes **quantized / packed weights** (4-bit,
+fused-codebook MoE) so they show their true values; and ships a scriptable
+[`diff`](#comparing-checkpoints-diff) for comparing two checkpoints.
 
 ![Demo](demo.gif)
 
-## Features
+## Highlights
 
-- 🔍 **Interactive browsing** of `safetensors` and GGUF file structures
-- 📁 **Hierarchical tree view** with expandable/collapsible groups
-- 🔎 **Fuzzy search** - instantly filter tensors with fuzzy matching using `/` key
-- 🔢 **Smart numeric sorting** for layer numbers (e.g., layer.0, layer.1, layer.2, ..., layer.10)
-- 📊 **Tensor details** including shape, data type, and size
-- 📈 **Value histogram** (`h`) - on the detail screen, a whole-tensor ASCII bar
-  chart shown below the stats, with absolute counts and percentages, formed live
-  as the scan runs; one bar per value for small-integer encodings (e.g. all 16
-  values of a `u4` view), whole-number-width bins for wider integers, and
-  equal-width range bins for floats
-- 🔗 **Multi-file support** - automatically merges multiple files into a unified view
-- 📂 **Directory support** - explore entire model directories with automatic `safetensors` index detection
-- 🌟 **Glob pattern support** - use wildcards to select multiple files (e.g., `*.safetensors`, `model-*.gguf`)
-- 📏 **Human-readable sizes** (B, KB, MB, GB)
-- ⌨️ **Keyboard navigation** for smooth exploration
-- 🧠 **GGUF support** - view GGML format tensors with quantization types
-- 🔢 **NumPy support** - read `.npy` arrays and `.npz` archives (including
-  `np.savez_compressed`), with full data preview / statistics / dtype
-  reinterpretation; no extra system dependencies (pure-Rust deflate)
-- 🧊 **HDF5 checkpoint support** (opt-in `--features hdf5`) - read Cerebras-style
-  `.h5`/`.hdf5` checkpoints, showing compression status and both the logical and
-  on-disk (compressed) sizes, plus their root-attribute metadata (`__version__`,
-  per-tensor and config `__metadata__` such as `codebook_packing_schema`) — each
-  tensor's `__metadata__` (marked `†`) shown beside it in the tree, with
-  standalone config in a top-level Metadata group
+- 🔬 **See the data, not just the shape.** From any tensor, open an ASCII
+  [**heatmap**](#tensor-data-preview), a [**numeric grid**](#tensor-data-preview)
+  of real values, a [**value histogram**](#value-histogram-h), and exact
+  whole-tensor [**statistics**](#statistics) (min/max, mean, std, % zeros,
+  NaN/Inf) — computed by streaming the tensor in bounded blocks, so it works on
+  **multi-GB** tensors without loading them into RAM.
+- 🧩 **Quantized weights, decoded.** [Reinterpret packed dtypes](#dtype-override)
+  on the fly — 4-bit `u4`/`i4` nibbles, or fused-codebook **MoE experts**
+  (`unpacked`, e.g. `u3×5`) — so quantized checkpoints show their true values and
+  unmerged per-expert shapes instead of raw 16-bit blobs.
+- 🗂️ **One tool, every format.** `safetensors`, GGUF, NumPy `.npy`/`.npz`, and
+  (opt-in) Cerebras-style **HDF5** — read through a single interface, with
+  sharded/multi-file models, directories, and glob patterns merged into one tree.
+  (The data views above — heatmap/grid/histogram/stats — cover safetensors,
+  NumPy, and HDF5; **GGUF is browse-only**: its tree, quant types, and metadata.)
+- 🔀 **`diff` two checkpoints.** A scriptable [subcommand](#comparing-checkpoints-diff):
+  structural diff by default (`diff`-style exit codes), or add
+  `--values`/`--histogram` with name/dtype/shape **filters** to compare only the
+  tensors you care about — in parallel, even across huge MoE checkpoints.
+- 🌐 **Built for big & remote.** Loads only metadata (fast startup on huge
+  models), copies to your local clipboard over SSH via **OSC 52**, and a `y` key
+  prints the exact CLI command to reopen any view — shareable and scriptable.
+- 🗜️ **HDF5 repacking.** Losslessly [re-compress](#repacking-hdf5-checkpoints---features-hdf5)
+  LZ4 checkpoints with **zstd**/gzip for a smaller on-disk footprint.
+
+Plus the essentials: 🔎 fuzzy search (`/`), 🔢 natural sort for layer numbers
+(`layer.2` before `layer.10`), 📏 human-readable sizes (KiB/MiB/GiB), and full
+⌨️ keyboard navigation with browser-style back/forward history.
 
 ## Installation
 
@@ -40,7 +50,7 @@ cargo install --git https://github.com/antont-cerebras/checkpoint-explorer
 ```
 
 ### Prerequisites
-- Rust (1.70 or later)
+- Rust 1.88 or later (the crate uses edition 2024 and let-chains)
 
 ### Build from source
 ```bash
@@ -176,8 +186,10 @@ keep exploring.
 | `l` | Show a legend explaining the symbols on the current screen (works on every screen) |
 | `c` | Copy the current screen's text to the clipboard (works on every screen) |
 | `f` | Copy the selected row's File path (tensor file, or a group/root's file or directory) |
+| `n` | Copy the selected tensor's Name to the clipboard |
 | `y` | Show and copy the CLI command that reopens this exact screen — file, tensor (or metadata entry), dtype/shape overrides, view, layout, zebra, base, slice (works on every screen) |
-| `h` | Show the checkpoint health report (when there is a mismatch) |
+| `s` | (Detail screen) compute the tensor's statistics on demand |
+| `h` | **Detail screen:** show the value histogram · **tree:** show the checkpoint health report (when there is a mismatch) |
 | `R` | Repack the current HDF5 checkpoint into a new file (HDF5 only) |
 | `Backspace` / `\` | Step **back** / **forward** through the screens you've visited (browser-style history) — e.g. reopen a view you just left |
 | `Esc` | Exit search mode |
@@ -461,6 +473,23 @@ checkpoint-explorer diff old/ new/ --dtype-is BF16 --shape-is '**,2048'
 checkpoint-explorer diff old/ new/ --values --names-from tensors.txt
 ```
 
+With a filter active, a line on **stderr** reports how many tensors matched (of
+the total) and the matched names collapsed into their index-templated schema, so
+it's clear which layers / experts were covered:
+
+```
+filter [name~*_proj.weight] matched 18624 of 31251 tensor(s):
+    model.layers.{0-47}.mlp.experts.{0-127}.down_proj.weight  (×6144)
+    ...
+```
+
+Value comparison (`--values` / `--histogram`) reads each tensor's data, so it
+runs **in parallel** — `--jobs N` sets how many tensors are compared at once
+(default: number of logical CPUs; `-j 1` = sequential). In a terminal a spinner
+lists the tensors currently being compared; the total elapsed time is printed
+when it finishes. All progress goes to stderr, so a piped diff on stdout stays
+clean.
+
 Related flags: `--tensor <NAME>` focuses one tensor (with a bin-by-bin
 `--histogram` table); `--histogram` compares value *distributions* (total
 variation distance); `--dtype <VIEW>` decodes under a view (e.g. `u4`,
@@ -471,7 +500,7 @@ every entry instead of collapsing per-layer runs; `--no-color` disables colour.
 
 ```
 Checkpoint Explorer - model.safetensors (1/1)
-↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · Enter/Space expand · E/C all · / search · l legend · c copy screen · f copy file · ⌫/\ back/fwd · q quit
+↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · Enter/Space expand · E/C all · / search · l legend · c copy screen · f copy file · n copy name · y copy command · ⌫/\ back/fwd · q quit
 ────────────────────────────────────────────────────────────────────────────────
 
 ▾ model.safetensors (▦ 342, 1.5B params, 1.2 GiB)
@@ -502,8 +531,8 @@ for a directory of shards, `N files in <dir>`.
 
 ## How It Works
 
-1. **Path Resolution**: Automatically discovers `safetensors` files from files, directories, or `safetensors` index files
-2. **File Loading**: Loads one or more `safetensors` files and extracts tensor metadata
+1. **Path Resolution**: Discovers checkpoint files (`safetensors`, GGUF, `.npy`/`.npz`, and — with `--features hdf5` — HDF5) from files, directories, glob patterns, or a `safetensors` index
+2. **File Loading**: Loads one or more files and extracts tensor metadata (not the tensor data)
 3. **Tree Building**: Organizes tensors into a hierarchical structure based on their names (split by '.')
 4. **Smart Sorting**: Uses natural sorting to handle numeric components correctly
 5. **Interactive Display**: Renders the tree with expansion/collapse functionality
@@ -516,7 +545,10 @@ for a directory of shards, `N files in <dir>`.
 - GGUF files (`.gguf`) with GGML tensor types including quantized formats
 - HDF5 checkpoints (`.h5`/`.hdf5`) when built with `--features hdf5` — Cerebras
   layout (URL-quoted tensor names as top-level datasets), with per-tensor
-  compression markers (e.g. `lz4`, `gzip`) and on-disk sizes
+  compression markers (e.g. `lz4`, `gzip`) and both logical and on-disk sizes;
+  root-attribute and per-tensor `__metadata__` (e.g. `codebook_packing_schema`)
+  are surfaced in the tree — per-tensor entries marked `†`, with standalone
+  config in a top-level Metadata group
 - `safetensors` index files (`model.safetensors.index.json`)
 - Directory scanning with recursive search option
 - All tensor data types supported by the `safetensors` and GGML formats
@@ -528,14 +560,22 @@ for a directory of shards, `N files in <dir>`.
 
 ## Dependencies
 
-- `safetensors` - For reading `safetensors` files
-- `gguf` - For reading GGUF files
-- `crossterm` - For terminal UI and keyboard input
-- `clap` - For command-line argument parsing
-- `anyhow` - For error handling
-- `serde_json` - For parsing `safetensors` index files
-- `glob` - For directory pattern matching
+- `ratatui` + `crossterm` - Terminal UI, rendering, and keyboard/mouse input
+- `safetensors` - For reading `safetensors` files (GGUF and NumPy `.npy`/`.npz` are read by built-in parsers, not external crates)
+- `memmap2` - Zero-copy memory-mapped reads
+- `rayon` - Parallel statistics scans and value comparisons
+- `fuzzy-matcher` - Fuzzy tensor-name search
+- `clap` - Command-line argument parsing
+- `anyhow` - Error handling
+- `serde_json` / `colored_json` - Parsing and pretty-printing `safetensors` index + metadata JSON
+- `glob` - Directory / pattern matching
+- `zip` - Reading `.npz` archives
+- Optional (`--features hdf5`): `hdf5-metno`, `ndarray`, `lz4_flex`, `zstd`, `half` - HDF5 reading with in-process LZ4/zstd codecs
 
 ## Contributing
 
 Contributions are welcome! Please feel free to submit issues or pull requests.
+
+## Acknowledgments
+
+Inspired by [EricLBuehler/safetensors_explorer](https://github.com/EricLBuehler/safetensors_explorer).
