@@ -12,6 +12,8 @@ mod hdf5_lz4;
 mod hdf5_zstd;
 mod health;
 mod npy;
+mod remote;
+mod s3;
 mod sample;
 mod tree;
 mod tui;
@@ -225,9 +227,26 @@ struct ExploreArgs {
         help = "Print the CLI command that reopens the requested view (what `y` copies) and exit, instead of rendering"
     )]
     emit_command: bool,
+
+    #[arg(
+        long = "ssh-read",
+        value_name = "[USER@]HOST",
+        help = "Read an s3:// checkpoint's structure over SSH via cstorch on [USER@]HOST (which has the credentials + access). Nothing but the tensor metadata (names/dtypes/shapes) leaves the host; secrets stay remote. Browse-only. Use for Cerebras cstorch checkpoints on MinIO"
+    )]
+    ssh_read: Option<String>,
+
+    #[arg(
+        long = "ssh-venv",
+        value_name = "PATH",
+        help = "Path to the cstorch virtualenv on the --ssh-read host, activated with `source <PATH>/bin/activate` (default: ~/venv)"
+    )]
+    ssh_venv: Option<String>,
 }
 
 #[derive(Subcommand)]
+// Parsed once at startup; the size gap between `Convert` and the many-flag `Diff`
+// variant doesn't matter here.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Repack an HDF5 checkpoint into a new file, re-compressing every dataset
     /// with the chosen codec (e.g. gzip/zstd are ~2× smaller than the LZ4 these
@@ -333,6 +352,14 @@ enum Command {
         /// is I/O-bound, so overlapping tensors speeds the whole run up.
         #[arg(short = 'j', long = "jobs", value_name = "N")]
         jobs: Option<usize>,
+        /// Read each s3:// checkpoint's structure over SSH via cstorch on
+        /// [USER@]HOST (which holds the credentials) — secrets stay remote.
+        /// Structural diff only (dtype/shape).
+        #[arg(long = "ssh-read", value_name = "[USER@]HOST")]
+        ssh_read: Option<String>,
+        /// Path to the cstorch virtualenv on the --ssh-read host (default: ~/venv).
+        #[arg(long = "ssh-venv", value_name = "PATH")]
+        ssh_venv: Option<String>,
     },
 }
 
@@ -366,9 +393,16 @@ fn main() -> Result<()> {
             dtype_is,
             shape_is,
             jobs,
+            ssh_read,
+            ssh_venv,
         }) => {
             // `diff`-style exit codes (0 same / 1 differ / 2 trouble) don't map to
             // the `Result` convention `main` uses elsewhere, so exit explicitly.
+            // `--ssh-read`: read each checkpoint's structure via cstorch on the
+            // remote (secrets stay there).
+            let remote = ssh_read.map(|host| {
+                crate::remote::RemoteRead::new(host, ssh_venv.unwrap_or_else(|| "~/venv".into()))
+            });
             let filter = match build_tensor_filter(
                 &name,
                 names.as_deref(),
@@ -411,6 +445,7 @@ fn main() -> Result<()> {
                 opts,
                 &filter,
                 jobs,
+                remote.as_ref(),
             );
             // Report how long it took, by default (on stderr, so a piped diff on
             // stdout stays clean). Skip on trouble (exit 2) — the error already said.
@@ -704,6 +739,69 @@ fn truncate_tail(s: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
+/// Run a remote `--ssh-read` fetch on a worker thread while animating a spinner on
+/// stderr. The SSH connection is pre-authenticated (see [`run_diff`]), so the read
+/// reuses it silently and the spinner never collides with a password prompt.
+type Loaded = (Vec<TensorInfo>, Vec<MetadataInfo>);
+
+fn ssh_read_both(
+    remote: &crate::remote::RemoteRead,
+    old: &str,
+    new: &str,
+) -> Result<(Loaded, Loaded)> {
+    use std::io::Write;
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    // Both reads run concurrently over the shared (pre-authenticated) SSH
+    // connection — ssh multiplexes them as separate channels on one login.
+    let spawn = |uri: &str| {
+        let (r, u) = (remote.clone(), uri.to_string());
+        std::thread::spawn(move || r.fetch(&u))
+    };
+    let (h_old, h_new) = (spawn(old), spawn(new));
+
+    // Two in-place status lines, one per read (truncated so they never wrap and
+    // break the cursor math). ✓ once finished, spinner while running. The header
+    // makes clear only metadata is fetched — the tensor data isn't downloaded.
+    let (lo, ln) = (truncate_tail(old, 72), truncate_tail(new, 72));
+    let mut err = std::io::stderr();
+    let _ = writeln!(
+        err,
+        "checkpoint-explorer diff: reading tensor metadata via ssh:"
+    );
+    let _ = writeln!(err, "\n"); // reserve two lines; cursor now just below them
+    let mut i = 0;
+    loop {
+        let (od, nd) = (h_old.is_finished(), h_new.is_finished());
+        let mark = |done: bool| {
+            if done {
+                '✓'
+            } else {
+                FRAMES[i % FRAMES.len()]
+            }
+        };
+        let _ = write!(
+            err,
+            "\x1b[2A\r\x1b[2K  {} {lo}\n\r\x1b[2K  {} {ln}\n",
+            mark(od),
+            mark(nd)
+        );
+        let _ = err.flush();
+        if od && nd {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        i += 1;
+    }
+    let join = |h: std::thread::JoinHandle<Result<Loaded>>| {
+        h.join()
+            .map_err(|_| anyhow::anyhow!("remote read thread panicked"))?
+    };
+    Ok((
+        join(h_old).with_context(|| format!("reading {old}"))?,
+        join(h_new).with_context(|| format!("reading {new}"))?,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)] // a CLI entry point; each arg is a distinct flag
 fn run_diff(
     old: &Path,
@@ -715,22 +813,37 @@ fn run_diff(
     opts: diff::DiffOpts,
     filter: &diff::TensorFilter,
     jobs: usize,
+    remote: Option<&crate::remote::RemoteRead>,
 ) -> i32 {
-    let load = |path: &Path| -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+    // `--ssh-read`: authenticate the shared SSH connection once up front (clean
+    // prompt), so the per-read spinners below don't fight the password prompt.
+    if let Some(r) = remote
+        && let Err(e) = r.connect()
+    {
+        eprintln!("checkpoint-explorer diff: {e:#} (reads will authenticate individually)");
+    }
+    let load_local = |path: &Path| -> Result<Loaded> {
         let (files, _health) =
             collect_safetensors_files(std::slice::from_ref(&path.to_path_buf()), recursive, true)?;
         if files.is_empty() {
             anyhow::bail!("no checkpoint files found at {}", path.display());
         }
-        Explorer::gather_checkpoint(&files)
+        Explorer::gather_checkpoint(&files, None)
     };
 
-    let load_both = || -> Result<_> {
-        let o = load(old).with_context(|| format!("reading {}", old.display()))?;
-        let n = load(new).with_context(|| format!("reading {}", new.display()))?;
-        Ok((o, n))
+    // Remote: read both checkpoints concurrently over the shared SSH connection,
+    // with a spinner per read. Local: read them sequentially (header reads are
+    // cheap).
+    let loaded = match remote {
+        Some(r) => ssh_read_both(r, &old.to_string_lossy(), &new.to_string_lossy()),
+        None => (|| {
+            Ok((
+                load_local(old).with_context(|| format!("reading {}", old.display()))?,
+                load_local(new).with_context(|| format!("reading {}", new.display()))?,
+            ))
+        })(),
     };
-    let ((old_t, old_m), (new_t, new_m)) = match load_both() {
+    let ((old_t, old_m), (new_t, new_m)) = match loaded {
         Ok(v) => v,
         Err(e) => {
             eprintln!("checkpoint-explorer diff: {e:#}");
@@ -1057,8 +1170,13 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
         std::process::exit(1);
     }
 
-    let (files, health_reports) =
-        collect_safetensors_files(&args.paths, args.recursive, args.no_health_check)?;
+    // `--ssh-read` delegates the read to cstorch on a remote host, so the s3://
+    // URIs are kept verbatim (no local listing). Otherwise list local sources.
+    let (files, health_reports) = if args.ssh_read.is_some() {
+        (args.paths.clone(), Vec::new())
+    } else {
+        collect_safetensors_files(&args.paths, args.recursive, args.no_health_check)?
+    };
 
     if files.is_empty() {
         eprintln!("Error: No checkpoint files found in the specified paths.");
@@ -1160,6 +1278,10 @@ fn run_explore(args: ExploreArgs) -> Result<()> {
     });
 
     let mut explorer = Explorer::new(files, health_reports, open, !args.no_preload);
+    if let Some(host) = args.ssh_read {
+        let venv = args.ssh_venv.unwrap_or_else(|| "~/venv".to_string());
+        explorer.set_remote_read(host, venv);
+    }
     if args.emit_command {
         explorer.render_plain(true)
     } else if args.plain {
@@ -1270,6 +1392,14 @@ fn collect_safetensors_files(
     let mut health_reports = Vec::new();
 
     for path in paths {
+        // Remote checkpoints are read via `--ssh-read` (handled before this
+        // function); a bare `s3://` here has no local credentials to read it with.
+        let raw = path.to_string_lossy();
+        if s3::is_uri(&raw) {
+            eprintln!("Warning: {raw}: reading an s3:// checkpoint needs --ssh-read <[user@]host>");
+            continue;
+        }
+
         // Try to expand as glob pattern
         let expanded_paths: Vec<PathBuf> = match glob::glob(&path.to_string_lossy()) {
             Ok(paths) => paths.filter_map(Result::ok).collect(),

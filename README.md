@@ -33,8 +33,11 @@ fused-codebook MoE) so they show their true values; and ships a scriptable
   `--values`/`--histogram` with name/dtype/shape **filters** to compare only the
   tensors you care about — in parallel, even across huge MoE checkpoints.
 - 🌐 **Built for big & remote.** Loads only metadata (fast startup on huge
-  models), copies to your local clipboard over SSH via **OSC 52**, and a `y` key
-  prints the exact CLI command to reopen any view — shareable and scriptable.
+  models), and browses checkpoints on **S3 / MinIO** whose credentials never leave
+  the server, by delegating the read to a remote host over SSH (`--ssh-read` — see
+  [Remote checkpoints](#remote-checkpoints-on-s3--minio---ssh-read)). Copies to your
+  local clipboard over SSH via **OSC 52**, and a `y` key prints the exact CLI
+  command to reopen any view — shareable and scriptable.
 - 🗜️ **HDF5 repacking.** Losslessly [re-compress](#repacking-hdf5-checkpoints---features-hdf5)
   LZ4 checkpoints with **zstd**/gzip for a smaller on-disk footprint.
 
@@ -126,6 +129,33 @@ checkpoint-explorer *.safetensors *.gguf
 # Mix glob patterns with explicit paths
 checkpoint-explorer model.safetensors checkpoint-*.safetensors
 ```
+
+### Remote checkpoints on S3 / MinIO (`--ssh-read`)
+Browse a checkpoint stored in S3-compatible object storage (e.g. **MinIO**) whose
+credentials live only on a remote host — for instance a Cerebras **cstorch**
+checkpoint where access is brokered by a secrets manager and you (rightly) don't
+want to copy keys to your laptop. `--ssh-read [USER@]HOST` delegates the read to
+that host: it SSHes in, runs a tiny `cerebras.pytorch` script that opens the
+checkpoint **lazily** and dumps each tensor's name/dtype/shape as JSON, and renders
+the tree locally.
+```bash
+checkpoint-explorer --ssh-read lab@usernode \
+  s3://inference-testing/some-model/4bit/260504/checkpoint
+```
+**Nothing but that metadata leaves the server** — no keys, no endpoint, no tensor
+data — and nothing is installed on the remote beyond its existing cstorch venv +
+`python3`. The venv is activated with `source ~/venv/bin/activate` by default;
+point elsewhere with `--ssh-venv /path/to/venv`.
+
+This is **browse-only** (structure + dtype + shape); the data views (heatmap /
+numeric grid / histogram / statistics) need the bytes locally, so copy a file down
+to preview its values. `diff` takes `--ssh-read` too, for a structural (dtype/shape)
+comparison of two remote checkpoints:
+```bash
+checkpoint-explorer diff --ssh-read lab@usernode s3://…/old/checkpoint s3://…/new/checkpoint
+```
+(The SSH connection is multiplexed — the two checkpoints are read **in parallel** and
+prompt for a password only once.)
 
 ### Open a tensor directly
 Jump straight to a tensor's preview on startup instead of navigating the tree —
