@@ -77,18 +77,33 @@ fn paint(text: &str, on: bool, code: &str) -> String {
     }
 }
 
-/// Render a changed tensor's `old` and `new` signatures, colouring only the token
-/// (dtype and/or shape) that actually differs — the old side red, the new green —
-/// so the eye lands on what changed. No colour when `color` is off.
+/// Render a changed tensor's `old` and `new` signatures, colouring only what
+/// actually differs — the dtype (if it changed) and the individual shape
+/// dimensions that changed — old side red, new green, so the eye lands on the
+/// change. When the ranks differ the whole shape is coloured (dims don't line up).
+/// No colour when `color` is off.
 fn render_change(old: &TensorSig, new: &TensorSig, color: bool) -> (String, String) {
     let dtype_changed = old.dtype != new.dtype;
-    let shape_changed = old.shape != new.shape;
-    let one = |sig: &TensorSig, code: &str| {
+    let same_rank = old.shape.len() == new.shape.len();
+    let one = |sig: &TensorSig, other: &[usize], code: &str| {
         let dtype = paint(&sig.dtype, color && dtype_changed, code);
-        let shape = paint(&format_shape(&sig.shape), color && shape_changed, code);
+        let shape = if !color {
+            format_shape(&sig.shape)
+        } else if !same_rank {
+            paint(&format_shape(&sig.shape), true, code)
+        } else {
+            // Colour each dimension only where it differs from the other side.
+            let dims: Vec<String> = sig
+                .shape
+                .iter()
+                .zip(other)
+                .map(|(d, o)| paint(&d.to_string(), d != o, code))
+                .collect();
+            format!("({})", dims.join(", "))
+        };
         format!("{dtype} {shape}")
     };
-    (one(old, RED), one(new, GREEN))
+    (one(old, &new.shape, RED), one(new, &old.shape, GREEN))
 }
 
 /// Split a name into a template (each run of digits → a `{}` placeholder) and the
@@ -1062,6 +1077,35 @@ mod tests {
                 .map(|(n, v)| (n.to_string(), v.clone()))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn change_colours_only_differing_dtype_and_dims() {
+        // dtype F16→U16 and only the first dim 256→64 differ; 3072/1540 are shared.
+        let (o, n) = render_change(
+            &sig("F16", &[256, 3072, 1540]),
+            &sig("U16", &[64, 3072, 1540]),
+            true,
+        );
+        assert!(o.contains(&format!("{RED}F16{RESET}"))); // dtype coloured
+        assert!(n.contains(&format!("{GREEN}U16{RESET}")));
+        assert!(o.contains(&format!("{RED}256{RESET}"))); // changed dim coloured
+        assert!(n.contains(&format!("{GREEN}64{RESET}")));
+        // Unchanged dims are plain (not wrapped in a colour code).
+        assert!(o.contains(", 3072, 1540)") && n.contains(", 3072, 1540)"));
+    }
+
+    #[test]
+    fn change_leaves_dtype_plain_when_only_a_dim_differs() {
+        let (o, _n) = render_change(&sig("F16", &[4, 8]), &sig("F16", &[2, 8]), true);
+        assert!(!o.contains(&format!("{RED}F16"))); // dtype unchanged → not coloured
+        assert!(o.contains(&format!("({RED}4{RESET}, 8)"))); // only dim0 coloured
+    }
+
+    #[test]
+    fn change_colours_whole_shape_when_ranks_differ() {
+        let (o, _n) = render_change(&sig("F16", &[4, 8]), &sig("F16", &[32]), true);
+        assert!(o.contains(&format!("{RED}(4, 8){RESET}")));
     }
 
     #[test]
