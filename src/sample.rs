@@ -1234,6 +1234,15 @@ pub(crate) trait TensorReader {
 
 /// Open the right [`TensorReader`] for a tensor, dispatching by file extension.
 pub(crate) fn open_reader(t: &TensorInfo) -> Result<Box<dyn TensorReader>, String> {
+    // Remote sources are browse-only for now: metadata comes over S3 range reads,
+    // but the data views (heatmap/values/stats) still read locally via mmap.
+    if t.source_path.starts_with("s3://") {
+        return Err(
+            "data views are local-only for remote (s3://) sources — copy the file locally to \
+             preview its data"
+                .to_string(),
+        );
+    }
     let ext = std::path::Path::new(&t.source_path)
         .extension()
         .and_then(|e| e.to_str())

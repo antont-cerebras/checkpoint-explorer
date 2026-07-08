@@ -11,7 +11,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap, HashSet},
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -352,6 +352,9 @@ pub struct Explorer {
     files: Vec<PathBuf>,
     tensors: Vec<TensorInfo>,
     metadata: Vec<MetadataInfo>,
+    /// When set (`--ssh-read`), remote `s3://…` sources have their metadata read
+    /// over SSH via cstorch on the remote, instead of directly (browse-only).
+    remote_read: Option<crate::remote::RemoteRead>,
     /// Whether the whole checkpoint structure has been read. A direct
     /// `--tensor X` open reads just that tensor first (fast path), leaving this
     /// `false` until the tree is shown and the full load runs.
@@ -469,6 +472,7 @@ impl Explorer {
             files,
             tensors: Vec::new(),
             metadata: Vec::new(),
+            remote_read: None,
             full_loaded: false,
             tree: Vec::new(),
             selected_idx: 0,
@@ -670,7 +674,19 @@ impl Explorer {
         }
     }
 
+    /// Read `s3://…` sources' metadata over SSH via cstorch on `host` (activating
+    /// the venv at `venv`), instead of directly — so credentials stay on the
+    /// remote (`--ssh-read` / `--ssh-venv`).
+    pub fn set_remote_read(&mut self, host: String, venv: String) {
+        self.remote_read = Some(crate::remote::RemoteRead::new(host, venv));
+    }
+
     fn load_all_files(&mut self) -> Result<()> {
+        // Already loaded (e.g. a remote `--ssh-read` structure read synchronously
+        // before the TUI started) — don't re-read.
+        if self.full_loaded {
+            return Ok(());
+        }
         self.tensors.clear();
         self.metadata.clear();
 
@@ -680,7 +696,8 @@ impl Explorer {
         // a loading frame — the same header/footer chrome as the tree, with a
         // spinner in place of the rows — until the worker finishes.
         let files = self.files.clone();
-        let handle = std::thread::spawn(move || Self::gather_checkpoint(&files));
+        let remote = self.remote_read.clone();
+        let handle = std::thread::spawn(move || Self::gather_checkpoint(&files, remote.as_ref()));
 
         let label = self
             .files
@@ -726,7 +743,7 @@ impl Explorer {
     fn load_quiet(&mut self) -> Result<()> {
         self.tensors.clear();
         self.metadata.clear();
-        let (tensors, metadata) = Self::gather_checkpoint(&self.files)?;
+        let (tensors, metadata) = Self::gather_checkpoint(&self.files, self.remote_read.as_ref())?;
         self.finalize_load(tensors, metadata);
         Ok(())
     }
@@ -837,8 +854,6 @@ impl Explorer {
     }
 
     fn read_safetensors_file(file_path: &Path) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
-        let mut tensors: Vec<TensorInfo> = Vec::new();
-        let mut metadata: Vec<MetadataInfo> = Vec::new();
         let source_path = absolute_path(file_path);
         let mut file = File::open(file_path)
             .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
@@ -851,31 +866,41 @@ impl Explorer {
         let mut len_buf = [0u8; 8];
         file.read_exact(&mut len_buf)
             .with_context(|| format!("Failed to read header length: {}", file_path.display()))?;
-        let header_len = u64::from_le_bytes(len_buf) as usize;
-
-        // Guard against a corrupt or non-safetensors file claiming a huge header.
-        const MAX_HEADER_SIZE: usize = 100_000_000;
-        if header_len > MAX_HEADER_SIZE {
-            anyhow::bail!(
-                "SafeTensors header too large ({header_len} bytes): {}",
-                file_path.display()
-            );
-        }
-
+        let header_len = Self::safetensors_header_len(u64::from_le_bytes(len_buf), &source_path)?;
         let mut header_buf = vec![0u8; header_len];
         file.read_exact(&mut header_buf)
             .with_context(|| format!("Failed to read header: {}", file_path.display()))?;
+        Self::parse_safetensors_header(&header_buf, &source_path)
+    }
 
-        let header: serde_json::Value = serde_json::from_slice(&header_buf).with_context(|| {
-            format!(
-                "Failed to parse SafeTensors header: {}",
-                file_path.display()
-            )
-        })?;
+    /// Validate a safetensors header length against a sane ceiling (guards a
+    /// corrupt/non-safetensors file claiming a huge header). Shared by the local
+    /// and S3 readers.
+    fn safetensors_header_len(raw: u64, source: &str) -> Result<usize> {
+        const MAX_HEADER_SIZE: u64 = 100_000_000;
+        if raw > MAX_HEADER_SIZE {
+            anyhow::bail!("SafeTensors header too large ({raw} bytes): {source}");
+        }
+        Ok(raw as usize)
+    }
 
-        let obj = header.as_object().ok_or_else(|| {
-            anyhow::anyhow!("Invalid SafeTensors header: {}", file_path.display())
-        })?;
+    /// Parse a safetensors header (the JSON blob after the 8-byte length) into
+    /// tensors + metadata. Shared by the local-file and S3 readers; `source` is
+    /// the tensors' `source_path` (a local path or an `s3://…` URI).
+    fn parse_safetensors_header(
+        header_buf: &[u8],
+        source: &str,
+    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+        let mut tensors: Vec<TensorInfo> = Vec::new();
+        let mut metadata: Vec<MetadataInfo> = Vec::new();
+        let source_path = source.to_string();
+
+        let header: serde_json::Value = serde_json::from_slice(header_buf)
+            .with_context(|| format!("Failed to parse SafeTensors header: {source}"))?;
+
+        let obj = header
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Invalid SafeTensors header: {source}"))?;
 
         for (key, value) in obj {
             // The `__metadata__` entry holds free-form string key/value pairs.
@@ -946,26 +971,38 @@ impl Explorer {
         let source_path = absolute_path(file_path);
         let mut file = File::open(file_path)
             .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
-        let header = crate::npy::parse_header(&mut file)
-            .map_err(|e| anyhow::anyhow!("{}: {e}", file_path.display()))?;
         let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
         let name = file_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("array")
             .to_string();
+        Self::read_numpy_reader(&mut file, file_len, name, source_path)
+    }
+
+    /// Build a `.npy` tensor from a reader positioned at the start of the file:
+    /// parse the header, then record the data byte-range up to `total_len`. Shared
+    /// by the local-file and S3 readers.
+    fn read_numpy_reader<R: Read>(
+        reader: &mut R,
+        total_len: u64,
+        name: String,
+        source_path: String,
+    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+        let header =
+            crate::npy::parse_header(reader).map_err(|e| anyhow::anyhow!("{source_path}: {e}"))?;
         let num_elements = header.shape.iter().product::<usize>();
         let tensor = TensorInfo {
             name,
             dtype: header.dtype,
             shape: header.shape,
-            size_bytes: (file_len as usize).saturating_sub(header.data_offset),
+            size_bytes: (total_len as usize).saturating_sub(header.data_offset),
             num_elements,
             storage: Storage::Unknown,
             source_path,
             layout: Layout::ByteRange {
                 start: header.data_offset as u64,
-                end: file_len,
+                end: total_len,
             },
         };
         Ok((vec![tensor], Vec::new()))
@@ -975,25 +1012,35 @@ impl Explorer {
     /// `.npy` array. We read each entry's header (decompressing only that much)
     /// to list the tensors; the reader decompresses the full entry on demand.
     fn read_npz_file(file_path: &Path) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
-        let mut tensors: Vec<TensorInfo> = Vec::new();
         let source_path = absolute_path(file_path);
         let file = File::open(file_path)
             .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
-        let mut zip = zip::ZipArchive::new(file)
-            .with_context(|| format!("Failed to read .npz archive: {}", file_path.display()))?;
+        Self::read_npz_reader(file, source_path)
+    }
+
+    /// List the arrays in a `.npz` archive from a seekable reader: read each
+    /// `<name>.npy` entry's header (decompressing only that much). Shared by the
+    /// local-file reader and the S3 reader (whose seeks are range GETs).
+    fn read_npz_reader<R: Read + Seek>(
+        reader: R,
+        source_path: String,
+    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+        let mut tensors: Vec<TensorInfo> = Vec::new();
+        let mut zip = zip::ZipArchive::new(reader)
+            .with_context(|| format!("Failed to read .npz archive: {source_path}"))?;
         let entries: Vec<String> = zip.file_names().map(String::from).collect();
         for entry_name in entries {
             let Some(name) = entry_name.strip_suffix(".npy") else {
                 continue; // not an array entry
             };
-            let mut entry = zip.by_name(&entry_name).with_context(|| {
-                format!("Failed to read {entry_name} in {}", file_path.display())
-            })?;
+            let mut entry = zip
+                .by_name(&entry_name)
+                .with_context(|| format!("Failed to read {entry_name} in {source_path}"))?;
             let stored_bytes = entry.compressed_size() as usize;
             let uncompressed = entry.size() as usize;
             let compressed = entry.compression() != zip::CompressionMethod::Stored;
             let header = crate::npy::parse_header(&mut entry)
-                .map_err(|e| anyhow::anyhow!("{}: {entry_name}: {e}", file_path.display()))?;
+                .map_err(|e| anyhow::anyhow!("{source_path}: {entry_name}: {e}"))?;
             let num_elements = header.shape.iter().product::<usize>();
             let storage = if compressed {
                 Storage::Compressed {
@@ -1095,10 +1142,26 @@ impl Explorer {
     /// load a checkpoint's structure headlessly.
     pub(crate) fn gather_checkpoint(
         files: &[PathBuf],
+        remote: Option<&crate::remote::RemoteRead>,
     ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
         let mut tensors: Vec<TensorInfo> = Vec::new();
         let mut metadata: Vec<MetadataInfo> = Vec::new();
         for file_path in files {
+            let as_str = file_path.to_string_lossy();
+            if crate::s3::is_uri(&as_str) {
+                // Remote checkpoints are read via cstorch on the host (`--ssh-read`),
+                // which keeps the credentials there.
+                let Some(r) = remote else {
+                    anyhow::bail!(
+                        "{as_str}: reading an s3:// checkpoint needs --ssh-read <[user@]host> \
+                         (its credentials stay on the remote)"
+                    );
+                };
+                let (t, m) = r.fetch(&as_str)?;
+                tensors.extend(t);
+                metadata.extend(m);
+                continue;
+            }
             let (t, m) = match file_path.extension().and_then(|s| s.to_str()) {
                 Some("safetensors") => Self::read_safetensors_file(file_path)?,
                 Some("gguf") => Self::read_gguf_file(file_path)?,
@@ -1531,6 +1594,18 @@ impl Explorer {
     pub fn run(&mut self) -> Result<()> {
         if self.files.is_empty() {
             return Ok(());
+        }
+
+        // A remote (`--ssh-read`) structure read runs an interactive `ssh` that may
+        // prompt for a password/2FA. Do it BEFORE taking over the screen, so the
+        // prompt uses the normal terminal instead of fighting the loading spinner
+        // in raw mode. Synchronous (no spinner); `load_all_files` then no-ops.
+        if let Some(remote) = &self.remote_read {
+            eprintln!(
+                "checkpoint-explorer: reading tensor metadata via ssh {} …",
+                remote.host
+            );
+            self.load_quiet()?;
         }
 
         // Set up the Ratatui terminal (raw mode, cleared screen, hidden cursor,
