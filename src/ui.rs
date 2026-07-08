@@ -187,6 +187,9 @@ pub struct DrawConfig<'a> {
     pub current_file: &'a str,
     pub file_idx: usize,
     pub total_files: usize,
+    /// Read remotely (`--ssh-read`): the checkpoint is metadata-only here, so the
+    /// title carries a browse-only badge and the data views are unavailable.
+    pub browse_only: bool,
     pub selected_idx: usize,
     pub scroll_offset: usize,
     pub search_mode: bool,
@@ -372,6 +375,9 @@ pub enum Overlay {
     Legend(Legend),
     /// The copied CLI command box (`y`); holds the command to display.
     Command(String),
+    /// A browse-only / unavailable notice (e.g. a remote `--ssh-read` source has
+    /// no local bytes for data views); holds the message to display.
+    Notice(String),
 }
 
 /// Rows of chrome above the tree list: the title, the search/hint line, and the
@@ -379,6 +385,12 @@ pub enum Overlay {
 const TREE_HEADER_HEIGHT: usize = 3;
 /// Rows of chrome below the tree list: the two-line status bar.
 const TREE_FOOTER_HEIGHT: usize = 2;
+
+/// Footer rows below the tree list: the two-line status bar, plus one more for the
+/// browse-only banner when reading a remote (`--ssh-read`) checkpoint.
+fn tree_footer_height(browse_only: bool) -> usize {
+    TREE_FOOTER_HEIGHT + usize::from(browse_only)
+}
 
 /// Where the tree's vertical scroll bar sits and how a pointer over it maps to a
 /// scroll offset. Built by [`UI::tree_scrollbar`]; consumed by the renderer (to
@@ -418,25 +430,26 @@ pub struct UI;
 impl UI {
     /// How many tree rows are visible at once (one screenful), used to size a
     /// PageUp/PageDown jump. `terminal_height` is the full terminal height.
-    pub fn visible_tree_rows(terminal_height: u16) -> usize {
+    pub fn visible_tree_rows(terminal_height: u16, browse_only: bool) -> usize {
         (terminal_height as usize)
-            .saturating_sub(TREE_HEADER_HEIGHT + TREE_FOOTER_HEIGHT)
+            .saturating_sub(TREE_HEADER_HEIGHT + tree_footer_height(browse_only))
             .max(1)
     }
 
     /// Body rows visible in the tree at the given size — used to compute the
     /// scroll offset so it stays consistent with [`Self::render_tree`]'s layout
-    /// (header = title + hint/search line(s) + rule; footer = the two status
-    /// lines).
+    /// (header = title + hint/search line(s) + rule; footer = the two status lines
+    /// plus, when browsing a remote checkpoint, the browse-only banner).
     pub fn tree_visible_rows(
         width: u16,
         height: u16,
         search_mode: bool,
         can_repack: bool,
+        browse_only: bool,
     ) -> usize {
         let header = Self::tree_header_rows(width, search_mode, can_repack);
         (height as usize)
-            .saturating_sub(header + TREE_FOOTER_HEIGHT)
+            .saturating_sub(header + tree_footer_height(browse_only))
             .max(1)
     }
 
@@ -463,9 +476,10 @@ impl UI {
         height: u16,
         search_mode: bool,
         can_repack: bool,
+        browse_only: bool,
         total: usize,
     ) -> Option<TreeScrollbar> {
-        let rows = Self::tree_visible_rows(width, height, search_mode, can_repack);
+        let rows = Self::tree_visible_rows(width, height, search_mode, can_repack, browse_only);
         if width < 2 || total <= rows {
             return None; // nothing to scroll (or no room for a bar + content)
         }
@@ -529,7 +543,11 @@ impl UI {
         )));
 
         let header_rows = lines.len();
-        let body_rows = (height as usize).saturating_sub(header_rows + TREE_FOOTER_HEIGHT);
+        let footer_rows = tree_footer_height(config.browse_only);
+        let body_rows = (height as usize).saturating_sub(header_rows + footer_rows);
+        // The status bar sits above the optional browse-only banner (the extra
+        // bottom row present only for a remote checkpoint).
+        let status_lift = u16::from(config.browse_only);
 
         // A vertical scroll bar rides the rightmost column when the tree
         // overflows the viewport — but only in the live TUI; a headless
@@ -540,6 +558,7 @@ impl UI {
                 height,
                 config.search_mode,
                 config.can_repack,
+                config.browse_only,
                 config.tree.len(),
             )
         } else {
@@ -646,7 +665,7 @@ impl UI {
         Paragraph::new(row0).render(
             Rect {
                 x: 0,
-                y: height.saturating_sub(2),
+                y: height.saturating_sub(2 + status_lift),
                 width,
                 height: 1,
             },
@@ -673,12 +692,32 @@ impl UI {
         Paragraph::new(row1).render(
             Rect {
                 x: 0,
-                y: height.saturating_sub(1),
+                y: height.saturating_sub(1 + status_lift),
                 width,
                 height: 1,
             },
             frame.buffer_mut(),
         );
+
+        // Browse-only banner on the very bottom row (remote `--ssh-read` only).
+        if config.browse_only {
+            Paragraph::new(Line::from(Span::styled(
+                " browse-only — remote metadata; data views need the file locally ",
+                Style::default()
+                    .bg(palette::STATUS_BG)
+                    .fg(palette::WARN)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .render(
+                Rect {
+                    x: 0,
+                    y: height.saturating_sub(1),
+                    width,
+                    height: 1,
+                },
+                frame.buffer_mut(),
+            );
+        }
 
         // Clickable regions: each footer chip (the hint block starts at row 1,
         // below the title) plus the top-right `[×]` (→ quit the tree).
@@ -729,8 +768,12 @@ impl UI {
         let (width, height) = (area.width, area.height);
 
         let (header, stats_gauge_row) =
-            detail_field_lines(tensor, shape, view, unindexed, stats, schema);
-        let (footer, chips) = detail_footer_lines(overridable, width);
+            detail_field_lines(tensor, shape, view, unindexed, stats, schema, width);
+        let (footer, chips) = detail_footer_lines(
+            overridable,
+            crate::remote::is_remote_source(&tensor.source_path),
+            width,
+        );
         let header_len = header.len();
         let footer_len = footer.len();
         // The screen row the footer block begins on (filled in per layout branch
@@ -787,6 +830,27 @@ impl UI {
             Paragraph::new(lines).render(area, frame.buffer_mut());
         }
 
+        // Browse-only banner on the bottom row (remote `--ssh-read`) — the lower
+        // part of the detail screen is otherwise blank, so it doesn't overlap.
+        if crate::remote::is_remote_source(&tensor.source_path) {
+            Paragraph::new(Line::from(Span::styled(
+                " browse-only — remote metadata; data views need the file locally ",
+                Style::default()
+                    .bg(palette::STATUS_BG)
+                    .fg(palette::WARN)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .render(
+                Rect {
+                    x: 0,
+                    y: height.saturating_sub(1),
+                    width,
+                    height: 1,
+                },
+                frame.buffer_mut(),
+            );
+        }
+
         // The header rows sit at `y = index` in both layouts, so overlay the stats
         // progress bar (native LineGauge) on its reserved row.
         if let (Some(row), Some((ratio, label))) = (stats_gauge_row, computing_gauge(stats)) {
@@ -830,6 +894,7 @@ impl UI {
         match overlay {
             Some(Overlay::Legend(l)) => Self::render_legend_band(frame, *l),
             Some(Overlay::Command(c)) => Self::render_command_band(frame, c),
+            Some(Overlay::Notice(m)) => Self::render_notice_box(frame, m),
             None => {}
         }
         regions
@@ -1566,6 +1631,22 @@ impl UI {
                 Line::from(dim_span("Click or press any key to return...")),
             ],
             Backdrop::Fill,
+        );
+    }
+
+    /// A browse-only / unavailable notice **floated over** the live frame (the
+    /// screen behind stays visible — unlike [`Self::render_message`]), dismissed by
+    /// any key. Used for [`Overlay::Notice`].
+    pub fn render_notice_box(frame: &mut Frame, message: &str) {
+        render_popup_box(
+            frame,
+            "Browse-only",
+            vec![
+                Line::from(Span::raw(message.to_string())),
+                Line::default(),
+                Line::from(dim_span("Click or press any key to dismiss")),
+            ],
+            Backdrop::Float,
         );
     }
 
@@ -3135,6 +3216,7 @@ fn detail_field_lines(
     unindexed: bool,
     stats: StatsView,
     schema: Option<&PackingSchema>,
+    width: u16,
 ) -> (Vec<Line<'static>>, Option<usize>) {
     let mut lines: Vec<Line> = Vec::new();
 
@@ -3260,10 +3342,25 @@ fn detail_field_lines(
         Layout::None => {}
     }
 
-    lines.push(Line::from(vec![
-        dim_span("File: "),
-        Span::raw(tensor.source_path.clone()),
-    ]));
+    // Wrap the (possibly long, remote scp-style) path over several lines rather
+    // than truncating it, so the whole path stays readable. Continuation lines are
+    // indented to line up under the path after the "File: " label.
+    let prefix = "File: ";
+    let indent = " ".repeat(prefix.len());
+    let avail = (width as usize).saturating_sub(prefix.len()).max(1);
+    let path_chars: Vec<char> = tensor.source_path.chars().collect();
+    if path_chars.is_empty() {
+        lines.push(Line::from(dim_span(prefix)));
+    } else {
+        for (i, chunk) in path_chars.chunks(avail).enumerate() {
+            let seg: String = chunk.iter().collect();
+            if i == 0 {
+                lines.push(Line::from(vec![dim_span(prefix), Span::raw(seg)]));
+            } else {
+                lines.push(Line::from(vec![Span::raw(indent.clone()), Span::raw(seg)]));
+            }
+        }
+    }
     // Flag a tensor that's on disk but absent from the index.
     if unindexed {
         lines.push(Line::from(Span::styled(
@@ -3306,6 +3403,15 @@ fn detail_field_lines(
                 spans.extend(detail_computing_spans(spinner, elapsed, progress));
                 spans
             }
+            // A remote (`--ssh-read`) source has no local bytes to scan, so don't
+            // offer the (non-working) `s` hint — say it's browse-only instead.
+            StatsView::Pending if crate::remote::is_remote_source(&tensor.source_path) => vec![
+                dim_span("Statistics: "),
+                Span::styled(
+                    "unavailable — remote source, browse-only",
+                    Style::default().fg(palette::WARN),
+                ),
+            ],
             StatsView::Pending => vec![
                 dim_span("Statistics: press "),
                 key_span("s"),
@@ -3323,7 +3429,11 @@ fn detail_field_lines(
 /// The detail screen's footer hint as wrapped [`Line`]s, split into `key label,`
 /// chips that wrap at `width` (so a chip is never broken across lines). Mirrors
 /// the tree's [`tree_hint_lines`] wrapping.
-fn detail_footer_lines(overridable: bool, width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
+fn detail_footer_lines(
+    overridable: bool,
+    remote: bool,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<ChipHit>) {
     // Each chunk is a run of spans that should not be split across lines; the
     // trailing text of each (the comma + space) keeps the on-screen wording. The
     // second field lists the chunk's clickable glyphs as `(char offset within the
@@ -3335,11 +3445,24 @@ fn detail_footer_lines(overridable: bool, width: u16) -> (Vec<Line<'static>>, Ve
             vec![(0, glyph.chars().count() as u16, key)],
         )
     };
+    // The data views (heatmap/values/histogram/bins) need local bytes: dim their
+    // hints for a remote (browse-only) source so it's clear they're inactive
+    // (still clickable → the same browse-only notice as pressing the key).
+    let data_chunk = |glyph: &'static str, rest: &'static str, key: KeyEvent| -> Chunk {
+        if remote {
+            (
+                vec![dim_span(glyph), dim_span(rest)],
+                vec![(0, glyph.chars().count() as u16, key)],
+            )
+        } else {
+            key_chunk(glyph, rest, key)
+        }
+    };
     let mut chunks: Vec<Chunk> = vec![(vec![Span::raw("Press ")], vec![])];
-    chunks.push(key_chunk("m", " for a heatmap, ", hint_key('m')));
-    chunks.push(key_chunk("v", " for numeric values, ", hint_key('v')));
-    chunks.push(key_chunk("h", " for a histogram, ", hint_key('h')));
-    chunks.push(key_chunk("b", " to set its bin count, ", hint_key('b')));
+    chunks.push(data_chunk("m", " for a heatmap, ", hint_key('m')));
+    chunks.push(data_chunk("v", " for numeric values, ", hint_key('v')));
+    chunks.push(data_chunk("h", " for a histogram, ", hint_key('h')));
+    chunks.push(data_chunk("b", " to set its bin count, ", hint_key('b')));
     if overridable {
         chunks.push(key_chunk("d", " to reinterpret the dtype, ", hint_key('d')));
         chunks.push(key_chunk("r", " to reshape, ", hint_key('r')));
@@ -3706,14 +3829,14 @@ mod tests {
     #[test]
     fn tree_scrollbar_geometry_and_mapping() {
         // Everything fits the viewport → no bar.
-        assert!(UI::tree_scrollbar(80, 40, false, false, 5).is_none());
+        assert!(UI::tree_scrollbar(80, 40, false, false, false, 5).is_none());
         // Too narrow for a bar plus content → no bar.
-        assert!(UI::tree_scrollbar(1, 40, false, false, 999).is_none());
+        assert!(UI::tree_scrollbar(1, 40, false, false, false, 999).is_none());
 
         // Overflow → a bar in the rightmost column, tracking the visible rows.
-        let visible = UI::tree_visible_rows(80, 20, false, false);
-        let sb =
-            UI::tree_scrollbar(80, 20, false, false, visible + 50).expect("overflow shows bar");
+        let visible = UI::tree_visible_rows(80, 20, false, false, false);
+        let sb = UI::tree_scrollbar(80, 20, false, false, false, visible + 50)
+            .expect("overflow shows bar");
         assert_eq!(sb.col, 79);
         assert_eq!(sb.rows as usize, visible);
         assert_eq!(sb.max_offset, 50);
@@ -3749,6 +3872,7 @@ mod tests {
                 current_file: "f",
                 file_idx: 0,
                 total_files: 1,
+                browse_only: false,
                 selected_idx: 0,
                 scroll_offset: 0,
                 search_mode: false,

@@ -32,9 +32,16 @@ pub fn init() -> Result<LiveTerminal> {
     // Capture the mouse so rows can be clicked and the wheel scrolls. (This means
     // the terminal's own text selection needs Shift held — the `y`/`c` shortcuts
     // and OSC-52 copy are the primary copy paths anyway.)
+    // Clear the screen AND the scrollback, then home the cursor, before the
+    // fullscreen viewport takes over. Any pre-TUI output (e.g. the `--ssh-read`
+    // password prompt + read spinner) otherwise leaves lines the plain screen
+    // clear (`\x1b[2J`) doesn't remove from the scrollback, so the tree appears
+    // pushed down from the top.
     execute!(
         out,
         terminal::Clear(ClearType::All),
+        terminal::Clear(ClearType::Purge),
+        cursor::MoveTo(0, 0),
         cursor::Hide,
         EnableMouseCapture
     )?;

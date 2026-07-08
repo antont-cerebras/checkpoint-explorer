@@ -1,21 +1,55 @@
 //! Read a remote checkpoint's **structure** (tensor names, dtypes, shapes) by
-//! delegating to a machine that already has access to it — over SSH, running a
-//! small `cerebras.pytorch` (cstorch) script that opens the checkpoint lazily and
-//! dumps metadata as JSON. Credentials stay on the remote (nothing is copied
-//! locally), nothing is installed there beyond the existing cstorch venv +
-//! `python3`, and it works for any URI `cstorch.load` accepts (S3/MinIO cstorch
-//! checkpoints included). Browse-only: no tensor data crosses the wire.
+//! delegating to a machine that already has access to it, over one authenticated
+//! SSH session ([`crate::sftp::RemoteSession`] — pure Rust, no external binary
+//! runs locally or on the server):
+//!
+//! - a **safetensors directory or file** is read over SFTP — only each shard's
+//!   header bytes are fetched, parsed with the local safetensors parser.
+//! - an **`s3://…` cstorch checkpoint** is read by running a small
+//!   `cerebras.pytorch` script (lazy load, metadata only) in the remote venv over
+//!   an SSH exec channel — the one path that inherently needs Python/cstorch on
+//!   the remote.
+//!
+//! Both share the one session, so a read — or `diff`'s two reads — costs a single
+//! authentication / password prompt. Credentials/data stay on the remote (nothing
+//! is copied locally). Browse-only: only header/metadata bytes cross the wire.
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::collections::HashSet;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::sftp::RemoteSession;
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo};
 
 /// Line prefix the remote script tags its JSON with, so we can pick it out of any
 /// motd / cstorch chatter on the SSH stdout.
 const SENTINEL: &str = "CKPT_EXPLORER_META:";
+
+/// Upper bound on SSH sessions used to read one safetensors dir's shards in
+/// parallel (work-stealing) — roughly one per shard for a typical sharded model,
+/// so no worker is more than ~1 shard deep. If opening this many trips sshd's
+/// concurrent-connection limit (e.g. two dirs diffed at once), the refused opens
+/// just mean fewer readers and the work-stealing counter still covers every shard.
+const MAX_SHARD_SESSIONS: usize = 12;
+
+/// Per-shard header parse output, tagged with the shard's index so results from
+/// several parallel readers can be merged back into a deterministic order.
+type ShardParse = (usize, Vec<TensorInfo>, Vec<MetadataInfo>);
+
+/// Whether a tensor's `source_path` refers to a remote (`--ssh-read`) source — an
+/// `s3://…` URI or an scp-style `[user@]host:path` — for which data views aren't
+/// available locally. The scp test (a `:` before any `/`, with a non-empty host to
+/// its left) matches how `scp` itself distinguishes a remote target from a local
+/// path, so local absolute/relative paths are never misread as remote.
+pub(crate) fn is_remote_source(source_path: &str) -> bool {
+    if source_path.starts_with("s3://") {
+        return true;
+    }
+    match source_path.find(':') {
+        Some(colon) if colon > 0 => !source_path[..colon].contains('/'),
+        _ => false,
+    }
+}
 
 /// A remote host + cstorch venv to read checkpoint metadata through (`--ssh-read`
 /// / `--ssh-venv`).
@@ -25,98 +59,167 @@ pub struct RemoteRead {
     pub venv: String,
 }
 
-/// SSH options that reuse one authenticated connection across calls (so an
-/// up-front auth, then each read, all share a single login — the password/2FA
-/// prompt happens once, and reads can show a spinner without fighting it).
-const CONTROL_ARGS: [&str; 6] = [
-    "-o",
-    "ControlMaster=auto",
-    "-o",
-    "ControlPath=/tmp/ckpt-explorer-ssh-%C",
-    "-o",
-    "ControlPersist=60",
-];
-
 impl RemoteRead {
     pub fn new(host: String, venv: String) -> Self {
         RemoteRead { host, venv }
     }
 
-    /// Open (and authenticate) the shared SSH master connection up front. Any
-    /// password/2FA prompt happens here, on the normal terminal, before any
-    /// spinner; subsequent [`Self::fetch`] calls reuse it without prompting.
-    /// Best-effort — if the master can't be established (e.g. multiplexing is
-    /// disabled), the reads simply authenticate themselves.
-    pub fn connect(&self) -> Result<()> {
-        eprintln!("checkpoint-explorer: connecting to {} via ssh …", self.host);
-        let status = Command::new("ssh")
-            .args(CONTROL_ARGS)
-            .arg("-N") // no remote command …
-            .arg("-f") // … background the master once authenticated
-            .arg(&self.host)
-            .status()
-            .with_context(|| format!("spawning `ssh {}`", self.host))?;
-        if !status.success() {
-            bail!(
-                "ssh connection to {} failed (exit {:?})",
-                self.host,
-                status.code()
-            );
-        }
-        Ok(())
+    /// Read a remote checkpoint's structure over a fresh SSH session (one auth),
+    /// with a progress spinner. For several reads sharing one session/prompt (e.g.
+    /// `diff`), use [`Self::open_with`] + [`Self::read`] directly.
+    pub fn fetch(&self, src: &str) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+        let mut password = None;
+        let session = self.open_with(&mut password)?; // password prompt (before the spinner)
+        eprintln!("checkpoint-explorer: reading tensor metadata over ssh …");
+        let bars = crate::progress::Bars::start(vec![src.to_string()]);
+        let out = self.read(&session, src, &password);
+        bars.finish(0, out.is_ok());
+        bars.join();
+        out
     }
 
-    /// SSH to the host, activate the cstorch venv, run the dump script, and parse
-    /// the returned metadata into tensors. `uri` is whatever `cstorch.load`
-    /// accepts (e.g. an `s3://…` cstorch checkpoint). Tensor data is never read.
-    pub fn fetch(&self, uri: &str) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
-        let script = dump_script(uri);
-        let remote_cmd = format!("source {}/bin/activate && exec python3 -", self.venv);
-        let mut child = Command::new("ssh")
-            .args(CONTROL_ARGS)
-            .arg(&self.host)
-            .arg(&remote_cmd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()) // show ssh auth prompts + cstorch errors live
-            .spawn()
-            .with_context(|| format!("spawning `ssh {}`", self.host))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("ssh stdin unavailable"))?
-            .write_all(script.as_bytes())
-            .context("sending the metadata script to the remote")?;
-        let out = child.wait_with_output().context("waiting for ssh")?;
-        if !out.status.success() {
+    /// Open an authenticated SSH session to the host, reusing/recording a password
+    /// so a subsequent session to the same host authenticates without prompting
+    /// again — used to read two checkpoints in parallel, and a dir's shards across
+    /// a pool, all behind one prompt.
+    pub fn open_with(&self, password: &mut Option<String>) -> Result<RemoteSession> {
+        RemoteSession::connect_with(&self.host, password)
+    }
+
+    /// Read one checkpoint over an already-open session: an `s3://…` cstorch
+    /// checkpoint via the cstorch dump over an SSH exec channel, or a remote
+    /// safetensors dir/file over SFTP. Tensor data is never read. `password` (the
+    /// one already entered for `session`) lets a multi-shard dir open a few more
+    /// sessions to read shards in parallel without prompting again.
+    pub fn read(
+        &self,
+        session: &RemoteSession,
+        src: &str,
+        password: &Option<String>,
+    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+        if src.starts_with("s3://") {
+            self.read_cstorch(session, src)
+        } else {
+            self.read_dir(session, src, password)
+        }
+    }
+
+    /// A remote safetensors directory/file over SFTP. Its shards' headers are read
+    /// **in parallel** across a pool of sessions — `session` plus up to
+    /// [`MAX_SHARD_SESSIONS`]`- 1` more opened here (reusing `password`, so no extra
+    /// prompt) — sharing one **work-stealing** shard counter, then merged in shard
+    /// order deduped by name.
+    ///
+    /// Work-stealing (rather than a fixed split) means `session` starts reading
+    /// immediately while the extra sessions are still completing their SSH
+    /// handshakes — hiding that setup latency — and a session drawing a slow or
+    /// large-headered shard doesn't hold up the others. A shard is claimed with one
+    /// atomic increment; a failed extra-open just means one fewer reader, not a
+    /// failed read.
+    fn read_dir(
+        &self,
+        session: &RemoteSession,
+        path: &str,
+        password: &Option<String>,
+    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+        use std::sync::atomic::AtomicUsize;
+
+        let files = session.list_shards(path)?;
+        if files.is_empty() {
+            bail!("no safetensors files found at {}", self.source_path(path));
+        }
+        // Stamp each tensor with *its own* shard's scp-style path (not the dir), so
+        // the status line / `f` shows the exact file and it's usable with scp.
+        let displays: Vec<String> = files.iter().map(|f| self.source_path(f)).collect();
+
+        let workers = files.len().min(MAX_SHARD_SESSIONS);
+        let next = AtomicUsize::new(0);
+        let parts: Vec<Result<Vec<ShardParse>>> = std::thread::scope(|s| {
+            let (files, displays, next) = (&files, &displays, &next);
+            let mut handles = Vec::with_capacity(workers);
+            // The already-open session reads straight away.
+            handles.push(s.spawn(move || session.read_shards(files, displays, next)));
+            // Extra sessions connect in parallel, then join the same queue.
+            for _ in 1..workers {
+                handles.push(s.spawn(move || {
+                    let mut pw = password.clone();
+                    match self.open_with(&mut pw) {
+                        Ok(extra) => extra.read_shards(files, displays, next),
+                        Err(_) => Ok(Vec::new()), // one fewer reader; others cover it
+                    }
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(anyhow!("shard read thread panicked")))
+                })
+                .collect()
+        });
+
+        let mut all: Vec<ShardParse> = Vec::new();
+        for part in parts {
+            all.extend(part?);
+        }
+        let (tensors, metadata) = merge_shards(all);
+        if tensors.is_empty() {
             bail!(
-                "remote read via {} failed (ssh exit {:?}) — see the error above",
-                self.host,
-                out.status.code()
+                "no tensors in the safetensors headers at {}",
+                self.source_path(path)
             );
         }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let json = stdout
+        Ok((tensors, metadata))
+    }
+
+    /// The `source_path` stamped on each remote tensor: an `s3://…` URI as-is, or a
+    /// remote path in **scp form** `[user@]host:path` — so the status line and the
+    /// `f` (copy file path) command yield something you can hand straight to
+    /// `scp`/`rsync`, and [`is_remote_source`] can still tell it's remote (data
+    /// views need the bytes locally).
+    fn source_path(&self, src: &str) -> String {
+        if src.starts_with("s3://") {
+            src.to_string()
+        } else {
+            format!("{}:{}", self.host, src)
+        }
+    }
+
+    /// `s3://` cstorch checkpoint: run the (lazy) cstorch dump script in the venv
+    /// over an SSH exec channel and parse the sentinel-tagged JSON it prints.
+    fn read_cstorch(
+        &self,
+        session: &RemoteSession,
+        src: &str,
+    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+        let script = dump_script(src);
+        let command = format!("source {}/bin/activate && python3 -", self.venv);
+        let out = session.exec_capture(&command, &script)?;
+        let json = out
             .lines()
             .rev()
             .find_map(|l| l.strip_prefix(SENTINEL))
             .ok_or_else(|| {
                 anyhow!(
-                    "no metadata returned from {} (see any error above)",
-                    self.host
+                    "no metadata returned from {} — remote output was:\n{}",
+                    self.host,
+                    out.trim()
                 )
             })?;
-        parse_dump(json, uri)
+        parse_dump(json, &self.source_path(src))
     }
 }
 
-/// The self-contained Python dumped over SSH. The URI is embedded as a JSON string
-/// literal (valid Python), so there's nothing to quote-escape at the shell.
-fn dump_script(uri: &str) -> String {
-    let uri_lit = serde_json::to_string(uri).unwrap_or_else(|_| "\"\"".into());
+/// The cstorch dump script for an `s3://…` checkpoint: `cstorch.load` (lazy — no
+/// tensor data) and emit each tensor's name/dtype/shape/itemsize as a
+/// sentinel-tagged JSON line. The URI is embedded as a JSON string literal (valid
+/// Python), so nothing needs quoting at the shell. (Safetensors dirs/files don't
+/// use this — they're read over SFTP; see [`crate::sftp`].)
+fn dump_script(src: &str) -> String {
+    let src_lit = serde_json::to_string(src).unwrap_or_else(|_| "\"\"".into());
     const TEMPLATE: &str = r#"
 import sys, json
-URI = __URI__
+SRC = __URI__
 S = "__SENTINEL__"
 def emit(obj):
     sys.stdout.write(S + json.dumps(obj) + "\n")
@@ -126,37 +229,29 @@ try:
 except Exception as e:
     emit({"error": "import cerebras.pytorch failed: %r" % (e,)}); sys.exit(0)
 try:
-    sd = cstorch.load(URI, map_location=None)   # lazy: metadata only, no data
+    sd = cstorch.load(SRC, map_location=None)   # lazy: metadata only, no data
 except Exception as e:
     emit({"error": "cstorch.load failed: %r" % (e,)}); sys.exit(0)
-try:
-    keys = list(sd.keys())
-except Exception as e:
-    emit({"error": "listing keys failed: %r" % (e,)}); sys.exit(0)
-tensors, meta = [], []
-for name in keys:
+tensors = []
+for name in list(sd.keys()):
     try:
         t = sd[name]
-        shape = [int(d) for d in t.shape]
-        dtype = str(getattr(t, "dtype", ""))
-        try:
-            itemsize = int(t.element_size())
-        except Exception:
-            itemsize = 0
-        tensors.append({"name": str(name), "dtype": dtype, "shape": shape, "itemsize": itemsize})
+        it = int(t.element_size()) if hasattr(t, "element_size") else 0
+        tensors.append({"name": str(name), "dtype": str(getattr(t, "dtype", "")), "shape": [int(d) for d in t.shape], "itemsize": it})
     except Exception:
-        meta.append({"name": str(name)})
-emit({"tensors": tensors, "metadata": meta})
+        pass
+emit({"tensors": tensors, "metadata": []})
 "#;
     TEMPLATE
-        .replace("__URI__", &uri_lit)
+        .replace("__URI__", &src_lit)
         .replace("__SENTINEL__", SENTINEL)
 }
 
 /// Parse the remote JSON (`{tensors:[…], metadata:[…]}` or `{error:…}`) into
-/// [`TensorInfo`]s whose `source_path` is the remote URI (so display and the `y`
-/// command round-trip, and the data views correctly report themselves remote).
-fn parse_dump(json: &str, uri: &str) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+/// [`TensorInfo`]s + [`MetadataInfo`], stamping each tensor with `source_path`
+/// (already remote-marked; see [`RemoteRead::source_path`]) so display, the `y`
+/// command, and the data-view "local-only" guard all behave.
+fn parse_dump(json: &str, source_path: &str) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
     let v: serde_json::Value =
         serde_json::from_str(json).context("parsing the remote metadata JSON")?;
     if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
@@ -193,15 +288,38 @@ fn parse_dump(json: &str, uri: &str) -> Result<(Vec<TensorInfo>, Vec<MetadataInf
                 size_bytes: num_elements * itemsize,
                 num_elements,
                 storage: Storage::Unknown,
-                source_path: uri.to_string(),
+                source_path: source_path.to_string(),
                 layout: Layout::None,
             });
         }
     }
     if tensors.is_empty() {
-        bail!("the remote returned no tensors for {uri}");
+        bail!("the remote returned no tensors for {source_path}");
     }
-    Ok((tensors, Vec::new()))
+    // safetensors `__metadata__` entries (name/value/value_type), when present.
+    let metadata = v
+        .get("metadata")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let name = e.get("name").and_then(|x| x.as_str())?.to_string();
+                    let value = e.get("value").and_then(|x| x.as_str())?.to_string();
+                    let value_type = e
+                        .get("value_type")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("string")
+                        .to_string();
+                    Some(MetadataInfo {
+                        name,
+                        value,
+                        value_type,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((tensors, metadata))
 }
 
 /// Map a torch dtype string (`torch.float16`) to the display name used elsewhere
@@ -229,16 +347,70 @@ fn map_dtype(torch: &str) -> String {
     .to_string()
 }
 
+/// Merge per-shard parse results into one checkpoint: order by shard index (so the
+/// result is deterministic regardless of which parallel reader finished first),
+/// then flatten, keeping the first occurrence of each tensor / metadata name.
+fn merge_shards(mut shards: Vec<ShardParse>) -> (Vec<TensorInfo>, Vec<MetadataInfo>) {
+    shards.sort_by_key(|(idx, _, _)| *idx);
+    let (mut tensors, mut metadata) = (Vec::new(), Vec::new());
+    let (mut seen_t, mut seen_m) = (HashSet::new(), HashSet::new());
+    for (_, ts, ms) in shards {
+        for t in ts {
+            if seen_t.insert(t.name.clone()) {
+                tensors.push(t);
+            }
+        }
+        for m in ms {
+            if seen_m.insert(m.name.clone()) {
+                metadata.push(m);
+            }
+        }
+    }
+    (tensors, metadata)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn script_embeds_uri_safely() {
+    fn cstorch_script_embeds_source_safely() {
         let s = dump_script("s3://b/k");
-        assert!(s.contains("URI = \"s3://b/k\""));
+        assert!(s.contains("SRC = \"s3://b/k\""));
         assert!(s.contains("import cerebras.pytorch"));
         assert!(s.contains(SENTINEL));
+    }
+
+    #[test]
+    fn parses_safetensors_dump_with_metadata_and_marks_source() {
+        let json = r#"{"tensors":[
+            {"name":"model.embed_tokens.weight","dtype":"BF16","shape":[151936,2048],"itemsize":2}
+        ],"metadata":[{"name":"format","value":"pt","value_type":"string"}]}"#;
+        let (t, m) = parse_dump(json, "lab@host:/opt/models/ckpt").unwrap();
+        assert_eq!(t[0].dtype, "BF16");
+        assert_eq!(t[0].shape, vec![151936, 2048]);
+        assert_eq!(t[0].source_path, "lab@host:/opt/models/ckpt");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].name, "format");
+        assert_eq!(m[0].value, "pt");
+    }
+
+    #[test]
+    fn source_path_is_scp_style_but_leaves_s3() {
+        let r = RemoteRead::new("lab@host".into(), "~/venv".into());
+        assert_eq!(r.source_path("s3://b/k"), "s3://b/k");
+        assert_eq!(r.source_path("/opt/models/x"), "lab@host:/opt/models/x");
+    }
+
+    #[test]
+    fn detects_remote_sources() {
+        assert!(is_remote_source("s3://bucket/ckpt"));
+        assert!(is_remote_source("lab@host:/opt/models/x"));
+        assert!(is_remote_source("host:relative/path"));
+        // local paths are never remote, even with a ':' inside a subdir
+        assert!(!is_remote_source("/opt/models/x"));
+        assert!(!is_remote_source("./model.safetensors"));
+        assert!(!is_remote_source("dir/a:b"));
     }
 
     #[test]
@@ -268,5 +440,41 @@ mod tests {
         assert_eq!(map_dtype("torch.bfloat16"), "BF16");
         assert_eq!(map_dtype("torch.uint8"), "U8");
         assert_eq!(map_dtype("torch.weirdtype"), "WEIRDTYPE");
+    }
+
+    fn tensor(name: &str) -> TensorInfo {
+        TensorInfo {
+            name: name.to_string(),
+            dtype: "F16".into(),
+            shape: vec![1],
+            size_bytes: 2,
+            num_elements: 1,
+            storage: Storage::Unknown,
+            source_path: "h:/p".into(),
+            layout: Layout::None,
+        }
+    }
+    fn meta(name: &str) -> MetadataInfo {
+        MetadataInfo {
+            name: name.to_string(),
+            value: "v".into(),
+            value_type: "string".into(),
+        }
+    }
+
+    #[test]
+    fn merge_shards_orders_by_index_and_dedups_first_seen() {
+        // Deliberately out of order (as parallel readers may finish): shard 2 then
+        // 0 then 1. `b` appears in shards 0 and 2 → the shard-0 copy wins.
+        let parts = vec![
+            (2, vec![tensor("c")], vec![meta("fmt")]),
+            (0, vec![tensor("a"), tensor("b")], vec![meta("fmt")]),
+            (1, vec![tensor("b")], vec![]),
+        ];
+        let (t, m) = merge_shards(parts);
+        let names: Vec<&str> = t.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]); // shard order, `b` deduped
+        assert_eq!(m.len(), 1); // duplicate `fmt` metadata collapsed
+        assert_eq!(m[0].name, "fmt");
     }
 }

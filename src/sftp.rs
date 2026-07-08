@@ -1,0 +1,353 @@
+//! Pure-Rust SSH client for reading remote checkpoint metadata over a single
+//! authenticated session (via `ssh2`/libssh2) — no external binary runs, locally
+//! or on the server, and the one session is reused for everything, so there's one
+//! auth / one password prompt even for `diff`'s two reads:
+//!
+//! - a **safetensors directory/file** is read over SFTP — open each shard, read
+//!   just its header (8-byte length + JSON; SFTP fetches only the bytes we ask
+//!   for, never the multi-GB body) and parse with the local safetensors parser
+//!   ([`Explorer::parse_safetensors_header`]).
+//! - an **`s3://…` cstorch checkpoint** is read by running the lazy cstorch dump
+//!   script over an SSH *exec* channel ([`RemoteSession::exec_capture`]); the
+//!   caller ([`crate::remote`]) builds the script and parses the result.
+//!
+//! Browse-only: no tensor data crosses the wire.
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow, bail};
+use ssh2::{CheckResult, KnownHostFileKind, Session};
+
+use crate::explorer::Explorer;
+use crate::tree::{MetadataInfo, TensorInfo};
+
+/// An authenticated SSH session. Constructed once per host, then reused for every
+/// read (SFTP for safetensors dirs, an exec channel for the cstorch dump), so a
+/// checkpoint — or two, for `diff` — costs one authentication / one password
+/// prompt.
+pub struct RemoteSession {
+    session: Session,
+}
+
+impl RemoteSession {
+    /// Connect to `[user@]host[:port]`, verify the host key against
+    /// `~/.ssh/known_hosts`, and authenticate (SSH agent → default identity files
+    /// → password / keyboard-interactive prompt), reusing/recording a password in
+    /// `password` so a second connection to the same host (another parallel `diff`
+    /// side, or a shard-reading pool member) authenticates without prompting again.
+    /// Agent/key auth needs no prompt regardless. Silent — the caller announces the
+    /// connection once, so opening a pool of sessions doesn't spam the terminal.
+    pub fn connect_with(target: &str, password: &mut Option<String>) -> Result<Self> {
+        let (user, host, port) = parse_target(target);
+        let tcp = TcpStream::connect((host.as_str(), port))
+            .with_context(|| format!("connecting to {host}:{port}"))?;
+        let mut session = Session::new().context("initialising the SSH session")?;
+        session.set_tcp_stream(tcp);
+        session.handshake().context("SSH handshake failed")?;
+        verify_host_key(&session, &host, port)?;
+        authenticate(&session, &user, &host, password)?;
+        Ok(RemoteSession { session })
+    }
+
+    /// Run `command` on the host over an SSH exec channel, feed it `stdin`, and
+    /// return its combined stdout+stderr. No local process is spawned and this
+    /// reuses the session's authentication — used for the `s3://` cstorch dump.
+    pub fn exec_capture(&self, command: &str, stdin: &str) -> Result<String> {
+        let mut ch = self
+            .session
+            .channel_session()
+            .context("opening an SSH exec channel")?;
+        // Fold stderr into stdout so a single read can't deadlock on a full
+        // stderr window (and cstorch chatter is captured for error messages).
+        ch.handle_extended_data(ssh2::ExtendedData::Merge).ok();
+        ch.exec(command)
+            .with_context(|| format!("running `{command}` on the remote"))?;
+        ch.write_all(stdin.as_bytes())
+            .context("sending the script to the remote")?;
+        ch.send_eof().ok();
+        let mut out = String::new();
+        ch.read_to_string(&mut out)
+            .context("reading the remote output")?;
+        ch.wait_close().ok();
+        let code = ch.exit_status().unwrap_or(0);
+        if code != 0 {
+            bail!("remote command exited with {code}:\n{}", out.trim());
+        }
+        Ok(out)
+    }
+
+    /// List the `.safetensors` shards of a directory (or a single file) over SFTP.
+    pub fn list_shards(&self, path: &str) -> Result<Vec<String>> {
+        let sftp = self.session.sftp().context("opening the SFTP subsystem")?;
+        list_shards(&sftp, path)
+    }
+
+    /// Claim shards from the shared `next` counter and read+parse each header over
+    /// one SFTP channel, returning `(index, tensors, metadata)` per shard claimed.
+    /// Several sessions sharing one `next` split the shards dynamically
+    /// (work-stealing): each grabs the next unread shard with a single atomic
+    /// increment, so a session that finishes early takes on more and a slow one
+    /// doesn't hold up the rest. `displays[idx]` is the `source_path` stamped on the
+    /// tensors of `files[idx]`.
+    #[allow(clippy::type_complexity)]
+    pub fn read_shards(
+        &self,
+        files: &[String],
+        displays: &[String],
+        next: &std::sync::atomic::AtomicUsize,
+    ) -> Result<Vec<(usize, Vec<TensorInfo>, Vec<MetadataInfo>)>> {
+        use std::sync::atomic::Ordering;
+        let sftp = self.session.sftp().context("opening the SFTP subsystem")?;
+        let mut out = Vec::new();
+        loop {
+            let idx = next.fetch_add(1, Ordering::Relaxed);
+            if idx >= files.len() {
+                break;
+            }
+            let header = read_header(&sftp, &files[idx])?;
+            let (ts, ms) = Explorer::parse_safetensors_header(&header, &displays[idx])?;
+            out.push((idx, ts, ms));
+        }
+        Ok(out)
+    }
+}
+
+/// Split `[user@]host[:port]` into its parts, defaulting the user to `$USER` and
+/// the port to 22. A trailing `:NNNN` is only treated as a port when it parses as
+/// a port number (so bare hostnames pass through untouched).
+fn parse_target(target: &str) -> (String, String, u16) {
+    let (user, rest) = match target.split_once('@') {
+        Some((u, r)) => (u.to_string(), r),
+        None => (default_user(), target),
+    };
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(n) => (h.to_string(), n),
+            Err(_) => (rest.to_string(), 22),
+        },
+        None => (rest.to_string(), 22),
+    };
+    (user, host, port)
+}
+
+fn default_user() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "root".to_string())
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// Verify the presented host key against `~/.ssh/known_hosts`. Refuses to proceed
+/// on a mismatch (possible MITM) or when the host is unknown — no blind
+/// trust-on-first-use — so this stays as strict as the `ssh` client.
+fn verify_host_key(session: &Session, host: &str, port: u16) -> Result<()> {
+    let mut known = session.known_hosts().context("reading known hosts")?;
+    // Missing/unreadable file is fine — we still reject NotFound below.
+    let _ = known.read_file(
+        &home_dir().join(".ssh/known_hosts"),
+        KnownHostFileKind::OpenSSH,
+    );
+    let (key, _kind) = session
+        .host_key()
+        .ok_or_else(|| anyhow!("{host} presented no host key"))?;
+    match known.check_port(host, port, key) {
+        CheckResult::Match => Ok(()),
+        CheckResult::Mismatch => bail!(
+            "host key for {host} does NOT match ~/.ssh/known_hosts — refusing to connect \
+             (possible man-in-the-middle). If the host legitimately changed, run \
+             `ssh-keygen -R {host}` and reconnect with `ssh {host}` once."
+        ),
+        CheckResult::NotFound => bail!(
+            "host key for {host} is not in ~/.ssh/known_hosts. Connect once with `ssh {host}` \
+             to record it, then retry."
+        ),
+        CheckResult::Failure => bail!("could not check the host key for {host}"),
+    }
+}
+
+/// Authenticate the session: SSH agent, then unencrypted default identity files,
+/// then an interactive password / keyboard-interactive prompt (covers plain
+/// passwords and 2FA). A password entered here is cached in `password` and reused
+/// on a subsequent call for the same host (no second prompt).
+fn authenticate(
+    session: &Session,
+    user: &str,
+    host: &str,
+    password: &mut Option<String>,
+) -> Result<()> {
+    if session.userauth_agent(user).is_ok() && session.authenticated() {
+        return Ok(());
+    }
+    for key in default_keys() {
+        if session.userauth_pubkey_file(user, None, &key, None).is_ok() && session.authenticated() {
+            return Ok(());
+        }
+    }
+    let methods = session
+        .auth_methods(user)
+        .unwrap_or("password,keyboard-interactive");
+    if methods.contains("password") {
+        let pw = match password {
+            Some(p) => p.clone(),
+            None => rpassword::prompt_password(format!("{user}@{host}'s password: "))
+                .context("reading password")?,
+        };
+        if session.userauth_password(user, &pw).is_ok() && session.authenticated() {
+            *password = Some(pw);
+            return Ok(());
+        }
+    }
+    if !session.authenticated() && methods.contains("keyboard-interactive") {
+        let mut prompter = Prompter { password };
+        let ok = session
+            .userauth_keyboard_interactive(user, &mut prompter)
+            .is_ok()
+            && session.authenticated();
+        if ok {
+            return Ok(());
+        }
+    }
+    bail!("authentication to {host} failed (server offers: {methods})");
+}
+
+/// The default identity files to try (unencrypted), most-preferred first.
+fn default_keys() -> Vec<PathBuf> {
+    let ssh = home_dir().join(".ssh");
+    ["id_ed25519", "id_ecdsa", "id_rsa"]
+        .iter()
+        .map(|n| ssh.join(n))
+        .filter(|p| p.exists())
+        .collect()
+}
+
+/// Answers the server's keyboard-interactive prompts from the terminal: hidden
+/// input for password-style prompts (reusing/caching `password` so a second
+/// connection doesn't prompt again), echoed input for anything the server wants
+/// shown (e.g. a visible OTP prompt).
+struct Prompter<'a> {
+    password: &'a mut Option<String>,
+}
+
+impl ssh2::KeyboardInteractivePrompt for Prompter<'_> {
+    fn prompt<'a>(
+        &mut self,
+        _user: &str,
+        instructions: &str,
+        prompts: &[ssh2::Prompt<'a>],
+    ) -> Vec<String> {
+        if !instructions.trim().is_empty() {
+            eprintln!("{}", instructions.trim());
+        }
+        prompts
+            .iter()
+            .map(|p| {
+                if p.echo {
+                    eprint!("{}", p.text);
+                    let mut line = String::new();
+                    let _ = std::io::stdin().read_line(&mut line);
+                    line.trim_end_matches(['\n', '\r']).to_string()
+                } else if let Some(cached) = self.password.as_ref() {
+                    cached.clone()
+                } else {
+                    let entered = rpassword::prompt_password(p.text.as_ref()).unwrap_or_default();
+                    *self.password = Some(entered.clone());
+                    entered
+                }
+            })
+            .collect()
+    }
+}
+
+/// Enumerate the `.safetensors` shards of `path` (a directory or a single file):
+/// the index's `weight_map` if present, plus every `*.safetensors` in the
+/// directory (covers no-index dirs / extra shards), deduped in first-seen order.
+fn list_shards(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<String>> {
+    if path.ends_with(".safetensors") {
+        return Ok(vec![path.to_string()]);
+    }
+    let base = path.trim_end_matches('/');
+    let mut files: Vec<String> = Vec::new();
+    let index = format!("{base}/model.safetensors.index.json");
+    if let Ok(bytes) = read_all(sftp, &index)
+        && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Some(wm) = v.get("weight_map").and_then(|w| w.as_object())
+    {
+        let mut shards: Vec<&str> = wm.values().filter_map(|s| s.as_str()).collect();
+        shards.sort_unstable();
+        shards.dedup();
+        for s in shards {
+            files.push(format!("{base}/{s}"));
+        }
+    }
+    if let Ok(entries) = sftp.readdir(Path::new(base)) {
+        let mut names: Vec<String> = entries
+            .iter()
+            .filter_map(|(p, _)| p.file_name().and_then(|n| n.to_str()))
+            .filter(|n| n.ends_with(".safetensors"))
+            .map(|n| format!("{base}/{n}"))
+            .collect();
+        names.sort();
+        for f in names {
+            if !files.contains(&f) {
+                files.push(f);
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// Read a shard's safetensors header over SFTP — the 8-byte little-endian length
+/// then that many JSON bytes — without touching the tensor data that follows.
+fn read_header(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<u8>> {
+    let mut f = sftp
+        .open(Path::new(path))
+        .with_context(|| format!("opening {path}"))?;
+    let mut len_buf = [0u8; 8];
+    f.read_exact(&mut len_buf)
+        .with_context(|| format!("reading header length of {path}"))?;
+    let n = Explorer::safetensors_header_len(u64::from_le_bytes(len_buf), path)?;
+    let mut header = vec![0u8; n];
+    f.read_exact(&mut header)
+        .with_context(|| format!("reading header of {path}"))?;
+    Ok(header)
+}
+
+/// Read a small remote file (the shard index) in full over SFTP.
+fn read_all(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<u8>> {
+    let mut f = sftp
+        .open(Path::new(path))
+        .with_context(|| format!("opening {path}"))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)
+        .with_context(|| format!("reading {path}"))?;
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_targets() {
+        assert_eq!(
+            parse_target("lab@net004:2222"),
+            ("lab".into(), "net004".into(), 2222)
+        );
+        assert_eq!(parse_target("lab@host"), ("lab".into(), "host".into(), 22));
+        // a trailing non-numeric `:segment` is not a port
+        assert_eq!(
+            parse_target("host:notaport"),
+            (default_user(), "host:notaport".into(), 22)
+        );
+        // bare host → default user + port 22
+        let (_, h, p) = parse_target("box");
+        assert_eq!((h.as_str(), p), ("box", 22));
+    }
+}
