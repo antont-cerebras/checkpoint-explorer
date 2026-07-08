@@ -875,8 +875,8 @@ impl Explorer {
 
     /// Validate a safetensors header length against a sane ceiling (guards a
     /// corrupt/non-safetensors file claiming a huge header). Shared by the local
-    /// and S3 readers.
-    fn safetensors_header_len(raw: u64, source: &str) -> Result<usize> {
+    /// reader and the remote (`--ssh-read`) reader.
+    pub(crate) fn safetensors_header_len(raw: u64, source: &str) -> Result<usize> {
         const MAX_HEADER_SIZE: u64 = 100_000_000;
         if raw > MAX_HEADER_SIZE {
             anyhow::bail!("SafeTensors header too large ({raw} bytes): {source}");
@@ -885,9 +885,10 @@ impl Explorer {
     }
 
     /// Parse a safetensors header (the JSON blob after the 8-byte length) into
-    /// tensors + metadata. Shared by the local-file and S3 readers; `source` is
-    /// the tensors' `source_path` (a local path or an `s3://…` URI).
-    fn parse_safetensors_header(
+    /// tensors + metadata. Shared by the local-file reader and the remote
+    /// (`--ssh-read`) reader; `source` is the tensors' `source_path` (a local path
+    /// or an `ssh://…` marker).
+    pub(crate) fn parse_safetensors_header(
         header_buf: &[u8],
         source: &str,
     ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
@@ -1148,19 +1149,21 @@ impl Explorer {
         let mut metadata: Vec<MetadataInfo> = Vec::new();
         for file_path in files {
             let as_str = file_path.to_string_lossy();
-            if crate::s3::is_uri(&as_str) {
-                // Remote checkpoints are read via cstorch on the host (`--ssh-read`),
-                // which keeps the credentials there.
-                let Some(r) = remote else {
-                    anyhow::bail!(
-                        "{as_str}: reading an s3:// checkpoint needs --ssh-read <[user@]host> \
-                         (its credentials stay on the remote)"
-                    );
-                };
+            // `--ssh-read`: every source is read on the remote (an s3:// cstorch
+            // checkpoint, or a remote safetensors directory/file), keeping the
+            // credentials and data there.
+            if let Some(r) = remote {
                 let (t, m) = r.fetch(&as_str)?;
                 tensors.extend(t);
                 metadata.extend(m);
                 continue;
+            }
+            // Without --ssh-read a bare s3:// URI has no local credentials to read.
+            if crate::s3::is_uri(&as_str) {
+                anyhow::bail!(
+                    "{as_str}: reading an s3:// checkpoint needs --ssh-read <[user@]host> \
+                     (its credentials stay on the remote)"
+                );
             }
             let (t, m) = match file_path.extension().and_then(|s| s.to_str()) {
                 Some("safetensors") => Self::read_safetensors_file(file_path)?,
@@ -1598,13 +1601,9 @@ impl Explorer {
 
         // A remote (`--ssh-read`) structure read runs an interactive `ssh` that may
         // prompt for a password/2FA. Do it BEFORE taking over the screen, so the
-        // prompt uses the normal terminal instead of fighting the loading spinner
-        // in raw mode. Synchronous (no spinner); `load_all_files` then no-ops.
-        if let Some(remote) = &self.remote_read {
-            eprintln!(
-                "checkpoint-explorer: reading tensor metadata via ssh {} …",
-                remote.host
-            );
+        // prompt uses the normal terminal; `fetch` announces + shows a spinner
+        // after the prompt. `load_all_files` then no-ops.
+        if self.remote_read.is_some() {
             self.load_quiet()?;
         }
 
@@ -1757,6 +1756,7 @@ impl Explorer {
             current_file: &title,
             file_idx: 0,
             total_files: 1,
+            browse_only: self.remote_read.is_some(),
             selected_idx: self.selected_idx,
             scroll_offset: self.scroll_offset,
             search_mode: self.search_mode,
@@ -1886,6 +1886,7 @@ impl Explorer {
         match overlay {
             Some(Overlay::Legend(l)) => UI::render_legend_band(frame, *l),
             Some(Overlay::Command(c)) => UI::render_command_band(frame, c),
+            Some(Overlay::Notice(m)) => UI::render_notice_box(frame, m),
             None => {}
         }
         Ok(info)
@@ -1964,7 +1965,13 @@ impl Explorer {
     }
 
     fn update_tree_scroll(&mut self, width: u16, height: u16) {
-        let body = UI::tree_visible_rows(width, height, self.search_mode, self.can_repack());
+        let body = UI::tree_visible_rows(
+            width,
+            height,
+            self.search_mode,
+            self.can_repack(),
+            self.remote_read.is_some(),
+        );
         let sel = self.selected_idx;
         self.scroll_offset = if sel >= self.scroll_offset + body {
             sel.saturating_sub(body - 1)
@@ -2040,6 +2047,7 @@ impl Explorer {
                         sz.height,
                         self.search_mode,
                         self.can_repack(),
+                        self.remote_read.is_some(),
                     );
                     let total = self.current_tree_len();
                     self.scroll_offset = self.scroll_offset.min(total.saturating_sub(body));
@@ -2094,6 +2102,7 @@ impl Explorer {
                                 sz.height,
                                 self.search_mode,
                                 self.can_repack(),
+                                self.remote_read.is_some(),
                                 self.current_tree_len(),
                             )
                             && sb.hit(col, row)
@@ -2163,6 +2172,7 @@ impl Explorer {
                                 sz.height,
                                 self.search_mode,
                                 self.can_repack(),
+                                self.remote_read.is_some(),
                                 self.current_tree_len(),
                             )
                         {
@@ -2530,7 +2540,7 @@ impl Explorer {
     /// matches what's currently visible.
     fn page_rows(&self) -> usize {
         let height = terminal::size().map(|(_, h)| h).unwrap_or(40);
-        UI::visible_tree_rows(height)
+        UI::visible_tree_rows(height, self.remote_read.is_some())
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -3129,6 +3139,10 @@ impl Explorer {
         let tensor = &tensor;
         let overridable = dtype_overridable(tensor);
         let unindexed = self.unindexed.contains(&tensor.source_path);
+        // A remote (`--ssh-read`) source has no local bytes: statistics and the
+        // data views can't run, so we don't preload/scan and the data keys show a
+        // browse-only notice instead of failing.
+        let remote = crate::remote::is_remote_source(&tensor.source_path);
         // While this screen is up, compute the tensor's exact stats in the
         // background and show the scan live on the Statistics line (a spinner +
         // timer) rather than silently claiming "press s". The reduction streams
@@ -3144,7 +3158,8 @@ impl Explorer {
         let warm = self.preload
             && stats_start != StatsStart::Auto
             && interaction == Interaction::Interactive
-            && overridable;
+            && overridable
+            && !remote;
         let mut scan: Option<ScanJob> = None;
         let mut spin_frame = 0usize;
         let mut first = true;
@@ -3168,7 +3183,7 @@ impl Explorer {
                 .unwrap_or_else(|| tensor.shape.clone());
             // `--compute-stats` kicks off the scan synchronously on first open,
             // animating the spinner right here; normal browsing stays fast.
-            if first && stats_start == StatsStart::Auto {
+            if first && stats_start == StatsStart::Auto && !remote {
                 self.compute_stats_animated(term, tensor, view, |f, sv| {
                     self.render_detail_frame(
                         f,
@@ -3370,6 +3385,23 @@ impl Explorer {
                 && let Some(c) = wrong_layout_char(k)
             {
                 layout_hint = Some(c);
+                continue;
+            }
+            // Browse-only (remote): the data keys can't run without local bytes, so
+            // float a notice over the detail explaining why instead of attempting a
+            // read that fails with an erasing pop-up.
+            if remote
+                && let Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Char('m' | 'v' | 'h' | 's' | 'S' | 'b' | 'B'),
+                    ..
+                })) = &ev
+            {
+                overlay = Some(Overlay::Notice(
+                    "Read remotely with --ssh-read: only the structure is here. Data views \
+                     (heatmap, values, histogram, statistics) need the file locally — copy the \
+                     checkpoint down to preview its values."
+                        .to_string(),
+                ));
                 continue;
             }
             match ev {
@@ -3752,6 +3784,7 @@ impl Explorer {
                             match overlay.as_ref() {
                                 Some(Overlay::Legend(l)) => UI::render_legend_band(f, *l),
                                 Some(Overlay::Command(c)) => UI::render_command_band(f, c),
+                                Some(Overlay::Notice(m)) => UI::render_notice_box(f, m),
                                 None => {}
                             }
                             if show_flash {
@@ -5076,33 +5109,72 @@ impl Explorer {
         }
     }
 
+    /// The host to fold into an scp-style positional (`host:/path`) so the reopen
+    /// command matches the shorthand launch — `Some` only for a remote checkpoint
+    /// whose source is a plain path (an `s3://…` cstorch source still needs
+    /// `--ssh-read`, so `None` there and for local checkpoints).
+    fn remote_scp_host(&self) -> Option<String> {
+        let remote = self.remote_read.as_ref()?;
+        let any_s3 = self
+            .files
+            .iter()
+            .any(|f| f.to_string_lossy().starts_with("s3://"));
+        (!any_s3).then(|| remote.host.clone())
+    }
+
     /// The path argument(s) that reopen this checkpoint the way it was launched:
     /// a single file as-is, or — when every loaded file lives in one directory (a
     /// sharded checkpoint opened as a folder) — that directory, so the command
     /// references the checkpoint rather than an arbitrary shard; otherwise the
-    /// individual files.
+    /// individual files. A remote path source is rendered scp-style (`host:/path`)
+    /// so it reopens via the shorthand.
     fn checkpoint_path_parts(&self) -> Vec<String> {
-        let quote = |p: &Path| shell_quote(&p.to_string_lossy());
+        let host = self.remote_scp_host();
+        let render = |s: &str| -> String {
+            match &host {
+                Some(h) => shell_quote(&format!("{h}:{s}")),
+                None => shell_quote(s),
+            }
+        };
         match self.files.as_slice() {
             [] => Vec::new(),
-            [one] => vec![quote(one)],
+            [one] => vec![render(&one.to_string_lossy())],
             many => {
                 let set: BTreeSet<String> = many
                     .iter()
                     .map(|p| p.to_string_lossy().into_owned())
                     .collect();
                 match common_dir(&set) {
-                    Some(dir) => vec![shell_quote(&dir)],
-                    None => many.iter().map(|p| quote(p)).collect(),
+                    Some(dir) => vec![render(&dir)],
+                    None => many.iter().map(|p| render(&p.to_string_lossy())).collect(),
                 }
             }
         }
     }
 
+    /// The program name plus, for an `s3://…` remote source, `--ssh-read HOST`
+    /// (and `--ssh-venv` when non-default). A remote path source carries its host
+    /// scp-style in the path arg instead (see [`Self::checkpoint_path_parts`]), so
+    /// it needs no flag; local checkpoints get just the program name.
+    fn command_prefix(&self) -> Vec<String> {
+        let mut parts = vec![PROGRAM.to_string()];
+        if let Some(remote) = &self.remote_read
+            && self.remote_scp_host().is_none()
+        {
+            parts.push("--ssh-read".to_string());
+            parts.push(shell_quote(&remote.host));
+            if remote.venv != "~/venv" {
+                parts.push("--ssh-venv".to_string());
+                parts.push(shell_quote(&remote.venv));
+            }
+        }
+        parts
+    }
+
     /// The command that reopens the current tree: the program and the file/dir
     /// arguments it was launched with.
     fn command_for_tree(&self) -> String {
-        let mut parts = vec![PROGRAM.to_string()];
+        let mut parts = self.command_prefix();
         parts.extend(self.checkpoint_path_parts());
         parts.extend(self.tree_state_args());
         parts.join(" ")
@@ -5140,7 +5212,7 @@ impl Explorer {
             }
             // A metadata row reopens the tree with that entry revealed.
             Some((TreeNode::Metadata { info }, _)) => {
-                let mut parts = vec![PROGRAM.to_string()];
+                let mut parts = self.command_prefix();
                 parts.extend(self.checkpoint_path_parts());
                 parts.push("--metadata".to_string());
                 parts.push(shell_quote(&info.name));
@@ -5157,7 +5229,7 @@ impl Explorer {
     /// commands. Uses the checkpoint's launch path(s), not the tensor's specific
     /// shard, so a directory checkpoint reopens whole.
     fn command_base(&self, tensor: &TensorInfo) -> Vec<String> {
-        let mut parts = vec![PROGRAM.to_string()];
+        let mut parts = self.command_prefix();
         parts.extend(self.checkpoint_path_parts());
         parts.push("--tensor".to_string());
         parts.push(shell_quote(&tensor.name));

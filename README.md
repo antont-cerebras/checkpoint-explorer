@@ -130,32 +130,46 @@ checkpoint-explorer *.safetensors *.gguf
 checkpoint-explorer model.safetensors checkpoint-*.safetensors
 ```
 
-### Remote checkpoints on S3 / MinIO (`--ssh-read`)
-Browse a checkpoint stored in S3-compatible object storage (e.g. **MinIO**) whose
-credentials live only on a remote host — for instance a Cerebras **cstorch**
-checkpoint where access is brokered by a secrets manager and you (rightly) don't
-want to copy keys to your laptop. `--ssh-read [USER@]HOST` delegates the read to
-that host: it SSHes in, runs a tiny `cerebras.pytorch` script that opens the
-checkpoint **lazily** and dumps each tensor's name/dtype/shape as JSON, and renders
-the tree locally.
+### Remote checkpoints over SSH (`--ssh-read`)
+Browse a checkpoint that lives only on a remote host — either behind credentials
+you (rightly) don't want to copy to your laptop (a Cerebras **cstorch** checkpoint
+on MinIO, brokered by a secrets manager), or simply on a box you reach by SSH.
+`--ssh-read [USER@]HOST` delegates the read to that host and renders the tree
+locally. It handles:
+- a **directory of safetensors shards** (or a single `.safetensors` file) at a
+  remote path — read over **pure-Rust SFTP** (the tool speaks SSH/SFTP itself, no
+  external binary runs locally or on the server). It fetches just each shard's
+  header (via the index's `weight_map` + the dir's `*.safetensors`) and parses it
+  with the same safetensors parser used for local files. Shards are read **in
+  parallel** over a small pool of SSH sessions (the entered password is reused, so
+  still one prompt). Host keys are checked against `~/.ssh/known_hosts`; auth uses
+  your SSH agent, default keys, or a password / keyboard-interactive prompt.
+- an **`s3://…` cstorch checkpoint** — opened **lazily** by a small
+  `cerebras.pytorch` script in the remote venv (`source ~/venv/bin/activate` by
+  default; point elsewhere with `--ssh-venv /path/to/venv`). This is the one path
+  that runs anything remotely (Python/cstorch, over `ssh`), since cstorch/akeyless
+  access is the whole point of it.
 ```bash
 checkpoint-explorer --ssh-read lab@usernode \
-  s3://inference-testing/some-model/4bit/260504/checkpoint
+  /opt/cerebras/inference/models/some-model-4bit                # safetensors dir (SFTP)
+checkpoint-explorer --ssh-read lab@usernode \
+  s3://inference-testing/some-model/4bit/260504/checkpoint      # s3 cstorch
+# scp-style shorthand for a remote safetensors dir (no --ssh-read needed):
+checkpoint-explorer usernode:/opt/cerebras/inference/models/some-model-4bit
 ```
-**Nothing but that metadata leaves the server** — no keys, no endpoint, no tensor
-data — and nothing is installed on the remote beyond its existing cstorch venv +
-`python3`. The venv is activated with `source ~/venv/bin/activate` by default;
-point elsewhere with `--ssh-venv /path/to/venv`.
+**Nothing but the header metadata leaves the server** — no keys, no tensor data.
 
 This is **browse-only** (structure + dtype + shape); the data views (heatmap /
-numeric grid / histogram / statistics) need the bytes locally, so copy a file down
-to preview its values. `diff` takes `--ssh-read` too, for a structural (dtype/shape)
-comparison of two remote checkpoints:
+numeric grid / histogram / statistics) need the bytes locally, so copy the
+checkpoint down to preview its values. `diff` takes `--ssh-read` too, for a
+structural (dtype/shape) comparison of two remote checkpoints:
 ```bash
-checkpoint-explorer diff --ssh-read lab@usernode s3://…/old/checkpoint s3://…/new/checkpoint
+checkpoint-explorer diff --ssh-read lab@usernode /opt/…/model-a /opt/…/model-b
 ```
-(The SSH connection is multiplexed — the two checkpoints are read **in parallel** and
-prompt for a password only once.)
+(The two checkpoints are read **in parallel** — any mix of `s3://` and safetensors
+dirs — each with its own colour progress spinner and elapsed timer. The password
+is entered once and reused for the second connection, so you're still prompted only
+once.)
 
 ### Open a tensor directly
 Jump straight to a tensor's preview on startup instead of navigating the tree —

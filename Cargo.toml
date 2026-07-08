@@ -45,6 +45,8 @@ yansi = "1.0.1"
 ratatui = "0.29"
 unicode-width = "=0.2.0"
 ansi-to-tui = "7.0.0"
+ssh2 = { version = "0.9.6", features = ["vendored-openssl"] }
+rpassword = "7.5.4"
 
 # Unix only: flush the tty input buffer on exit (discard mouse-wheel reports
 # still queued when quitting mid-scroll) so the shell doesn't echo them as
