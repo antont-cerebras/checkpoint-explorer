@@ -1213,6 +1213,30 @@ fn meta_line_width() -> usize {
         .max(40)
 }
 
+/// Window two long, differing lines each to `max` columns around where they first
+/// diverge — `…<shared context><difference>…` — so a changed line whose values
+/// share a long prefix still shows the actual change (rather than both clipping to
+/// the same prefix). Keeps ~a quarter of the window as leading shared context.
+fn window_pair(o: &str, n: &str, max: usize) -> (String, String) {
+    let oc: Vec<char> = o.chars().collect();
+    let nc: Vec<char> = n.chars().collect();
+    let prefix = oc.iter().zip(&nc).take_while(|(a, b)| a == b).count();
+    let start = prefix.saturating_sub(max / 4);
+    let render = |chars: &[char]| -> String {
+        let end = (start + max).min(chars.len());
+        let mut s = String::new();
+        if start > 0 {
+            s.push('…');
+        }
+        s.extend(&chars[start..end]);
+        if end < chars.len() {
+            s.push('…');
+        }
+        s
+    };
+    (render(&oc), render(&nc))
+}
+
 /// Clip `line` to `max` columns, appending `…` when truncated.
 fn clip_width(line: String, max: usize) -> String {
     if line.chars().count() <= max {
@@ -1245,35 +1269,79 @@ fn pretty_json(v: &str) -> Option<String> {
 /// at [`MAX_META_DIFF_LINES`] so one huge value (e.g. a big `weight_map`) can't
 /// flood the output — the remainder is summarised as a count.
 fn write_meta_line_diff(s: &mut String, old: &str, new: &str, color: bool) {
-    use similar::{ChangeTag, TextDiff};
+    use similar::{DiffOp, TextDiff};
     let width = meta_line_width();
     let diff = TextDiff::from_lines(old, new);
+    let (ol, nl) = (diff.old_slices(), diff.new_slices());
+    let strip = |line: &str| line.strip_suffix('\n').unwrap_or(line).to_string();
     // Render the diff lines (with `⋮` between hunks), tallying total changes.
     let mut lines: Vec<String> = Vec::new();
     let (mut removed, mut added) = (0usize, 0usize);
+    // A removed/added/context line, clipped to the width from the left.
+    let push = |lines: &mut Vec<String>, sign: char, code: &str, line: &str| {
+        lines.push(paint(
+            &clip_width(format!("{sign} {line}"), width),
+            color,
+            code,
+        ));
+    };
     for (hunk, group) in diff.grouped_ops(3).iter().enumerate() {
         if hunk > 0 {
             lines.push(paint("⋮", color, DIM));
         }
         for op in group {
-            for change in diff.iter_changes(op) {
-                let (sign, code) = match change.tag() {
-                    ChangeTag::Delete => {
-                        removed += 1;
-                        ('-', RED)
+            match *op {
+                DiffOp::Equal { old_index, len, .. } => {
+                    for l in &ol[old_index..old_index + len] {
+                        push(&mut lines, ' ', DIM, &strip(l));
                     }
-                    ChangeTag::Insert => {
-                        added += 1;
-                        ('+', GREEN)
+                }
+                DiffOp::Delete {
+                    old_index, old_len, ..
+                } => {
+                    removed += old_len;
+                    for l in &ol[old_index..old_index + old_len] {
+                        push(&mut lines, '-', RED, &strip(l));
                     }
-                    ChangeTag::Equal => (' ', DIM),
-                };
-                let text = change.value();
-                let text = text.strip_suffix('\n').unwrap_or(text);
-                // Clip the (uncoloured) line to the width before colouring, so one
-                // enormous line can't flood the terminal.
-                let clipped = clip_width(format!("{sign} {text}"), width);
-                lines.push(paint(&clipped, color, code));
+                }
+                DiffOp::Insert {
+                    new_index, new_len, ..
+                } => {
+                    added += new_len;
+                    for l in &nl[new_index..new_index + new_len] {
+                        push(&mut lines, '+', GREEN, &strip(l));
+                    }
+                }
+                DiffOp::Replace {
+                    old_index,
+                    old_len,
+                    new_index,
+                    new_len,
+                } => {
+                    removed += old_len;
+                    added += new_len;
+                    // Pair replaced lines old[k]↔new[k]. When a pair is too wide to
+                    // show whole, window each around where they diverge (… diff …)
+                    // rather than clipping both to the same shared prefix.
+                    let pairs = old_len.min(new_len);
+                    for k in 0..pairs {
+                        let (o, n) = (strip(ol[old_index + k]), strip(nl[new_index + k]));
+                        if o.chars().count() > width || n.chars().count() > width {
+                            let (ow, nw) = window_pair(&o, &n, width.saturating_sub(2));
+                            lines.push(paint(&format!("- {ow}"), color, RED));
+                            lines.push(paint(&format!("+ {nw}"), color, GREEN));
+                        } else {
+                            lines.push(paint(&format!("- {o}"), color, RED));
+                            lines.push(paint(&format!("+ {n}"), color, GREEN));
+                        }
+                    }
+                    for l in &ol[old_index + pairs..old_index + old_len] {
+                        push(&mut lines, '-', RED, &strip(l));
+                    }
+                    for l in &nl[new_index + pairs..new_index + new_len] {
+                        push(&mut lines, '+', GREEN, &strip(l));
+                    }
+                }
             }
         }
     }
@@ -1676,6 +1744,21 @@ mod tests {
         assert!(line("- ", r#""v": "old""#), "{out}");
         assert!(line("+ ", r#""v": "new""#), "{out}");
         assert!(out.contains(r#""a": 1"#), "{out}"); // unchanged line kept as context
+    }
+
+    #[test]
+    fn long_changed_line_is_windowed_around_its_difference() {
+        // A single changed line whose two versions share a long prefix: each is
+        // windowed around the divergence (AAA/BBB visible), not clipped to the
+        // shared prefix.
+        let old = format!("{{\n  \"x\": \"{}AAA\"\n}}", "z".repeat(300));
+        let new = format!("{{\n  \"x\": \"{}BBB\"\n}}", "z".repeat(300));
+        let mut s = String::new();
+        write_meta_line_diff(&mut s, &old, &new, false);
+        assert!(
+            s.contains("AAA") && s.contains("BBB") && s.contains('…'),
+            "{s}"
+        );
     }
 
     #[test]
