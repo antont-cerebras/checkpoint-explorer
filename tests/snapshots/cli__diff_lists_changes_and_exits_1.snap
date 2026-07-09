@@ -7,6 +7,9 @@ expression: out
 scope: tensor structure (name, dtype, shape) — element values not compared
 legend: - removed, + added, ~ changed
 
+size: 92 B → 164 B (+72 B, +78.3%)
+params: 40 → 56 (+16, +40.0%)
+
 tensors: -1 +1 ~2 (2 unchanged)
   - lm_head.weight  [F16 (2, 2)]
   + model.rotary_emb.inv_freq  [F32 (16)]
