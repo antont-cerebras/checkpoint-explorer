@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write;
 
 use glob::{MatchOptions, Pattern};
+use serde_json::Value;
 
 use crate::sample::{HistBins, HistogramDiff, ValueDiff};
 use crate::tree::{MetadataInfo, TensorInfo};
@@ -839,8 +840,15 @@ impl DiffReport {
                     // line-by-line), else any already-multi-line value is diffed
                     // as-is. Short single-line values stay inline, windowed around
                     // where they first diverge.
-                    let line_pair = match (pretty_json(&old.value), pretty_json(&new.value)) {
-                        (Some(o), Some(n)) if is_multiline(&o) || is_multiline(&n) => Some((o, n)),
+                    let w = meta_line_width();
+                    let line_pair = match (pretty_json(&old.value, w), pretty_json(&new.value, w)) {
+                        // JSON on both sides: decide purely on the width-aware pretty
+                        // form — line diff if it expanded, else inline (small JSON
+                        // stays compact even if its raw form had newlines).
+                        (Some(o), Some(n)) => {
+                            (is_multiline(&o) || is_multiline(&n)).then_some((o, n))
+                        }
+                        // Non-JSON: line diff a raw multi-line value; else inline.
                         _ if is_multiline(&old.value) || is_multiline(&new.value) => {
                             Some((old.value.clone(), new.value.clone()))
                         }
@@ -1255,12 +1263,84 @@ fn is_multiline(v: &str) -> bool {
     v.contains('\n')
 }
 
-/// Pretty-print `v` if it parses as JSON, so a minified value gets expanded to one
-/// line per field and diffs readably (same formatter the HDF5 reader uses).
-/// `None` when it isn't JSON (a plain scalar/string stays as-is).
-fn pretty_json(v: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(v.trim()).ok()?;
-    serde_json::to_string_pretty(&value).ok()
+/// Pretty-print `v` if it parses as JSON, expanded to one field/element per line
+/// so it diffs readably — but **width-aware**: any object/array whose one-line
+/// form fits in `width` stays inline (a small `{"bit_widths": [3, 3, 3]}` isn't
+/// blown up into eight lines). `None` when `v` isn't JSON.
+fn pretty_json(v: &str, width: usize) -> Option<String> {
+    let value: Value = serde_json::from_str(v.trim()).ok()?;
+    let mut out = String::new();
+    write_json(&mut out, &value, 0, 0, width);
+    Some(out)
+}
+
+/// A JSON value on one line with `: `/`, ` separators (no newlines) — the inline
+/// form the width test compares against.
+fn compact_json(v: &Value) -> String {
+    match v {
+        Value::Object(m) => {
+            let items: Vec<String> = m
+                .iter()
+                .map(|(k, val)| {
+                    format!(
+                        "{}: {}",
+                        serde_json::to_string(k).unwrap_or_default(),
+                        compact_json(val)
+                    )
+                })
+                .collect();
+            format!("{{{}}}", items.join(", "))
+        }
+        Value::Array(a) => {
+            let items: Vec<String> = a.iter().map(compact_json).collect();
+            format!("[{}]", items.join(", "))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Write `v` starting at column `col`: inline (via [`compact_json`]) when it fits
+/// in `width`, else expanded one child per line at `indent`, recursing so nested
+/// values that fit stay inline.
+fn write_json(out: &mut String, v: &Value, indent: usize, col: usize, width: usize) {
+    let compact = compact_json(v);
+    if col + compact.chars().count() <= width || !matches!(v, Value::Object(_) | Value::Array(_)) {
+        out.push_str(&compact);
+        return;
+    }
+    let (pad, cpad) = ("  ".repeat(indent), "  ".repeat(indent + 1));
+    match v {
+        Value::Object(m) => {
+            out.push_str("{\n");
+            for (i, (k, val)) in m.iter().enumerate() {
+                let key = serde_json::to_string(k).unwrap_or_default();
+                out.push_str(&cpad);
+                out.push_str(&key);
+                out.push_str(": ");
+                write_json(
+                    out,
+                    val,
+                    indent + 1,
+                    cpad.len() + key.chars().count() + 2,
+                    width,
+                );
+                out.push_str(if i + 1 < m.len() { ",\n" } else { "\n" });
+            }
+            out.push_str(&pad);
+            out.push('}');
+        }
+        Value::Array(a) => {
+            out.push_str("[\n");
+            for (i, val) in a.iter().enumerate() {
+                out.push_str(&cpad);
+                write_json(out, val, indent + 1, cpad.len(), width);
+                out.push_str(if i + 1 < a.len() { ",\n" } else { "\n" });
+            }
+            out.push_str(&pad);
+            out.push(']');
+        }
+        _ => {}
+    }
 }
 
 /// Write a git-style line diff of two metadata values, indented under the entry
@@ -1720,21 +1800,45 @@ mod tests {
     }
 
     #[test]
-    fn pretty_json_expands_objects_only() {
-        assert!(pretty_json(r#"{"a":1,"b":2}"#).unwrap().contains('\n'));
-        assert!(pretty_json("not json").is_none());
-        assert!(pretty_json("d5f887bb41").is_none());
+    fn pretty_json_is_width_aware() {
+        // Small object fits on one line — not blown up.
+        assert!(!pretty_json(r#"{"a":1,"b":2}"#, 80).unwrap().contains('\n'));
+        // Too wide → expanded, one field per line.
+        let big = format!(
+            r#"{{"items":[{}]}}"#,
+            (0..40)
+                .map(|i| format!(r#""x{i}""#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(pretty_json(&big, 80).unwrap().contains('\n'));
+        // A nested small object stays inline even inside an expanded parent.
+        let nested = format!(r#"{{"pad":"{}","q":{{"bits":[3,3,3]}}}}"#, "z".repeat(90));
+        assert!(
+            pretty_json(&nested, 80)
+                .unwrap()
+                .contains(r#""q": {"bits": [3, 3, 3]}"#),
+            "{:?}",
+            pretty_json(&nested, 80)
+        );
+        assert!(pretty_json("not json", 80).is_none());
+        assert!(pretty_json("d5f887bb41", 80).is_none());
     }
 
     #[test]
-    fn changed_json_metadata_renders_as_a_line_diff() {
+    fn changed_large_json_metadata_renders_as_a_line_diff() {
         let mv = |v: &str| MetaVal {
             value: v.to_string(),
             value_type: "string".to_string(),
         };
-        // Minified JSON on both sides → pretty-printed then line-diffed.
-        let old = summary(&[], &[("spec", mv(r#"{"a":1,"v":"old"}"#))]);
-        let new = summary(&[], &[("spec", mv(r#"{"a":1,"v":"new"}"#))]);
+        // A JSON object large enough to expand, with one field changed.
+        let obj = |val: &str| {
+            let mut fields: Vec<String> = (0..20).map(|i| format!(r#""k{i}":"x""#)).collect();
+            fields.push(format!(r#""v":"{val}""#));
+            format!("{{{}}}", fields.join(","))
+        };
+        let old = summary(&[], &[("spec", mv(&obj("old")))]);
+        let new = summary(&[], &[("spec", mv(&obj("new")))]);
         let out = compare(&old, &new).render("o", "n", PLAIN);
         assert!(out.contains("~ spec:"), "{out}"); // line-diff header, not `= … → …`
         let line = |sign: &str, needle: &str| {
@@ -1743,7 +1847,6 @@ mod tests {
         };
         assert!(line("- ", r#""v": "old""#), "{out}");
         assert!(line("+ ", r#""v": "new""#), "{out}");
-        assert!(out.contains(r#""a": 1"#), "{out}"); // unchanged line kept as context
     }
 
     #[test]
