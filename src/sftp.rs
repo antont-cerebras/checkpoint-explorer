@@ -41,14 +41,27 @@ impl RemoteSession {
     /// connection once, so opening a pool of sessions doesn't spam the terminal.
     pub fn connect_with(target: &str, password: &mut Option<String>) -> Result<Self> {
         let (user, host, port) = parse_target(target);
-        let tcp = TcpStream::connect((host.as_str(), port))
-            .with_context(|| format!("connecting to {host}:{port}"))?;
-        let mut session = Session::new().context("initialising the SSH session")?;
-        session.set_tcp_stream(tcp);
-        session.handshake().context("SSH handshake failed")?;
-        verify_host_key(&session, &host, port)?;
-        authenticate(&session, &user, &host, password)?;
-        Ok(RemoteSession { session })
+        // A rejected password leaves the ssh2 session unusable for anything else, so
+        // each attempt authenticates on a *fresh* connection (rather than retrying
+        // on the tainted one, which then fails the read). A freshly-prompted
+        // password gets a few tries — re-prompting on a new connection each time;
+        // a cached one (reused for a second connection) gets a single try, no loop.
+        let max_attempts = if password.is_some() { 1 } else { 3 };
+        let mut last_err = None;
+        for attempt in 1..=max_attempts {
+            let session = handshake(&host, port)?;
+            match authenticate(&session, &user, &host, password) {
+                Ok(()) => return Ok(RemoteSession { session }),
+                Err(e) => {
+                    if attempt < max_attempts {
+                        eprintln!("checkpoint-explorer: {e} — try again");
+                        *password = None; // re-prompt on the next attempt
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.expect("at least one attempt was made"))
     }
 
     /// Run `command` on the host over an SSH exec channel, feed it `stdin`, and
@@ -172,10 +185,26 @@ fn verify_host_key(session: &Session, host: &str, port: u16) -> Result<()> {
     }
 }
 
+/// TCP-connect, SSH-handshake, and verify the host key — a fresh, unauthenticated
+/// session ready for one authentication attempt.
+fn handshake(host: &str, port: u16) -> Result<Session> {
+    let tcp =
+        TcpStream::connect((host, port)).with_context(|| format!("connecting to {host}:{port}"))?;
+    let mut session = Session::new().context("initialising the SSH session")?;
+    session.set_tcp_stream(tcp);
+    session.handshake().context("SSH handshake failed")?;
+    verify_host_key(&session, host, port)?;
+    Ok(session)
+}
+
 /// Authenticate the session: SSH agent, then unencrypted default identity files,
-/// then an interactive password / keyboard-interactive prompt (covers plain
-/// passwords and 2FA). A password entered here is cached in `password` and reused
-/// on a subsequent call for the same host (no second prompt).
+/// then a single password method — `password` auth if the server offers it, else
+/// keyboard-interactive (covering plain passwords and 2FA). Exactly one password
+/// method is tried per session: a rejected `userauth_password` taints the session,
+/// so falling through to keyboard-interactive on it would authenticate a
+/// connection that then can't run a channel. A wrong password fails here; the
+/// caller retries on a fresh connection. A password entered here is cached in
+/// `password` and reused on a subsequent call for the same host (no second prompt).
 fn authenticate(
     session: &Session,
     user: &str,
@@ -203,18 +232,20 @@ fn authenticate(
             *password = Some(pw);
             return Ok(());
         }
+        bail!("authentication to {host} failed");
     }
-    if !session.authenticated() && methods.contains("keyboard-interactive") {
+    if methods.contains("keyboard-interactive") {
         let mut prompter = Prompter { password };
-        let ok = session
+        if session
             .userauth_keyboard_interactive(user, &mut prompter)
             .is_ok()
-            && session.authenticated();
-        if ok {
+            && session.authenticated()
+        {
             return Ok(());
         }
+        bail!("authentication to {host} failed");
     }
-    bail!("authentication to {host} failed (server offers: {methods})");
+    bail!("no supported authentication method for {host} (server offers: {methods})");
 }
 
 /// The default identity files to try (unencrypted), most-preferred first.
