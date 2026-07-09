@@ -28,13 +28,18 @@ fused-codebook MoE) so they show their true values; and ships a scriptable
   sharded/multi-file models, directories, and glob patterns merged into one tree.
   (The data views above — heatmap/grid/histogram/stats — cover safetensors,
   NumPy, and HDF5; **GGUF is browse-only**: its tree, quant types, and metadata.)
-- 🔀 **`diff` two checkpoints.** A scriptable [subcommand](#comparing-checkpoints-diff):
-  structural diff by default (`diff`-style exit codes), or add
-  `--values`/`--histogram` with name/dtype/shape **filters** to compare only the
-  tensors you care about — in parallel, even across huge MoE checkpoints.
+- 🔀 **`diff` two checkpoints — local or remote.** A scriptable
+  [subcommand](#comparing-checkpoints-diff): structural diff by default
+  (`diff`-style exit codes) with a coloured, readable summary — overall size and
+  parameter-count change, per-tensor dtype/shape changes, and git-style line diffs
+  for metadata — or add `--values`/`--histogram` with name/dtype/shape **filters**
+  to compare only the tensors you care about, in parallel even across huge MoE
+  checkpoints. Diffs **S3 / MinIO** and remote-SSH checkpoints too (`--ssh-read`),
+  so you can compare two deployed checkpoints without downloading either.
 - 🌐 **Built for big & remote.** Loads only metadata (fast startup on huge
-  models), and browses checkpoints on **S3 / MinIO** whose credentials never leave
-  the server, by delegating the read to a remote host over SSH (`--ssh-read` — see
+  models), and **browses *and* diffs checkpoints on S3 / MinIO** — or any box you
+  reach by SSH — whose credentials never leave the server, by delegating the read
+  to a remote host (`--ssh-read`, or an scp-style `host:/path`; see
   [Remote checkpoints](#remote-checkpoints-on-s3--minio---ssh-read)). Copies to your
   local clipboard over SSH via **OSC 52**, and a `y` key prints the exact CLI
   command to reopen any view — shareable and scriptable.
@@ -490,6 +495,12 @@ checkpoint-explorer diff old.safetensors new.safetensors
 # change to a difference and reports max/mean |Δ|. Reads the data.
 checkpoint-explorer diff old.safetensors new.safetensors --values
 ```
+
+A remote structural diff of two `s3://` cstorch checkpoints — read over a single
+SSH session (one password prompt), rendered in colour (old **red**, new **green**,
+secondary detail dimmed):
+
+![diff --ssh-read comparing two remote S3 checkpoints](diff-example.svg)
 
 **Comparing a subset of tensors.** Any of the filters below scopes the whole
 diff (structural *and* `--values`/`--histogram`) to the matching tensors, so you
