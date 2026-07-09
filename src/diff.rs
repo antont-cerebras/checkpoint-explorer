@@ -661,8 +661,13 @@ impl DiffReport {
         };
 
         let mut s = String::new();
-        let _ = writeln!(s, "--- {old_label}");
-        let _ = writeln!(s, "+++ {new_label}");
+        // Old side red, new side green — the same convention as the entries/totals.
+        let _ = writeln!(s, "{}", paint(&format!("--- {old_label}"), opts.color, RED));
+        let _ = writeln!(
+            s,
+            "{}",
+            paint(&format!("+++ {new_label}"), opts.color, GREEN)
+        );
 
         // Spell out what was (and wasn't) compared, and what the -/+/~ markers on
         // the summary and the entries below mean.
@@ -969,8 +974,8 @@ pub fn render_tensor_focus(
     color: bool,
 ) -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "--- {old_label}");
-    let _ = writeln!(s, "+++ {new_label}");
+    let _ = writeln!(s, "{}", paint(&format!("--- {old_label}"), color, RED));
+    let _ = writeln!(s, "{}", paint(&format!("+++ {new_label}"), color, GREEN));
     let _ = writeln!(s);
     match (old, new) {
         (Some(o), None) => {
@@ -1535,6 +1540,23 @@ mod tests {
         histogram: false,
         filtered: false,
     };
+
+    const COLOUR: DiffOpts = DiffOpts {
+        color: true,
+        metadata: true,
+        group: true,
+        values: false,
+        histogram: false,
+        filtered: false,
+    };
+
+    #[test]
+    fn header_colours_old_red_new_green() {
+        let s = summary(&[("a", sig("F16", &[2]))], &[]);
+        let out = compare(&s, &s).render("OLD", "NEW", COLOUR);
+        assert!(out.contains("\x1b[31m--- OLD\x1b[0m"), "{out}");
+        assert!(out.contains("\x1b[32m+++ NEW\x1b[0m"), "{out}");
+    }
 
     fn vd(differing: u64, elements: u64, max_abs: f64, mean_abs: f64) -> ValueDiff {
         ValueDiff {
