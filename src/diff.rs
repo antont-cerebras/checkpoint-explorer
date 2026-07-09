@@ -834,16 +834,30 @@ impl DiffReport {
                 let name = display_name(&g.template, &g.indices);
                 let suffix = count_suffix(g.count);
                 if old.value != new.value {
-                    // Window each value around where they first diverge, so the
-                    // actual change shows even in a long JSON blob (a plain head
-                    // truncation would print the same shared prefix for both).
-                    let (o, n) = quote_diff(&old.value, &new.value);
-                    let _ = writeln!(
-                        s,
-                        "  ~ {name} = {} → {}{suffix}",
-                        paint(&o, opts.color, RED),
-                        paint(&n, opts.color, GREEN),
-                    );
+                    // Prefer a git-style line diff for long values: JSON is
+                    // pretty-printed first (so even a minified one-liner diffs
+                    // line-by-line), else any already-multi-line value is diffed
+                    // as-is. Short single-line values stay inline, windowed around
+                    // where they first diverge.
+                    let line_pair = match (pretty_json(&old.value), pretty_json(&new.value)) {
+                        (Some(o), Some(n)) if is_multiline(&o) || is_multiline(&n) => Some((o, n)),
+                        _ if is_multiline(&old.value) || is_multiline(&new.value) => {
+                            Some((old.value.clone(), new.value.clone()))
+                        }
+                        _ => None,
+                    };
+                    if let Some((o, n)) = line_pair {
+                        let _ = writeln!(s, "  ~ {name}:{suffix}");
+                        write_meta_line_diff(&mut s, &o, &n, opts.color);
+                    } else {
+                        let (o, n) = quote_diff(&old.value, &new.value);
+                        let _ = writeln!(
+                            s,
+                            "  ~ {name} = {} → {}{suffix}",
+                            paint(&o, opts.color, RED),
+                            paint(&n, opts.color, GREEN),
+                        );
+                    }
                 } else {
                     // Same value, different declared type.
                     let _ = writeln!(
@@ -1181,6 +1195,45 @@ fn quote_diff(old: &str, new: &str) -> (String, String) {
         format!("\"{s}\"")
     };
     (render(&o), render(&n))
+}
+
+/// Whether a metadata value spans multiple lines — the cue to show a line diff
+/// rather than a one-line `old → new` (typically a pretty-printed JSON blob).
+fn is_multiline(v: &str) -> bool {
+    v.contains('\n')
+}
+
+/// Pretty-print `v` if it parses as JSON, so a minified value gets expanded to one
+/// line per field and diffs readably (same formatter the HDF5 reader uses).
+/// `None` when it isn't JSON (a plain scalar/string stays as-is).
+fn pretty_json(v: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(v.trim()).ok()?;
+    serde_json::to_string_pretty(&value).ok()
+}
+
+/// Write a git-style line diff of two metadata values, indented under the entry
+/// name: removed lines red `-`, added lines green `+`, a few lines of context
+/// (dim), with `⋮` between hunks. Uses [`similar`] for the line matching.
+fn write_meta_line_diff(s: &mut String, old: &str, new: &str, color: bool) {
+    use similar::{ChangeTag, TextDiff};
+    let diff = TextDiff::from_lines(old, new);
+    for (hunk, group) in diff.grouped_ops(3).iter().enumerate() {
+        if hunk > 0 {
+            let _ = writeln!(s, "      {}", paint("⋮", color, DIM));
+        }
+        for op in group {
+            for change in diff.iter_changes(op) {
+                let (sign, code) = match change.tag() {
+                    ChangeTag::Delete => ('-', RED),
+                    ChangeTag::Insert => ('+', GREEN),
+                    ChangeTag::Equal => (' ', DIM),
+                };
+                let text = change.value();
+                let text = text.strip_suffix('\n').unwrap_or(text);
+                let _ = writeln!(s, "      {}", paint(&format!("{sign} {text}"), color, code));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1543,6 +1596,45 @@ mod tests {
         let (t, idx) = templatize("model.layers.12.experts.3.weight");
         assert_eq!(t, "model.layers.{}.experts.{}.weight");
         assert_eq!(idx, ["12", "3"]);
+    }
+
+    #[test]
+    fn pretty_json_expands_objects_only() {
+        assert!(pretty_json(r#"{"a":1,"b":2}"#).unwrap().contains('\n'));
+        assert!(pretty_json("not json").is_none());
+        assert!(pretty_json("d5f887bb41").is_none());
+    }
+
+    #[test]
+    fn changed_json_metadata_renders_as_a_line_diff() {
+        let mv = |v: &str| MetaVal {
+            value: v.to_string(),
+            value_type: "string".to_string(),
+        };
+        // Minified JSON on both sides → pretty-printed then line-diffed.
+        let old = summary(&[], &[("spec", mv(r#"{"a":1,"v":"old"}"#))]);
+        let new = summary(&[], &[("spec", mv(r#"{"a":1,"v":"new"}"#))]);
+        let out = compare(&old, &new).render("o", "n", PLAIN);
+        assert!(out.contains("~ spec:"), "{out}"); // line-diff header, not `= … → …`
+        let line = |sign: &str, needle: &str| {
+            out.lines()
+                .any(|l| l.trim_start().starts_with(sign) && l.contains(needle))
+        };
+        assert!(line("- ", r#""v": "old""#), "{out}");
+        assert!(line("+ ", r#""v": "new""#), "{out}");
+        assert!(out.contains(r#""a": 1"#), "{out}"); // unchanged line kept as context
+    }
+
+    #[test]
+    fn multiline_metadata_shows_a_line_diff() {
+        let old = "{\n  \"k\": 1,\n  \"v\": \"aaa\"\n}";
+        let new = "{\n  \"k\": 1,\n  \"v\": \"bbb\"\n}";
+        let mut s = String::new();
+        write_meta_line_diff(&mut s, old, new, false);
+        // The changed line shows as -/+, the unchanged line as context.
+        assert!(s.contains("- ") && s.contains("aaa"), "{s}");
+        assert!(s.contains("+ ") && s.contains("bbb"), "{s}");
+        assert!(s.contains("\"k\": 1"), "{s}");
     }
 
     #[test]
