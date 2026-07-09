@@ -451,11 +451,21 @@ fn main() -> Result<()> {
             );
             // Report how long it took, by default (on stderr, so a piped diff on
             // stdout stays clean). Skip on trouble (exit 2) — the error already said.
+            // Dimmed (when stderr is a colour terminal) as a secondary footer line.
             if code != 2 {
-                eprintln!(
+                use std::io::IsTerminal;
+                let msg = format!(
                     "checkpoint-explorer diff: done in {}",
                     format_elapsed(started.elapsed())
                 );
+                let dim = !no_color
+                    && std::env::var_os("NO_COLOR").is_none()
+                    && std::io::stderr().is_terminal();
+                if dim {
+                    eprintln!("\x1b[2m{msg}\x1b[0m");
+                } else {
+                    eprintln!("{msg}");
+                }
             }
             std::process::exit(code)
         }
