@@ -60,15 +60,38 @@ impl Bars {
     }
 }
 
+/// Shorten `s` to at most `max` columns by replacing the middle with `…`, keeping
+/// both ends — so a URI/path keeps its scheme/host prefix and its tail.
+fn truncate_middle(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let keep = max - 1; // room for the ellipsis
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let h: String = s.chars().take(head).collect();
+    let t: String = s.chars().skip(n - tail).collect();
+    format!("{h}…{t}")
+}
+
 fn spawn(
     labels: Vec<String>,
     states: Vec<Arc<AtomicU8>>,
     durations: Vec<Arc<AtomicU64>>,
     start: Instant,
 ) -> JoinHandle<()> {
-    // Truncate labels so a line (mark + path + timer) can't wrap and break the
-    // fixed-height redraw.
-    let labels: Vec<String> = labels.iter().map(|l| crate::truncate_tail(l, 60)).collect();
+    // Fit labels to the terminal width so a line (mark + path + timer) can't wrap
+    // and break the fixed-height redraw. Truncate in the *middle* so both ends —
+    // the `s3://`/`host:` prefix and the checkpoint tail — stay visible.
+    let cols = crossterm::terminal::size()
+        .map(|(c, _)| c as usize)
+        .unwrap_or(80);
+    let budget = cols.saturating_sub(12).max(20); // "  ⠋ <label> 12.3s"
+    let labels: Vec<String> = labels.iter().map(|l| truncate_middle(l, budget)).collect();
     std::thread::spawn(move || {
         const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         // Bold cyan spinner, bold green ✓, bold red ✗; dimmed labels so the
@@ -113,4 +136,25 @@ fn spawn(
             i += 1;
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_middle;
+
+    #[test]
+    fn middle_truncation_keeps_both_ends() {
+        // Short enough → untouched.
+        assert_eq!(truncate_middle("s3://bucket/key", 100), "s3://bucket/key");
+        // Ellipsis goes in the middle, both ends kept.
+        assert_eq!(truncate_middle("abcdefghij", 5), "ab…ij");
+        assert_eq!(truncate_middle("abcdefghij", 1), "…");
+        // A long string is elided in the middle: the kept head and tail are a real
+        // prefix and suffix of the input, and the result fits the budget.
+        let s = "s3://inference-opensource/minimax-m2.5/4bit/260402";
+        let t = truncate_middle(s, 24);
+        assert!(t.chars().count() <= 24 && t.contains('…'), "{t}");
+        let (head, tail) = t.split_once('…').unwrap();
+        assert!(s.starts_with(head) && s.ends_with(tail), "{t}");
+    }
 }
