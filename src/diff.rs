@@ -81,7 +81,9 @@ fn paint(text: &str, on: bool, code: &str) -> String {
 /// A `label: old → new (±abs, ±rel%)` line summarizing an overall total's change
 /// (checkpoint size or parameter count), formatting values with `fmt`. Shows
 /// "(unchanged)" when equal, and omits the percentage when the old side is zero
-/// (no baseline). The delta is red when it shrank, green when it grew.
+/// (no baseline). Coloured like the tensor diff — the old value red, the new value
+/// green — while the parenthetical delta is dimmed (a convenience; its sign
+/// already shows the direction).
 fn totals_line(
     label: &str,
     old: usize,
@@ -103,12 +105,10 @@ fn totals_line(
             delta.unsigned_abs() as f64 / old as f64 * 100.0
         )
     };
-    let change = paint(
-        &format!("{sign}{mag}{rel}"),
-        color,
-        if delta >= 0 { GREEN } else { RED },
-    );
-    format!("{label}: {} → {} ({change})", fmt(old), fmt(new))
+    let old_s = paint(&fmt(old), color, RED);
+    let new_s = paint(&fmt(new), color, GREEN);
+    let delta_s = paint(&format!("{sign}{mag}{rel}"), color, DIM);
+    format!("{label}: {old_s} → {new_s} ({delta_s})")
 }
 
 /// Render a changed tensor's `old` and `new` signatures, colouring only what
@@ -1176,6 +1176,11 @@ mod tests {
         assert_eq!(
             totals_line("size", 0, 100, false, format_size),
             "size: 0 B → 100 B (+100 B)"
+        );
+        // Coloured like the tensor diff: old red, new green, delta dimmed.
+        assert_eq!(
+            totals_line("size", 100, 150, true, format_size),
+            "size: \x1b[31m100 B\x1b[0m → \x1b[32m150 B\x1b[0m (\x1b[2m+50 B, +50.0%\x1b[0m)"
         );
     }
     fn mv(value: &str, ty: &str) -> MetaVal {
