@@ -13,7 +13,7 @@
 //!
 //! Browse-only: no tensor data crosses the wire.
 
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
@@ -54,7 +54,15 @@ impl RemoteSession {
                 Ok(()) => return Ok(RemoteSession { session }),
                 Err(e) => {
                     if attempt < max_attempts {
-                        eprintln!("checkpoint-explorer: {e} — try again");
+                        let msg = format!("checkpoint-explorer: {e} — try again");
+                        // Bold yellow on a colour terminal (respecting NO_COLOR);
+                        // plain when piped.
+                        if std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+                        {
+                            eprintln!("\x1b[1;33m{msg}\x1b[0m");
+                        } else {
+                            eprintln!("{msg}");
+                        }
                         *password = None; // re-prompt on the next attempt
                     }
                     last_err = Some(e);
