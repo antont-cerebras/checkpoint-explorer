@@ -834,11 +834,15 @@ impl DiffReport {
                 let name = display_name(&g.template, &g.indices);
                 let suffix = count_suffix(g.count);
                 if old.value != new.value {
+                    // Window each value around where they first diverge, so the
+                    // actual change shows even in a long JSON blob (a plain head
+                    // truncation would print the same shared prefix for both).
+                    let (o, n) = quote_diff(&old.value, &new.value);
                     let _ = writeln!(
                         s,
                         "  ~ {name} = {} → {}{suffix}",
-                        paint(&quote_trunc(&old.value), opts.color, RED),
-                        paint(&quote_trunc(&new.value), opts.color, GREEN),
+                        paint(&o, opts.color, RED),
+                        paint(&n, opts.color, GREEN),
                     );
                 } else {
                     // Same value, different declared type.
@@ -1150,6 +1154,33 @@ fn quote_trunc(v: &str) -> String {
     } else {
         format!("\"{flat}\"")
     }
+}
+
+/// Quote a *changed* value pair for one-line display, each windowed around the
+/// first character where they differ (with `…` where truncated) — so the actual
+/// change is visible even in a long JSON blob, where head-truncation would print
+/// the same shared prefix for both sides. Newlines are flattened to spaces. Short
+/// values that fit are shown in full.
+fn quote_diff(old: &str, new: &str) -> (String, String) {
+    const WINDOW: usize = 60; // chars shown per side
+    const CTX: usize = 12; // shared context kept before the first difference
+    let o: Vec<char> = old.replace(['\n', '\r'], " ").chars().collect();
+    let n: Vec<char> = new.replace(['\n', '\r'], " ").chars().collect();
+    let prefix = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
+    let start = prefix.saturating_sub(CTX);
+    let render = |chars: &[char]| -> String {
+        let end = (start + WINDOW).min(chars.len());
+        let mut s = String::new();
+        if start > 0 {
+            s.push('…');
+        }
+        s.extend(&chars[start..end]);
+        if end < chars.len() {
+            s.push('…');
+        }
+        format!("\"{s}\"")
+    };
+    (render(&o), render(&n))
 }
 
 #[cfg(test)]
@@ -1512,6 +1543,22 @@ mod tests {
         let (t, idx) = templatize("model.layers.12.experts.3.weight");
         assert_eq!(t, "model.layers.{}.experts.{}.weight");
         assert_eq!(idx, ["12", "3"]);
+    }
+
+    #[test]
+    fn quote_diff_windows_around_the_first_difference() {
+        // Long values sharing a prefix: both are windowed so the diverging token
+        // shows (a plain head-truncation would print the same prefix for both).
+        let old = format!("{}ALPHA-tail", "x".repeat(100));
+        let new = format!("{}BETA-tail", "x".repeat(100));
+        let (o, n) = quote_diff(&old, &new);
+        assert!(o.starts_with("\"…") && o.contains("ALPHA"), "{o}");
+        assert!(n.starts_with("\"…") && n.contains("BETA"), "{n}");
+        // Short values are shown in full, no ellipsis.
+        assert_eq!(
+            quote_diff("d5f887bb41", "46c41d7cf4"),
+            ("\"d5f887bb41\"".to_string(), "\"46c41d7cf4\"".to_string())
+        );
     }
 
     #[test]
