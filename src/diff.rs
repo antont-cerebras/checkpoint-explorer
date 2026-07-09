@@ -1197,6 +1197,10 @@ fn quote_diff(old: &str, new: &str) -> (String, String) {
     (render(&o), render(&n))
 }
 
+/// Max diff lines shown for one changed metadata value before the rest is
+/// summarised as a count — bounds a huge value (e.g. a big `weight_map`).
+const MAX_META_DIFF_LINES: usize = 20;
+
 /// Whether a metadata value spans multiple lines — the cue to show a line diff
 /// rather than a one-line `old → new` (typically a pretty-printed JSON blob).
 fn is_multiline(v: &str) -> bool {
@@ -1213,26 +1217,47 @@ fn pretty_json(v: &str) -> Option<String> {
 
 /// Write a git-style line diff of two metadata values, indented under the entry
 /// name: removed lines red `-`, added lines green `+`, a few lines of context
-/// (dim), with `⋮` between hunks. Uses [`similar`] for the line matching.
+/// (dim), with `⋮` between hunks. Uses [`similar`] for the line matching. Capped
+/// at [`MAX_META_DIFF_LINES`] so one huge value (e.g. a big `weight_map`) can't
+/// flood the output — the remainder is summarised as a count.
 fn write_meta_line_diff(s: &mut String, old: &str, new: &str, color: bool) {
     use similar::{ChangeTag, TextDiff};
     let diff = TextDiff::from_lines(old, new);
+    // Render the diff lines (with `⋮` between hunks), tallying total changes.
+    let mut lines: Vec<String> = Vec::new();
+    let (mut removed, mut added) = (0usize, 0usize);
     for (hunk, group) in diff.grouped_ops(3).iter().enumerate() {
         if hunk > 0 {
-            let _ = writeln!(s, "      {}", paint("⋮", color, DIM));
+            lines.push(paint("⋮", color, DIM));
         }
         for op in group {
             for change in diff.iter_changes(op) {
                 let (sign, code) = match change.tag() {
-                    ChangeTag::Delete => ('-', RED),
-                    ChangeTag::Insert => ('+', GREEN),
+                    ChangeTag::Delete => {
+                        removed += 1;
+                        ('-', RED)
+                    }
+                    ChangeTag::Insert => {
+                        added += 1;
+                        ('+', GREEN)
+                    }
                     ChangeTag::Equal => (' ', DIM),
                 };
                 let text = change.value();
                 let text = text.strip_suffix('\n').unwrap_or(text);
-                let _ = writeln!(s, "      {}", paint(&format!("{sign} {text}"), color, code));
+                lines.push(paint(&format!("{sign} {text}"), color, code));
             }
         }
+    }
+    for line in lines.iter().take(MAX_META_DIFF_LINES) {
+        let _ = writeln!(s, "      {line}");
+    }
+    if lines.len() > MAX_META_DIFF_LINES {
+        let note = format!(
+            "… {} more diff line(s) — {removed} removed, {added} added in total",
+            lines.len() - MAX_META_DIFF_LINES
+        );
+        let _ = writeln!(s, "      {}", paint(&note, color, DIM));
     }
 }
 
@@ -1623,6 +1648,23 @@ mod tests {
         assert!(line("- ", r#""v": "old""#), "{out}");
         assert!(line("+ ", r#""v": "new""#), "{out}");
         assert!(out.contains(r#""a": 1"#), "{out}"); // unchanged line kept as context
+    }
+
+    #[test]
+    fn large_metadata_line_diff_is_capped() {
+        let old = (0..100)
+            .map(|i| format!("line {i} old"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = (0..100)
+            .map(|i| format!("line {i} new"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut s = String::new();
+        write_meta_line_diff(&mut s, &old, &new, false);
+        let n = s.lines().count();
+        assert!(n <= MAX_META_DIFF_LINES + 1, "capped, got {n} lines");
+        assert!(s.contains("more diff line"), "{s}");
     }
 
     #[test]
