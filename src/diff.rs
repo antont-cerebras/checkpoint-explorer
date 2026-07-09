@@ -1201,6 +1201,30 @@ fn quote_diff(old: &str, new: &str) -> (String, String) {
 /// summarised as a count — bounds a huge value (e.g. a big `weight_map`).
 const MAX_META_DIFF_LINES: usize = 20;
 
+/// Max columns for a single metadata diff line before it's clipped with `…` —
+/// bounds a value with one enormous line (e.g. a nested, serialised tensor list
+/// that pretty-JSON leaves as a single escaped string). Uses the terminal width
+/// when attached, else a sane default; leaves room for the indent.
+fn meta_line_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(cols, _)| cols as usize)
+        .unwrap_or(120)
+        .saturating_sub(6)
+        .max(40)
+}
+
+/// Clip `line` to `max` columns, appending `…` when truncated.
+fn clip_width(line: String, max: usize) -> String {
+    if line.chars().count() <= max {
+        line
+    } else {
+        line.chars()
+            .take(max.saturating_sub(1))
+            .chain(std::iter::once('…'))
+            .collect()
+    }
+}
+
 /// Whether a metadata value spans multiple lines — the cue to show a line diff
 /// rather than a one-line `old → new` (typically a pretty-printed JSON blob).
 fn is_multiline(v: &str) -> bool {
@@ -1222,6 +1246,7 @@ fn pretty_json(v: &str) -> Option<String> {
 /// flood the output — the remainder is summarised as a count.
 fn write_meta_line_diff(s: &mut String, old: &str, new: &str, color: bool) {
     use similar::{ChangeTag, TextDiff};
+    let width = meta_line_width();
     let diff = TextDiff::from_lines(old, new);
     // Render the diff lines (with `⋮` between hunks), tallying total changes.
     let mut lines: Vec<String> = Vec::new();
@@ -1245,7 +1270,10 @@ fn write_meta_line_diff(s: &mut String, old: &str, new: &str, color: bool) {
                 };
                 let text = change.value();
                 let text = text.strip_suffix('\n').unwrap_or(text);
-                lines.push(paint(&format!("{sign} {text}"), color, code));
+                // Clip the (uncoloured) line to the width before colouring, so one
+                // enormous line can't flood the terminal.
+                let clipped = clip_width(format!("{sign} {text}"), width);
+                lines.push(paint(&clipped, color, code));
             }
         }
     }
