@@ -15,7 +15,7 @@ use glob::{MatchOptions, Pattern};
 
 use crate::sample::{HistBins, HistogramDiff, ValueDiff};
 use crate::tree::{MetadataInfo, TensorInfo};
-use crate::utils::format_shape;
+use crate::utils::{format_parameters, format_shape, format_size};
 
 const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
@@ -76,6 +76,39 @@ fn paint(text: &str, on: bool, code: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// A `label: old → new (±abs, ±rel%)` line summarizing an overall total's change
+/// (checkpoint size or parameter count), formatting values with `fmt`. Shows
+/// "(unchanged)" when equal, and omits the percentage when the old side is zero
+/// (no baseline). The delta is red when it shrank, green when it grew.
+fn totals_line(
+    label: &str,
+    old: usize,
+    new: usize,
+    color: bool,
+    fmt: fn(usize) -> String,
+) -> String {
+    if old == new {
+        return format!("{label}: {} (unchanged)", fmt(new));
+    }
+    let delta = new as i128 - old as i128;
+    let sign = if delta >= 0 { "+" } else { "-" };
+    let mag = fmt(delta.unsigned_abs() as usize);
+    let rel = if old == 0 {
+        String::new()
+    } else {
+        format!(
+            ", {sign}{:.1}%",
+            delta.unsigned_abs() as f64 / old as f64 * 100.0
+        )
+    };
+    let change = paint(
+        &format!("{sign}{mag}{rel}"),
+        color,
+        if delta >= 0 { GREEN } else { RED },
+    );
+    format!("{label}: {} → {} ({change})", fmt(old), fmt(new))
 }
 
 /// Render a changed tensor's `old` and `new` signatures, colouring only what
@@ -396,6 +429,11 @@ pub struct MetaVal {
 pub struct CheckpointSummary {
     pub tensors: BTreeMap<String, TensorSig>,
     pub metadata: BTreeMap<String, MetaVal>,
+    /// Total size in bytes and total parameter count, summed over the deduped
+    /// tensors (so a sharded checkpoint isn't double-counted) — for the diff's
+    /// overall size/params comparison.
+    pub total_bytes: usize,
+    pub total_params: usize,
 }
 
 impl CheckpointSummary {
@@ -405,9 +443,15 @@ impl CheckpointSummary {
     /// genuinely disagree, which a diff can't meaningfully represent anyway).
     pub fn from_loaded(tensors: &[TensorInfo], metadata: &[MetadataInfo]) -> Self {
         let mut t = BTreeMap::new();
+        // Track size/params per name (last-wins, matching `t`) so totals are over
+        // the deduped set rather than counting a shared name once per shard.
+        let mut sizes: BTreeMap<String, (usize, usize)> = BTreeMap::new();
         for ti in tensors {
             t.insert(ti.name.clone(), TensorSig::of(ti));
+            sizes.insert(ti.name.clone(), (ti.size_bytes, ti.num_elements));
         }
+        let total_bytes = sizes.values().map(|(b, _)| b).sum();
+        let total_params = sizes.values().map(|(_, p)| p).sum();
         let mut m = BTreeMap::new();
         for mi in metadata {
             m.insert(
@@ -421,6 +465,8 @@ impl CheckpointSummary {
         Self {
             tensors: t,
             metadata: m,
+            total_bytes,
+            total_params,
         }
     }
 }
@@ -579,6 +625,12 @@ pub struct DiffReport {
     pub meta_added: Vec<(String, MetaVal)>,
     pub meta_changed: Vec<MetaChange>,
     pub meta_unchanged: usize,
+    /// Overall size (bytes) and parameter count of each side, for the size/params
+    /// comparison in the summary.
+    pub old_bytes: usize,
+    pub new_bytes: usize,
+    pub old_params: usize,
+    pub new_params: usize,
 }
 
 impl DiffReport {
@@ -624,6 +676,32 @@ impl DiffReport {
             s,
             "{}",
             paint("legend: - removed, + added, ~ changed", opts.color, DIM)
+        );
+
+        // Overall change: total on-disk size and parameter count (absolute +
+        // relative %); the per-tensor breakdown follows.
+        let _ = writeln!(s);
+        let _ = writeln!(
+            s,
+            "{}",
+            totals_line(
+                "size",
+                self.old_bytes,
+                self.new_bytes,
+                opts.color,
+                format_size
+            )
+        );
+        let _ = writeln!(
+            s,
+            "{}",
+            totals_line(
+                "params",
+                self.old_params,
+                self.new_params,
+                opts.color,
+                format_parameters
+            )
         );
 
         let _ = writeln!(
@@ -855,6 +933,10 @@ pub fn compare_with(
         meta_added,
         meta_changed,
         meta_unchanged,
+        old_bytes: old.total_bytes,
+        new_bytes: new.total_bytes,
+        old_params: old.total_params,
+        new_params: new.total_params,
     }
 }
 
@@ -1075,6 +1157,27 @@ mod tests {
             shape: shape.to_vec(),
         }
     }
+
+    #[test]
+    fn totals_line_shows_absolute_and_relative_change() {
+        assert_eq!(
+            totals_line("size", 100, 150, false, format_size),
+            "size: 100 B → 150 B (+50 B, +50.0%)"
+        );
+        assert_eq!(
+            totals_line("params", 56, 40, false, format_parameters),
+            "params: 56 → 40 (-16, -28.6%)"
+        );
+        // equal → unchanged; zero baseline → no percentage
+        assert_eq!(
+            totals_line("size", 100, 100, false, format_size),
+            "size: 100 B (unchanged)"
+        );
+        assert_eq!(
+            totals_line("size", 0, 100, false, format_size),
+            "size: 0 B → 100 B (+100 B)"
+        );
+    }
     fn mv(value: &str, ty: &str) -> MetaVal {
         MetaVal {
             value: value.to_string(),
@@ -1091,6 +1194,8 @@ mod tests {
                 .iter()
                 .map(|(n, v)| (n.to_string(), v.clone()))
                 .collect(),
+            total_bytes: 0,
+            total_params: 0,
         }
     }
 
@@ -1280,6 +1385,8 @@ mod tests {
                 .map(|n| (n.to_string(), sig("U8", &[4])))
                 .collect(),
             metadata: Default::default(),
+            total_bytes: 0,
+            total_params: 0,
         };
         let per = ValueDiff {
             elements: 4,
@@ -1341,10 +1448,14 @@ mod tests {
         let old = CheckpointSummary {
             tensors: mk("F16").into_iter().collect(),
             metadata: Default::default(),
+            total_bytes: 0,
+            total_params: 0,
         };
         let new = CheckpointSummary {
             tensors: mk("BF16").into_iter().collect(),
             metadata: Default::default(),
+            total_bytes: 0,
+            total_params: 0,
         };
         let r = compare(&old, &new);
         // Grouped (default): one collapsed line with the range and ×count.
