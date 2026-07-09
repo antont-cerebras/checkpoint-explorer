@@ -4,6 +4,8 @@ expression: out
 ---
 --- tests/fixtures/diff_old.safetensors
 +++ tests/fixtures/diff_new.safetensors
+scope: tensor structure (name, dtype, shape) — element values not compared
+legend: - removed, + added, ~ changed
 
 tensors: -1 +1 ~2 (2 unchanged)
   - lm_head.weight  [F16 (2, 2)]

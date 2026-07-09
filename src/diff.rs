@@ -19,6 +19,7 @@ use crate::utils::format_shape;
 
 const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
+const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
 /// Rendering options for the diff output.
@@ -610,6 +611,20 @@ impl DiffReport {
         let mut s = String::new();
         let _ = writeln!(s, "--- {old_label}");
         let _ = writeln!(s, "+++ {new_label}");
+
+        // Spell out what was (and wasn't) compared, and what the -/+/~ markers on
+        // the summary and the entries below mean.
+        let scope = if opts.values {
+            "scope: tensor structure (name, dtype, shape) + element values"
+        } else {
+            "scope: tensor structure (name, dtype, shape) — element values not compared"
+        };
+        let _ = writeln!(s, "{}", paint(scope, opts.color, DIM));
+        let _ = writeln!(
+            s,
+            "{}",
+            paint("legend: - removed, + added, ~ changed", opts.color, DIM)
+        );
 
         let _ = writeln!(
             s,
