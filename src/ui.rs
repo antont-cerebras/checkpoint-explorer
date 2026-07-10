@@ -2733,7 +2733,7 @@ fn tree_span(selected: bool, color: Color, text: impl Into<String>) -> Span<'sta
 /// The tree browser's key-hint line(s), word-wrapped to `width` on the
 /// ` · `-separated `key label` chips (the long hint spills onto a second line).
 fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
-    use KeyCode::{Backspace, Down, Enter, Left, Right, Up};
+    use KeyCode::{Backspace, Down, Enter, Left, PageDown, PageUp, Right, Up};
     let plain = KeyModifiers::NONE;
     let shift = KeyModifiers::SHIFT;
     // Each chip's key text is a list of segments; a `Seg::Key` glyph is clickable
@@ -2764,6 +2764,14 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<Chi
                 Seg::Key("↓", KeyEvent::new(Down, shift)),
             ],
             "sibling",
+        ),
+        (
+            vec![
+                Seg::Key("PgUp", KeyEvent::new(PageUp, plain)),
+                Seg::Sep("/"),
+                Seg::Key("PgDn", KeyEvent::new(PageDown, plain)),
+            ],
+            "page",
         ),
         (
             vec![
