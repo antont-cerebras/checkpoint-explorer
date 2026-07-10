@@ -32,11 +32,63 @@ use std::path::{Path, PathBuf};
 use crate::explorer::{DataLayout, Explorer, OpenRequest, OpenView};
 use crate::tree::{MetadataInfo, TensorInfo};
 
+/// Worked examples shown at the end of `--help` (not the terse `-h`), grouped by
+/// the most useful things you can do. Written to read cleanly for both people
+/// and coding agents: one commented, copy-pasteable command per line.
+const EXAMPLES: &str = "\
+Examples:
+  Browse a checkpoint — a single file, a sharded directory, or a glob:
+      checkpoint-explorer model.safetensors
+      checkpoint-explorer /path/to/sharded-model/
+      checkpoint-explorer 'model-*.safetensors'
+
+  Look inside a tensor's data — heatmap, numeric grid, histogram, statistics:
+      checkpoint-explorer model.safetensors --tensor model.layers.0.mlp.down_proj.weight --heatmap
+      checkpoint-explorer model.safetensors --tensor NAME --values --dtype u4   # decode packed 4-bit
+
+  Read a remote / S3 checkpoint over SSH (only metadata leaves the host):
+      checkpoint-explorer --ssh-read user@host s3://bucket/model/checkpoint
+      checkpoint-explorer user@host:/opt/models/some-model          # scp-style; a safetensors dir
+
+  Export the structure for scripts / agents (text, or --format json):
+      checkpoint-explorer model.safetensors --print-tree
+      checkpoint-explorer model.safetensors --print-tensors --format json
+      checkpoint-explorer model.safetensors --print-tree --name '*.mlp.*'   # !GLOB excludes
+
+  Compare two checkpoints (exit 0 = identical, 1 = differ, 2 = error):
+      checkpoint-explorer diff old.safetensors new.safetensors
+      checkpoint-explorer diff old/ new/ --values --name '*.mlp.*'
+
+  Repack an HDF5 checkpoint with an alternative codec — smaller on disk (hdf5 build only):
+      checkpoint-explorer convert in.hdf5 out.hdf5 --codec zstd
+
+  Per-subcommand help:  checkpoint-explorer diff --help  ·  checkpoint-explorer convert --help";
+
 #[derive(Parser)]
 #[command(name = "checkpoint-explorer")]
+#[command(version)]
 #[command(
-    about = "Interactive explorer for model checkpoints (.safetensors, .gguf, .npy, .npz, .hdf5)"
+    about = "Explore model checkpoints in the terminal — browse the tree, look inside tensor data, and diff (.safetensors / .gguf / .npy / .npz / .hdf5)"
 )]
+#[command(long_about = "\
+Interactive terminal explorer for model checkpoints — .safetensors, .gguf, .npy/.npz, \
+and (with the hdf5 build) .hdf5.
+
+Beyond the tree of tensor names and shapes, it shows the actual data: ASCII heatmaps, \
+numeric-value grids, value histograms, and exact whole-tensor statistics — streamed in \
+bounded blocks, so multi-GB tensors work without loading them into RAM. Packed / \
+quantized weights (4-bit, fused-codebook MoE) are decoded to their true values. \
+Sharded / multi-file models, directories, and globs merge into one tree.
+
+Remote checkpoints are read over SSH — a safetensors directory/file via SFTP, or an \
+s3:// cstorch checkpoint via a remote venv — sending only metadata off the host, so \
+data and credentials stay remote. For scripts and agents there are one-shot \
+--print-tree / --print-tensors exports (text or JSON) and a `diff` subcommand with \
+diff-style exit codes.
+
+Give one or more paths to browse; press `l` in any screen for its key legend. See the \
+examples below and `<command> --help`.")]
+#[command(after_long_help = EXAMPLES)]
 #[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
@@ -51,7 +103,7 @@ struct Cli {
 #[derive(ClapArgs)]
 struct ExploreArgs {
     #[arg(
-        help = "Checkpoint files, directories, or glob patterns to explore (e.g., *.safetensors, model-*.gguf, *.npy, *.npz, *.hdf5). An scp-style [USER@]HOST:/path reads that remote path over SSH (browse-only), the same as --ssh-read"
+        help = "Checkpoint files, directories, or glob patterns to explore (e.g. *.safetensors, model-*.gguf, *.npy, *.npz, *.hdf5). Remote paths work too — an scp-style [USER@]HOST:/path (read over SSH, like --ssh-read), or an s3:// URI passed together with --ssh-read <HOST>; both browse-only, only metadata leaves the host"
     )]
     paths: Vec<PathBuf>,
 
@@ -93,24 +145,24 @@ struct ExploreArgs {
         long,
         value_name = "DTYPE",
         value_parser = sample::parse_view_dtype,
-        help = "Reinterpret the opened tensor's dtype: u4, i4, unpacked (fused codebook, needs a packing schema), f16, bf16, i16, u16, f32, i32, u32, f64, i64, u64, i8, u8, stored"
+        help = "Reinterpret the tensor's dtype: u4, i4, unpacked (fused codebook, needs a packing schema), f16, bf16, i16, u16, f32, i32, u32, f64, i64, u64, i8, u8, stored"
     )]
     dtype: Option<sample::ViewDtype>,
 
     #[arg(
         long,
         conflicts_with = "heatmap",
-        help = "Open the opened tensor's numeric values grid"
+        help = "Open straight into the tensor's numeric-values grid"
     )]
     values: bool,
 
-    #[arg(long, help = "Open the opened tensor's heatmap")]
+    #[arg(long, help = "Open straight into the tensor's heatmap")]
     heatmap: bool,
 
     #[arg(
         long,
         conflicts_with_all = ["values", "heatmap", "tree"],
-        help = "Show the opened tensor's value histogram on its detail screen"
+        help = "Show the tensor's value histogram on its detail screen"
     )]
     histogram: bool,
 
@@ -1189,11 +1241,19 @@ fn split_scp(s: &str) -> Option<(String, String)> {
 
 fn run_explore(mut args: ExploreArgs) -> Result<()> {
     if args.paths.is_empty() {
-        eprintln!("Error: Please specify one or more checkpoint files or directories to explore.");
+        eprintln!("checkpoint-explorer: no checkpoint given.\n");
+        eprintln!("Usage:");
         eprintln!(
-            "Usage: checkpoint-explorer <file1.safetensors> [file2.gguf] [model.hdf5] [directory] [*.safetensors] ..."
+            "  checkpoint-explorer <PATH>...            browse a checkpoint (file, directory, or glob)"
         );
-        eprintln!("       checkpoint-explorer convert <input.hdf5> <output.hdf5>");
+        eprintln!(
+            "  checkpoint-explorer <PATH> --print-tree  dump its structure (text, or --format json)"
+        );
+        eprintln!("  checkpoint-explorer diff <OLD> <NEW>     compare two checkpoints");
+        eprintln!(
+            "  checkpoint-explorer --ssh-read <HOST> <s3://…|/remote/path>   read a remote / S3 checkpoint"
+        );
+        eprintln!("\nRun `checkpoint-explorer --help` for all options and examples.");
         std::process::exit(1);
     }
 
