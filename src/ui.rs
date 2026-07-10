@@ -188,8 +188,8 @@ pub struct DrawConfig<'a> {
     pub file_idx: usize,
     pub total_files: usize,
     /// Read remotely (`--ssh-read`): the checkpoint is metadata-only here, so the
-    /// title carries a browse-only badge and the data views are unavailable.
-    pub browse_only: bool,
+    /// title carries a metadata-only badge and the data views are unavailable.
+    pub metadata_only: bool,
     pub selected_idx: usize,
     pub scroll_offset: usize,
     pub search_mode: bool,
@@ -375,7 +375,7 @@ pub enum Overlay {
     Legend(Legend),
     /// The copied CLI command box (`y`); holds the command to display.
     Command(String),
-    /// A browse-only / unavailable notice (e.g. a remote `--ssh-read` source has
+    /// A metadata-only / unavailable notice (e.g. a remote `--ssh-read` source has
     /// no local bytes for data views); holds the message to display.
     Notice(String),
 }
@@ -387,9 +387,9 @@ const TREE_HEADER_HEIGHT: usize = 3;
 const TREE_FOOTER_HEIGHT: usize = 2;
 
 /// Footer rows below the tree list: the two-line status bar, plus one more for the
-/// browse-only banner when reading a remote (`--ssh-read`) checkpoint.
-fn tree_footer_height(browse_only: bool) -> usize {
-    TREE_FOOTER_HEIGHT + usize::from(browse_only)
+/// metadata-only banner when reading a remote (`--ssh-read`) checkpoint.
+fn tree_footer_height(metadata_only: bool) -> usize {
+    TREE_FOOTER_HEIGHT + usize::from(metadata_only)
 }
 
 /// Where the tree's vertical scroll bar sits and how a pointer over it maps to a
@@ -430,26 +430,26 @@ pub struct UI;
 impl UI {
     /// How many tree rows are visible at once (one screenful), used to size a
     /// PageUp/PageDown jump. `terminal_height` is the full terminal height.
-    pub fn visible_tree_rows(terminal_height: u16, browse_only: bool) -> usize {
+    pub fn visible_tree_rows(terminal_height: u16, metadata_only: bool) -> usize {
         (terminal_height as usize)
-            .saturating_sub(TREE_HEADER_HEIGHT + tree_footer_height(browse_only))
+            .saturating_sub(TREE_HEADER_HEIGHT + tree_footer_height(metadata_only))
             .max(1)
     }
 
     /// Body rows visible in the tree at the given size — used to compute the
     /// scroll offset so it stays consistent with [`Self::render_tree`]'s layout
     /// (header = title + hint/search line(s) + rule; footer = the two status lines
-    /// plus, when browsing a remote checkpoint, the browse-only banner).
+    /// plus, when browsing a remote checkpoint, the metadata-only banner).
     pub fn tree_visible_rows(
         width: u16,
         height: u16,
         search_mode: bool,
         can_repack: bool,
-        browse_only: bool,
+        metadata_only: bool,
     ) -> usize {
         let header = Self::tree_header_rows(width, search_mode, can_repack);
         (height as usize)
-            .saturating_sub(header + tree_footer_height(browse_only))
+            .saturating_sub(header + tree_footer_height(metadata_only))
             .max(1)
     }
 
@@ -476,10 +476,10 @@ impl UI {
         height: u16,
         search_mode: bool,
         can_repack: bool,
-        browse_only: bool,
+        metadata_only: bool,
         total: usize,
     ) -> Option<TreeScrollbar> {
-        let rows = Self::tree_visible_rows(width, height, search_mode, can_repack, browse_only);
+        let rows = Self::tree_visible_rows(width, height, search_mode, can_repack, metadata_only);
         if width < 2 || total <= rows {
             return None; // nothing to scroll (or no room for a bar + content)
         }
@@ -543,11 +543,11 @@ impl UI {
         )));
 
         let header_rows = lines.len();
-        let footer_rows = tree_footer_height(config.browse_only);
+        let footer_rows = tree_footer_height(config.metadata_only);
         let body_rows = (height as usize).saturating_sub(header_rows + footer_rows);
-        // The status bar sits above the optional browse-only banner (the extra
+        // The status bar sits above the optional metadata-only banner (the extra
         // bottom row present only for a remote checkpoint).
-        let status_lift = u16::from(config.browse_only);
+        let status_lift = u16::from(config.metadata_only);
 
         // A vertical scroll bar rides the rightmost column when the tree
         // overflows the viewport — but only in the live TUI; a headless
@@ -558,7 +558,7 @@ impl UI {
                 height,
                 config.search_mode,
                 config.can_repack,
-                config.browse_only,
+                config.metadata_only,
                 config.tree.len(),
             )
         } else {
@@ -701,10 +701,10 @@ impl UI {
             frame.buffer_mut(),
         );
 
-        // Browse-only banner on the very bottom row (remote `--ssh-read` only).
-        if config.browse_only {
+        // Metadata-only banner on the very bottom row (remote `--ssh-read` only).
+        if config.metadata_only {
             Paragraph::new(Line::from(Span::styled(
-                " browse-only — remote metadata; data views need the file locally ",
+                " metadata-only — data views need the file locally ",
                 Style::default()
                     .bg(palette::STATUS_BG)
                     .fg(palette::WARN)
@@ -832,11 +832,11 @@ impl UI {
             Paragraph::new(lines).render(area, frame.buffer_mut());
         }
 
-        // Browse-only banner on the bottom row (remote `--ssh-read`) — the lower
+        // Metadata-only banner on the bottom row (remote `--ssh-read`) — the lower
         // part of the detail screen is otherwise blank, so it doesn't overlap.
         if crate::remote::is_remote_source(&tensor.source_path) {
             Paragraph::new(Line::from(Span::styled(
-                " browse-only — remote metadata; data views need the file locally ",
+                " metadata-only — data views need the file locally ",
                 Style::default()
                     .bg(palette::STATUS_BG)
                     .fg(palette::WARN)
@@ -1626,13 +1626,13 @@ impl UI {
         );
     }
 
-    /// A browse-only / unavailable notice **floated over** the live frame (the
+    /// A metadata-only / unavailable notice **floated over** the live frame (the
     /// screen behind stays visible — unlike [`Self::render_message`]), dismissed by
     /// any key. Used for [`Overlay::Notice`].
     pub fn render_notice_box(frame: &mut Frame, message: &str) {
         render_popup_box(
             frame,
-            "Browse-only",
+            "Metadata-only",
             vec![
                 Line::from(Span::raw(message.to_string())),
                 Line::default(),
@@ -3597,11 +3597,11 @@ fn detail_field_lines(
                 spans
             }
             // A remote (`--ssh-read`) source has no local bytes to scan, so don't
-            // offer the (non-working) `s` hint — say it's browse-only instead.
+            // offer the (non-working) `s` hint — say it's metadata-only instead.
             StatsView::Pending if crate::remote::is_remote_source(&tensor.source_path) => vec![
                 dim_span("Statistics: "),
                 Span::styled(
-                    "unavailable — remote source, browse-only",
+                    "unavailable — remote source, metadata-only",
                     Style::default().fg(palette::WARN),
                 ),
             ],
@@ -3639,8 +3639,8 @@ fn detail_footer_lines(
         )
     };
     // The data views (heatmap/values/histogram/bins) need local bytes: dim their
-    // hints for a remote (browse-only) source so it's clear they're inactive
-    // (still clickable → the same browse-only notice as pressing the key).
+    // hints for a remote (metadata-only) source so it's clear they're inactive
+    // (still clickable → the same metadata-only notice as pressing the key).
     let data_chunk = |glyph: &'static str, rest: &'static str, key: KeyEvent| -> Chunk {
         if remote {
             (
@@ -4080,7 +4080,7 @@ mod tests {
                 current_file: "f",
                 file_idx: 0,
                 total_files: 1,
-                browse_only: false,
+                metadata_only: false,
                 selected_idx: 0,
                 scroll_offset: 0,
                 search_mode: false,

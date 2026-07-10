@@ -12,7 +12,7 @@
 //!
 //! Both share the one session, so a read — or `diff`'s two reads — costs a single
 //! authentication / password prompt. Credentials/data stay on the remote (nothing
-//! is copied locally). Browse-only: only header/metadata bytes cross the wire.
+//! is copied locally). Metadata-only: only header/metadata bytes cross the wire.
 
 use std::collections::HashSet;
 
