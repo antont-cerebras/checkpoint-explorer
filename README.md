@@ -27,7 +27,7 @@ fused-codebook MoE) so they show their true values; and ships a scriptable
   (opt-in) Cerebras-style **HDF5** — read through a single interface, with
   sharded/multi-file models, directories, and glob patterns merged into one tree.
   (The data views above — heatmap/grid/histogram/stats — cover safetensors,
-  NumPy, and HDF5; **GGUF is browse-only**: its tree, quant types, and metadata.)
+  NumPy, and HDF5; **GGUF is metadata-only**: its tree, quant types, and metadata.)
 - 🔀 **`diff` two checkpoints — local or remote.** A scriptable
   [subcommand](#comparing-checkpoints-diff): structural diff by default
   (`diff`-style exit codes) with a coloured, readable summary — overall size and
@@ -164,7 +164,7 @@ checkpoint-explorer usernode:/opt/cerebras/inference/models/some-model-4bit
 ```
 **Nothing but the header metadata leaves the server** — no keys, no tensor data.
 
-This is **browse-only** (structure + dtype + shape); the data views (heatmap /
+This is **metadata-only** (structure + dtype + shape); the data views (heatmap /
 numeric grid / histogram / statistics) need the bytes locally, so copy the
 checkpoint down to preview its values. `diff` takes `--ssh-read` too, for a
 structural (dtype/shape) comparison of two remote checkpoints:

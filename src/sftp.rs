@@ -11,7 +11,7 @@
 //!   script over an SSH *exec* channel ([`RemoteSession::exec_capture`]); the
 //!   caller ([`crate::remote`]) builds the script and parses the result.
 //!
-//! Browse-only: no tensor data crosses the wire.
+//! Metadata-only: no tensor data crosses the wire.
 
 use std::io::{IsTerminal, Read, Write};
 use std::net::TcpStream;

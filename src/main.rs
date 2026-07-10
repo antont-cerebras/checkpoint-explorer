@@ -35,34 +35,51 @@ use crate::tree::{MetadataInfo, TensorInfo};
 /// Worked examples shown at the end of `--help` (not the terse `-h`), grouped by
 /// the most useful things you can do. Written to read cleanly for both people
 /// and coding agents: one commented, copy-pasteable command per line.
-const EXAMPLES: &str = "\
-Examples:
-  Browse a checkpoint — a single file, a sharded directory, or a glob:
+///
+/// The `Examples:` title and each group's one-line description are styled to
+/// match clap's own section headers (bold + underline) and sub-emphasis (bold),
+/// but only when help is going to a colour-capable terminal — piped or
+/// `NO_COLOR` output stays plain, like the rest of clap's help.
+fn examples_help() -> String {
+    use std::io::IsTerminal;
+    let colour = std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
+    // (title = bold+underline like `Options:`, group = bold sub-heading, r = reset).
+    let (title, group, r) = if colour {
+        ("\x1b[1m\x1b[4m", "\x1b[1m", "\x1b[0m")
+    } else {
+        ("", "", "")
+    };
+    format!(
+        "\
+{title}Examples:{r}
+  {group}Browse a checkpoint{r} — a single file, a sharded directory, or a glob:
       checkpoint-explorer model.safetensors
       checkpoint-explorer /path/to/sharded-model/
       checkpoint-explorer 'model-*.safetensors'
 
-  Look inside a tensor's data — heatmap, numeric grid, histogram, statistics:
+  {group}Look inside a tensor's data{r} — heatmap, numeric grid, histogram, statistics:
       checkpoint-explorer model.safetensors --tensor model.layers.0.mlp.down_proj.weight --heatmap
       checkpoint-explorer model.safetensors --tensor NAME --values --dtype u4   # decode packed 4-bit
 
-  Read a remote / S3 checkpoint over SSH (only metadata leaves the host):
+  {group}Read a remote / S3 checkpoint over SSH{r} (only metadata leaves the host):
       checkpoint-explorer --ssh-read user@host s3://bucket/model/checkpoint
       checkpoint-explorer user@host:/opt/models/some-model          # scp-style; a safetensors dir
 
-  Export the structure for scripts / agents (text, or --format json):
+  {group}Export the structure for scripts / agents{r} (text, or --format json):
       checkpoint-explorer model.safetensors --print-tree
       checkpoint-explorer model.safetensors --print-tensors --format json
       checkpoint-explorer model.safetensors --print-tree --name '*.mlp.*'   # !GLOB excludes
 
-  Compare two checkpoints (exit 0 = identical, 1 = differ, 2 = error):
+  {group}Compare two checkpoints{r} (exit 0 = identical, 1 = differ, 2 = error):
       checkpoint-explorer diff old.safetensors new.safetensors
       checkpoint-explorer diff old/ new/ --values --name '*.mlp.*'
 
-  Repack an HDF5 checkpoint with an alternative codec — smaller on disk (hdf5 build only):
+  {group}Repack an HDF5 checkpoint with an alternative codec{r} — smaller on disk (hdf5 build only):
       checkpoint-explorer convert in.hdf5 out.hdf5 --codec zstd
 
-  Per-subcommand help:  checkpoint-explorer diff --help  ·  checkpoint-explorer convert --help";
+  Per-subcommand help:  checkpoint-explorer diff --help  ·  checkpoint-explorer convert --help"
+    )
+}
 
 #[derive(Parser)]
 #[command(name = "checkpoint-explorer")]
@@ -88,7 +105,7 @@ diff-style exit codes.
 
 Give one or more paths to browse; press `l` in any screen for its key legend. See the \
 examples below and `<command> --help`.")]
-#[command(after_long_help = EXAMPLES)]
+#[command(after_long_help = examples_help())]
 #[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
@@ -102,9 +119,12 @@ struct Cli {
 
 #[derive(ClapArgs)]
 struct ExploreArgs {
-    #[arg(
-        help = "Checkpoint files, directories, or glob patterns to explore (e.g. *.safetensors, model-*.gguf, *.npy, *.npz, *.hdf5). Remote paths work too — an scp-style [USER@]HOST:/path (read over SSH, like --ssh-read), or an s3:// URI passed together with --ssh-read <HOST>; both browse-only, only metadata leaves the host"
-    )]
+    #[arg(help = "Checkpoint files, directories, or glob patterns to explore \
+                (e.g. *.safetensors, model-*.gguf, *.npy, *.npz, *.hdf5).\n\
+                \n\
+                Remote paths work too (read over SSH — only metadata leaves the host):\n  \
+                [USER@]HOST:/path   scp-style path, like --ssh-read\n  \
+                s3://…              an S3 checkpoint; pass with --ssh-read <HOST>")]
     paths: Vec<PathBuf>,
 
     #[arg(
@@ -323,7 +343,7 @@ struct ExploreArgs {
     #[arg(
         long = "ssh-read",
         value_name = "[USER@]HOST",
-        help = "Read a remote checkpoint's structure over SSH on [USER@]HOST (which has the access): an s3:// cstorch checkpoint, or a path to a safetensors directory/file on that host. Only the tensor metadata (names/dtypes/shapes) leaves the host — data/secrets stay remote. Browse-only"
+        help = "Read a remote checkpoint's structure over SSH on [USER@]HOST (which has the access): an s3:// checkpoint, or a path to a safetensors directory/file on that host. Only the tensor metadata (names/dtypes/shapes) leaves the host — data/secrets stay remote. Metadata-only"
     )]
     ssh_read: Option<String>,
 

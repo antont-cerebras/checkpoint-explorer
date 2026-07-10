@@ -467,7 +467,7 @@ pub struct Explorer {
     tensors: Vec<TensorInfo>,
     metadata: Vec<MetadataInfo>,
     /// When set (`--ssh-read`), remote `s3://…` sources have their metadata read
-    /// over SSH via cstorch on the remote, instead of directly (browse-only).
+    /// over SSH via cstorch on the remote, instead of directly (metadata-only).
     remote_read: Option<crate::remote::RemoteRead>,
     /// Whether the whole checkpoint structure has been read. A direct
     /// `--tensor X` open reads just that tensor first (fast path), leaving this
@@ -1894,7 +1894,7 @@ impl Explorer {
             current_file: &title,
             file_idx: 0,
             total_files: 1,
-            browse_only: self.remote_read.is_some(),
+            metadata_only: self.remote_read.is_some(),
             selected_idx: self.selected_idx,
             scroll_offset: self.scroll_offset,
             search_mode: self.search_mode,
@@ -3702,7 +3702,7 @@ impl Explorer {
         let unindexed = self.unindexed.contains(&tensor.source_path);
         // A remote (`--ssh-read`) source has no local bytes: statistics and the
         // data views can't run, so we don't preload/scan and the data keys show a
-        // browse-only notice instead of failing.
+        // metadata-only notice instead of failing.
         let remote = crate::remote::is_remote_source(&tensor.source_path);
         // While this screen is up, compute the tensor's exact stats in the
         // background and show the scan live on the Statistics line (a spinner +
@@ -3948,7 +3948,7 @@ impl Explorer {
                 layout_hint = Some(c);
                 continue;
             }
-            // Browse-only (remote): the data keys can't run without local bytes, so
+            // Metadata-only (remote): the data keys can't run without local bytes, so
             // float a notice over the detail explaining why instead of attempting a
             // read that fails with an erasing pop-up.
             if remote

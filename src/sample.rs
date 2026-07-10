@@ -1235,7 +1235,7 @@ pub(crate) trait TensorReader {
 /// Open the right [`TensorReader`] for a tensor, dispatching by file extension.
 pub(crate) fn open_reader(t: &TensorInfo) -> Result<Box<dyn TensorReader>, String> {
     // Remote sources (`--ssh-read`: `s3://…` or scp-style `host:/path`) are
-    // browse-only: their metadata was read on the remote, but the data views
+    // metadata-only: their metadata was read on the remote, but the data views
     // (heatmap/values/stats) read locally via mmap, so there are no bytes here.
     if crate::remote::is_remote_source(&t.source_path) {
         return Err(
