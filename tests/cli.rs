@@ -192,6 +192,18 @@ fn print_tree_text() {
 }
 
 #[test]
+fn print_tree_name_filter() {
+    // Include glob: only the matching tensors (and their groups) survive.
+    settings().bind(|| insta::assert_snapshot!(export(&["--print-tree", "--name", "*.mlp.*"])));
+}
+
+#[test]
+fn print_tensors_name_exclude() {
+    // Negated glob: everything except the pattern.
+    settings().bind(|| insta::assert_snapshot!(export(&["--print-tensors", "--name", "!*.mlp.*"])));
+}
+
+#[test]
 fn print_tree_json() {
     settings().bind(|| insta::assert_snapshot!(export(&["--print-tree", "--format", "json"])));
 }

@@ -1922,8 +1922,14 @@ impl Explorer {
     /// Load the checkpoint and print the grouped tree to stdout, then return —
     /// `--print-tree`. Text is the fully-expanded browser tree; JSON is the
     /// `model.safetensors.index.json` shape (see [`TreeFormat`]).
-    pub fn print_tree(&mut self, format: TreeFormat, detail: TreeDetail) -> Result<()> {
+    pub fn print_tree(
+        &mut self,
+        format: TreeFormat,
+        detail: TreeDetail,
+        filter: &crate::filter::NameFilter,
+    ) -> Result<()> {
         self.load_quiet()?;
+        self.apply_name_filter(filter);
         let out = match format {
             TreeFormat::Text => self.tree_text(detail),
             TreeFormat::Json => self.tree_json(detail),
@@ -1933,13 +1939,32 @@ impl Explorer {
 
     /// Load the checkpoint and print a flat list of every tensor to stdout, then
     /// return — `--print-tensors`.
-    pub fn print_tensors(&mut self, format: TreeFormat, detail: TreeDetail) -> Result<()> {
+    pub fn print_tensors(
+        &mut self,
+        format: TreeFormat,
+        detail: TreeDetail,
+        filter: &crate::filter::NameFilter,
+    ) -> Result<()> {
         self.load_quiet()?;
+        self.apply_name_filter(filter);
         let out = match format {
             TreeFormat::Text => self.tensors_text(detail),
             TreeFormat::Json => self.tensors_json(detail),
         };
         emit_stdout(&out)
+    }
+
+    /// Drop the tensors and metadata whose names don't pass `filter`, then rebuild
+    /// the tree — scoping a `--print-tree` / `--print-tensors` export to a subset.
+    /// A no-op when the filter is inactive.
+    fn apply_name_filter(&mut self, filter: &crate::filter::NameFilter) {
+        if !filter.is_active() {
+            return;
+        }
+        self.tensors.retain(|t| filter.matches(&t.name));
+        self.metadata.retain(|m| filter.matches(&m.name));
+        self.total_parameters = self.tensors.iter().map(|t| t.num_elements).sum();
+        self.build_tree();
     }
 
     /// The whole tree as text — every group and tensor in the browser's row
