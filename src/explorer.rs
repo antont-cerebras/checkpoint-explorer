@@ -1252,17 +1252,33 @@ impl Explorer {
     /// returning to the tree from a detail/data view, and when the app was
     /// opened with `--tensor`/`--metadata`, so you land back on that row.
     fn reveal_tensor(&mut self, name: &str) {
-        if !self.search_mode {
-            TreeBuilder::expand_to_tensor(&mut self.tree, name);
-            self.flatten_tree();
-        }
-        let tree = if self.search_mode {
+        let visible = if self.search_mode {
             &self.filtered_tree
         } else {
             &self.flattened_tree
         };
-        if let Some(idx) = tree.iter().position(|(node, _)| node.name() == name) {
+        // Fast path — the row is already on screen (e.g. returning to an expanded
+        // tree from a detail view, the common case): just move the cursor. No
+        // ancestor is collapsed, so there's nothing to expand and no reason to
+        // rebuild the (possibly large) flattened tree — that rebuild was the
+        // source of the lag going back to a big remote checkpoint's tree.
+        if let Some(idx) = visible.iter().position(|(node, _)| node.name() == name) {
             self.selected_idx = idx;
+            return;
+        }
+        // Otherwise the target sits under a collapsed group: expand its ancestors,
+        // re-flatten, then locate it. (Search results are a flat list, so if it
+        // wasn't found above it isn't a current match — leave the cursor put.)
+        if !self.search_mode {
+            TreeBuilder::expand_to_tensor(&mut self.tree, name);
+            self.flatten_tree();
+            if let Some(idx) = self
+                .flattened_tree
+                .iter()
+                .position(|(n, _)| n.name() == name)
+            {
+                self.selected_idx = idx;
+            }
         }
     }
 
@@ -1276,6 +1292,14 @@ impl Explorer {
     }
 
     fn update_filtered_tree(&mut self) {
+        // `filtered_tree` is only ever read while searching, so during plain
+        // browsing don't spend a full clone of the (possibly huge) flattened tree
+        // keeping it in sync — the dominant cost of returning to a big expanded
+        // tree from a detail view. `enter_search_mode` sets `search_mode` before
+        // calling this, so the results list is still built the moment you search.
+        if !self.search_mode {
+            return;
+        }
         if self.search_query.is_empty() {
             self.filtered_tree = self.flattened_tree.clone();
         } else {
@@ -5713,6 +5737,53 @@ mod tests {
         e.selected_idx = 0;
         e.move_to_parent();
         assert_eq!(e.selected_idx, 0);
+    }
+
+    // reveal_tensor lands the cursor on a leaf whether or not its group is already
+    // open — and when it's already visible it must NOT rebuild the flattened tree
+    // (that rebuild was the lag returning to a big expanded remote tree).
+    #[test]
+    fn reveal_tensor_moves_cursor_and_only_reflattens_when_needed() {
+        use crate::tree::{Layout, Storage, TensorInfo};
+        let ti = |name: &str| TensorInfo {
+            name: name.to_string(),
+            dtype: "F32".into(),
+            shape: vec![2, 2],
+            size_bytes: 16,
+            num_elements: 4,
+            storage: Storage::Unknown,
+            source_path: "/tmp/x.safetensors".into(),
+            layout: Layout::None,
+        };
+        let mut e = Explorer::new(Vec::new(), Vec::new(), None, false);
+        e.finalize_load(
+            vec![ti("blk.0.a"), ti("blk.0.b"), ti("blk.1.a"), ti("blk.1.b")],
+            Vec::new(),
+        );
+
+        // Fully expanded: the leaf is already visible, so revealing it just moves
+        // the cursor onto that exact row without changing the flattened tree.
+        e.set_all_expanded(true);
+        let before = e.flattened_tree.clone();
+        e.reveal_tensor("blk.1.b");
+        assert_eq!(e.flattened_tree.len(), before.len());
+        assert_eq!(
+            e.flattened_tree[e.selected_idx].0.name(),
+            "blk.1.b",
+            "cursor should land on the revealed leaf"
+        );
+
+        // Collapsed: the leaf isn't visible, so reveal must expand its ancestors,
+        // grow the flattened tree, and still land on it.
+        e.set_all_expanded(false);
+        let collapsed_rows = e.flattened_tree.len();
+        e.selected_idx = 0;
+        e.reveal_tensor("blk.1.b");
+        assert!(
+            e.flattened_tree.len() > collapsed_rows,
+            "reveal expands to it"
+        );
+        assert_eq!(e.flattened_tree[e.selected_idx].0.name(), "blk.1.b");
     }
 
     #[test]
