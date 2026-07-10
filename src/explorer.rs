@@ -2355,8 +2355,7 @@ impl Explorer {
                         self.search_cursor =
                             (self.search_cursor + 1).min(self.search_query.chars().count());
                     }
-                    // In the results list Home/End jump to the first/last match
-                    // and PageUp/PageDown move by one screenful.
+                    // In the results list Home/End jump to the first/last match.
                     KeyEvent {
                         code: KeyCode::Home,
                         ..
@@ -2366,14 +2365,16 @@ impl Explorer {
                     } if self.search_mode => {
                         self.selected_idx = self.filtered_tree.len().saturating_sub(1);
                     }
+                    // PageUp/PageDown move the cursor by one screenful — both while
+                    // browsing the tree and in the search results list.
                     KeyEvent {
                         code: KeyCode::PageUp,
                         ..
-                    } if self.search_mode => self.move_selection(-(self.page_rows() as i32)),
+                    } => self.move_selection(-(self.page_rows() as i32)),
                     KeyEvent {
                         code: KeyCode::PageDown,
                         ..
-                    } if self.search_mode => self.move_selection(self.page_rows() as i32),
+                    } => self.move_selection(self.page_rows() as i32),
                     // ← jumps to the parent group; → enters the group (its
                     // first child), expanding it first if collapsed.
                     KeyEvent {
@@ -5711,6 +5712,29 @@ mod tests {
         // Top-level row has no parent.
         e.selected_idx = 0;
         e.move_to_parent();
+        assert_eq!(e.selected_idx, 0);
+    }
+
+    #[test]
+    fn move_selection_pages_through_the_browsing_tree_and_clamps() {
+        // Not searching, so move_selection (what PageUp/PageDown call) walks the
+        // full flattened tree rather than the filtered results.
+        let mut e = explorer_with_depths(&vec![0; 100]);
+        assert!(!e.search_mode);
+
+        // A page-sized jump down advances by the delta.
+        e.selected_idx = 0;
+        e.move_selection(20);
+        assert_eq!(e.selected_idx, 20);
+
+        // Past the end it clamps to the last row rather than overshooting.
+        e.move_selection(1000);
+        assert_eq!(e.selected_idx, 99);
+
+        // A page-sized jump up steps back, and never underflows past the top.
+        e.move_selection(-20);
+        assert_eq!(e.selected_idx, 79);
+        e.move_selection(-1000);
         assert_eq!(e.selected_idx, 0);
     }
 
