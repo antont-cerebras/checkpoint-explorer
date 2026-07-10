@@ -75,7 +75,16 @@ impl RemoteSession {
     /// Run `command` on the host over an SSH exec channel, feed it `stdin`, and
     /// return its combined stdout+stderr. No local process is spawned and this
     /// reuses the session's authentication — used for the `s3://` cstorch dump.
-    pub fn exec_capture(&self, command: &str, stdin: &str) -> Result<String> {
+    /// Run `command` with `stdin` piped in, streaming the merged stdout/stderr:
+    /// `on_line` is called with each complete line *as it arrives* (so a remote
+    /// script's progress lines can drive a live bar), and the full output is
+    /// returned once the command exits.
+    pub fn exec_capture(
+        &self,
+        command: &str,
+        stdin: &str,
+        mut on_line: impl FnMut(&str),
+    ) -> Result<String> {
         let mut ch = self
             .session
             .channel_session()
@@ -88,9 +97,32 @@ impl RemoteSession {
         ch.write_all(stdin.as_bytes())
             .context("sending the script to the remote")?;
         ch.send_eof().ok();
+
+        // Read incrementally and hand off complete lines as they land. Lines are
+        // split on raw bytes and decoded whole, so a multi-byte char spanning a
+        // read boundary is never cut mid-sequence.
         let mut out = String::new();
-        ch.read_to_string(&mut out)
-            .context("reading the remote output")?;
+        let mut pending: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = ch.read(&mut buf).context("reading the remote output")?;
+            if n == 0 {
+                break;
+            }
+            pending.extend_from_slice(&buf[..n]);
+            while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=pos).collect();
+                let text = String::from_utf8_lossy(&line);
+                on_line(text.trim_end_matches(['\n', '\r']));
+                out.push_str(&text);
+            }
+        }
+        if !pending.is_empty() {
+            let text = String::from_utf8_lossy(&pending);
+            on_line(&text);
+            out.push_str(&text);
+        }
+
         ch.wait_close().ok();
         let code = ch.exit_status().unwrap_or(0);
         if code != 0 {
@@ -118,6 +150,7 @@ impl RemoteSession {
         files: &[String],
         displays: &[String],
         next: &std::sync::atomic::AtomicUsize,
+        progress: Option<&crate::progress::LoadProgress>,
     ) -> Result<Vec<(usize, Vec<TensorInfo>, Vec<MetadataInfo>)>> {
         use std::sync::atomic::Ordering;
         let sftp = self.session.sftp().context("opening the SFTP subsystem")?;
@@ -130,6 +163,9 @@ impl RemoteSession {
             let header = read_header(&sftp, &files[idx])?;
             let (ts, ms) = Explorer::parse_safetensors_header(&header, &displays[idx])?;
             out.push((idx, ts, ms));
+            if let Some(p) = progress {
+                p.advance();
+            }
         }
         Ok(out)
     }

@@ -18,12 +18,17 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::progress::LoadProgress;
 use crate::sftp::RemoteSession;
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo};
 
 /// Line prefix the remote script tags its JSON with, so we can pick it out of any
 /// motd / cstorch chatter on the SSH stdout.
 const SENTINEL: &str = "CKPT_EXPLORER_META:";
+
+/// Line prefix for the dump script's `done/total` progress reports, streamed
+/// ahead of the final metadata so the load bar fills for an `s3://` read too.
+const PROGRESS_TAG: &str = "CKPT_EXPLORER_PROG:";
 
 /// Upper bound on SSH sessions used to read one safetensors dir's shards in
 /// parallel (work-stealing) — roughly one per shard for a typical sharded model,
@@ -72,7 +77,8 @@ impl RemoteRead {
         let session = self.open_with(&mut password)?; // password prompt (before the spinner)
         eprintln!("checkpoint-explorer: reading tensor metadata over ssh …");
         let bars = crate::progress::Bars::start(vec![src.to_string()]);
-        let out = self.read(&session, src, &password);
+        let progress = bars.progress(0);
+        let out = self.read(&session, src, &password, progress.as_deref());
         bars.finish(0, out.is_ok());
         bars.join();
         out
@@ -96,11 +102,12 @@ impl RemoteRead {
         session: &RemoteSession,
         src: &str,
         password: &Option<String>,
+        progress: Option<&LoadProgress>,
     ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
         if src.starts_with("s3://") {
-            self.read_cstorch(session, src)
+            self.read_cstorch(session, src, progress)
         } else {
-            self.read_dir(session, src, password)
+            self.read_dir(session, src, password, progress)
         }
     }
 
@@ -121,12 +128,17 @@ impl RemoteRead {
         session: &RemoteSession,
         path: &str,
         password: &Option<String>,
+        progress: Option<&LoadProgress>,
     ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
         use std::sync::atomic::AtomicUsize;
 
         let files = session.list_shards(path)?;
         if files.is_empty() {
             bail!("no safetensors files found at {}", self.source_path(path));
+        }
+        // Now the shard count is known — the bar switches from spinner to filling.
+        if let Some(p) = progress {
+            p.set_total(files.len());
         }
         // Stamp each tensor with *its own* shard's scp-style path (not the dir), so
         // the status line / `f` shows the exact file and it's usable with scp.
@@ -138,13 +150,13 @@ impl RemoteRead {
             let (files, displays, next) = (&files, &displays, &next);
             let mut handles = Vec::with_capacity(workers);
             // The already-open session reads straight away.
-            handles.push(s.spawn(move || session.read_shards(files, displays, next)));
+            handles.push(s.spawn(move || session.read_shards(files, displays, next, progress)));
             // Extra sessions connect in parallel, then join the same queue.
             for _ in 1..workers {
                 handles.push(s.spawn(move || {
                     let mut pw = password.clone();
                     match self.open_with(&mut pw) {
-                        Ok(extra) => extra.read_shards(files, displays, next),
+                        Ok(extra) => extra.read_shards(files, displays, next, progress),
                         Err(_) => Ok(Vec::new()), // one fewer reader; others cover it
                     }
                 }));
@@ -191,10 +203,22 @@ impl RemoteRead {
         &self,
         session: &RemoteSession,
         src: &str,
+        progress: Option<&LoadProgress>,
     ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
         let script = dump_script(src);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
-        let out = session.exec_capture(&command, &script)?;
+        // Feed the streamed `PROG:done/total` lines into the load bar as they land.
+        let out = session.exec_capture(&command, &script, |line| {
+            if let Some((d, t)) = line
+                .strip_prefix(PROGRESS_TAG)
+                .and_then(|rest| rest.split_once('/'))
+                && let (Ok(done), Ok(total)) = (d.trim().parse(), t.trim().parse())
+                && let Some(p) = progress
+            {
+                p.set_total(total);
+                p.set_done(done);
+            }
+        })?;
         let json = out
             .lines()
             .rev()
@@ -221,8 +245,12 @@ fn dump_script(src: &str) -> String {
 import sys, json
 SRC = __URI__
 S = "__SENTINEL__"
+P = "__PROGRESS__"
 def emit(obj):
     sys.stdout.write(S + json.dumps(obj) + "\n")
+    sys.stdout.flush()
+def prog(done, total):
+    sys.stdout.write("%s%d/%d\n" % (P, done, total))
     sys.stdout.flush()
 try:
     import cerebras.pytorch as cstorch
@@ -232,19 +260,26 @@ try:
     sd = cstorch.load(SRC, map_location=None)   # lazy: metadata only, no data
 except Exception as e:
     emit({"error": "cstorch.load failed: %r" % (e,)}); sys.exit(0)
+keys = list(sd.keys())
+total = len(keys)
+prog(0, total)                                  # total known → bar goes determinate
+step = max(1, total // 100)                     # ~100 updates, not one per tensor
 tensors = []
-for name in list(sd.keys()):
+for i, name in enumerate(keys):
     try:
         t = sd[name]
         it = int(t.element_size()) if hasattr(t, "element_size") else 0
         tensors.append({"name": str(name), "dtype": str(getattr(t, "dtype", "")), "shape": [int(d) for d in t.shape], "itemsize": it})
     except Exception:
         pass
+    if (i + 1) % step == 0 or i + 1 == total:
+        prog(i + 1, total)
 emit({"tensors": tensors, "metadata": []})
 "#;
     TEMPLATE
         .replace("__URI__", &src_lit)
         .replace("__SENTINEL__", SENTINEL)
+        .replace("__PROGRESS__", PROGRESS_TAG)
 }
 
 /// Parse the remote JSON (`{tensors:[…], metadata:[…]}` or `{error:…}`) into

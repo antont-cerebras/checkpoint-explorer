@@ -7,9 +7,50 @@
 
 use std::io::{IsTerminal, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// Shared, thread-safe progress for the checkpoint-structure load: a count of
+/// completed units (shards / files) the reader bumps as it goes, and a total
+/// that starts at 0 and is set once known (e.g. after a remote directory is
+/// listed). The loading screen polls [`LoadProgress::snapshot`] to draw a bar
+/// instead of a bare spinner, so a slow SSH read visibly makes progress.
+#[derive(Default)]
+pub struct LoadProgress {
+    done: AtomicUsize,
+    total: AtomicUsize,
+}
+
+impl LoadProgress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record how many units the load comprises, once that's known.
+    pub fn set_total(&self, total: usize) {
+        self.total.store(total, Ordering::Relaxed);
+    }
+
+    /// Mark one more unit complete.
+    pub fn advance(&self) {
+        self.done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the absolute completed count (for a reader that reports totals rather
+    /// than ticking — e.g. the remote cstorch dump's progress lines).
+    pub fn set_done(&self, done: usize) {
+        self.done.store(done, Ordering::Relaxed);
+    }
+
+    /// `(done, total)` for rendering; `total` is 0 until [`Self::set_total`].
+    pub fn snapshot(&self) -> (usize, usize) {
+        (
+            self.done.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+        )
+    }
+}
 
 const RUNNING: u8 = 0;
 const OK: u8 = 1;
@@ -20,6 +61,7 @@ const ERR: u8 = 2;
 pub struct Bars {
     states: Vec<Arc<AtomicU8>>,
     durations: Vec<Arc<AtomicU64>>,
+    progress: Vec<Arc<LoadProgress>>,
     start: Instant,
     handle: Option<JoinHandle<()>>,
 }
@@ -30,16 +72,30 @@ impl Bars {
         let n = labels.len();
         let states: Vec<_> = (0..n).map(|_| Arc::new(AtomicU8::new(RUNNING))).collect();
         let durations: Vec<_> = (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let progress: Vec<_> = (0..n).map(|_| Arc::new(LoadProgress::new())).collect();
         let start = Instant::now();
-        let handle = std::io::stderr()
-            .is_terminal()
-            .then(|| spawn(labels, states.clone(), durations.clone(), start));
+        let handle = std::io::stderr().is_terminal().then(|| {
+            spawn(
+                labels,
+                states.clone(),
+                durations.clone(),
+                progress.clone(),
+                start,
+            )
+        });
         Bars {
             states,
             durations,
+            progress,
             start,
             handle,
         }
+    }
+
+    /// The shared progress handle for read `i` — hand it to the reader so it can
+    /// report shard/file completion, and the bar fills in as they land.
+    pub fn progress(&self, i: usize) -> Option<Arc<LoadProgress>> {
+        self.progress.get(i).cloned()
     }
 
     /// Mark read `i` finished — freezing its timer and showing `✓` (ok) or `✗`.
@@ -78,19 +134,45 @@ fn truncate_middle(s: &str, max: usize) -> String {
     format!("{h}…{t}")
 }
 
+/// Width of the drawn `━━━━━━` progress bar, in columns.
+const BAR_COLS: usize = 16;
+
+/// How many of `width` bar columns are filled for `done`/`total` (rounded,
+/// clamped to `width`; empty when `total` is 0).
+fn filled_cols(done: usize, total: usize, width: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    (((done as f64 / total as f64) * width as f64).round() as usize).min(width)
+}
+
+/// Start column of the indeterminate bar's bright `win`-wide window at animation
+/// `frame`, ping-ponging across a `width`-wide bar (so it shows an alive bar
+/// while the total is still unknown — connecting / listing the directory).
+fn sweep_pos(frame: usize, width: usize, win: usize) -> usize {
+    let span = width.saturating_sub(win);
+    if span == 0 {
+        return 0;
+    }
+    let t = frame % (span * 2);
+    if t <= span { t } else { span * 2 - t }
+}
+
 fn spawn(
     labels: Vec<String>,
     states: Vec<Arc<AtomicU8>>,
     durations: Vec<Arc<AtomicU64>>,
+    progress: Vec<Arc<LoadProgress>>,
     start: Instant,
 ) -> JoinHandle<()> {
-    // Fit labels to the terminal width so a line (mark + path + timer) can't wrap
-    // and break the fixed-height redraw. Truncate in the *middle* so both ends —
-    // the `s3://`/`host:` prefix and the checkpoint tail — stay visible.
+    // Fit labels to the terminal width so a line (mark + path + bar + timer) can't
+    // wrap and break the fixed-height redraw. Truncate in the *middle* so both
+    // ends — the `s3://`/`host:` prefix and the checkpoint tail — stay visible.
     let cols = crossterm::terminal::size()
         .map(|(c, _)| c as usize)
         .unwrap_or(80);
-    let budget = cols.saturating_sub(12).max(20); // "  ⠋ <label> 12.3s"
+    // "  ⠋ <label>  [bar]  123/456  12.3s"
+    let budget = cols.saturating_sub(BAR_COLS + 30).max(20);
     let labels: Vec<String> = labels.iter().map(|l| truncate_middle(l, budget)).collect();
     std::thread::spawn(move || {
         const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -122,9 +204,38 @@ fn spawn(
                     durations[k].load(Ordering::Relaxed)
                 };
                 let secs = ms as f64 / 1000.0;
+                // A `[███░░░] done/total` bar once the total is known (e.g. after a
+                // remote dir is listed); until then just the spinner + timer.
+                let (done, total) = progress[k].snapshot();
+                let bar = if total > 0 {
+                    // Determinate: a thin bar in the TUI `LineGauge` style
+                    // (`symbols::line::THICK`) — done part in the mark's colour, the
+                    // rest dim — plus the `done/total` count.
+                    let filled = filled_cols(done, total, BAR_COLS);
+                    format!(
+                        "  {color}{}{RESET}{DIM}{}{RESET} {done}/{total}",
+                        "━".repeat(filled),
+                        "━".repeat(BAR_COLS - filled),
+                    )
+                } else if st == RUNNING {
+                    // Total not known yet (still connecting / listing the dir) or an
+                    // `s3://` read with no per-shard count: an indeterminate bar with
+                    // a bright window sweeping across, so a live bar shows from the
+                    // start instead of a bare spinner.
+                    let win = 3.min(BAR_COLS);
+                    let pos = sweep_pos(i, BAR_COLS, win);
+                    format!(
+                        "  {DIM}{}{RESET}{color}{}{RESET}{DIM}{}{RESET}",
+                        "━".repeat(pos),
+                        "━".repeat(win),
+                        "━".repeat(BAR_COLS - pos - win),
+                    )
+                } else {
+                    String::new() // finished with no known total: mark + timer only
+                };
                 let _ = write!(
                     err,
-                    "\r\x1b[2K  {color}{mark}{RESET} {DIM}{}{RESET} {color}{secs:.1}s{RESET}\n",
+                    "\r\x1b[2K  {color}{mark}{RESET} {DIM}{}{RESET}{bar} {color}{secs:.1}s{RESET}\n",
                     labels[k]
                 );
             }
@@ -140,7 +251,39 @@ fn spawn(
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_middle;
+    use super::{LoadProgress, filled_cols, sweep_pos, truncate_middle};
+
+    #[test]
+    fn load_progress_tracks_done_and_total() {
+        let p = LoadProgress::new();
+        assert_eq!(p.snapshot(), (0, 0)); // total unknown until set
+        p.set_total(48);
+        p.advance();
+        p.advance();
+        assert_eq!(p.snapshot(), (2, 48));
+    }
+
+    #[test]
+    fn sweep_window_ping_pongs_within_bounds() {
+        let (w, win) = (16usize, 3usize);
+        let span = w - win; // 13
+        assert_eq!(sweep_pos(0, w, win), 0); // starts at the left
+        assert_eq!(sweep_pos(span, w, win), span); // reaches the right edge
+        assert_eq!(sweep_pos(span + 1, w, win), span - 1); // then reverses
+        // Never runs the window past the bar.
+        for f in 0..100 {
+            assert!(sweep_pos(f, w, win) + win <= w, "frame {f} overflows");
+        }
+    }
+
+    #[test]
+    fn bar_fill_is_proportional_and_clamped() {
+        assert_eq!(filled_cols(0, 48, 16), 0);
+        assert_eq!(filled_cols(24, 48, 16), 8); // half
+        assert_eq!(filled_cols(48, 48, 16), 16); // full
+        assert_eq!(filled_cols(47, 48, 16), 16); // rounds up, still clamped
+        assert_eq!(filled_cols(5, 0, 16), 0); // no total → empty, no divide-by-zero
+    }
 
     #[test]
     fn middle_truncation_keeps_both_ends() {

@@ -824,8 +824,9 @@ fn run_diff(
             let bars = progress::Bars::start(vec![old_str.to_string(), new_str.to_string()]);
             let read =
                 |session: &crate::sftp::RemoteSession, src: &str, i: usize| -> Result<Loaded> {
+                    let progress = bars.progress(i);
                     let out = r
-                        .read(session, src, &password)
+                        .read(session, src, &password, progress.as_deref())
                         .with_context(|| format!("reading {src}"));
                     bars.finish(i, out.is_ok());
                     out
