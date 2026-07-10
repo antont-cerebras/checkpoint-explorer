@@ -1,0 +1,81 @@
+---
+source: tests/cli.rs
+expression: "export(&[\"--print-tree\", \"--format\", \"json\", \"-v\"])"
+---
+{
+  "metadata": {
+    "total_size": 272
+  },
+  "tensors": {
+    "lm_head.weight": {
+      "dtype": "I32",
+      "num_elements": 8,
+      "shape": [
+        2,
+        4
+      ],
+      "size_bytes": 32
+    },
+    "model.embed_tokens.weight": {
+      "dtype": "F16",
+      "num_elements": 24,
+      "shape": [
+        6,
+        4
+      ],
+      "size_bytes": 48
+    },
+    "model.layers.0.input_layernorm.weight": {
+      "dtype": "F32",
+      "num_elements": 4,
+      "shape": [
+        4
+      ],
+      "size_bytes": 16
+    },
+    "model.layers.0.mlp.down_proj.weight": {
+      "dtype": "U16",
+      "num_elements": 60,
+      "shape": [
+        3,
+        4,
+        5
+      ],
+      "size_bytes": 120
+    },
+    "model.layers.0.self_attn.q_proj.weight": {
+      "dtype": "BF16",
+      "num_elements": 16,
+      "shape": [
+        4,
+        4
+      ],
+      "size_bytes": 32
+    },
+    "model.norm.weight": {
+      "dtype": "F32",
+      "num_elements": 4,
+      "shape": [
+        4
+      ],
+      "size_bytes": 16
+    },
+    "model.scale.u8": {
+      "dtype": "U8",
+      "num_elements": 8,
+      "shape": [
+        8
+      ],
+      "size_bytes": 8
+    }
+  },
+  "weight_map": {
+    "lm_head.weight": "[FIXTURE]",
+    "model.embed_tokens.weight": "[FIXTURE]",
+    "model.layers.0.input_layernorm.weight": "[FIXTURE]",
+    "model.layers.0.mlp.down_proj.weight": "[FIXTURE]",
+    "model.layers.0.self_attn.q_proj.weight": "[FIXTURE]",
+    "model.norm.weight": "[FIXTURE]",
+    "model.scale.u8": "[FIXTURE]"
+  }
+}

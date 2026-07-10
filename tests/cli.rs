@@ -165,7 +165,9 @@ fn plain(extra_args: &[&str]) -> String {
 /// the checkout location.
 fn settings() -> insta::Settings {
     let mut s = insta::Settings::clone_current();
-    s.add_filter(r"\S*tiny\.(?:safetensors|hdf5)", "[FIXTURE]");
+    // Match the fixture path/basename but not a surrounding quote, so JSON
+    // exports (`"…tiny.safetensors"`) keep their delimiters in the snapshot.
+    s.add_filter(r#"[^\s"]*tiny\.(?:safetensors|hdf5)"#, "[FIXTURE]");
     // The statistics / histogram scan duration (e.g. `(2ms)`, `(1.0s)`) is timing.
     s.add_filter(r"\(\d+(?:\.\d+)?m?s\)", "(<time>)");
     s
@@ -174,6 +176,51 @@ fn settings() -> insta::Settings {
 #[test]
 fn plain_tree() {
     settings().bind(|| insta::assert_snapshot!(plain(&[])));
+}
+
+/// Run a one-shot `--print-*` export (no `--plain`) and capture stdout.
+fn export(extra_args: &[&str]) -> String {
+    ensure_fixture();
+    let mut args = vec![FIXTURE];
+    args.extend_from_slice(extra_args);
+    run_bin(&args)
+}
+
+#[test]
+fn print_tree_text() {
+    settings().bind(|| insta::assert_snapshot!(export(&["--print-tree"])));
+}
+
+#[test]
+fn print_tree_json() {
+    settings().bind(|| insta::assert_snapshot!(export(&["--print-tree", "--format", "json"])));
+}
+
+#[test]
+fn print_tree_json_verbose() {
+    settings()
+        .bind(|| insta::assert_snapshot!(export(&["--print-tree", "--format", "json", "-v"])));
+}
+
+#[test]
+fn print_tensors_text() {
+    settings().bind(|| insta::assert_snapshot!(export(&["--print-tensors"])));
+}
+
+#[test]
+fn print_tensors_text_verbose() {
+    settings().bind(|| insta::assert_snapshot!(export(&["--print-tensors", "-v"])));
+}
+
+#[test]
+fn print_tensors_json() {
+    settings().bind(|| insta::assert_snapshot!(export(&["--print-tensors", "--format", "json"])));
+}
+
+#[test]
+fn print_tensors_json_verbose() {
+    settings()
+        .bind(|| insta::assert_snapshot!(export(&["--print-tensors", "--format", "json", "-v"])));
 }
 
 #[test]

@@ -1,0 +1,81 @@
+---
+source: tests/cli.rs
+expression: "export(&[\"--print-tensors\", \"--format\", \"json\", \"-v\"])"
+---
+[
+  {
+    "dtype": "I32",
+    "file": "[FIXTURE]",
+    "name": "lm_head.weight",
+    "num_elements": 8,
+    "shape": [
+      2,
+      4
+    ],
+    "size_bytes": 32
+  },
+  {
+    "dtype": "F16",
+    "file": "[FIXTURE]",
+    "name": "model.embed_tokens.weight",
+    "num_elements": 24,
+    "shape": [
+      6,
+      4
+    ],
+    "size_bytes": 48
+  },
+  {
+    "dtype": "F32",
+    "file": "[FIXTURE]",
+    "name": "model.layers.0.input_layernorm.weight",
+    "num_elements": 4,
+    "shape": [
+      4
+    ],
+    "size_bytes": 16
+  },
+  {
+    "dtype": "U16",
+    "file": "[FIXTURE]",
+    "name": "model.layers.0.mlp.down_proj.weight",
+    "num_elements": 60,
+    "shape": [
+      3,
+      4,
+      5
+    ],
+    "size_bytes": 120
+  },
+  {
+    "dtype": "BF16",
+    "file": "[FIXTURE]",
+    "name": "model.layers.0.self_attn.q_proj.weight",
+    "num_elements": 16,
+    "shape": [
+      4,
+      4
+    ],
+    "size_bytes": 32
+  },
+  {
+    "dtype": "F32",
+    "file": "[FIXTURE]",
+    "name": "model.norm.weight",
+    "num_elements": 4,
+    "shape": [
+      4
+    ],
+    "size_bytes": 16
+  },
+  {
+    "dtype": "U8",
+    "file": "[FIXTURE]",
+    "name": "model.scale.u8",
+    "num_elements": 8,
+    "shape": [
+      8
+    ],
+    "size_bytes": 8
+  }
+]

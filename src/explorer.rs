@@ -25,6 +25,7 @@ use crate::tree::{
 };
 use crate::ui::{DrawConfig, Legend, NumBase, Overlay, StatsView, StripeMode, UI};
 use crate::utils::base64_encode;
+use ratatui::text::{Line, Span};
 
 /// Whether the data views show the evenly-spaced overview or the first/last
 /// How a data view lays out the values it shows: an evenly-spaced overview, the
@@ -92,6 +93,119 @@ pub fn parse_tree_state(s: &str) -> Result<TreeState, String> {
         )),
     }
 }
+
+/// Output format for `--print-tree`. (The `t` copy shortcut always uses `Text`.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum TreeFormat {
+    /// The grouped tree as text — one row per node, fully expanded, in the same
+    /// layout the browser shows (no viewport limit, no header/footer chrome).
+    #[default]
+    Text,
+    /// A `model.safetensors.index.json`-style object: a `metadata.total_size`
+    /// and a `weight_map` of tensor name → its shard file. `-v` adds a `tensors`
+    /// block with each tensor's dtype / shape / element count.
+    Json,
+}
+
+/// How much per-tensor detail the tree export includes; raised by repeating `-v`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeDetail {
+    /// Text: names + the browser's own fields. JSON: the bare index.json shape.
+    Compact,
+    /// Text: each tensor row also names its source file. JSON: adds a `tensors`
+    /// block (dtype, shape, element count) alongside the `weight_map`.
+    Full,
+}
+
+impl TreeDetail {
+    /// Map a repeated-`-v` count to a detail level (0 → compact, ≥1 → full).
+    pub fn from_verbosity(count: u8) -> Self {
+        if count == 0 {
+            TreeDetail::Compact
+        } else {
+            TreeDetail::Full
+        }
+    }
+}
+
+/// Which structure an export dumps: the grouped tree or a flat tensor list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportShape {
+    Tree,
+    Tensors,
+}
+
+/// One entry in the `t` copy menu — a (shape, format, detail) combination, i.e.
+/// one CLI `--print-tree`/`--print-tensors` [`--format json`] [`-v`] variant.
+#[derive(Clone, Copy)]
+struct ExportChoice {
+    label: &'static str,
+    shape: ExportShape,
+    format: TreeFormat,
+    detail: TreeDetail,
+}
+
+/// The eight export variants offered by `t`, one per CLI combination. `+ files`
+/// (text) appends each tensor's source file; `+ details` (JSON) adds a
+/// per-tensor block/objects — both what `-v` does.
+const EXPORT_CHOICES: &[ExportChoice] = {
+    use ExportShape::{Tensors, Tree};
+    use TreeDetail::{Compact, Full};
+    use TreeFormat::{Json, Text};
+    &[
+        ExportChoice {
+            label: "tree · text",
+            shape: Tree,
+            format: Text,
+            detail: Compact,
+        },
+        ExportChoice {
+            label: "tree · text + files",
+            shape: Tree,
+            format: Text,
+            detail: Full,
+        },
+        ExportChoice {
+            label: "tree · JSON (index.json-style)",
+            shape: Tree,
+            format: Json,
+            detail: Compact,
+        },
+        ExportChoice {
+            label: "tree · JSON + tensor details",
+            shape: Tree,
+            format: Json,
+            detail: Full,
+        },
+        ExportChoice {
+            label: "tensors · text",
+            shape: Tensors,
+            format: Text,
+            detail: Compact,
+        },
+        ExportChoice {
+            label: "tensors · text + files",
+            shape: Tensors,
+            format: Text,
+            detail: Full,
+        },
+        ExportChoice {
+            label: "tensors · JSON (names)",
+            shape: Tensors,
+            format: Json,
+            detail: Compact,
+        },
+        ExportChoice {
+            label: "tensors · JSON + details",
+            shape: Tensors,
+            format: Json,
+            detail: Full,
+        },
+    ]
+};
+
+/// How many lines of the highlighted export the `t` menu previews.
+const MENU_PREVIEW_LINES: usize = 14;
 
 /// A tensor + view to open on startup, from the CLI flags.
 pub struct OpenRequest {
@@ -1805,6 +1919,392 @@ impl Explorer {
         crate::tui::headless_render(120, 40, |f| self.render_tree_frame(f, false))
     }
 
+    /// Load the checkpoint and print the grouped tree to stdout, then return —
+    /// `--print-tree`. Text is the fully-expanded browser tree; JSON is the
+    /// `model.safetensors.index.json` shape (see [`TreeFormat`]).
+    pub fn print_tree(&mut self, format: TreeFormat, detail: TreeDetail) -> Result<()> {
+        self.load_quiet()?;
+        let out = match format {
+            TreeFormat::Text => self.tree_text(detail),
+            TreeFormat::Json => self.tree_json(detail),
+        };
+        emit_stdout(&out)
+    }
+
+    /// Load the checkpoint and print a flat list of every tensor to stdout, then
+    /// return — `--print-tensors`.
+    pub fn print_tensors(&mut self, format: TreeFormat, detail: TreeDetail) -> Result<()> {
+        self.load_quiet()?;
+        let out = match format {
+            TreeFormat::Text => self.tensors_text(detail),
+            TreeFormat::Json => self.tensors_json(detail),
+        };
+        emit_stdout(&out)
+    }
+
+    /// The whole tree as text — every group and tensor in the browser's row
+    /// layout, fully expanded regardless of the live collapse state, with no
+    /// viewport limit or header/footer chrome. Backs the `t` copy and
+    /// `--print-tree`. `Full` appends each tensor's source file.
+    fn tree_text(&self, detail: TreeDetail) -> String {
+        fn walk(
+            node: &TreeNode,
+            depth: usize,
+            detail: TreeDetail,
+            unindexed: &HashSet<String>,
+            schemas: &HashMap<String, PackingSchema>,
+            out: &mut Vec<String>,
+        ) {
+            let mut line = crate::ui::tree_row_text(node, depth, unindexed, schemas);
+            if detail == TreeDetail::Full
+                && let TreeNode::Tensor { info, .. } = node
+            {
+                line.push_str(&format!("  ← {}", file_basename(&info.source_path)));
+            }
+            out.push(line);
+            if let TreeNode::Group { children, .. } = node {
+                for child in children {
+                    walk(child, depth + 1, detail, unindexed, schemas, out);
+                }
+            }
+        }
+        // Render a fully-expanded copy so every group's arrow (▾) matches the
+        // listing below it, regardless of the live collapse state.
+        let mut tree = self.tree.clone();
+        TreeBuilder::set_all_expanded(&mut tree, true);
+        let mut out = Vec::new();
+        for node in &tree {
+            walk(
+                node,
+                0,
+                detail,
+                &self.unindexed,
+                &self.packing_schemas,
+                &mut out,
+            );
+        }
+        out.join("\n")
+    }
+
+    /// A flat, one-line-per-tensor listing (in natural-sorted order), reusing the
+    /// browser's tensor-row field layout but without its leading `·` bullet — a
+    /// flat list needs no tree marker. `Full` appends each tensor's source file.
+    fn tensors_text(&self, detail: TreeDetail) -> String {
+        self.tensors
+            .iter()
+            .map(|t| {
+                let line = crate::ui::tensor_list_line(t, &self.unindexed, &self.packing_schemas);
+                let mut text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                if detail == TreeDetail::Full {
+                    text.push_str(&format!("  ← {}", file_basename(&t.source_path)));
+                }
+                text
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The tree as `model.safetensors.index.json`-style JSON: `metadata.total_size`
+    /// (summed logical bytes) and a `weight_map` of tensor name → shard file.
+    /// `Full` adds a `tensors` block with each tensor's dtype / shape / counts.
+    fn tree_json(&self, detail: TreeDetail) -> String {
+        let total_size: usize = self.tensors.iter().map(|t| t.size_bytes).sum();
+        let weight_map: serde_json::Map<String, serde_json::Value> = self
+            .tensors
+            .iter()
+            .map(|t| (t.name.clone(), file_basename(&t.source_path).into()))
+            .collect();
+        let mut root = serde_json::Map::new();
+        root.insert(
+            "metadata".into(),
+            serde_json::json!({ "total_size": total_size }),
+        );
+        root.insert("weight_map".into(), serde_json::Value::Object(weight_map));
+        if detail == TreeDetail::Full {
+            let tensors: serde_json::Map<String, serde_json::Value> = self
+                .tensors
+                .iter()
+                .map(|t| (t.name.clone(), tensor_facts(t)))
+                .collect();
+            root.insert("tensors".into(), serde_json::Value::Object(tensors));
+        }
+        serde_json::to_string_pretty(&serde_json::Value::Object(root)).unwrap_or_default()
+    }
+
+    /// A JSON list of tensors: bare names (`Compact`) or objects with name,
+    /// dtype, shape, element count and source file (`Full`). Natural-sorted.
+    fn tensors_json(&self, detail: TreeDetail) -> String {
+        let items: Vec<serde_json::Value> = match detail {
+            TreeDetail::Compact => self.tensors.iter().map(|t| t.name.clone().into()).collect(),
+            TreeDetail::Full => self
+                .tensors
+                .iter()
+                .map(|t| {
+                    let mut o = tensor_facts(t);
+                    if let serde_json::Value::Object(m) = &mut o {
+                        m.insert("name".into(), t.name.clone().into());
+                        m.insert("file".into(), file_basename(&t.source_path).into());
+                    }
+                    o
+                })
+                .collect(),
+        };
+        serde_json::to_string_pretty(&serde_json::Value::Array(items)).unwrap_or_default()
+    }
+
+    /// The `t` shortcut: open a modal menu to pick which export variant to copy
+    /// (tree / tensor list × text / JSON × plain / verbose — every CLI
+    /// `--print-*` combination), then copy that. `↑`/`↓` (or `1`–`8`) move,
+    /// Enter copies, Esc / click cancels. `term` is the borrowed live terminal.
+    fn copy_menu(&mut self, term: &mut crate::tui::LiveTerminal) {
+        let labels: Vec<&str> = EXPORT_CHOICES.iter().map(|c| c.label).collect();
+        let last = EXPORT_CHOICES.len() - 1;
+        let mut sel = 0usize;
+        // The preview is regenerated only when the highlight moves (it renders
+        // the real export, which is cheap but not free on a huge checkpoint).
+        let mut previewed = usize::MAX;
+        let mut preview: Vec<Line<'static>> = Vec::new();
+        let mut item_rects: Vec<ratatui::layout::Rect> = Vec::new();
+        loop {
+            if sel != previewed {
+                preview = self.export_preview(EXPORT_CHOICES[sel]);
+                previewed = sel;
+            }
+            if term
+                .draw(|f| {
+                    self.render_tree_frame(f, true);
+                    item_rects = UI::render_menu_box(f, "Copy as…", &labels, sel, &preview);
+                })
+                .is_err()
+            {
+                return;
+            }
+            // Which menu row (if any) is under a mouse position.
+            let hit = |col: u16, row: u16| -> Option<usize> {
+                item_rects.iter().position(|r| {
+                    row >= r.y && row < r.y + r.height && col >= r.x && col < r.x + r.width
+                })
+            };
+            match event::read() {
+                Ok(Event::Key(key)) => {
+                    if is_ctrl_c(&key) {
+                        quit_immediately();
+                    }
+                    match key.code {
+                        KeyCode::Up => sel = if sel == 0 { last } else { sel - 1 },
+                        KeyCode::Down => sel = if sel == last { 0 } else { sel + 1 },
+                        KeyCode::Home => sel = 0,
+                        KeyCode::End => sel = last,
+                        // 1–8 pick a row directly.
+                        KeyCode::Char(d @ '1'..='9') => {
+                            let i = d as usize - '1' as usize;
+                            if i <= last {
+                                self.copy_export(term, EXPORT_CHOICES[i]);
+                                return;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            self.copy_export(term, EXPORT_CHOICES[sel]);
+                            return;
+                        }
+                        KeyCode::Esc | KeyCode::Char('q') => return,
+                        _ => {}
+                    }
+                }
+                Ok(Event::Mouse(m)) => match m.kind {
+                    MouseEventKind::ScrollUp => sel = if sel == 0 { last } else { sel - 1 },
+                    MouseEventKind::ScrollDown => sel = if sel == last { 0 } else { sel + 1 },
+                    // Hover highlights the row under the cursor.
+                    MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                        if let Some(i) = hit(m.column, m.row) {
+                            sel = i;
+                        }
+                    }
+                    // Click a row to copy it; a click off the list cancels.
+                    MouseEventKind::Down(_) => match hit(m.column, m.row) {
+                        Some(i) => {
+                            self.copy_export(term, EXPORT_CHOICES[i]);
+                            return;
+                        }
+                        None => return,
+                    },
+                    _ => {}
+                },
+                Ok(_) => {}       // resize etc.: redraw
+                Err(_) => return, // input closed
+            }
+        }
+    }
+
+    /// The head of a menu `choice`'s export, styled like the tree, for the
+    /// picker's live preview — real output from this checkpoint. Always returns a
+    /// fixed number of rows (blank-padded, then a "+N more" / blank summary) so
+    /// the menu box is the same size for every option.
+    fn export_preview(&self, choice: ExportChoice) -> Vec<Line<'static>> {
+        let (mut lines, total) = match (choice.shape, choice.format) {
+            (ExportShape::Tree, TreeFormat::Text) => self.tree_preview_lines(choice.detail),
+            (ExportShape::Tensors, TreeFormat::Text) => self.tensors_preview_lines(choice.detail),
+            // JSON: syntax-highlight it with the same palette as the metadata
+            // view (falling back to plain lines if it somehow doesn't parse).
+            (_, TreeFormat::Json) => {
+                let full = self.export_text(choice);
+                let styled = crate::ui::highlight_json_lines(&full).unwrap_or_else(|| {
+                    full.lines()
+                        .map(|l| Line::from(Span::raw(l.to_string())))
+                        .collect()
+                });
+                let total = styled.len();
+                (styled.into_iter().take(MENU_PREVIEW_LINES).collect(), total)
+            }
+        };
+        lines.resize_with(MENU_PREVIEW_LINES, Line::default);
+        lines.push(if total > MENU_PREVIEW_LINES {
+            Line::from(crate::ui::dim_span(format!(
+                "… (+{} more lines)",
+                total - MENU_PREVIEW_LINES
+            )))
+        } else {
+            Line::default()
+        });
+        lines
+    }
+
+    /// Styled preview rows for the tree export (first [`MENU_PREVIEW_LINES`]), plus
+    /// the total row count. Walks fully expanded (forcing the open ▾ on collapsed
+    /// groups) without cloning the tree.
+    fn tree_preview_lines(&self, detail: TreeDetail) -> (Vec<Line<'static>>, usize) {
+        fn walk(
+            node: &TreeNode,
+            depth: usize,
+            detail: TreeDetail,
+            unindexed: &HashSet<String>,
+            schemas: &HashMap<String, PackingSchema>,
+            out: &mut Vec<Line<'static>>,
+            total: &mut usize,
+        ) {
+            *total += 1;
+            if out.len() < MENU_PREVIEW_LINES {
+                let mut line = crate::ui::tree_row_line(node, depth, unindexed, schemas);
+                if let TreeNode::Group {
+                    expanded: false, ..
+                } = node
+                {
+                    for span in &mut line.spans {
+                        if span.content == "▸" {
+                            span.content = "▾".into();
+                            break;
+                        }
+                    }
+                }
+                if detail == TreeDetail::Full
+                    && let TreeNode::Tensor { info, .. } = node
+                {
+                    line.spans.push(crate::ui::dim_span(format!(
+                        "  ← {}",
+                        file_basename(&info.source_path)
+                    )));
+                }
+                out.push(line);
+            }
+            if let TreeNode::Group { children, .. } = node {
+                for child in children {
+                    walk(child, depth + 1, detail, unindexed, schemas, out, total);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        let mut total = 0;
+        for node in &self.tree {
+            walk(
+                node,
+                0,
+                detail,
+                &self.unindexed,
+                &self.packing_schemas,
+                &mut out,
+                &mut total,
+            );
+        }
+        (out, total)
+    }
+
+    /// Styled preview rows for the flat tensor list (first [`MENU_PREVIEW_LINES`]),
+    /// plus the total tensor count.
+    fn tensors_preview_lines(&self, detail: TreeDetail) -> (Vec<Line<'static>>, usize) {
+        let lines = self
+            .tensors
+            .iter()
+            .take(MENU_PREVIEW_LINES)
+            .map(|t| {
+                let mut line =
+                    crate::ui::tensor_list_line(t, &self.unindexed, &self.packing_schemas);
+                if detail == TreeDetail::Full {
+                    line.spans.push(crate::ui::dim_span(format!(
+                        "  ← {}",
+                        file_basename(&t.source_path)
+                    )));
+                }
+                line
+            })
+            .collect();
+        (lines, self.tensors.len())
+    }
+
+    /// Copy the export text for `choice`. If it fits the terminal clipboard, copy
+    /// it directly (with a confirmation flash); otherwise copy the exact CLI
+    /// command that reproduces it and show that in a dismissible band.
+    fn copy_export(&mut self, term: &mut crate::tui::LiveTerminal, choice: ExportChoice) {
+        let text = self.export_text(choice);
+        if copy_to_clipboard(&text) {
+            self.flash_copied(choice.label);
+        } else {
+            let command = self.export_command(choice);
+            copy_to_clipboard(&command); // the command itself is small — always fits
+            if term
+                .draw(|f| {
+                    self.render_tree_frame(f, true);
+                    UI::render_export_band(f, &command);
+                })
+                .is_ok()
+            {
+                wait_for_dismiss();
+            }
+        }
+    }
+
+    /// The exported text for a menu `choice`.
+    fn export_text(&self, choice: ExportChoice) -> String {
+        match (choice.shape, choice.format) {
+            (ExportShape::Tree, TreeFormat::Text) => self.tree_text(choice.detail),
+            (ExportShape::Tree, TreeFormat::Json) => self.tree_json(choice.detail),
+            (ExportShape::Tensors, TreeFormat::Text) => self.tensors_text(choice.detail),
+            (ExportShape::Tensors, TreeFormat::Json) => self.tensors_json(choice.detail),
+        }
+    }
+
+    /// The concrete CLI command reproducing a menu `choice`, built the way `y`
+    /// builds its reopen command (real paths, scp-style / `--ssh-read` for a
+    /// remote source), so it runs as-is.
+    fn export_command(&self, choice: ExportChoice) -> String {
+        let mut parts = self.command_prefix();
+        parts.extend(self.checkpoint_path_parts());
+        parts.push(
+            match choice.shape {
+                ExportShape::Tree => "--print-tree",
+                ExportShape::Tensors => "--print-tensors",
+            }
+            .to_string(),
+        );
+        if choice.format == TreeFormat::Json {
+            parts.push("--format".to_string());
+            parts.push("json".to_string());
+        }
+        if choice.detail == TreeDetail::Full {
+            parts.push("-v".to_string());
+        }
+        parts.join(" ")
+    }
+
     /// Build the detail-screen draw config and render it into `frame` — the
     /// Ratatui counterpart of [`Self::render_tree_frame`], shared by the live loop
     /// and the headless render.
@@ -2016,7 +2516,10 @@ impl Explorer {
 
     /// Note a copy confirmation to flash on the bottom line for `COPY_FLASH`.
     fn flash_copied(&mut self, what: &str) {
-        self.copied_flash = Some((what.to_string(), std::time::Instant::now()));
+        self.copied_flash = Some((
+            format!("✓ Copied {what} to the clipboard"),
+            std::time::Instant::now(),
+        ));
     }
 
     /// The tree browser. Handles in-place keys (navigation, search, expand) and
@@ -2256,13 +2759,21 @@ impl Explorer {
                         modifiers: KeyModifiers::CONTROL,
                         ..
                     } => return Ok(Nav::Quit),
-                    // `c` (no modifier) copies the screen's text; `f` copies the
-                    // selected row's source File. In search mode both fall
-                    // through to be typed into the query.
+                    // `c` (no modifier) copies the screen's text; `t` copies the
+                    // whole (fully-expanded) tree; `f` copies the selected row's
+                    // source File. In search mode they fall through to the query.
                     KeyEvent {
                         code: KeyCode::Char('c'),
                         ..
                     } if !self.search_mode => self.copy_tree_screen(),
+                    KeyEvent {
+                        code: KeyCode::Char('t'),
+                        ..
+                    } if !self.search_mode => {
+                        let mut term = self.terminal.take().expect("interactive loop owns it");
+                        self.copy_menu(&mut term);
+                        self.terminal = Some(term);
+                    }
                     KeyEvent {
                         code: KeyCode::Char('f'),
                         ..
@@ -5605,6 +6116,56 @@ fn collect_source_paths(node: &TreeNode, out: &mut BTreeSet<String>) {
     }
 }
 
+/// Write `out` (plus a trailing newline) to stdout, treating a closed pipe
+/// (`| head`, `| grep -q`) as a normal, quiet exit rather than a panic — the
+/// one-shot `--print-*` exports are meant to be piped.
+fn emit_stdout(out: &str) -> Result<()> {
+    use std::io::Write;
+    let mut stdout = io::stdout();
+    match stdout
+        .write_all(out.as_bytes())
+        .and_then(|()| stdout.write_all(b"\n"))
+        .and_then(|()| stdout.flush())
+    {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The final path component of a tensor's `source_path` (its shard file), for
+/// the JSON `weight_map` and verbose listings. Works for local, scp-style
+/// (`host:/…`) and `s3://` paths; falls back to the whole string if it ends in
+/// no component (e.g. a trailing slash).
+fn file_basename(source_path: &str) -> &str {
+    source_path
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(source_path)
+}
+
+/// The per-tensor detail object shared by the JSON exports: dtype, shape,
+/// element count and logical byte size.
+fn tensor_facts(t: &TensorInfo) -> serde_json::Value {
+    let mut facts = serde_json::json!({
+        "dtype": t.dtype,
+        "shape": t.shape,
+        "num_elements": t.num_elements,
+        "size_bytes": t.size_bytes,
+    });
+    // For a compressed tensor (HDF5), also report the codec and on-disk size.
+    if let Storage::Compressed {
+        codec,
+        stored_bytes,
+    } = &t.storage
+    {
+        facts["codec"] = serde_json::Value::String(codec.clone());
+        facts["stored_bytes"] = serde_json::json!(stored_bytes);
+    }
+    facts
+}
+
 /// Quote `s` as a single shell argument: left bare when it's only made of safe
 /// characters (so plain tensor names and paths stay readable), else wrapped in
 /// single quotes with any embedded quote escaped. Used to build copyable CLI
@@ -5625,13 +6186,28 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
-/// Copy `text` to the terminal clipboard via the OSC 52 escape sequence. This
-/// reaches the *local* clipboard even over SSH/tmux (when the terminal supports
-/// OSC 52), unlike shelling out to xclip/pbcopy on the remote host.
-fn copy_to_clipboard(text: &str) {
+/// Largest OSC 52 base64 payload we'll emit. Past this, terminals and tmux tend
+/// to reject or truncate the sequence and spill the base64 into the display as
+/// text — so we refuse rather than corrupt the screen, offering `--print-tree`
+/// instead. Calibrated from a real ~30B checkpoint whose tree copies fine
+/// (~186 KiB of base64); 1 MiB leaves generous headroom for much larger models
+/// while still catching a pathological, terminal-breaking payload.
+const OSC52_MAX_B64: usize = 1 << 20; // 1 MiB
+
+/// Copy `text` to the clipboard via OSC 52 (reaches the local clipboard even
+/// over SSH/tmux). Returns `false` — emitting nothing — when the encoded payload
+/// exceeds [`OSC52_MAX_B64`], since a terminal that can't take it would otherwise
+/// dump the raw base64 on screen. Callers can then offer a fallback. (All copies
+/// but the whole-tree `t` are bounded by the viewport and comfortably fit.)
+fn copy_to_clipboard(text: &str) -> bool {
+    let b64 = base64_encode(text.as_bytes());
+    if b64.len() > OSC52_MAX_B64 {
+        return false;
+    }
     let mut stdout = io::stdout();
-    let _ = write!(stdout, "\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let _ = write!(stdout, "\x1b]52;c;{b64}\x07");
     let _ = stdout.flush();
+    true
 }
 
 #[cfg(test)]
@@ -5784,6 +6360,172 @@ mod tests {
             "reveal expands to it"
         );
         assert_eq!(e.flattened_tree[e.selected_idx].0.name(), "blk.1.b");
+    }
+
+    fn export_fixture() -> Explorer {
+        use crate::tree::{Layout, Storage, TensorInfo};
+        let ti = |name: &str, file: &str| TensorInfo {
+            name: name.to_string(),
+            dtype: "F32".into(),
+            shape: vec![4, 8],
+            size_bytes: 128,
+            num_elements: 32,
+            storage: Storage::Unknown,
+            source_path: format!("/ckpt/{file}"),
+            layout: Layout::None,
+        };
+        let mut e = Explorer::new(Vec::new(), Vec::new(), None, false);
+        e.finalize_load(
+            vec![
+                ti("model.layers.0.a", "model-00001.safetensors"),
+                ti("model.layers.0.b", "model-00001.safetensors"),
+                ti("model.layers.1.a", "model-00002.safetensors"),
+                ti("model.layers.1.b", "model-00002.safetensors"),
+            ],
+            Vec::new(),
+        );
+        e
+    }
+
+    #[test]
+    fn tree_text_export_is_fully_expanded() {
+        let e = export_fixture();
+        let text = e.tree_text(TreeDetail::Compact);
+        // Every group opens (▾, never a collapsed ▸) and the numeric layer group
+        // is summarised (≡ 2), independent of the live collapse state.
+        assert!(
+            !text.contains('▸'),
+            "export must be fully expanded:\n{text}"
+        );
+        assert!(text.contains("≡ 2"), "layer count shown:\n{text}");
+        // All four leaves are listed.
+        assert_eq!(text.matches(" [F32, ").count(), 4);
+    }
+
+    #[test]
+    fn tree_text_export_keeps_full_metadata() {
+        use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo};
+        // A metadata value well past the live tree's 50-char cap.
+        let long = "A".repeat(300);
+        let mut e = Explorer::new(Vec::new(), Vec::new(), None, false);
+        e.finalize_load(
+            vec![TensorInfo {
+                name: "blk.weight".into(),
+                dtype: "F32".into(),
+                shape: vec![2, 2],
+                size_bytes: 16,
+                num_elements: 4,
+                storage: Storage::Unknown,
+                source_path: "/x.safetensors".into(),
+                layout: Layout::None,
+            }],
+            vec![MetadataInfo {
+                name: "blk.weight.__metadata__".into(),
+                value: long.clone(),
+                value_type: "string".into(),
+            }],
+        );
+        let text = e.tree_text(TreeDetail::Compact);
+        // The export shows the whole value — not the "…"-truncated tree-row form.
+        assert!(
+            text.contains(&long),
+            "metadata truncated in export:\n{text}"
+        );
+    }
+
+    #[test]
+    fn tensors_text_export_is_flat_and_natural_sorted() {
+        let e = export_fixture();
+        let flat = e.tensors_text(TreeDetail::Compact);
+        let lines: Vec<&str> = flat.lines().collect();
+        assert_eq!(lines.len(), 4);
+        // Full tensor names (not the abbreviated tree labels), in natural order.
+        assert!(lines[0].contains("model.layers.0.a"));
+        assert!(lines[3].contains("model.layers.1.b"));
+        // --verbose appends the source file.
+        let flat_v = e.tensors_text(TreeDetail::Full);
+        assert!(flat_v.contains("← model-00001.safetensors"));
+    }
+
+    #[test]
+    fn tree_json_export_matches_index_json_shape() {
+        let e = export_fixture();
+        let v: serde_json::Value = serde_json::from_str(&e.tree_json(TreeDetail::Compact)).unwrap();
+        assert_eq!(v["metadata"]["total_size"], 512); // 4 × 128 bytes
+        assert_eq!(
+            v["weight_map"]["model.layers.1.a"],
+            "model-00002.safetensors"
+        );
+        assert!(
+            v.get("tensors").is_none(),
+            "compact omits per-tensor detail"
+        );
+        // --verbose adds a tensors block keyed by name.
+        let full: serde_json::Value = serde_json::from_str(&e.tree_json(TreeDetail::Full)).unwrap();
+        assert_eq!(full["tensors"]["model.layers.0.a"]["dtype"], "F32");
+        assert_eq!(
+            full["tensors"]["model.layers.0.a"]["shape"],
+            serde_json::json!([4, 8])
+        );
+    }
+
+    #[test]
+    fn oversized_clipboard_copy_is_refused_not_spilled() {
+        // A payload whose base64 exceeds the OSC 52 ceiling is refused (returns
+        // false, emits nothing) rather than dumped to the terminal as raw
+        // base64 — the failure mode for copying a very large tree.
+        let big = "x".repeat(OSC52_MAX_B64); // base64 is ~4/3 larger → over the cap
+        assert!(!copy_to_clipboard(&big));
+        // (The success path is not asserted here: it would emit the OSC 52
+        // escape and clobber the clipboard of whoever runs the tests.)
+    }
+
+    #[test]
+    fn tensors_json_export_is_names_then_objects() {
+        let e = export_fixture();
+        let names: serde_json::Value =
+            serde_json::from_str(&e.tensors_json(TreeDetail::Compact)).unwrap();
+        assert_eq!(names.as_array().unwrap().len(), 4);
+        assert_eq!(names[0], "model.layers.0.a"); // natural-sorted array
+        let full: serde_json::Value =
+            serde_json::from_str(&e.tensors_json(TreeDetail::Full)).unwrap();
+        assert_eq!(full[0]["name"], "model.layers.0.a");
+        assert_eq!(full[0]["file"], "model-00001.safetensors");
+        assert_eq!(full[0]["num_elements"], 32);
+    }
+
+    #[test]
+    fn copy_menu_covers_all_eight_cli_variants() {
+        let e = export_fixture();
+        // One menu entry per (shape × format × verbosity) CLI combination.
+        assert_eq!(EXPORT_CHOICES.len(), 8);
+        for c in EXPORT_CHOICES {
+            // The command carries exactly the flags for this choice…
+            let cmd = e.export_command(*c);
+            let shape_flag = match c.shape {
+                ExportShape::Tree => "--print-tree",
+                ExportShape::Tensors => "--print-tensors",
+            };
+            assert!(cmd.contains(shape_flag), "{cmd}");
+            assert_eq!(
+                cmd.contains("--format json"),
+                c.format == TreeFormat::Json,
+                "{cmd}"
+            );
+            assert_eq!(
+                cmd.split_whitespace().any(|t| t == "-v"),
+                c.detail == TreeDetail::Full,
+                "{cmd}"
+            );
+            // …and export_text dispatches to the matching generator.
+            let expected = match (c.shape, c.format) {
+                (ExportShape::Tree, TreeFormat::Text) => e.tree_text(c.detail),
+                (ExportShape::Tree, TreeFormat::Json) => e.tree_json(c.detail),
+                (ExportShape::Tensors, TreeFormat::Text) => e.tensors_text(c.detail),
+                (ExportShape::Tensors, TreeFormat::Json) => e.tensors_json(c.detail),
+            };
+            assert_eq!(e.export_text(*c), expected, "{}", c.label);
+        }
     }
 
     #[test]

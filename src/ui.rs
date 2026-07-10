@@ -596,6 +596,7 @@ impl UI {
                     selected,
                     config.unindexed,
                     config.packing_schemas,
+                    MetaDisplay::Capped, // live tree keeps rows short
                 ));
             }
             Paragraph::new(body).render(
@@ -672,10 +673,11 @@ impl UI {
             frame.buffer_mut(),
         );
 
-        // Second line: a copy confirmation (green) overrides the dimmed source file.
+        // Second line: a transient copy confirmation (green, shown verbatim)
+        // overrides the dimmed source file.
         let row1 = if let Some(flash) = config.copied_flash {
             Line::from(Span::styled(
-                format!("✓ Copied {flash} to the clipboard"),
+                flash.to_string(),
                 Style::default()
                     .fg(palette::SUCCESS)
                     .add_modifier(Modifier::BOLD),
@@ -910,6 +912,7 @@ impl UI {
             legend_title(legend),
             legend_band_lines(legend),
             Backdrop::Float,
+            None,
         );
     }
 
@@ -1011,7 +1014,6 @@ impl UI {
     /// through), or the raw text lines for a non-JSON value — with the same
     /// line-budget elision and footer.
     pub fn render_metadata_detail(frame: &mut Frame, metadata: &MetadataInfo) {
-        use ansi_to_tui::IntoText;
         let area = frame.area();
         let rows = area.height as usize;
 
@@ -1031,24 +1033,13 @@ impl UI {
 
         // A JSON object/array is highlighted (via `colored_json`'s ANSI, parsed
         // back into styled spans); everything else falls back to plain text lines.
-        let value_lines: Vec<Line> = match highlight_json(&metadata.value) {
-            Some(colored) => colored
-                .join("\n")
-                .into_text()
-                .map(|t| t.lines)
-                .unwrap_or_else(|_| {
-                    metadata
-                        .value
-                        .lines()
-                        .map(|l| Line::from(l.to_string()))
-                        .collect()
-                }),
-            None => metadata
+        let value_lines: Vec<Line> = highlight_json_lines(&metadata.value).unwrap_or_else(|| {
+            metadata
                 .value
                 .lines()
                 .map(|l| Line::from(l.to_string()))
-                .collect(),
-        };
+                .collect()
+        });
 
         // Show as many value lines as fit (header above + a short footer below),
         // noting how many were elided rather than cutting silently.
@@ -1631,6 +1622,7 @@ impl UI {
                 Line::from(dim_span("Click or press any key to return...")),
             ],
             Backdrop::Fill,
+            None,
         );
     }
 
@@ -1647,7 +1639,103 @@ impl UI {
                 Line::from(dim_span("Click or press any key to dismiss")),
             ],
             Backdrop::Float,
+            None,
         );
+    }
+
+    /// Borderless band shown when a chosen export is too big for the terminal
+    /// clipboard: it copies the concrete CLI command that reproduces it instead
+    /// and shows it on its own full-width line(s) at column 0 (so a long path
+    /// stays selectable even past the terminal width). Mirrors
+    /// [`Self::render_command_band`].
+    pub fn render_export_band(frame: &mut Frame, command: &str) {
+        let term_w = (frame.area().width as usize).max(1);
+        let title = Line::from(vec![
+            Span::styled(
+                " Too large to copy ",
+                Style::default()
+                    .fg(palette::KEY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "— export command copied to the clipboard ",
+                Style::default().fg(palette::SUCCESS),
+            ),
+        ]);
+        // The command, soft-wrapped at full width onto its own line(s), flush at
+        // column 0 so it stays selectable by hand when OSC-52 can't reach the
+        // terminal.
+        let chars: Vec<char> = command.chars().collect();
+        let cmd_rows = chars.len().div_ceil(term_w).max(1);
+        let mut content: Vec<Line> = (0..cmd_rows)
+            .map(|r| {
+                let seg: String = chars.iter().skip(r * term_w).take(term_w).collect();
+                Line::from(Span::raw(seg))
+            })
+            .collect();
+        content.push(Line::from(dim_span(
+            "run it to export  ·  any key dismisses",
+        )));
+        render_titled_bar(frame, title, content);
+    }
+
+    /// A floating selection menu: `items` numbered one per row with `selected`
+    /// highlighted, a `preview` of the highlighted choice's output below, and a
+    /// key hint. Used by the `t` copy-format picker; the caller drives selection
+    /// and repaints. Returns each item's on-screen rect so clicks/hovers can be
+    /// mapped back to a row.
+    pub fn render_menu_box(
+        frame: &mut Frame,
+        title: &str,
+        items: &[&str],
+        selected: usize,
+        preview: &[Line<'static>],
+    ) -> Vec<Rect> {
+        let mut content: Vec<Line> = items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let row = format!("{}. {item}", i + 1);
+                if i == selected {
+                    Line::from(Span::styled(
+                        format!("▸ {row}"),
+                        Style::default()
+                            .fg(palette::ACCENT)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                } else {
+                    Line::from(Span::raw(format!("  {row}")))
+                }
+            })
+            .collect();
+        // Live, tree-coloured preview of the highlighted export (from the current
+        // checkpoint), each line indented under a "preview:" header.
+        content.push(Line::default());
+        content.push(Line::from(dim_span("preview:")));
+        for line in preview {
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(line.spans.iter().cloned());
+            content.push(Line::from(spans));
+        }
+        content.push(Line::default());
+        content.push(Line::from(dim_span(
+            "↑/↓ or 1–8 choose  ·  Enter/click copy  ·  Esc cancel",
+        )));
+        // A fixed inner width keeps the box a constant size across options (the
+        // preview rows are already a fixed count); over-wide lines are clipped.
+        let width = (frame.area().width as usize)
+            .saturating_sub(4)
+            .clamp(24, 110);
+        let inner = render_popup_box(frame, title, content, Backdrop::Float, Some(width));
+        // The items occupy the first `items.len()` inner rows.
+        (0..items.len())
+            .map(|i| Rect {
+                x: inner.x,
+                y: inner.y + i as u16,
+                width: inner.width,
+                height: 1,
+            })
+            .collect()
     }
 
     /// Draw the copied CLI command as a borderless pop-up *over* the current
@@ -1850,19 +1938,27 @@ enum Backdrop {
 /// is cleared) so the screen behind stays visible — a real pop-up; with
 /// [`Backdrop::Fill`] the whole frame is wiped to the scrim first, for standalone
 /// message screens. Shared by the legend pop-up and message screens.
+/// Draw a centered popup box and return its inner (content) rect, so callers
+/// that need to hit-test the content — e.g. a clickable menu — can map screen
+/// coordinates to rows. `fixed_inner_w`, when set, pins the content width (lines
+/// wider than it are clipped) so the box is a constant size regardless of its
+/// content — otherwise the box sizes to the widest line.
 fn render_popup_box(
     frame: &mut Frame,
     title: &str,
     content: Vec<Line<'static>>,
     backdrop: Backdrop,
-) {
+    fixed_inner_w: Option<usize>,
+) -> Rect {
     let area = frame.area();
-    let inner_w = content
-        .iter()
-        .map(Line::width)
-        .max()
-        .unwrap_or(0)
-        .max(title.chars().count() + 2);
+    let inner_w = fixed_inner_w.unwrap_or_else(|| {
+        content
+            .iter()
+            .map(Line::width)
+            .max()
+            .unwrap_or(0)
+            .max(title.chars().count() + 2)
+    });
     let box_w = ((inner_w + 4) as u16).min(area.width); // 2 borders + 2 padding
     let box_h = ((content.len() + 2) as u16).min(area.height); // 2 borders
     let rect = Rect {
@@ -1902,6 +1998,7 @@ fn render_popup_box(
     Paragraph::new(content)
         .style(panel)
         .render(inner, frame.buffer_mut());
+    inner
 }
 
 /// A full-width pop-up framed with only top+bottom borders (the `title` rides the
@@ -2699,13 +2796,16 @@ fn to_yansi(color: Color) -> yansi::Color {
 /// JSON highlighting styled from the app palette, so a metadata config reads in
 /// the same colors as the rest of the UI: keys in the structural cyan accent
 /// (like tree groups), numbers in the amber dtype color, strings green, and the
-/// brackets/colons dimmed so the structure recedes behind the values.
+/// `{}`/`[]` brackets in the normal foreground — the same contrast as the commas
+/// and other punctuation colored_json leaves unstyled — while the colons stay
+/// dimmed so key/value separators recede behind the values.
 fn json_styler() -> colored_json::Styler {
     let dim = to_yansi(palette::DIM).foreground();
+    let bracket = to_yansi(Color::Reset).foreground();
     colored_json::Styler {
-        object_brackets: dim,
+        object_brackets: bracket,
         object_colon: dim,
-        array_brackets: dim,
+        array_brackets: bracket,
         key: to_yansi(palette::ACCENT).bold(),
         string_value: to_yansi(palette::SUCCESS).foreground(),
         integer_value: to_yansi(palette::DTYPE).foreground(),
@@ -2792,6 +2892,7 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<Chi
         (vec![Seg::Key("/", hint_key('/'))], "search"),
         (vec![Seg::Key("l", hint_key('l'))], "legend"),
         (vec![Seg::Key("c", hint_key('c'))], "copy screen"),
+        (vec![Seg::Key("t", hint_key('t'))], "copy tree"),
         (vec![Seg::Key("f", hint_key('f'))], "copy file"),
         (vec![Seg::Key("n", hint_key('n'))], "copy name"),
         (vec![Seg::Key("y", hint_key('y'))], "copy command"),
@@ -2925,12 +3026,95 @@ fn tree_search_line(config: &DrawConfig) -> Line<'static> {
 /// with the name, shape and size at full strength and only the leaf marker /
 /// storage tag dimmed; a `selected` row is drawn plain so the caller's highlight
 /// reads cleanly.
+/// The plain text of one tree row (no colour), exactly as [`tree_node_line`]
+/// draws it — the shared building block for exporting the tree / a tensor list
+/// (`t`, `--print-tree`, `--print-tensors`).
+pub fn tree_row_text(
+    node: &TreeNode,
+    depth: usize,
+    unindexed: &HashSet<String>,
+    packing_schemas: &HashMap<String, PackingSchema>,
+) -> String {
+    line_to_text(&tree_row_line(node, depth, unindexed, packing_schemas))
+}
+
+/// The styled tree row (the colour the browser draws) — the building block for
+/// the export text and the copy-menu preview.
+pub fn tree_row_line(
+    node: &TreeNode,
+    depth: usize,
+    unindexed: &HashSet<String>,
+    packing_schemas: &HashMap<String, PackingSchema>,
+) -> Line<'static> {
+    tree_node_line(
+        node,
+        depth,
+        false,
+        unindexed,
+        packing_schemas,
+        MetaDisplay::Full,
+    )
+}
+
+/// A tensor's row for the flat list: the same coloured fields as the tree, at
+/// its full name, but without the leading `·` bullet a flat list doesn't need.
+pub fn tensor_list_line(
+    info: &TensorInfo,
+    unindexed: &HashSet<String>,
+    packing_schemas: &HashMap<String, PackingSchema>,
+) -> Line<'static> {
+    let node = TreeNode::Tensor {
+        info: info.clone(),
+        label: None,
+    };
+    without_bullet(tree_node_line(
+        &node,
+        0,
+        false,
+        unindexed,
+        packing_schemas,
+        MetaDisplay::Capped,
+    ))
+}
+
+/// Drop the leading `·`/unindexed bullet from a depth-0 tensor row: span 0 is the
+/// (empty) indent and span 1 is the bullet, so remove it and trim the space that
+/// prefixes the name in the following span, leaving the coloured fields intact.
+fn without_bullet(line: Line<'static>) -> Line<'static> {
+    let mut spans = line.spans;
+    if spans.len() >= 2 {
+        spans.remove(1);
+        if let Some(next) = spans.get_mut(1) {
+            next.content = next.content.trim_start().to_string().into();
+        }
+    }
+    Line::from(spans)
+}
+
+/// The plain text of a styled line (its span contents concatenated).
+fn line_to_text(line: &Line<'static>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+/// How a metadata value is rendered in a tree row: capped to keep the live
+/// tree's rows short, or in full for exports (`--print-tree`, the `t` preview)
+/// where the whole value is wanted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetaDisplay {
+    Capped,
+    Full,
+}
+
 fn tree_node_line(
     node: &TreeNode,
     depth: usize,
     selected: bool,
     unindexed: &HashSet<String>,
     packing_schemas: &HashMap<String, PackingSchema>,
+    meta: MetaDisplay,
 ) -> Line<'static> {
     let indent = "  ".repeat(depth);
     let plain = |t: String| tree_span(selected, Color::Reset, t);
@@ -3027,11 +3211,12 @@ fn tree_node_line(
         }
         TreeNode::Metadata { info } => {
             let flat = info.value.split_whitespace().collect::<Vec<_>>().join(" ");
-            let truncated_value = if flat.chars().count() > 50 {
+            // Exports keep the whole value; the live tree caps it so rows stay short.
+            let truncated_value = if meta == MetaDisplay::Full || flat.chars().count() <= 50 {
+                flat
+            } else {
                 let head: String = flat.chars().take(47).collect();
                 format!("{head}...")
-            } else {
-                flat
             };
             s.push(tree_span(selected, palette::META, "†"));
             s.push(tree_span(selected, Color::Reset, " "));
@@ -3051,7 +3236,7 @@ fn tree_node_line(
 }
 
 /// A dimmed span (field labels, chrome) for the detail screen.
-fn dim_span(text: impl Into<String>) -> Span<'static> {
+pub fn dim_span(text: impl Into<String>) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(palette::DIM))
 }
 
@@ -3670,6 +3855,21 @@ fn highlight_json(raw: &str) -> Option<Vec<String>> {
     .to_colored_json(&value, colored_json::ColorMode::On)
     .ok()?;
     Some(pretty.split('\n').map(str::to_string).collect())
+}
+
+/// [`highlight_json`] parsed back into styled Ratatui lines (via `ansi-to-tui`),
+/// or `None` for non-JSON. Shared by the metadata detail view and the copy-menu
+/// preview so both show the same `colored_json` palette.
+pub fn highlight_json_lines(raw: &str) -> Option<Vec<Line<'static>>> {
+    use ansi_to_tui::IntoText;
+    let mut lines = highlight_json(raw)?.join("\n").into_text().ok()?.lines;
+    // `colored_json`'s resets parse to an explicit `bg = Reset`, which would
+    // paint the terminal's default background over a panel (e.g. the copy-menu
+    // pop-up). Drop it so each span inherits whatever container draws it.
+    for span in lines.iter_mut().flat_map(|line| line.spans.iter_mut()) {
+        span.style.bg = None;
+    }
+    Some(lines)
 }
 
 /// Truncate `s` to at most `width` characters, keeping the END (so a path's

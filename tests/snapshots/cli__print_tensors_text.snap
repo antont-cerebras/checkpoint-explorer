@@ -1,0 +1,11 @@
+---
+source: tests/cli.rs
+expression: "export(&[\"--print-tensors\"])"
+---
+lm_head.weight [I32, (2, 4), 32 B]
+model.embed_tokens.weight [F16, (6, 4), 48 B]
+model.layers.0.input_layernorm.weight [F32, (4), 16 B]
+model.layers.0.mlp.down_proj.weight [U16, (3, 4, 5), 120 B]
+model.layers.0.self_attn.q_proj.weight [BF16, (4, 4), 32 B]
+model.norm.weight [F32, (4), 16 B]
+model.scale.u8 [U8, (8), 8 B]
