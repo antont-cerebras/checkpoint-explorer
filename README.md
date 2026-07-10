@@ -246,6 +246,10 @@ checkpoint-explorer model.safetensors --print-tensors --format json -v
 
 # Works over SSH too — only the structure crosses the wire
 checkpoint-explorer host:/opt/model --print-tree --format json
+
+# Filter by a name glob (repeatable); prefix ! to exclude
+checkpoint-explorer model.safetensors --print-tree --name '*.mlp.*'
+checkpoint-explorer model.safetensors --print-tensors --name '!*.bias'
 ```
 
 | Flag | Effect |
@@ -254,6 +258,7 @@ checkpoint-explorer host:/opt/model --print-tree --format json
 | `--print-tensors` | Print a flat list of every tensor and exit |
 | `--format <text\|json>` | Output format for the above (default `text`) |
 | `-v` / `--verbose` | Add per-tensor detail (source file in text; a `tensors` block / detail objects — dtype, shape, element count, and codec + on-disk size for compressed tensors — in JSON) |
+| `--name <GLOB>` | Restrict the printed tree/list to matching tensor names (repeatable; prefix `!` to exclude, e.g. `'!*.bias'` = everything but biases) |
 
 ### Keyboard Controls
 
@@ -553,7 +558,7 @@ engine (`*`, `**`, `?`, `[…]`):
 
 | Flag | Selects |
 |------|---------|
-| `--name <GLOB>` | Tensors whose name matches the glob, e.g. `'*.mlp.down_proj.weight'`, `'model.layers.*'`. Repeatable — matches ANY given. |
+| `--name <GLOB>` | Tensors whose name matches the glob, e.g. `'*.mlp.down_proj.weight'`, `'model.layers.*'`. Repeatable — matches ANY given; prefix `!` to exclude (`'!*.bias'` = everything but biases). |
 | `--names <A,B,C>` | Exact names (comma-separated). |
 | `--names-from <FILE>` | Exact names from a file (one per line; `#` comments allowed). |
 | `--dtype-is <GLOB>` | Tensors whose stored dtype matches, e.g. `BF16`, `'F*'` (F16/F32/…). Case-insensitive; matches either side, so it catches a dtype change. |

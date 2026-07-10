@@ -3,6 +3,7 @@ mod codec;
 mod convert;
 mod diff;
 mod explorer;
+mod filter;
 mod gguf;
 #[cfg(feature = "hdf5")]
 mod hdf5;
@@ -261,6 +262,13 @@ struct ExploreArgs {
     verbose: u8,
 
     #[arg(
+        long = "name",
+        value_name = "GLOB",
+        help = "Filter --print-tree / --print-tensors to tensors whose name matches this glob (e.g. '*.mlp.*', 'model.layers.0.*'). Repeatable; prefix with ! to exclude ('!*.bias' = everything but biases)"
+    )]
+    name: Vec<String>,
+
+    #[arg(
         long = "ssh-read",
         value_name = "[USER@]HOST",
         help = "Read a remote checkpoint's structure over SSH on [USER@]HOST (which has the access): an s3:// cstorch checkpoint, or a path to a safetensors directory/file on that host. Only the tensor metadata (names/dtypes/shapes) leaves the host — data/secrets stay remote. Browse-only"
@@ -358,7 +366,8 @@ enum Command {
         no_color: bool,
         /// Only diff tensors whose name matches this glob (e.g.
         /// '*.mlp.down_proj.weight', 'model.layers.*'). Repeatable — a tensor
-        /// passes if it matches ANY. Scopes the whole diff (structural + values)
+        /// passes if it matches ANY; prefix with ! to exclude ('!*.bias' =
+        /// everything but biases). Scopes the whole diff (structural + values)
         /// to the matching subset; metadata is not compared.
         #[arg(long = "name", value_name = "GLOB")]
         name: Vec<String>,
@@ -535,10 +544,7 @@ fn build_tensor_filter(
 ) -> Result<diff::TensorFilter> {
     use glob::Pattern;
 
-    let name_globs = name
-        .iter()
-        .map(|g| Pattern::new(g).with_context(|| format!("invalid --name glob {g:?}")))
-        .collect::<Result<Vec<_>>>()?;
+    let name_filter = filter::NameFilter::parse(name)?;
 
     let mut exact: HashSet<String> = HashSet::new();
     if let Some(list) = names {
@@ -579,7 +585,7 @@ fn build_tensor_filter(
         .transpose()?;
 
     Ok(diff::TensorFilter {
-        name_globs,
+        names: name_filter,
         names_exact,
         dtype,
         shape,
@@ -1326,14 +1332,16 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         let venv = args.ssh_venv.unwrap_or_else(|| "~/venv".to_string());
         explorer.set_remote_read(host, venv);
     }
-    // One-shot exports: print the tree / tensor list and exit (honour --format
-    // and -v), before any interactive or --plain rendering.
-    let detail = explorer::TreeDetail::from_verbosity(args.verbose);
-    if args.print_tree {
-        return explorer.print_tree(args.format, detail);
-    }
-    if args.print_tensors {
-        return explorer.print_tensors(args.format, detail);
+    // One-shot exports: print the tree / tensor list and exit (honour --format,
+    // -v, and the --name filter), before any interactive or --plain rendering.
+    if args.print_tree || args.print_tensors {
+        let detail = explorer::TreeDetail::from_verbosity(args.verbose);
+        let filter = filter::NameFilter::parse(&args.name)?;
+        return if args.print_tree {
+            explorer.print_tree(args.format, detail, &filter)
+        } else {
+            explorer.print_tensors(args.format, detail, &filter)
+        };
     }
 
     if args.emit_command {

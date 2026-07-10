@@ -1,0 +1,6 @@
+---
+source: tests/cli.rs
+expression: "export(&[\"--print-tree\", \"--name\", \"*.mlp.*\"])"
+---
+▾ [FIXTURE] (▦ 1, 60 params, 120 B)
+  · model.layers.0.mlp.down_proj.weight [U16, (3, 4, 5), 120 B]

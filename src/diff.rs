@@ -14,6 +14,7 @@ use std::fmt::Write;
 use glob::{MatchOptions, Pattern};
 use serde_json::Value;
 
+use crate::filter::NameFilter;
 use crate::sample::{HistBins, HistogramDiff, ValueDiff};
 use crate::tree::{MetadataInfo, TensorInfo};
 use crate::utils::{format_parameters, format_shape, format_size};
@@ -501,8 +502,8 @@ fn shape_match_opts() -> MatchOptions {
 /// via [`shape_key`], dtypes case-insensitively).
 #[derive(Default)]
 pub struct TensorFilter {
-    /// Name globs; a tensor passes if it matches **any** (empty = unconstrained).
-    pub name_globs: Vec<Pattern>,
+    /// Name globs (with `!`-negation) — the shared [`NameFilter`].
+    pub names: NameFilter,
     /// Exact names (union of `--names` and `--names-from`); `None` = unconstrained.
     pub names_exact: Option<HashSet<String>>,
     /// A dtype glob, matched against the UPPERCASED dtype; `None` = unconstrained.
@@ -514,7 +515,7 @@ pub struct TensorFilter {
 impl TensorFilter {
     /// Whether any constraint is set (so the diff is scoped to a subset).
     pub fn is_active(&self) -> bool {
-        !self.name_globs.is_empty()
+        self.names.is_active()
             || self.names_exact.is_some()
             || self.dtype.is_some()
             || self.shape.is_some()
@@ -525,7 +526,7 @@ impl TensorFilter {
     /// shape constraint matches if **either** side matches, so a tensor whose
     /// dtype or shape changed is still selected.
     fn matches(&self, name: &str, old: Option<&TensorSig>, new: Option<&TensorSig>) -> bool {
-        if !self.name_globs.is_empty() && !self.name_globs.iter().any(|p| p.matches(name)) {
+        if !self.names.matches(name) {
             return false;
         }
         if self
@@ -576,9 +577,13 @@ impl TensorFilter {
             return None;
         }
         let mut parts = Vec::new();
-        if !self.name_globs.is_empty() {
-            let globs: Vec<&str> = self.name_globs.iter().map(Pattern::as_str).collect();
+        if !self.names.include.is_empty() {
+            let globs: Vec<&str> = self.names.include.iter().map(Pattern::as_str).collect();
             parts.push(format!("name~{}", globs.join("|")));
+        }
+        if !self.names.exclude.is_empty() {
+            let globs: Vec<&str> = self.names.exclude.iter().map(Pattern::as_str).collect();
+            parts.push(format!("name!~{}", globs.join("|")));
         }
         if let Some(set) = &self.names_exact {
             parts.push(format!("names({})", set.len()));
@@ -2051,7 +2056,10 @@ mod tests {
     #[test]
     fn filter_name_glob_matches_any() {
         let f = TensorFilter {
-            name_globs: vec![glob("*.mlp.*.weight"), glob("*.norm.weight")],
+            names: NameFilter {
+                include: vec![glob("*.mlp.*.weight"), glob("*.norm.weight")],
+                exclude: vec![],
+            },
             ..Default::default()
         };
         assert!(f.is_active());
@@ -2117,7 +2125,10 @@ mod tests {
     #[test]
     fn filter_constraints_compose_with_and() {
         let f = TensorFilter {
-            name_globs: vec![glob("*.down_proj.weight")],
+            names: NameFilter {
+                include: vec![glob("*.down_proj.weight")],
+                exclude: vec![],
+            },
             dtype: Some(glob("BF16")),
             ..Default::default()
         };
@@ -2151,7 +2162,10 @@ mod tests {
             &[],
         );
         let f = TensorFilter {
-            name_globs: vec![glob("*.down_proj.weight")],
+            names: NameFilter {
+                include: vec![glob("*.down_proj.weight")],
+                exclude: vec![],
+            },
             ..Default::default()
         };
         f.apply(&mut old, &mut new);
