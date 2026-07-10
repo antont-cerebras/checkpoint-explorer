@@ -1,0 +1,13 @@
+---
+source: tests/cli.rs
+expression: "export(&[\"--print-tensors\", \"--format\", \"json\"])"
+---
+[
+  "lm_head.weight",
+  "model.embed_tokens.weight",
+  "model.layers.0.input_layernorm.weight",
+  "model.layers.0.mlp.down_proj.weight",
+  "model.layers.0.self_attn.q_proj.weight",
+  "model.norm.weight",
+  "model.scale.u8"
+]

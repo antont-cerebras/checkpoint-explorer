@@ -221,6 +221,40 @@ without `--tensor` is reported as ambiguous.
 Dismissing the opened screen drops you into the normal tree browser, so you can
 keep exploring.
 
+### Export the tree or tensor list (scripting)
+Print the checkpoint structure to stdout and exit — for piping into `grep` /
+`jq` or saving to a file — instead of opening the browser. `--print-tree` dumps
+the grouped tree (fully expanded, the same text the `t` key copies);
+`--print-tensors` a flat list of every tensor. Both default to plain text and
+accept `--format json`; add `-v` for per-tensor detail. Output is pipe-safe
+(closing the pipe, e.g. `| head`, exits cleanly).
+
+```bash
+# The whole tree as text, fully expanded
+checkpoint-explorer model.safetensors --print-tree
+
+# A flat, one-per-line list of every tensor (natural-sorted)
+checkpoint-explorer shards/ --print-tensors
+
+# A model.safetensors.index.json-style object: metadata.total_size + a
+# weight_map of tensor name -> shard file
+checkpoint-explorer shards/ --print-tree --format json
+
+# -v adds detail: the source file in text; a `tensors` block (dtype/shape/
+# element count, plus codec + on-disk size for compressed tensors) in JSON
+checkpoint-explorer model.safetensors --print-tensors --format json -v
+
+# Works over SSH too — only the structure crosses the wire
+checkpoint-explorer host:/opt/model --print-tree --format json
+```
+
+| Flag | Effect |
+|------|--------|
+| `--print-tree` | Print the grouped tree (fully expanded) and exit |
+| `--print-tensors` | Print a flat list of every tensor and exit |
+| `--format <text\|json>` | Output format for the above (default `text`) |
+| `-v` / `--verbose` | Add per-tensor detail (source file in text; a `tensors` block / detail objects — dtype, shape, element count, and codec + on-disk size for compressed tensors — in JSON) |
+
 ### Keyboard Controls
 
 | Key | Action |
@@ -234,6 +268,7 @@ keep exploring.
 | `/` | Enter search mode to filter tensors |
 | `l` | Show a legend explaining the symbols on the current screen (works on every screen) |
 | `c` | Copy the current screen's text to the clipboard (works on every screen) |
+| `t` | (Tree) open a menu to copy the tree or a flat tensor list — text or JSON, plain or verbose (every `--print-*` variant) — to the clipboard |
 | `f` | Copy the selected row's File path (tensor file, or a group/root's file or directory) |
 | `n` | Copy the selected tensor's Name to the clipboard |
 | `y` | Show and copy the CLI command that reopens this exact screen — file, tensor (or metadata entry), dtype/shape overrides, view, layout, zebra, base, slice (works on every screen) |
@@ -253,7 +288,14 @@ search box is active, `Backspace` edits the query instead.)
 `c` copies the **text of the current screen** to the clipboard — the tree
 listing, a tensor's detail, or a data view's grid — via the OSC 52 terminal
 escape, so it reaches your local clipboard even over SSH/tmux (when the terminal
-supports it). A status bar pinned to the bottom of the tree shows the file the
+supports it). `t` (in the tree) opens a small menu to copy the **whole
+checkpoint** rather than just the visible screen — pick the tree or a flat
+tensor list, as text or JSON, plain or verbose (every `--print-*` variant; see
+[Export the tree or tensor list](#export-the-tree-or-tensor-list-scripting)).
+If the chosen export is too large for the terminal's clipboard, `t` instead
+copies the exact CLI command that reproduces it and shows it, so you can run
+that to export it.
+A status bar pinned to the bottom of the tree shows the file the
 selected tensor lives in (or, for a group/root, the single file or the shared
 directory of its tensors); `f` copies that path (so copying the root yields the
 file or the checkpoint directory).

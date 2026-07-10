@@ -231,6 +231,36 @@ struct ExploreArgs {
     emit_command: bool,
 
     #[arg(
+        long = "print-tree",
+        conflicts_with = "print_tensors",
+        help = "Print the whole checkpoint tree (grouped, fully expanded) and exit — plain text, or a model.safetensors.index.json-style object with --format=json"
+    )]
+    print_tree: bool,
+
+    #[arg(
+        long = "print-tensors",
+        help = "Print a flat list of every tensor and exit — plain text, or a JSON array with --format=json"
+    )]
+    print_tensors: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = explorer::TreeFormat::default(),
+        value_name = "FORMAT",
+        help = "Output format for --print-tree / --print-tensors: text (default) or json"
+    )]
+    format: explorer::TreeFormat,
+
+    #[arg(
+        short = 'v',
+        long = "verbose",
+        action = clap::ArgAction::Count,
+        help = "Add per-tensor detail to --print-tree / --print-tensors: the source file in text; a tensors block / detail objects in json"
+    )]
+    verbose: u8,
+
+    #[arg(
         long = "ssh-read",
         value_name = "[USER@]HOST",
         help = "Read a remote checkpoint's structure over SSH on [USER@]HOST (which has the access): an s3:// cstorch checkpoint, or a path to a safetensors directory/file on that host. Only the tensor metadata (names/dtypes/shapes) leaves the host — data/secrets stay remote. Browse-only"
@@ -1295,6 +1325,16 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         let venv = args.ssh_venv.unwrap_or_else(|| "~/venv".to_string());
         explorer.set_remote_read(host, venv);
     }
+    // One-shot exports: print the tree / tensor list and exit (honour --format
+    // and -v), before any interactive or --plain rendering.
+    let detail = explorer::TreeDetail::from_verbosity(args.verbose);
+    if args.print_tree {
+        return explorer.print_tree(args.format, detail);
+    }
+    if args.print_tensors {
+        return explorer.print_tensors(args.format, detail);
+    }
+
     if args.emit_command {
         explorer.render_plain(true)
     } else if args.plain {

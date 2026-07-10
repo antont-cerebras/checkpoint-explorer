@@ -1,0 +1,16 @@
+---
+source: tests/cli.rs
+expression: "export(&[\"--print-tree\"])"
+---
+▾ [FIXTURE] (▦ 7, 124 params, 272 B)
+  ▾ 🔧 Metadata (▦ 0, 0 B)
+    † format [string]: pt
+  · lm_head.weight [I32, (2, 4), 32 B]
+  ▾ model (▦ 6, 240 B)
+    · embed_tokens.weight [F16, (6, 4), 48 B]
+    ▾ layers.0 (▦ 3, 168 B)
+      · input_layernorm.weight [F32, (4), 16 B]
+      · mlp.down_proj.weight [U16, (3, 4, 5), 120 B]
+      · self_attn.q_proj.weight [BF16, (4, 4), 32 B]
+    · norm.weight [F32, (4), 16 B]
+    · scale.u8 [U8, (8), 8 B]

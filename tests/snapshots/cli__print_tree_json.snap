@@ -1,0 +1,18 @@
+---
+source: tests/cli.rs
+expression: "export(&[\"--print-tree\", \"--format\", \"json\"])"
+---
+{
+  "metadata": {
+    "total_size": 272
+  },
+  "weight_map": {
+    "lm_head.weight": "[FIXTURE]",
+    "model.embed_tokens.weight": "[FIXTURE]",
+    "model.layers.0.input_layernorm.weight": "[FIXTURE]",
+    "model.layers.0.mlp.down_proj.weight": "[FIXTURE]",
+    "model.layers.0.self_attn.q_proj.weight": "[FIXTURE]",
+    "model.norm.weight": "[FIXTURE]",
+    "model.scale.u8": "[FIXTURE]"
+  }
+}
