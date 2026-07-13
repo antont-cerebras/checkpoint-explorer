@@ -255,6 +255,9 @@ pub struct OpenRequest {
     /// render-time aid (for `--plain` / inspection); not part of `y`'s round-trip
     /// since the legend is a transient overlay you dismiss.
     pub legend: bool,
+    /// Open straight into the health-check popup on the tree (`--health`, the `h`
+    /// key). Part of `y`'s round-trip: the popup's `y` copies this command.
+    pub health: bool,
     /// Render the view once and exit without interactive navigation.
     pub exit_after: bool,
 }
@@ -1476,6 +1479,7 @@ impl Explorer {
             None => (false, false, None),
         };
         let want_legend = self.open.as_ref().is_some_and(|r| r.legend);
+        let want_health = self.open.as_ref().is_some_and(|r| r.health);
         if let Some(n) = bins {
             self.histogram_bins.set(Some(n));
         }
@@ -1497,7 +1501,11 @@ impl Explorer {
         // screen, instead of rendering. Used by the round-trip test (render the
         // screen, take this command, re-render, assert the two match).
         if emit_command {
-            println!("{}", self.reopen_command(&screen, want_stats, want_hist));
+            let mut cmd = self.reopen_command(&screen, want_stats, want_hist);
+            if want_health {
+                cmd = format!("{cmd} --health");
+            }
+            println!("{cmd}");
             return Ok(());
         }
 
@@ -1505,10 +1513,37 @@ impl Explorer {
         // draw the tree frame, then composite the legend band on top when asked —
         // mirroring the interactive `l` path (`show_legend`).
         if matches!(screen, Screen::Tree) {
+            // `--health`: composite the (structural) health popup over the tree.
+            let health = want_health.then(|| {
+                crate::check::run(
+                    self.files
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    &self.tensors,
+                    &self.metadata,
+                    &self.files,
+                    &self.health_reports,
+                    &crate::filter::NameFilter::default(),
+                    false,
+                    1,
+                )
+            });
             let text = crate::tui::headless_render(120, 40, |f| {
                 self.render_tree_frame(f, false); // headless: no scroll bar
                 if want_legend {
                     UI::render_legend_band(f, Legend::Tree);
+                }
+                if let Some(report) = &health {
+                    UI::render_check_report(
+                        f,
+                        report,
+                        crate::ui::CheckPopup::Idle {
+                            copied: None,
+                            can_scan: false,
+                        },
+                    );
                 }
             })?;
             println!("{text}");
@@ -1769,6 +1804,9 @@ impl Explorer {
         let mut history = vec![Screen::Tree];
         let mut cursor = 0usize;
 
+        // `--health` opens straight into the health-check popup once the tree is up.
+        let want_health = self.open.as_ref().is_some_and(|r| r.health);
+
         // A `--tensor` request seeds the history with that screen — or, with
         // `--exit`, renders it once and quits without entering the navigator.
         if let Some(req) = self.open.take() {
@@ -1809,6 +1847,15 @@ impl Explorer {
             }
         } else {
             self.load_all_files()?;
+        }
+
+        // `--health`: float the health-check popup over the tree before handing
+        // off to the navigator (dismissing it drops into the normal tree).
+        if want_health {
+            self.ensure_full_load()?;
+            let mut term = self.terminal.take().expect("interactive loop owns it");
+            self.show_check_report(&mut term);
+            self.terminal = Some(term);
         }
 
         loop {
@@ -2819,13 +2866,14 @@ impl Explorer {
                         self.copy_command(&mut term, &self.command_for_tree_selection(), None);
                         self.terminal = Some(term);
                     }
-                    // `h` shows the checkpoint health report (when there is one).
+                    // `h` runs the health checks and floats the report (the check
+                    // popup; `v` there runs the value scan, `y` copies).
                     KeyEvent {
                         code: KeyCode::Char('h'),
                         ..
                     } if !self.search_mode => {
                         let mut term = self.terminal.take().expect("interactive loop owns it");
-                        self.show_health_report(&mut term);
+                        self.show_check_report(&mut term);
                         self.terminal = Some(term);
                     }
                     // `l` opens the legend for the tree's glyphs.
@@ -5272,16 +5320,6 @@ impl Explorer {
         }
     }
 
-    fn show_health_report(&self, term: &mut crate::tui::LiveTerminal) {
-        if !self.health_reports.is_empty()
-            && term
-                .draw(|f| UI::render_health_warning(f, &self.health_reports))
-                .is_ok()
-        {
-            wait_for_dismiss();
-        }
-    }
-
     /// The single HDF5 file backing this checkpoint, if repacking applies (one
     /// `.h5`/`.hdf5` file). `None` for safetensors/GGUF or multi-file views.
     fn repack_input(&self) -> Option<PathBuf> {
@@ -5637,6 +5675,223 @@ impl Explorer {
             .is_ok()
         {
             wait_for_dismiss();
+        }
+    }
+
+    /// Run the health checks and float the report over the tree: `v` runs the
+    /// value-tier scan (progress bar; `Esc` cancels), `y` copies the CLI command
+    /// that reopens the popup, `c` copies the whole screen, `r` copies just the
+    /// report; `Esc` or a click dismisses and Ctrl-C quits (other keys are
+    /// ignored, a non-Latin one showing the wrong-layout hint).
+    ///
+    /// The structural checks are header-only and run up front; the `--values`
+    /// scan reads every tensor's bytes on a background thread (local only).
+    fn show_check_report(&self, term: &mut crate::tui::LiveTerminal) {
+        use crate::ui::CheckPopup;
+
+        let label = self
+            .files
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Structural (header-only) checks first — fast and non-blocking.
+        let mut report = crate::check::run(
+            label,
+            &self.tensors,
+            &self.metadata,
+            &self.files,
+            &self.health_reports,
+            &crate::filter::NameFilter::default(),
+            false,
+            1,
+        );
+
+        // What was just copied (and when), so the footer can flash it briefly.
+        let mut copied_at: Option<(std::time::Instant, &'static str)> = None;
+        // A non-Latin key (wrong keyboard layout) shows a hint, as on other screens.
+        let mut layout_hint: Option<char> = None;
+
+        loop {
+            let copied = copied_at
+                .filter(|(t, _)| t.elapsed() < COPY_FLASH)
+                .map(|(_, what)| what);
+            // Offer the value scan while it can still add something: a local
+            // source that hasn't been scanned yet.
+            let can_scan = self.remote_read.is_none() && !report.values;
+            let state = CheckPopup::Idle { copied, can_scan };
+            let hint = layout_hint;
+            if term
+                .draw(|f| {
+                    self.render_tree_frame(f, true);
+                    UI::render_check_report(f, &report, state);
+                    if let Some(c) = hint {
+                        UI::render_notice(f, &layout_hint_msg(c));
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
+
+            // While the copy flash is up, wake to clear it when it expires; else
+            // block until the next event.
+            let event = if copied.is_some() {
+                let left =
+                    COPY_FLASH.saturating_sub(copied_at.map_or(COPY_FLASH, |(t, _)| t.elapsed()));
+                if event::poll(left).unwrap_or(false) {
+                    event::read().ok()
+                } else {
+                    copied_at = None; // flash expired — redraw without it
+                    continue;
+                }
+            } else {
+                event::read().ok()
+            };
+
+            // Any input clears a prior layout hint; a fresh wrong-layout key re-sets
+            // it in the `_` arm below.
+            layout_hint = None;
+            match event {
+                Some(Event::Key(key)) => {
+                    if is_ctrl_c(&key) {
+                        quit_immediately();
+                    }
+                    let now = std::time::Instant::now();
+                    match key.code {
+                        // `v` runs the value scan on a worker; the popup animates a
+                        // spinner + progress bar meanwhile, and `Esc` cancels.
+                        KeyCode::Char('v') if can_scan => {
+                            self.run_value_scan(term, &mut report);
+                            copied_at = None;
+                        }
+                        // `y` copies the command that reopens this popup from the CLI
+                        // (the app-wide "copy command" convention).
+                        KeyCode::Char('y') => {
+                            let cmd = format!("{} --health", self.command_for_tree());
+                            if copy_to_clipboard(&cmd) {
+                                copied_at = Some((now, "command"));
+                            }
+                        }
+                        // `c` copies the whole screen — the tree with this popup
+                        // composited on top (not just the tree behind it), rendered
+                        // at the live terminal size so the popup lands where it does
+                        // on screen (a fixed size would misplace the centred box).
+                        KeyCode::Char('c') => {
+                            let (w, h) = term
+                                .size()
+                                .map(|s| (s.width, s.height))
+                                .unwrap_or((120, 40));
+                            let screen = crate::tui::headless_render(w, h, |f| {
+                                self.render_tree_frame(f, false);
+                                UI::render_check_report(
+                                    f,
+                                    &report,
+                                    CheckPopup::Idle {
+                                        copied: None,
+                                        can_scan,
+                                    },
+                                );
+                            });
+                            if let Ok(text) = screen
+                                && copy_to_clipboard(&text)
+                            {
+                                copied_at = Some((now, "screen"));
+                            }
+                        }
+                        // `r` copies only the report.
+                        KeyCode::Char('r') => {
+                            let text = report.render(false);
+                            if copy_to_clipboard(&text) {
+                                copied_at = Some((now, "report"));
+                            }
+                        }
+                        // `Esc` dismisses; other keys are ignored (it's a popup, not
+                        // a modal — a stray key shouldn't close it) — but a non-Latin
+                        // key (wrong layout) gets the same hint as elsewhere.
+                        KeyCode::Esc => break,
+                        _ => layout_hint = wrong_layout_char(&key),
+                    }
+                }
+                // Dismiss on a click (Down, not the trailing Up); ignore
+                // motion/drag/wheel/resize.
+                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => break,
+                Some(_) => {}
+                None => break,
+            }
+        }
+    }
+
+    /// Run the value-tier scan on a worker thread, animating the popup (spinner +
+    /// progress bar) until it finishes or `Esc` cancels. On completion the result
+    /// is folded into `report` (the "Value scan" row fills in); a cancelled scan
+    /// leaves `report` untouched.
+    fn run_value_scan(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        report: &mut crate::check::CheckReport,
+    ) {
+        use crate::ui::CheckPopup;
+
+        let tensors = self.tensors.clone();
+        let metadata = self.metadata.clone();
+        let progress = Arc::new(crate::progress::LoadProgress::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let jobs = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let (p, c) = (Arc::clone(&progress), Arc::clone(&cancel));
+            std::thread::spawn(move || {
+                let res = crate::check::scan_values(
+                    &tensors,
+                    &metadata,
+                    &crate::filter::NameFilter::default(),
+                    jobs,
+                    &p,
+                    &c,
+                );
+                let _ = tx.send(res);
+            });
+        }
+
+        let mut frame = 0usize;
+        let result = loop {
+            let (done, total) = progress.snapshot();
+            if term
+                .draw(|f| {
+                    self.render_tree_frame(f, true);
+                    UI::render_check_report(f, report, CheckPopup::Scanning { done, total, frame });
+                })
+                .is_err()
+            {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            frame = frame.wrapping_add(1);
+            match rx.try_recv() {
+                Ok(res) => break Some(res),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false)
+                && let Ok(Event::Key(k)) = event::read()
+            {
+                if is_ctrl_c(&k) {
+                    quit_immediately();
+                }
+                if matches!(k.code, KeyCode::Esc) {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        };
+
+        // Incorporate the result unless the scan was cancelled.
+        if !cancel.load(Ordering::Relaxed)
+            && let Some(res) = result
+        {
+            report.results.push(res);
+            report.values = true;
         }
     }
 

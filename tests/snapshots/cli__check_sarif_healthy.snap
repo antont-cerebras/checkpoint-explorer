@@ -1,0 +1,57 @@
+---
+source: tests/cli.rs
+expression: out
+---
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/antont-cerebras/checkpoint-explorer",
+          "name": "checkpoint-explorer",
+          "rules": [
+            {
+              "id": "byte_ranges",
+              "name": "Byte-range integrity",
+              "shortDescription": {
+                "text": "safetensors spans contiguous, sized correctly, no truncation"
+              }
+            },
+            {
+              "id": "hdf5",
+              "name": "HDF5 integrity",
+              "shortDescription": {
+                "text": "chunk shapes consistent with tensor shapes, datatypes recognized"
+              }
+            },
+            {
+              "id": "layers",
+              "name": "Layer completeness",
+              "shortDescription": {
+                "text": "layer indices contiguous, tensor set uniform across layers"
+              }
+            },
+            {
+              "id": "shapes_dtypes",
+              "name": "Shape / dtype sanity",
+              "shortDescription": {
+                "text": "no duplicate names, no empty tensors, dtype uniform within each role"
+              }
+            },
+            {
+              "id": "files",
+              "name": "Files & sharding",
+              "shortDescription": {
+                "text": "index matches files on disk, shard numbering complete"
+              }
+            }
+          ],
+          "version": "[VERSION]"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

@@ -4,7 +4,8 @@ expression: "plain(&[])"
 ---
 Checkpoint Explorer - [FIXTURE] (1/1)                                                                 [×]
 ↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · PgUp/PgDn page · Enter/Space expand · E/C all · / search
-l legend · c copy screen · t copy tree · f copy file · n copy name · y copy command · ⌫/\ back/fwd · R repack · q quit
+l legend · h health · c copy screen · t copy tree · f copy file · n copy name · y copy command · ⌫/\ back/fwd · R repack
+q quit
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ▾ [FIXTURE] (▦ 23, 988 params, 2.0 KiB → 1.2 KiB)
   ▸ 🔧 Metadata (▦ 0, 0 B)
@@ -14,7 +15,6 @@ l legend · c copy screen · t copy tree · f copy file · n copy name · y copy
     ▸ layers (≡ 3, ▦ 19, 1.9 KiB → 1.2 KiB)
     · norm.weight [F32, (4), 16 B (uncompressed)]
     · scale.i8 [I8, (8), 8 B → 16 B (⇩ gzip)]
-
 
 
 

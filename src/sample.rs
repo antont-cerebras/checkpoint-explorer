@@ -2096,7 +2096,13 @@ impl BlobReader {
 /// concurrent external write could change the mapping (standard mmap tradeoff).
 fn mmap_file(path: &str) -> Result<memmap2::Mmap, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string()) }
+    let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| e.to_string())? };
+    // We read each tensor's contiguous range front-to-back, so bias the kernel
+    // toward large read-ahead. Over NFS this is the difference between one 4 KiB
+    // page fault per page and big streaming reads — the main cost of scanning a
+    // large uncompressed safetensors checkpoint. Best-effort (ignored on error).
+    let _ = mmap.advise(memmap2::Advice::Sequential);
+    Ok(mmap)
 }
 
 impl TensorReader for BlobReader {

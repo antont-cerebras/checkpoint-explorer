@@ -1,3 +1,4 @@
+mod check;
 mod codec;
 #[cfg(feature = "hdf5")]
 mod convert;
@@ -73,6 +74,10 @@ fn examples_help() -> String {
   {group}Compare two checkpoints{r} (exit 0 = identical, 1 = differ, 2 = error):
       checkpoint-explorer diff old.safetensors new.safetensors
       checkpoint-explorer diff old/ new/ --values --name '*.mlp.*'
+
+  {group}Health-check a checkpoint{r} (exit 0 = healthy, 1 = problems, 2 = error):
+      checkpoint-explorer check /path/to/model/
+      checkpoint-explorer check model.safetensors --values   # also scan for NaN/±Inf, all-zero
 
   {group}Repack an HDF5 checkpoint with an alternative codec{r} — smaller on disk (hdf5 build only):
       checkpoint-explorer convert in.hdf5 out.hdf5 --codec zstd
@@ -287,6 +292,12 @@ struct ExploreArgs {
 
     #[arg(
         long,
+        help = "Open straight into the health-check popup on the tree (the `h` key)"
+    )]
+    health: bool,
+
+    #[arg(
+        long,
         help = "Render the requested view once and exit, without entering interactive navigation"
     )]
     exit: bool,
@@ -466,8 +477,63 @@ enum Command {
         #[arg(short = 'j', long = "jobs", value_name = "N")]
         jobs: Option<usize>,
         /// Read each checkpoint's structure over SSH on [USER@]HOST (which holds the
-        /// access): an s3:// cstorch checkpoint or a remote safetensors
-        /// directory/file. Data/secrets stay remote; structural diff (dtype/shape).
+        /// access): an s3:// checkpoint or a remote safetensors directory/file.
+        /// Data/secrets stay remote; structural diff (dtype/shape).
+        #[arg(long = "ssh-read", value_name = "[USER@]HOST")]
+        ssh_read: Option<String>,
+        /// Path to the cstorch virtualenv on the --ssh-read host (default: ~/venv).
+        #[arg(long = "ssh-venv", value_name = "PATH")]
+        ssh_venv: Option<String>,
+    },
+
+    /// Run health checks on a checkpoint and report any problems.
+    ///
+    /// Structural checks read only headers: byte-range integrity (safetensors
+    /// spans are sized right, contiguous, and the file isn't truncated), HDF5
+    /// chunk/dtype integrity (the equivalent for .hdf5), layer completeness
+    /// (contiguous layer indices, a uniform tensor set per layer), shape/dtype
+    /// sanity, and file/shard correspondence. --values additionally scans tensor
+    /// data for NaN/±Inf and all-zero/constant tensors (reads the whole
+    /// checkpoint locally).
+    ///
+    /// Exit status follows `diff`: 0 = healthy, 1 = problems found, 2 = trouble
+    /// (a path couldn't be read). Warnings only fail the run under --strict.
+    Check {
+        /// The checkpoint to check — a file, directory, or glob (shards merge
+        /// into one checkpoint).
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<PathBuf>,
+        /// Recursively search directories for checkpoint files.
+        #[arg(short, long)]
+        recursive: bool,
+        /// Also scan tensor data (NaN/±Inf, all-zero, constant tensors). Reads the
+        /// whole checkpoint, so it's slower and needs the files locally.
+        #[arg(long)]
+        values: bool,
+        /// Fail (exit 1) on warnings too, not just errors.
+        #[arg(long)]
+        strict: bool,
+        /// Limit the --values scan to tensors whose name matches this glob
+        /// (repeatable; prefix ! to exclude). The structural checks always run on
+        /// the whole checkpoint.
+        #[arg(long = "name", value_name = "GLOB")]
+        name: Vec<String>,
+        /// Scan up to N tensors in parallel with --values (default: logical CPUs;
+        /// 1 = sequential).
+        #[arg(short = 'j', long = "jobs", value_name = "N")]
+        jobs: Option<usize>,
+        /// Output format: text (default), json (a structured report for scripts /
+        /// agents / CI), or sarif (SARIF 2.1.0 for GitHub code scanning).
+        #[arg(long, value_enum, default_value_t = check::Format::default(), value_name = "FORMAT")]
+        format: check::Format,
+        /// Never colorize the output (also off when stdout isn't a terminal, or
+        /// when NO_COLOR is set).
+        #[arg(long = "no-color")]
+        no_color: bool,
+        /// Check a remote checkpoint's structure over SSH on [USER@]HOST (which
+        /// holds the access): an s3:// checkpoint or a remote safetensors
+        /// directory/file. Only metadata leaves the host, so the structural
+        /// checks run but --values (value scan) does not.
         #[arg(long = "ssh-read", value_name = "[USER@]HOST")]
         ssh_read: Option<String>,
         /// Path to the cstorch virtualenv on the --ssh-read host (default: ~/venv).
@@ -580,8 +646,143 @@ fn main() -> Result<()> {
             }
             std::process::exit(code)
         }
+        Some(Command::Check {
+            paths,
+            recursive,
+            values,
+            strict,
+            name,
+            jobs,
+            format,
+            no_color,
+            ssh_read,
+            ssh_venv,
+        }) => {
+            let jobs = jobs.filter(|&j| j > 0).unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            });
+            let remote = ssh_read.map(|host| {
+                crate::remote::RemoteRead::new(host, ssh_venv.unwrap_or_else(|| "~/venv".into()))
+            });
+            std::process::exit(run_check(
+                &paths,
+                recursive,
+                values,
+                strict,
+                &name,
+                jobs,
+                format,
+                no_color,
+                remote.as_ref(),
+            ))
+        }
         None => run_explore(cli.explore),
     }
+}
+
+/// Run health checks on a checkpoint and print the report. Returns the process
+/// exit code: `0` healthy, `1` problems found (warnings only when `strict`), `2`
+/// trouble (a path couldn't be read). With `remote`, the structural (header-only)
+/// checks run over SSH; the `--values` scan needs the bytes locally.
+#[allow(clippy::too_many_arguments)] // a CLI entry point; each arg is a distinct flag
+fn run_check(
+    paths: &[PathBuf],
+    recursive: bool,
+    values: bool,
+    strict: bool,
+    name: &[String],
+    jobs: usize,
+    format: check::Format,
+    no_color: bool,
+    remote: Option<&crate::remote::RemoteRead>,
+) -> i32 {
+    let filter = match filter::NameFilter::parse(name) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("checkpoint-explorer check: {e:#}");
+            return 2;
+        }
+    };
+
+    // Build the report (or an exit code, on trouble).
+    let report: Result<check::CheckReport, i32> = if let Some(r) = remote {
+        if values {
+            eprintln!(
+                "checkpoint-explorer check: --values needs the checkpoint locally \
+                 (only metadata is read over --ssh-read)"
+            );
+            return 2;
+        }
+        let src = paths[0].to_string_lossy().to_string();
+        (|| -> Result<check::CheckReport> {
+            let mut password: Option<String> = None;
+            let session = r.open_with(&mut password)?;
+            eprintln!("checkpoint-explorer check: reading tensor metadata over ssh …");
+            let bars = progress::Bars::start(vec![src.clone()]);
+            let progress = bars.progress(0);
+            let out = r
+                .read(&session, &src, &password, progress.as_deref())
+                .with_context(|| format!("reading {src}"));
+            bars.finish(0, out.is_ok());
+            bars.join();
+            let (tensors, metadata) = out?;
+            // No local files/health over SSH — the file/shard check is n/a.
+            Ok(check::run(
+                src.clone(),
+                &tensors,
+                &metadata,
+                &[],
+                &[],
+                &filter,
+                false,
+                jobs,
+            ))
+        })()
+        .map_err(|e: anyhow::Error| {
+            eprintln!("checkpoint-explorer check: {e:#}");
+            2
+        })
+    } else {
+        // Health enabled: its index-vs-disk report is folded into the file check.
+        (|| -> Result<check::CheckReport> {
+            let (files, health) = collect_safetensors_files(paths, recursive, false)?;
+            if files.is_empty() {
+                anyhow::bail!("no checkpoint files found");
+            }
+            let (tensors, metadata) = Explorer::gather_checkpoint(&files, None)?;
+            let label = paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Ok(check::run(
+                label, &tensors, &metadata, &files, &health, &filter, values, jobs,
+            ))
+        })()
+        .map_err(|e: anyhow::Error| {
+            eprintln!("checkpoint-explorer check: {e:#}");
+            2
+        })
+    };
+
+    let report = match report {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+    match format {
+        check::Format::Text => print!("{}", report.render(color_enabled(no_color))),
+        check::Format::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&report.to_json(strict)).unwrap_or_default()
+        ),
+        check::Format::Sarif => println!(
+            "{}",
+            serde_json::to_string_pretty(&report.to_sarif()).unwrap_or_default()
+        ),
+    }
+    report.exit_code(strict)
 }
 
 /// Compare two checkpoints' structure and print the summary. Returns the process
@@ -1340,8 +1541,11 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
     // Flags that target the tree browser rather than a tensor view: with no
     // `--tensor` (and no data view), they make the tree the opened screen, so
     // e.g. `--expand-all` or `--legend` alone don't demand a tensor.
-    let tree_oriented =
-        args.tree || args.tree_state.is_some() || args.search.is_some() || args.legend;
+    let tree_oriented = args.tree
+        || args.tree_state.is_some()
+        || args.search.is_some()
+        || args.legend
+        || args.health;
     let view = if args.values {
         OpenView::Values
     } else if args.heatmap {
@@ -1385,6 +1589,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.tree_state.is_some()
         || args.search.is_some()
         || args.legend
+        || args.health
         || args.exit;
     let open = wants_open.then_some(OpenRequest {
         tensor: args.tensor,
@@ -1404,6 +1609,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         tree_state: args.tree_state,
         search: args.search,
         legend: args.legend,
+        health: args.health,
         exit_after: args.exit,
     });
 

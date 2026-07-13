@@ -11,7 +11,6 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget,
 };
 
-use crate::health::HealthReport;
 use crate::sample::{HistBins, Histogram, PackingSchema, Sample, SampleMode, Stats, ViewDtype};
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo, TreeNode, metadata_short};
 use crate::utils::{format_parameters, format_shape, format_size};
@@ -1643,6 +1642,146 @@ impl UI {
         );
     }
 
+    /// Float the health-check report (`h` in the tree) over the live tree. Built
+    /// as styled lines directly from the [`CheckReport`](crate::check::CheckReport)
+    /// (so every span sits on the popup's panel background, matching the box) —
+    /// coloured marks per check, indented findings, a verdict, and a `state`-driven
+    /// footer. While scanning, the "Value scan" row becomes an animated spinner.
+    pub fn render_check_report(
+        frame: &mut Frame,
+        report: &crate::check::CheckReport,
+        state: CheckPopup,
+    ) {
+        use crate::check::{Severity, Status, count_phrase, fmt_elapsed};
+        let bg = palette::PANEL_BG;
+        // Every span carries the panel background, so text and box match.
+        let sty = |s: String, style: Style| Span::styled(s, style.bg(bg));
+
+        // Title column width, including the synthetic "Value scan" row.
+        let width = report
+            .results
+            .iter()
+            .map(|r| r.title.len())
+            .chain(std::iter::once("Value scan".len()))
+            .max()
+            .unwrap_or(0);
+
+        let mut lines: Vec<Line> = vec![Line::from(sty(
+            format!(
+                "{} file(s) · {} tensors · {} params",
+                report.n_files,
+                report.n_tensors,
+                crate::utils::format_parameters(report.params)
+            ),
+            Style::default().fg(palette::DIM),
+        ))];
+
+        for r in &report.results {
+            let (mark, mc) = match r.status() {
+                Status::Pass => ("✓", palette::SUCCESS),
+                Status::Warn => ("⚠", palette::WARN),
+                Status::Fail => ("✗", palette::ERROR),
+                Status::Na => ("⊘", palette::DIM),
+            };
+            let mut trailer_text = match r.status() {
+                Status::Pass => format!("— {}", r.note),
+                Status::Na => "— n/a for this checkpoint".to_string(),
+                _ => format!("({})", count_phrase(r.errors(), r.warnings())),
+            };
+            // The value scan carries its wall-clock time (like the CLI bar).
+            if let Some(d) = r.elapsed {
+                trailer_text.push_str(&format!("  ({})", fmt_elapsed(d)));
+            }
+            let trailer = sty(trailer_text, Style::default().fg(palette::DIM));
+            lines.push(check_row(
+                sty(mark.into(), Style::default().fg(mc)),
+                r.title,
+                width,
+                trailer,
+                bg,
+            ));
+            for f in &r.findings {
+                let (fm, fc) = match f.severity {
+                    Severity::Error => ("✗", palette::ERROR),
+                    Severity::Warning => ("⚠", palette::WARN),
+                };
+                let mut spans = vec![
+                    sty("      ".into(), Style::default()),
+                    sty(fm.into(), Style::default().fg(fc)),
+                    sty(" ".into(), Style::default()),
+                ];
+                if let Some(subj) = &f.subject {
+                    spans.push(sty(
+                        format!("{subj}  "),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ));
+                }
+                spans.push(sty(f.message.clone(), Style::default()));
+                lines.push(Line::from(spans));
+            }
+        }
+
+        // The value tier isn't in `results` until it runs: show a spinner while
+        // scanning, else a "not run" hint.
+        if !report.values {
+            let (mark, mc, trailer) = match state {
+                // The count lives in the footer bar — don't repeat it here.
+                CheckPopup::Scanning { frame, .. } => (
+                    CHECK_SPINNER[frame % CHECK_SPINNER.len()].to_string(),
+                    palette::ACCENT,
+                    sty("— scanning…".into(), Style::default().fg(palette::DIM)),
+                ),
+                _ => (
+                    "·".into(),
+                    palette::DIM,
+                    sty(
+                        "— not run (press v)".into(),
+                        Style::default().fg(palette::DIM),
+                    ),
+                ),
+            };
+            lines.push(check_row(
+                sty(mark, Style::default().fg(mc)),
+                "Value scan",
+                width,
+                trailer,
+                bg,
+            ));
+        }
+
+        let (e, w) = (report.errors(), report.warnings());
+        let verdict = if e > 0 {
+            sty(
+                format!("FAIL — {}", count_phrase(e, w)),
+                Style::default().fg(palette::ERROR),
+            )
+        } else if w > 0 {
+            sty(
+                format!("OK with warnings — {}", count_phrase(0, w)),
+                Style::default().fg(palette::WARN),
+            )
+        } else if report.values {
+            sty(
+                "OK — no issues found".into(),
+                Style::default().fg(palette::SUCCESS),
+            )
+        } else {
+            sty(
+                "OK — no metadata issues found".into(),
+                Style::default().fg(palette::SUCCESS),
+            )
+        };
+        lines.push(Line::from(vec![
+            sty("  ".into(), Style::default()),
+            verdict,
+        ]));
+
+        lines.push(Line::default());
+        lines.push(check_footer_line(&state, bg));
+
+        render_popup_box(frame, "Health check", lines, Backdrop::Float, None);
+    }
+
     /// Borderless band shown when a chosen export is too big for the terminal
     /// clipboard: it copies the concrete CLI command that reproduces it instead
     /// and shows it on its own full-width line(s) at column 0 (so a long path
@@ -1814,61 +1953,6 @@ impl UI {
             frame.buffer_mut(),
         );
     }
-
-    /// The Ratatui port of [`Self::draw_health_warning`]: a full-screen warning
-    /// panel summarising checkpoint health issues. Each category is capped so the
-    /// panel stays small; missing items are red, extra items yellow.
-    pub fn render_health_warning(frame: &mut Frame, reports: &[HealthReport]) {
-        let mut lines: Vec<Line> = vec![
-            Line::from(Span::styled(
-                "⚠  Checkpoint health check",
-                Style::default().fg(palette::WARN),
-            )),
-            Line::from(Span::styled(
-                "=".repeat(60),
-                Style::default().fg(palette::WARN),
-            )),
-        ];
-        for report in reports {
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "{} does not match the .safetensors files on disk.",
-                    report.index_path
-                ),
-                Style::default().fg(palette::WARN),
-            )));
-            lines.push(Line::default());
-            health_section_lines(
-                &mut lines,
-                "Referenced by the index but MISSING",
-                &report.missing_files,
-                palette::ERROR,
-            );
-            health_section_lines(
-                &mut lines,
-                "Present on disk but NOT in the index",
-                &report.extra_files,
-                palette::WARN,
-            );
-            health_section_lines(
-                &mut lines,
-                "Expected by the index but absent from their file",
-                &report.missing_tensors,
-                palette::ERROR,
-            );
-            health_section_lines(
-                &mut lines,
-                "In files but not listed in the index",
-                &report.extra_tensors,
-                palette::WARN,
-            );
-        }
-        lines.push(Line::from(dim_span(
-            "The explorer scans the directory directly when the index is stale. Click or press any key to return.",
-        )));
-        Paragraph::new(lines).render(frame.area(), frame.buffer_mut());
-    }
 }
 
 /// Worst-case display width of a legend symbol: every non-ASCII glyph is counted
@@ -1930,6 +2014,108 @@ enum Backdrop {
     /// message screens that own the frame (nothing is drawn beneath), so no
     /// terminal default background shows around the box.
     Fill,
+}
+
+/// The state of the health-check popup ([`UI::render_check_report`]).
+#[derive(Clone, Copy)]
+pub enum CheckPopup {
+    /// Showing the report. `copied` briefly flashes what was just copied
+    /// (`"command"` / `"report"` / `"screen"`); `can_scan` offers the `v` value
+    /// scan (off for a remote source or once it has run).
+    Idle {
+        copied: Option<&'static str>,
+        can_scan: bool,
+    },
+    /// A value scan is running: `done`/`total` tensors, `frame` animates the row
+    /// spinner and drives the footer bar.
+    Scanning {
+        done: usize,
+        total: usize,
+        frame: usize,
+    },
+}
+
+/// Braille spinner frames for the in-progress "Value scan" row.
+const CHECK_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// One check row: `  <mark> <title padded>  <trailer>`, all on the panel `bg`.
+fn check_row(
+    mark: Span<'static>,
+    title: &str,
+    width: usize,
+    trailer: Span<'static>,
+    bg: Color,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  ", Style::default().bg(bg)),
+        mark,
+        Span::styled(format!(" {title:<width$}  "), Style::default().bg(bg)),
+        trailer,
+    ])
+}
+
+/// The popup footer: the value-scan bar while scanning, a copy confirmation right
+/// after `y`, or the key hints — with the key glyphs bold/accented (not dimmed)
+/// so it's clear they're actionable.
+fn check_footer_line(state: &CheckPopup, bg: Color) -> Line<'static> {
+    let key = |k: &str| {
+        Span::styled(
+            k.to_string(),
+            Style::default()
+                .fg(palette::KEY)
+                .add_modifier(Modifier::BOLD)
+                .bg(bg),
+        )
+    };
+    let dim = |s: &str| Span::styled(s.to_string(), Style::default().fg(palette::DIM).bg(bg));
+    match *state {
+        CheckPopup::Scanning { done, total, .. } => {
+            const W: usize = 18;
+            let filled = if total == 0 {
+                0
+            } else {
+                (((done as f64 / total as f64) * W as f64).round() as usize).min(W)
+            };
+            Line::from(vec![
+                Span::styled(
+                    "━".repeat(filled),
+                    Style::default().fg(palette::ACCENT).bg(bg),
+                ),
+                Span::styled(
+                    "━".repeat(W - filled),
+                    Style::default().fg(palette::DIM).bg(bg),
+                ),
+                Span::styled(format!("  {done}/{total}   "), Style::default().bg(bg)),
+                key("Esc"),
+                dim(" cancel"),
+            ])
+        }
+        CheckPopup::Idle {
+            copied: Some(what), ..
+        } => Line::from(Span::styled(
+            format!("✓ copied {what} to the clipboard"),
+            Style::default().fg(palette::SUCCESS).bg(bg),
+        )),
+        CheckPopup::Idle { can_scan, .. } => {
+            let mut items: Vec<(&str, &str)> = Vec::new();
+            if can_scan {
+                items.push(("v", " value scan"));
+            }
+            items.push(("c", " copy screen"));
+            items.push(("r", " copy report"));
+            items.push(("y", " copy command"));
+            items.push(("Esc", " dismiss"));
+            let mut spans = Vec::new();
+            for (i, (k, label)) in items.iter().enumerate() {
+                if i > 0 {
+                    spans.push(dim(" · "));
+                }
+                spans.push(key(k));
+                spans.push(dim(label));
+            }
+            Line::from(spans)
+        }
+    }
 }
 
 /// A centred, content-sized pop-up over the frame: a rounded [`Block`] (accent
@@ -2090,36 +2276,6 @@ fn input_box_spans(text: &str, cursor: usize, min_chars: usize) -> Vec<Span<'sta
     }
     spans.push(Span::styled(" ", field));
     spans
-}
-
-/// Append one health-report section to `lines` (the Ratatui port of
-/// [`health_section`]): a coloured title with the count, up to `CAP` items, and a
-/// dimmed "… and N more" when capped, then a blank separator. Empty sections are
-/// skipped.
-fn health_section_lines(
-    lines: &mut Vec<Line<'static>>,
-    title: &str,
-    items: &[String],
-    color: Color,
-) {
-    if items.is_empty() {
-        return;
-    }
-    const CAP: usize = 6;
-    lines.push(Line::from(Span::styled(
-        format!("{title} ({}):", items.len()),
-        Style::default().fg(color),
-    )));
-    for item in items.iter().take(CAP) {
-        lines.push(Line::from(Span::raw(format!("  {item}"))));
-    }
-    if items.len() > CAP {
-        lines.push(Line::from(dim_span(format!(
-            "  … and {} more",
-            items.len() - CAP
-        ))));
-    }
-    lines.push(Line::default());
 }
 
 /// The legend pop-up's box title, one per screen.
@@ -2891,6 +3047,7 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<Chi
         ),
         (vec![Seg::Key("/", hint_key('/'))], "search"),
         (vec![Seg::Key("l", hint_key('l'))], "legend"),
+        (vec![Seg::Key("h", hint_key('h'))], "health"),
         (vec![Seg::Key("c", hint_key('c'))], "copy screen"),
         (vec![Seg::Key("t", hint_key('t'))], "copy tree"),
         (vec![Seg::Key("f", hint_key('f'))], "copy file"),
