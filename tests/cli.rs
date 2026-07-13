@@ -107,6 +107,19 @@ fn run_bin(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Run the binary and return `(stdout, exit code)` without asserting success —
+/// `check` / `diff` use a nonzero exit to signal findings, not failure.
+fn run_bin_status(args: &[&str]) -> (String, i32) {
+    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
+        .args(args)
+        .output()
+        .expect("run checkpoint-explorer");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
 /// Run the binary in `--plain` mode against `fixture` and return its screen text.
 fn run_plain(fixture: &str, extra_args: &[&str]) -> String {
     let mut args = vec![fixture];
@@ -204,6 +217,72 @@ fn print_tensors_name_exclude() {
 }
 
 #[test]
+fn check_healthy_fixture() {
+    ensure_fixture();
+    let (out, code) = run_bin_status(&["check", FIXTURE]);
+    assert_eq!(code, 0, "healthy fixture should pass; got:\n{out}");
+    settings().bind(|| insta::assert_snapshot!(out));
+}
+
+#[test]
+fn check_json_healthy() {
+    ensure_fixture();
+    let (out, code) = run_bin_status(&["check", FIXTURE, "--format", "json"]);
+    assert_eq!(code, 0);
+    settings().bind(|| insta::assert_snapshot!(out));
+}
+
+#[test]
+fn check_sarif_healthy() {
+    ensure_fixture();
+    let (out, code) = run_bin_status(&["check", FIXTURE, "--format", "sarif"]);
+    assert_eq!(code, 0);
+    let mut s = settings();
+    // The crate version (0.x.y) is in the SARIF driver; normalize it so the
+    // snapshot survives version bumps (the SARIF "2.1.0" is left as-is).
+    s.add_filter(r#""version": "0\.\d+\.\d+""#, r#""version": "[VERSION]""#);
+    s.bind(|| insta::assert_snapshot!(out));
+}
+
+#[test]
+fn check_values_scans_data() {
+    ensure_fixture();
+    // --values runs the value scan (with the progress bar, a no-op when piped).
+    let (out, code) = run_bin_status(&["check", FIXTURE, "--values"]);
+    assert_eq!(code, 0, "got:\n{out}");
+    assert!(out.contains("Value scan"));
+    assert!(
+        out.contains("no NaN"),
+        "value scan should have run; got:\n{out}"
+    );
+    assert!(
+        !out.contains("skipped"),
+        "value scan should not be skipped; got:\n{out}"
+    );
+}
+
+#[test]
+fn check_detects_truncation() {
+    ensure_fixture();
+    // A copy with the last 8 data bytes lopped off — a classic interrupted
+    // download. The byte-range check should fail the run (exit 1).
+    let bytes = std::fs::read(FIXTURE).expect("read fixture");
+    let dir = std::env::temp_dir().join("checkpoint_explorer_check_trunc");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let path = dir.join("model.safetensors");
+    std::fs::write(&path, &bytes[..bytes.len() - 8]).expect("write truncated copy");
+
+    let (out, code) = run_bin_status(&["check", path.to_str().unwrap()]);
+    assert_eq!(code, 1, "truncated file should fail; got:\n{out}");
+    assert!(
+        out.contains("file truncated"),
+        "expected a truncation finding; got:\n{out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn print_tree_json() {
     settings().bind(|| insta::assert_snapshot!(export(&["--print-tree", "--format", "json"])));
 }
@@ -287,6 +366,7 @@ fn y_roundtrips() {
         vec!["--tensor", t, "--values", "--slice", "1"],
         vec!["--tensor", t, "--values", "--overview", "--base", "hex"],
         vec!["--tensor", t, "--heatmap"],
+        vec!["--health"], // the health-check popup over the tree
     ] {
         assert_y_roundtrip(FIXTURE, &extra);
     }
@@ -506,6 +586,7 @@ mod hdf5 {
             vec!["--tensor", &dp, "--values", "--base", "hex"],
             vec!["--tensor", &dp, "--values", "--slice", "2"],
             vec!["--tensor", &dp, "--heatmap"],
+            vec!["--health"], // the health-check popup over the tree
         ];
         for extra in cases {
             super::assert_y_roundtrip(H5, extra);

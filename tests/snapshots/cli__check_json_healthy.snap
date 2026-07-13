@@ -1,0 +1,49 @@
+---
+source: tests/cli.rs
+expression: out
+---
+{
+  "checkpoint": "[FIXTURE]",
+  "checks": [
+    {
+      "findings": [],
+      "id": "byte_ranges",
+      "status": "pass",
+      "title": "Byte-range integrity"
+    },
+    {
+      "findings": [],
+      "id": "hdf5",
+      "status": "na",
+      "title": "HDF5 integrity"
+    },
+    {
+      "findings": [],
+      "id": "layers",
+      "status": "na",
+      "title": "Layer completeness"
+    },
+    {
+      "findings": [],
+      "id": "shapes_dtypes",
+      "status": "pass",
+      "title": "Shape / dtype sanity"
+    },
+    {
+      "findings": [],
+      "id": "files",
+      "status": "na",
+      "title": "Files & sharding"
+    }
+  ],
+  "exit_code": 0,
+  "healthy": true,
+  "summary": {
+    "errors": 0,
+    "files": 1,
+    "params": 124,
+    "tensors": 7,
+    "warnings": 0
+  },
+  "values": false
+}

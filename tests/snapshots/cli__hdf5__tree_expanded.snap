@@ -4,7 +4,8 @@ expression: "plain(&[\"--tree-state\", \"expanded\"])"
 ---
 Checkpoint Explorer - [FIXTURE] (1/1)                                                                 [×]
 ↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · PgUp/PgDn page · Enter/Space expand · E/C all · / search
-l legend · c copy screen · t copy tree · f copy file · n copy name · y copy command · ⌫/\ back/fwd · R repack · q quit
+l legend · h health · c copy screen · t copy tree · f copy file · n copy name · y copy command · ⌫/\ back/fwd · R repack
+q quit
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ▾ [FIXTURE] (▦ 23, 988 params, 2.0 KiB → 1.2 KiB)
   ▾ 🔧 Metadata (▦ 0, 0 B)
@@ -39,5 +40,4 @@ l legend · c copy screen · t copy tree · f copy file · n copy name · y copy
           · gate_up_proj.weight [U16 as [4,3,3,6], (6, 3, 4) as (24, 3, 4), 144 B → 134 B (⇩ gzip)]
         · input_layernorm.weight [F32, (4), 16 B → 19 B (⇩ gzip)]
         · self_attn.q_proj.weight [I32, (4, 4), 64 B → 41 B (⇩ gzip)]
-      ▾ 2 (▦ 6, 624 B → 382 B)
  ▪ [FIXTURE]

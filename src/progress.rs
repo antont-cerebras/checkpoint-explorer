@@ -191,7 +191,11 @@ fn spawn(
         let mut i = 0usize;
         loop {
             let now: Vec<u8> = states.iter().map(|s| s.load(Ordering::Acquire)).collect();
-            let _ = write!(err, "\x1b[{n}A"); // back up to the first reserved line
+            // Assemble the whole frame into one buffer and emit it in a single
+            // write, so the terminal never renders a half-drawn frame (writing each
+            // line separately to the unbuffered stderr is what makes it flicker).
+            let mut frame = String::with_capacity(n * 96);
+            frame.push_str(&format!("\x1b[{n}A")); // back up to the first reserved line
             for (k, &st) in now.iter().enumerate() {
                 let (color, mark) = match st {
                     OK => (DONE, '✓'),
@@ -233,12 +237,14 @@ fn spawn(
                 } else {
                     String::new() // finished with no known total: mark + timer only
                 };
-                let _ = write!(
-                    err,
-                    "\r\x1b[2K  {color}{mark}{RESET} {DIM}{}{RESET}{bar} {color}{secs:.1}s{RESET}\n",
+                // `\r` + text + clear-to-EOL (`\x1b[K` *after* the text, so there's
+                // no blank-then-fill flash) — overwrites the line in place.
+                frame.push_str(&format!(
+                    "\r  {color}{mark}{RESET} {DIM}{}{RESET}{bar} {color}{secs:.1}s{RESET}\x1b[K\n",
                     labels[k]
-                );
+                ));
             }
+            let _ = err.write_all(frame.as_bytes());
             let _ = err.flush();
             if now.iter().all(|&st| st != RUNNING) {
                 break;

@@ -6,8 +6,9 @@ values, histograms, and exact statistics, computed right in your terminal on
 tensors of *any* size. It reads [`safetensors`](https://huggingface.co/docs/safetensors),
 [GGUF](https://huggingface.co/docs/hub/gguf), NumPy (`.npy` / `.npz`), and (opt-in)
 HDF5 (`.h5` / `.hdf5`) checkpoints; decodes **quantized / packed weights** (4-bit,
-fused-codebook MoE) so they show their true values; and ships a scriptable
-[`diff`](#comparing-checkpoints-diff) for comparing two checkpoints.
+fused-codebook MoE) so they show their true values; and ships scriptable
+[`diff`](#comparing-checkpoints-diff) and [`check`](#checking-checkpoints-check)
+subcommands for comparing and health-checking checkpoints.
 
 ![Demo](demo.gif)
 
@@ -36,6 +37,12 @@ fused-codebook MoE) so they show their true values; and ships a scriptable
   to compare only the tensors you care about, in parallel even across huge MoE
   checkpoints. Diffs **S3 / MinIO** and remote-SSH checkpoints too (`--ssh-read`),
   so you can compare two deployed checkpoints without downloading either.
+- 🩺 **`check` a checkpoint's health.** A scriptable
+  [subcommand](#checking-checkpoints-check) (`diff`-style exit codes) that flags
+  **truncated / corrupt** safetensors files, **missing layers** or dropped
+  shards, index/file mismatches, and dtype/shape oddities — all header-only, so it
+  works over `--ssh-read` / S3 — plus a `--values` pass that scans tensor data for
+  **NaN/±Inf** and all-zero/constant tensors.
 - 🌐 **Built for big & remote.** Loads only metadata (fast startup on huge
   models), and **browses *and* diffs checkpoints on S3 / MinIO** — or any box you
   reach by SSH — whose credentials never leave the server, by delegating the read
@@ -278,7 +285,7 @@ checkpoint-explorer model.safetensors --print-tensors --name '!*.bias'
 | `n` | Copy the selected tensor's Name to the clipboard |
 | `y` | Show and copy the CLI command that reopens this exact screen — file, tensor (or metadata entry), dtype/shape overrides, view, layout, zebra, base, slice (works on every screen) |
 | `s` | (Detail screen) compute the tensor's statistics on demand |
-| `h` | **Detail screen:** show the value histogram · **tree:** show the checkpoint health report (when there is a mismatch) |
+| `h` | **Detail screen:** show the value histogram · **Tree:** run the health checks and float the report in a popup — `v` runs the value-tier data scan (progress bar; `Esc` cancels), `r` copies the report, `c` the screen, `y` the reopen command (`--health`); same checks as the [`check`](#checking-checkpoints-check) subcommand (auto-suggested when an index/file mismatch is detected) |
 | `R` | Repack the current HDF5 checkpoint into a new file (HDF5 only) |
 | `Backspace` / `\` | Step **back** / **forward** through the screens you've visited (browser-style history) — e.g. reopen a view you just left |
 | `Esc` | Exit search mode |
@@ -597,6 +604,70 @@ Related flags: `--tensor <NAME>` focuses one tensor (with a bin-by-bin
 variation distance); `--dtype <VIEW>` decodes under a view (e.g. `u4`,
 `unpacked`) before comparing; `--only-tensors` skips metadata; `--full` lists
 every entry instead of collapsing per-layer runs; `--no-color` disables colour.
+
+### Checking checkpoints (`check`)
+
+Run health checks on a checkpoint and report anything wrong. Exit status follows
+`diff`: **`0`** healthy, **`1`** problems found, **`2`** trouble (a path couldn't
+be read) — so it drops straight into CI or a pre-flight script.
+
+```bash
+# Structural checks (header-only, fast)
+checkpoint-explorer check /path/to/model/
+
+# Also scan tensor data for NaN/±Inf and all-zero / constant tensors
+checkpoint-explorer check model.safetensors --values
+
+# Machine-readable report for scripts / agents / CI
+checkpoint-explorer check /path/to/model/ --format json
+
+# SARIF 2.1.0 — upload to GitHub code scanning / feed static-analysis tooling
+checkpoint-explorer check /path/to/model/ --format sarif > checkpoint.sarif
+
+# A remote / S3 checkpoint (structural checks only — data stays on the host)
+checkpoint-explorer check --ssh-read lab@usernode s3://bucket/model/checkpoint
+```
+
+The **structural** checks read only headers, so they're cheap and work over
+`--ssh-read` / `s3://` too:
+
+- **Byte-range integrity** — safetensors tensor spans are sized correctly for
+  their dtype/shape, packed contiguously from offset 0 with no gaps or overlaps,
+  and the file is neither **truncated** (a classic interrupted download) nor
+  padded with trailing data.
+- **HDF5 integrity** — the `.hdf5` equivalent (HDF5 stores chunked, filtered
+  datasets rather than a flat blob): each dataset's chunk shape matches its
+  tensor rank, the stored chunk count doesn't exceed the chunk grid, and its
+  datatype was recognized. (The decompression pipeline itself is exercised by
+  `--values`, which reads the data and reports any unreadable dataset.)
+- **Layer completeness** — from tensor names alone: `…layers.<i>.…` indices are
+  contiguous `0..=max`, and every layer carries the same set of sub-tensors
+  (catches a dropped shard or a partial checkpoint).
+- **Shape / dtype sanity** — no duplicate tensor names, no zero-element tensors,
+  and a heads-up when a tensor's dtype is inconsistent *within its role* (a stray
+  F32 among a role's F16s — the signature of a partial cast). Tensors are grouped
+  by role (the name with layer/expert indices blanked), so a checkpoint's
+  legitimate mix of dtypes-by-role — weights BF16, quant scales F16, codebooks
+  F32 — is **not** flagged; only a within-role outlier is.
+- **Files & sharding** — the `model.safetensors.index.json` matches the files on
+  disk (the same index/health check the explorer runs), and `…-<i>-of-<N>` shard
+  numbering is complete.
+
+`--values` adds a **value** tier that scans each tensor's data (locally, across
+`--jobs N` threads): **NaN/±Inf** elements (an error) and **all-zero / constant**
+tensors (a warning). `--name <GLOB>` scopes the value scan (repeatable; prefix
+`!` to exclude); the structural checks always run on the whole checkpoint.
+
+Findings have two severities: **errors** always fail the run, **warnings** only
+fail it under `--strict`.
+
+The checks are also available **interactively**: press `h` in the tree browser
+(or launch with `--health`) to float the report in a popup. There, `v` runs the
+value-tier data scan (progress bar; `Esc` cancels), `r` copies the report, `c`
+copies the tree screen, and `y` copies the CLI command that reopens the popup
+(`… --health`); `Esc` or a click dismisses. (`v` is offered only for a local
+checkpoint — a remote `--ssh-read` source has no local bytes to scan.) When the
+explorer auto-detects an index/file mismatch on startup it points you to `h`.
 
 ## Example Output
 
