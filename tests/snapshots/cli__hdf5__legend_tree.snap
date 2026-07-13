@@ -12,11 +12,9 @@ q quit
   · lm_head.weight [F16, (10, 4), 80 B → 27 B (⇩ gzip)]
   ▾ model (▦ 22, 2.0 KiB → 1.2 KiB)
     · embed_tokens.weight [F16, (10, 4), 80 B → 27 B (⇩ gzip)]
-    ▸ layers (≡ 3, ▦ 19, 1.9 KiB → 1.2 KiB)
-    · norm.weight [F32, (4), 16 B (uncompressed)]
-    · sc╭ Legend — checkpoint tree ────────────────────────────────────────────────────────────────────────────╮
-        │   ▾ ▸             a group, expanded / collapsed (Enter or Space toggles it)                          │
-        │   ·               a tensor (a stored array)                                                          │
+    ▸ la╭ Legend — checkpoint tree ────────────────────────────────────────────────────────────────────────────╮
+    · no│   ▾ ▸             a group, expanded / collapsed (Enter or Space toggles it)                          │
+    · sc│   ·               a tensor (a stored array)                                                          │
         │   ✚               an extra tensor on disk but not listed in the index (model.safetensors.index.json) │
         │   †               a metadata entry (shown beside its tensor, or in the Metadata group)               │
         │   ≡ N             number of layers (numbered sub-groups) in the group                                │
@@ -27,6 +25,9 @@ q quit
         │                                                                                                      │
         │   I16             the tensor's data type is tinted (warm amber)                                      │
         │   ▪ ▸             status bar: a single source file / a directory of shards                           │
+        │                                                                                                      │
+        │    read-only       this tool only reads — it never writes, modifies, or deletes your files           │
+        │    metadata-only   a remote source: only header metadata is loaded; data views need the file locally │
         │                                                                                                      │
         │ Click or press any key to close.                                                                     │
         ╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
@@ -39,5 +40,5 @@ q quit
 
 
 
-
  ▪ [FIXTURE]
+                                                                                                              read-only

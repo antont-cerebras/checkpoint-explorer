@@ -47,7 +47,9 @@ subcommands for comparing and health-checking checkpoints.
   models), and **browses *and* diffs checkpoints on S3 / MinIO** — or any box you
   reach by SSH — whose credentials never leave the server, by delegating the read
   to a remote host (`--ssh-read`, or an scp-style `host:/path`; see
-  [Remote checkpoints](#remote-checkpoints-on-s3--minio---ssh-read)). Copies to your
+  [Remote checkpoints](#remote-checkpoints-on-s3--minio---ssh-read)). The remote
+  access is **strictly read-only** — it can't create, modify, or delete anything
+  on the host, so it's safe to point at production checkpoints. Copies to your
   local clipboard over SSH via **OSC 52**, and a `y` key prints the exact CLI
   command to reopen any view — shareable and scriptable.
 - 🗜️ **HDF5 repacking.** Losslessly [re-compress](#repacking-hdf5-checkpoints---features-hdf5)
@@ -170,6 +172,13 @@ checkpoint-explorer --ssh-read lab@usernode \
 checkpoint-explorer usernode:/opt/cerebras/inference/models/some-model-4bit
 ```
 **Nothing but the header metadata leaves the server** — no keys, no tensor data.
+
+> **Read-only, guaranteed.** `--ssh-read` never modifies the remote checkpoint.
+> Files are opened strictly read-only (`OpenFlags::READ` — no create/write/
+> truncate), the tool issues no `mkdir`/`remove`/`rename`/`chmod`, and the `s3://`
+> path only *loads* the checkpoint and prints metadata to stdout (no
+> `save`/write). So it's safe to point at production checkpoints — it cannot
+> accidentally alter or delete anything on the host.
 
 This is **metadata-only** (structure + dtype + shape); the data views (heatmap /
 numeric grid / histogram / statistics) need the bytes locally, so copy the

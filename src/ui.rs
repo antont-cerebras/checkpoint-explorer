@@ -222,6 +222,8 @@ pub struct DrawConfig<'a> {
     /// scroll bar: a headless `--plain` / screen-copy render is a static text
     /// dump with no viewport, so it shows no bar (see [`UI::tree_scrollbar`]).
     pub interactive: bool,
+    /// Whether the mouse is hovering the read-only badge, floating its hint.
+    pub readonly_hover: bool,
 }
 
 /// How a screen should render the statistics area: not computed yet, a scan in
@@ -426,7 +428,49 @@ impl TreeScrollbar {
 
 pub struct UI;
 
+/// The read-only badge text, drawn bottom-right on every view. This tool never
+/// modifies a checkpoint (local or remote), so the badge is unconditional.
+const READONLY_BADGE: &str = " read-only ";
+
 impl UI {
+    /// Draw the persistent `read-only` badge on the very bottom status line,
+    /// right-aligned. Rendered last on every view (tree / detail / data) so it
+    /// sits above whatever occupies that row. When `hover` is set (the mouse is
+    /// over the badge) a small hint pop-up floats just above it.
+    pub fn render_readonly_badge(frame: &mut Frame, hover: bool) {
+        let area = frame.area();
+        let badge_w = READONLY_BADGE.chars().count() as u16;
+        if area.width <= badge_w || area.height == 0 {
+            return;
+        }
+        Paragraph::new(Line::from(Span::styled(
+            READONLY_BADGE,
+            Style::default()
+                .bg(palette::STATUS_BG)
+                .fg(palette::SUCCESS)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .render(
+            Rect {
+                x: area.width - badge_w,
+                y: area.height - 1,
+                width: badge_w,
+                height: 1,
+            },
+            frame.buffer_mut(),
+        );
+        if hover {
+            render_readonly_hint(frame);
+        }
+    }
+
+    /// Is the point `(col, row)` over the read-only badge, given the frame size?
+    /// Lets a loop toggle the hover hint without duplicating the badge geometry.
+    pub fn readonly_badge_hit(width: u16, height: u16, col: u16, row: u16) -> bool {
+        let badge_w = READONLY_BADGE.chars().count() as u16;
+        width > badge_w && height > 0 && row == height - 1 && col >= width - badge_w
+    }
+
     /// How many tree rows are visible at once (one screenful), used to size a
     /// PageUp/PageDown jump. `terminal_height` is the full terminal height.
     pub fn visible_tree_rows(terminal_height: u16, metadata_only: bool) -> usize {
@@ -636,7 +680,10 @@ impl UI {
         }
 
         // --- bottom two-line status bar ---
-        let max_text = (width as usize).saturating_sub(6);
+        // Reserve room on the right of the bottom status line for the persistent
+        // read-only badge (drawn by `render_readonly_badge` below), so the status
+        // text never runs under it.
+        let max_text = (width as usize).saturating_sub(6 + READONLY_BADGE.chars().count());
         let row0 = if config.search_mode && config.tree.is_empty() {
             Line::from(vec![
                 Span::raw(format!(
@@ -719,6 +766,8 @@ impl UI {
                 frame.buffer_mut(),
             );
         }
+
+        Self::render_readonly_badge(frame, config.readonly_hover);
 
         // Clickable regions: each footer chip (the hint block starts at row 1,
         // below the title) plus the top-right `[×]` (→ quit the tree).
@@ -2187,6 +2236,47 @@ fn render_popup_box(
     inner
 }
 
+/// A small hint pop-up for the read-only badge, anchored bottom-right just above
+/// the badge row so it points at it. Floats over the live frame; the caller only
+/// draws it while the mouse hovers the badge (see [`UI::render_readonly_badge`]).
+fn render_readonly_hint(frame: &mut Frame) {
+    let area = frame.area();
+    let body = [
+        "This tool only ever reads your checkpoint —",
+        "it never writes, modifies, or deletes anything.",
+        "Safe to point at production files, local or remote.",
+    ];
+    let inner_w = body.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+    let box_w = ((inner_w + 4) as u16).min(area.width); // 2 borders + 2 padding
+    let box_h = ((body.len() + 2) as u16).min(area.height); // 2 borders
+    // Bottom-right, flush with the right edge and sitting on the row just above
+    // the badge (which occupies the last row); clamp so it stays on-screen.
+    let rect = Rect {
+        x: area.width.saturating_sub(box_w),
+        y: area.height.saturating_sub(1 + box_h),
+        width: box_w,
+        height: box_h,
+    };
+    Clear.render(rect, frame.buffer_mut());
+    let panel = Style::default().bg(palette::PANEL_BG);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(palette::SUCCESS))
+        .title(Span::styled(
+            " read-only ",
+            Style::default()
+                .fg(palette::SUCCESS)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .padding(Padding::horizontal(1))
+        .style(panel);
+    let inner = block.inner(rect);
+    block.render(rect, frame.buffer_mut());
+    Paragraph::new(body.iter().map(|l| Line::from(*l)).collect::<Vec<_>>())
+        .style(panel)
+        .render(inner, frame.buffer_mut());
+}
+
 /// A full-width pop-up framed with only top+bottom borders (the `title` rides the
 /// top rule) over the live frame, centred vertically. Its body rows stay flush at
 /// column 0 — used by the copied-command pop-up so the command can still be
@@ -2470,6 +2560,33 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
             lines.push(Line::from(swatch));
         }
     }
+
+    // Common to every screen: the persistent bottom status-line badges.
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            " read-only ",
+            Style::default()
+                .bg(palette::STATUS_BG)
+                .fg(palette::SUCCESS)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("      this tool only reads — it never writes, modifies, or deletes your files"),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            " metadata-only ",
+            Style::default()
+                .bg(palette::STATUS_BG)
+                .fg(palette::WARN)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(
+            "  a remote source: only header metadata is loaded; data views need the file locally",
+        ),
+    ]));
 
     lines.push(Line::default());
     lines.push(Line::from(dim_span("Click or press any key to close.")));
@@ -4252,6 +4369,7 @@ mod tests {
                 packing_schemas: schemas,
                 copied_flash: None,
                 interactive,
+                readonly_hover: false,
             }
         }
 

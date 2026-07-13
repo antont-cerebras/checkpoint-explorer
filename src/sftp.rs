@@ -11,7 +11,12 @@
 //!   script over an SSH *exec* channel ([`RemoteSession::exec_capture`]); the
 //!   caller ([`crate::remote`]) builds the script and parses the result.
 //!
-//! Metadata-only: no tensor data crosses the wire.
+//! **Read-only, metadata-only.** Every remote access is a read: files are opened
+//! read-only ([`open_readonly`] — `OpenFlags::READ`, no create/write/truncate
+//! bits), and the module never issues `mkdir` / `remove` / `rename` / `setstat`
+//! or an `s3://` command that writes. The cstorch path only *loads* the
+//! checkpoint and prints metadata to stdout. So `--ssh-read` cannot create or
+//! modify anything on the server — and no tensor data crosses the wire.
 
 use std::io::{IsTerminal, Read, Write};
 use std::net::TcpStream;
@@ -378,12 +383,26 @@ fn list_shards(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<String>> {
     Ok(files)
 }
 
+/// Open a remote file **read-only**. This is the *only* way this module opens a
+/// file, so the entire remote path is structurally incapable of creating,
+/// truncating, or writing anything on the server: `OpenFlags::READ` carries no
+/// write/create/append/truncate bit (adding one would have to be an explicit,
+/// reviewable edit here). The `mode` argument only applies to file *creation*,
+/// which READ never triggers.
+fn open_readonly(sftp: &ssh2::Sftp, path: &str) -> Result<ssh2::File> {
+    sftp.open_mode(
+        Path::new(path),
+        ssh2::OpenFlags::READ,
+        0,
+        ssh2::OpenType::File,
+    )
+    .with_context(|| format!("opening {path}"))
+}
+
 /// Read a shard's safetensors header over SFTP — the 8-byte little-endian length
 /// then that many JSON bytes — without touching the tensor data that follows.
 fn read_header(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<u8>> {
-    let mut f = sftp
-        .open(Path::new(path))
-        .with_context(|| format!("opening {path}"))?;
+    let mut f = open_readonly(sftp, path)?;
     let mut len_buf = [0u8; 8];
     f.read_exact(&mut len_buf)
         .with_context(|| format!("reading header length of {path}"))?;
@@ -396,9 +415,7 @@ fn read_header(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<u8>> {
 
 /// Read a small remote file (the shard index) in full over SFTP.
 fn read_all(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<u8>> {
-    let mut f = sftp
-        .open(Path::new(path))
-        .with_context(|| format!("opening {path}"))?;
+    let mut f = open_readonly(sftp, path)?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)
         .with_context(|| format!("reading {path}"))?;

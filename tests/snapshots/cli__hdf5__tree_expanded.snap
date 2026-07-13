@@ -41,3 +41,4 @@ q quit
         · input_layernorm.weight [F32, (4), 16 B → 19 B (⇩ gzip)]
         · self_attn.q_proj.weight [I32, (4, 4), 64 B → 41 B (⇩ gzip)]
  ▪ [FIXTURE]
+                                                                                                              read-only
