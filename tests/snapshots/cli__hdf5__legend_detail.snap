@@ -24,12 +24,12 @@ r to re│   as      the active dtype reinterpretation (press d), e.g. 'BF16 as 
        │                                                                                                       │
        │   Statistics:  zeros = fraction of exactly-zero values · non-finite = count of NaN/∞                  │
        │                                                                                                       │
-       │    read-only       this tool only reads — it never writes, modifies, or deletes your files            │
-       │    metadata-only   a remote source: only header metadata is loaded; data views need the file locally  │
+       │    read-only        browsing mode (default): repack / convert blocked — press W to allow writes       │
+       │    ⚡ WRITABLE ⚡   writes enabled (W, or --start-writable): R repacks this checkpoint to a new file  │
+       │    metadata-only    a remote source: only header metadata is loaded; data views need the file locally │
        │                                                                                                       │
        │ Click or press any key to close.                                                                      │
        ╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯
-
 
 
 

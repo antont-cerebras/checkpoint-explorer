@@ -152,6 +152,12 @@ struct ExploreArgs {
     no_preload: bool,
 
     #[arg(
+        long = "start-writable",
+        help = "Start the browser in writable mode so R can repack this checkpoint into a new file. The default is read-only, which blocks conversions; toggle it at any time with W. The source checkpoint is never modified either way. No effect on remote (--ssh-read) sources, which are always read-only."
+    )]
+    start_writable: bool,
+
+    #[arg(
         long,
         value_name = "NAME",
         help = "Open a specific tensor on startup (exact name); optional when the checkpoint has only one tensor (e.g. a .npy). Combine with --dtype/--shape/--values/--heatmap/--edge"
@@ -1614,6 +1620,9 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
     });
 
     let mut explorer = Explorer::new(files, health_reports, open, !args.no_preload);
+    if args.start_writable {
+        explorer.set_access(crate::ui::Access::Writable);
+    }
     if let Some(host) = args.ssh_read {
         let venv = args.ssh_venv.unwrap_or_else(|| "~/venv".to_string());
         explorer.set_remote_read(host, venv);

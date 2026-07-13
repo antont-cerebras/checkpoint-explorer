@@ -224,6 +224,8 @@ pub struct DrawConfig<'a> {
     pub interactive: bool,
     /// Whether the mouse is hovering the read-only badge, floating its hint.
     pub readonly_hover: bool,
+    /// The current access mode, shown by the bottom-right badge.
+    pub access: Access,
 }
 
 /// How a screen should render the statistics area: not computed yet, a scan in
@@ -428,26 +430,51 @@ impl TreeScrollbar {
 
 pub struct UI;
 
-/// The read-only badge text, drawn bottom-right on every view. This tool never
-/// modifies a checkpoint (local or remote), so the badge is unconditional.
+/// Whether the browser may write to disk. Read-only is the default; the user
+/// opts into writes (the `R` repack / `convert`) with `--start-writable` or the
+/// `W` key. Remote (`--ssh-read`) sources are always [`Access::ReadOnly`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Access {
+    ReadOnly,
+    Writable,
+}
+
+/// The bottom-right status badge for each [`Access`] mode. Writable is the loud
+/// one — all-caps, reddish, bracketed by lightning bolts — since it means writes
+/// are enabled. [`badge_reserve_width`] takes the wider of the two.
 const READONLY_BADGE: &str = " read-only ";
+const WRITABLE_BADGE: &str = " ⚡ WRITABLE ⚡ ";
+
+/// Display width of the widest access-mode badge (writable, with its wide ⚡
+/// glyphs) — reserved on the right of the bottom status line and used as the
+/// hover hit region, so neither badge is clipped or overrun by status text.
+fn badge_reserve_width() -> u16 {
+    use unicode_width::UnicodeWidthStr;
+    READONLY_BADGE.width().max(WRITABLE_BADGE.width()) as u16
+}
 
 impl UI {
-    /// Draw the persistent `read-only` badge on the very bottom status line,
-    /// right-aligned. Rendered last on every view (tree / detail / data) so it
-    /// sits above whatever occupies that row. When `hover` is set (the mouse is
-    /// over the badge) a small hint pop-up floats just above it.
-    pub fn render_readonly_badge(frame: &mut Frame, hover: bool) {
+    /// Draw the persistent access-mode badge on the very bottom status line,
+    /// right-aligned — `read-only` (green) or `writable` (amber). Rendered last on
+    /// every view (tree / detail / data) so it sits above whatever occupies that
+    /// row. When `hover` is set (the mouse is over the badge) a small hint pop-up
+    /// floats just above it.
+    pub fn render_readonly_badge(frame: &mut Frame, access: Access, hover: bool) {
+        use unicode_width::UnicodeWidthStr;
         let area = frame.area();
-        let badge_w = READONLY_BADGE.chars().count() as u16;
+        let (text, color) = match access {
+            Access::ReadOnly => (READONLY_BADGE, palette::SUCCESS),
+            Access::Writable => (WRITABLE_BADGE, palette::ERROR),
+        };
+        let badge_w = text.width() as u16;
         if area.width <= badge_w || area.height == 0 {
             return;
         }
         Paragraph::new(Line::from(Span::styled(
-            READONLY_BADGE,
+            text,
             Style::default()
                 .bg(palette::STATUS_BG)
-                .fg(palette::SUCCESS)
+                .fg(color)
                 .add_modifier(Modifier::BOLD),
         )))
         .render(
@@ -460,14 +487,15 @@ impl UI {
             frame.buffer_mut(),
         );
         if hover {
-            render_readonly_hint(frame);
+            render_readonly_hint(frame, access);
         }
     }
 
-    /// Is the point `(col, row)` over the read-only badge, given the frame size?
-    /// Lets a loop toggle the hover hint without duplicating the badge geometry.
+    /// Is the point `(col, row)` over the access-mode badge, given the frame size?
+    /// Uses the wider (`read-only`) badge so both modes hit. Lets a loop toggle the
+    /// hover hint without duplicating the badge geometry.
     pub fn readonly_badge_hit(width: u16, height: u16, col: u16, row: u16) -> bool {
-        let badge_w = READONLY_BADGE.chars().count() as u16;
+        let badge_w = badge_reserve_width();
         width > badge_w && height > 0 && row == height - 1 && col >= width - badge_w
     }
 
@@ -681,9 +709,9 @@ impl UI {
 
         // --- bottom two-line status bar ---
         // Reserve room on the right of the bottom status line for the persistent
-        // read-only badge (drawn by `render_readonly_badge` below), so the status
+        // access-mode badge (drawn by `render_readonly_badge` below), so the status
         // text never runs under it.
-        let max_text = (width as usize).saturating_sub(6 + READONLY_BADGE.chars().count());
+        let max_text = (width as usize).saturating_sub(6 + badge_reserve_width() as usize);
         let row0 = if config.search_mode && config.tree.is_empty() {
             Line::from(vec![
                 Span::raw(format!(
@@ -767,7 +795,7 @@ impl UI {
             );
         }
 
-        Self::render_readonly_badge(frame, config.readonly_hover);
+        Self::render_readonly_badge(frame, config.access, config.readonly_hover);
 
         // Clickable regions: each footer chip (the hint block starts at row 1,
         // below the title) plus the top-right `[×]` (→ quit the tree).
@@ -1661,34 +1689,31 @@ impl UI {
     /// The Ratatui port of [`Self::draw_message`]: a simple full-screen message
     /// (title, underline rule, body, footer) over the pop-up panel surface.
     pub fn render_message(frame: &mut Frame, title: &str, message: &str) {
-        render_popup_box(
-            frame,
-            title,
-            vec![
-                Line::from(Span::raw(message.to_string())),
-                Line::default(),
-                Line::from(dim_span("Click or press any key to return...")),
-            ],
-            Backdrop::Fill,
-            None,
-        );
+        let mut lines = wrap_prose(message, popup_text_width(frame));
+        lines.push(Line::default());
+        lines.push(Line::from(dim_span("Click or press any key to return...")));
+        render_popup_box(frame, title, lines, Backdrop::Fill, None);
     }
 
     /// A metadata-only / unavailable notice **floated over** the live frame (the
     /// screen behind stays visible — unlike [`Self::render_message`]), dismissed by
     /// any key. Used for [`Overlay::Notice`].
     pub fn render_notice_box(frame: &mut Frame, message: &str) {
-        render_popup_box(
-            frame,
-            "Metadata-only",
-            vec![
-                Line::from(Span::raw(message.to_string())),
-                Line::default(),
-                Line::from(dim_span("Click or press any key to dismiss")),
-            ],
-            Backdrop::Float,
-            None,
-        );
+        let mut lines = wrap_prose(message, popup_text_width(frame));
+        lines.push(Line::default());
+        lines.push(Line::from(dim_span("Click or press any key to dismiss")));
+        render_popup_box(frame, "Metadata-only", lines, Backdrop::Float, None);
+    }
+
+    /// A titled notice **floated over** the live frame (the screen behind stays
+    /// visible), its body word-wrapped and dismissed by any key. Unlike
+    /// [`Self::render_message`] (which wipes the frame), the caller must draw the
+    /// background first — used for tree-context messages like the repack notices.
+    pub fn render_float_notice(frame: &mut Frame, title: &str, message: &str) {
+        let mut lines = wrap_prose(message, popup_text_width(frame));
+        lines.push(Line::default());
+        lines.push(Line::from(dim_span("Click or press any key to return...")));
+        render_popup_box(frame, title, lines, Backdrop::Float, None);
     }
 
     /// Float the health-check report (`h` in the tree) over the live tree. Built
@@ -2236,16 +2261,32 @@ fn render_popup_box(
     inner
 }
 
-/// A small hint pop-up for the read-only badge, anchored bottom-right just above
-/// the badge row so it points at it. Floats over the live frame; the caller only
-/// draws it while the mouse hovers the badge (see [`UI::render_readonly_badge`]).
-fn render_readonly_hint(frame: &mut Frame) {
+/// A small hint pop-up for the access-mode badge, anchored bottom-right just
+/// above the badge row so it points at it. Its wording depends on the current
+/// [`Access`]. Floats over the live frame; the caller only draws it while the
+/// mouse hovers the badge (see [`UI::render_readonly_badge`]).
+fn render_readonly_hint(frame: &mut Frame, access: Access) {
     let area = frame.area();
-    let body = [
-        "This tool only ever reads your checkpoint —",
-        "it never writes, modifies, or deletes anything.",
-        "Safe to point at production files, local or remote.",
-    ];
+    let (title, color, body): (&str, Color, &[&str]) = match access {
+        Access::ReadOnly => (
+            " read-only ",
+            palette::SUCCESS,
+            &[
+                "Read-only mode (the default): the browser will not",
+                "write to disk — repack / convert is blocked.",
+                "Press W (or start with --start-writable) to allow writes.",
+            ],
+        ),
+        Access::Writable => (
+            " ⚡ WRITABLE ⚡ ",
+            palette::ERROR,
+            &[
+                "Writable mode: writes are enabled — R can repack this",
+                "checkpoint into a new file. The source is never modified.",
+                "Press W to return to read-only.",
+            ],
+        ),
+    };
     let inner_w = body.iter().map(|l| l.chars().count()).max().unwrap_or(0);
     let box_w = ((inner_w + 4) as u16).min(area.width); // 2 borders + 2 padding
     let box_h = ((body.len() + 2) as u16).min(area.height); // 2 borders
@@ -2261,12 +2302,10 @@ fn render_readonly_hint(frame: &mut Frame) {
     let panel = Style::default().bg(palette::PANEL_BG);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(palette::SUCCESS))
+        .border_style(Style::default().fg(color))
         .title(Span::styled(
-            " read-only ",
-            Style::default()
-                .fg(palette::SUCCESS)
-                .add_modifier(Modifier::BOLD),
+            title,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
         .padding(Padding::horizontal(1))
         .style(panel);
@@ -2275,6 +2314,40 @@ fn render_readonly_hint(frame: &mut Frame) {
     Paragraph::new(body.iter().map(|l| Line::from(*l)).collect::<Vec<_>>())
         .style(panel)
         .render(inner, frame.buffer_mut());
+}
+
+/// A sensible wrap width for a free-form pop-up body: fits the frame with a
+/// margin for the box borders/padding, capped for readability.
+fn popup_text_width(frame: &Frame) -> usize {
+    (frame.area().width as usize)
+        .saturating_sub(6)
+        .clamp(24, 84)
+}
+
+/// Word-wrap free-form prose into `Line`s no wider than `width` (existing `\n`s
+/// are kept as hard breaks), so a long sentence in a pop-up body wraps instead of
+/// clipping at the box edge. An over-long single word is left whole.
+fn wrap_prose(text: &str, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for para in text.split('\n') {
+        let mut cur = String::new();
+        for word in para.split_whitespace() {
+            if cur.is_empty() {
+                cur.push_str(word);
+            } else if cur.chars().count() + 1 + word.chars().count() <= width {
+                cur.push(' ');
+                cur.push_str(word);
+            } else {
+                lines.push(Line::from(std::mem::take(&mut cur)));
+                cur.push_str(word);
+            }
+        }
+        // Push the paragraph's last (or only) line — empty when `para` was blank,
+        // which preserves an intentional blank line between paragraphs.
+        lines.push(Line::from(cur));
+    }
+    lines
 }
 
 /// A full-width pop-up framed with only top+bottom borders (the `title` rides the
@@ -2562,29 +2635,29 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
     }
 
     // Common to every screen: the persistent bottom status-line badges.
+    let status_bg = Style::default()
+        .bg(palette::STATUS_BG)
+        .add_modifier(Modifier::BOLD);
     lines.push(Line::default());
     lines.push(Line::from(vec![
         Span::raw("  "),
-        Span::styled(
-            " read-only ",
-            Style::default()
-                .bg(palette::STATUS_BG)
-                .fg(palette::SUCCESS)
-                .add_modifier(Modifier::BOLD),
+        Span::styled(" read-only ", status_bg.fg(palette::SUCCESS)),
+        Span::raw(
+            "       browsing mode (default): repack / convert blocked — press W to allow writes",
         ),
-        Span::raw("      this tool only reads — it never writes, modifies, or deletes your files"),
     ]));
     lines.push(Line::from(vec![
         Span::raw("  "),
-        Span::styled(
-            " metadata-only ",
-            Style::default()
-                .bg(palette::STATUS_BG)
-                .fg(palette::WARN)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(" ⚡ WRITABLE ⚡ ", status_bg.fg(palette::ERROR)),
         Span::raw(
-            "  a remote source: only header metadata is loaded; data views need the file locally",
+            "  writes enabled (W, or --start-writable): R repacks this checkpoint to a new file",
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(" metadata-only ", status_bg.fg(palette::WARN)),
+        Span::raw(
+            "   a remote source: only header metadata is loaded; data views need the file locally",
         ),
     ]));
 
@@ -3181,6 +3254,9 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<Chi
     ];
     if can_repack {
         items.push((vec![Seg::Key("R", hint_key('R'))], "repack"));
+        // `W` toggles the read-only ⇄ writable posture that gates the repack. A
+        // fixed label keeps the footer height stable when the mode flips.
+        items.push((vec![Seg::Key("W", hint_key('W'))], "read/write"));
     }
     items.push((vec![Seg::Key("q", hint_key('q'))], "quit"));
 
@@ -4370,6 +4446,7 @@ mod tests {
                 copied_flash: None,
                 interactive,
                 readonly_hover: false,
+                access: Access::ReadOnly,
             }
         }
 

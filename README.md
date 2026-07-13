@@ -52,6 +52,12 @@ subcommands for comparing and health-checking checkpoints.
   on the host, so it's safe to point at production checkpoints. Copies to your
   local clipboard over SSH via **OSC 52**, and a `y` key prints the exact CLI
   command to reopen any view — shareable and scriptable.
+- 🔒 **Read-only by default.** The interactive browser starts read-only even for
+  local checkpoints, so a stray keystroke can never rewrite your data: the `R`
+  repack stays blocked until you opt in with the `W` key (or launch with
+  `--start-writable`). The source file is never modified either way, and remote
+  (`--ssh-read`) sources are always read-only. A `read-only` / `writable` badge on
+  the bottom status line always shows which mode you're in.
 - 🗜️ **HDF5 repacking.** Losslessly [re-compress](#repacking-hdf5-checkpoints---features-hdf5)
   LZ4 checkpoints with **zstd**/gzip for a smaller on-disk footprint.
 
@@ -295,7 +301,8 @@ checkpoint-explorer model.safetensors --print-tensors --name '!*.bias'
 | `y` | Show and copy the CLI command that reopens this exact screen — file, tensor (or metadata entry), dtype/shape overrides, view, layout, zebra, base, slice (works on every screen) |
 | `s` | (Detail screen) compute the tensor's statistics on demand |
 | `h` | **Detail screen:** show the value histogram · **Tree:** run the health checks and float the report in a popup — `v` runs the value-tier data scan (progress bar; `Esc` cancels), `r` copies the report, `c` the screen, `y` the reopen command (`--health`); same checks as the [`check`](#checking-checkpoints-check) subcommand (auto-suggested when an index/file mismatch is detected) |
-| `R` | Repack the current HDF5 checkpoint into a new file (HDF5 only) |
+| `R` | Repack the current HDF5 checkpoint into a new file (HDF5 only; needs writable mode — press `W` first) |
+| `W` | Toggle read-only ⇄ writable (works on every screen). Read-only is the default and blocks `R`; the source file is never modified either way |
 | `Backspace` / `\` | Step **back** / **forward** through the screens you've visited (browser-style history) — e.g. reopen a view you just left |
 | `Esc` | Exit search mode |
 | `q` | Quit the application (or exit search mode if active) |
@@ -525,11 +532,15 @@ You choose the **codec** and the streaming **buffer size**:
 - `lz4` — the format these checkpoints ship with: fast, but only ~2×.
 - `none` — store uncompressed.
 
-From the main tree screen press `R`: it asks for the output filename (pre-filled
-with `<name>.repacked.hdf5`), then the codec, then the buffer size, and shows a
-progress bar while it streams each dataset across.
+From the main tree screen press `R`. Because the browser starts **read-only**,
+`R` is blocked until you enable writes — press `W` (the badge flips to
+`writable`), then `R`. It asks for the output filename (pre-filled with
+`<name>.repacked.hdf5`), then the codec, then the buffer size, and shows a
+progress bar while it streams each dataset across. The source is never touched —
+repacking only ever writes the new file.
 
-The same is available non-interactively:
+The same is available non-interactively — `convert` is an explicit write command,
+so it needs no such opt-in:
 
 ```bash
 # Repack with zstd (default level), 256 MiB streaming buffer

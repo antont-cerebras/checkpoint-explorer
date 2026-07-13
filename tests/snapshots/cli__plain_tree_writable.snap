@@ -1,0 +1,44 @@
+---
+source: tests/cli.rs
+expression: "plain(&[\"--start-writable\"])"
+---
+Checkpoint Explorer - [FIXTURE] (1/1)                                                          [×]
+↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · PgUp/PgDn page · Enter/Space expand · E/C all · / search
+l legend · h health · c copy screen · t copy tree · f copy file · n copy name · y copy command · ⌫/\ back/fwd · q quit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+▾ [FIXTURE] (▦ 7, 124 params, 272 B)
+  ▸ 🔧 Metadata (▦ 0, 0 B)
+  · lm_head.weight [I32, (2, 4), 32 B]
+  ▾ model (▦ 6, 240 B)
+    · embed_tokens.weight [F16, (6, 4), 48 B]
+    ▸ layers.0 (▦ 3, 168 B)
+    · norm.weight [F32, (4), 16 B]
+    · scale.u8 [U8, (8), 8 B]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ ▪ [FIXTURE]
+                                                                                                         ⚡ WRITABLE ⚡

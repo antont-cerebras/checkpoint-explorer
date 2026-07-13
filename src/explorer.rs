@@ -23,7 +23,7 @@ use crate::sample::{HistShared, Histogram, PackingSchema, SampleMode, Stats, Vie
 use crate::tree::{
     Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key,
 };
-use crate::ui::{DrawConfig, Legend, NumBase, Overlay, StatsView, StripeMode, UI};
+use crate::ui::{Access, DrawConfig, Legend, NumBase, Overlay, StatsView, StripeMode, UI};
 use crate::utils::base64_encode;
 use ratatui::text::{Line, Span};
 
@@ -569,6 +569,10 @@ pub struct Explorer {
     /// Whether the mouse is currently hovering the read-only badge, which floats
     /// its hint pop-up. Toggled by the browsing loops on mouse-move.
     readonly_hover: Cell<bool>,
+    /// The browser's access mode. Read-only by default (blocks the `R` repack);
+    /// the user opts in with `--start-writable` or the `W` key. Remote sources are
+    /// always read-only regardless of this (see [`Self::effective_access`]).
+    access: Cell<Access>,
 }
 
 impl Explorer {
@@ -630,6 +634,23 @@ impl Explorer {
             preload,
             unindexed,
             readonly_hover: Cell::new(false),
+            access: Cell::new(Access::ReadOnly),
+        }
+    }
+
+    /// Set the browser's initial access mode (`--start-writable`). No effect on a
+    /// remote source, which [`Self::effective_access`] pins to read-only anyway.
+    pub fn set_access(&self, access: Access) {
+        self.access.set(access);
+    }
+
+    /// The access mode actually in force: a remote (`--ssh-read`) source can never
+    /// be written, so it is always read-only; otherwise the toggled [`Self::access`].
+    fn effective_access(&self) -> Access {
+        if self.remote_read.is_some() {
+            Access::ReadOnly
+        } else {
+            self.access.get()
         }
     }
 
@@ -1961,6 +1982,7 @@ impl Explorer {
             copied_flash: self.copied_flash.as_ref().map(|(what, _)| what.as_str()),
             interactive,
             readonly_hover: self.readonly_hover.get(),
+            access: self.effective_access(),
         };
         *self.clickable.borrow_mut() = UI::render_tree(frame, &config);
     }
@@ -2412,7 +2434,7 @@ impl Explorer {
             self.schema_for(&tensor.name),
             overlay,
         );
-        UI::render_readonly_badge(frame, self.readonly_hover.get());
+        UI::render_readonly_badge(frame, self.effective_access(), self.readonly_hover.get());
     }
 
     /// Render a tensor's detail screen to plain text via an in-memory Ratatui
@@ -2491,7 +2513,7 @@ impl Explorer {
             Some(Overlay::Notice(m)) => UI::render_notice_box(frame, m),
             None => {}
         }
-        UI::render_readonly_badge(frame, self.readonly_hover.get());
+        UI::render_readonly_badge(frame, self.effective_access(), self.readonly_hover.get());
         Ok(info)
     }
 
@@ -2914,6 +2936,15 @@ impl Explorer {
                     } if !self.search_mode => {
                         let mut term = self.terminal.take().expect("interactive loop owns it");
                         self.repack_checkpoint(&mut term);
+                        self.terminal = Some(term);
+                    }
+                    // `W` toggles read-only ⇄ writable (gates the `R` repack).
+                    KeyEvent {
+                        code: KeyCode::Char('W'),
+                        ..
+                    } if !self.search_mode => {
+                        let mut term = self.terminal.take().expect("interactive loop owns it");
+                        self.toggle_access(&mut term);
                         self.terminal = Some(term);
                     }
                     KeyEvent {
@@ -4036,6 +4067,12 @@ impl Explorer {
             }
             match ev {
                 Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+                // `W` toggles read-only ⇄ writable (mirrors the tree; the badge sits
+                // on this screen too).
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Char('W'),
+                    ..
+                })) => self.toggle_access(term),
                 Ok(Event::Key(KeyEvent {
                     code: KeyCode::Char('m'),
                     ..
@@ -4580,6 +4617,9 @@ impl Explorer {
                             // Switch representation in place, keeping the current slice.
                             KeyCode::Char('m') => repr = Representation::Heatmap,
                             KeyCode::Char('v') => repr = Representation::Values,
+                            // `W` toggles read-only ⇄ writable (the badge is on this
+                            // screen too; the `R` repack lives back in the tree).
+                            KeyCode::Char('W') => self.toggle_access(term),
                             // Cycle the data-view layout overview → edges → window
                             // → overview; remembered for the session.
                             KeyCode::Char('e') | KeyCode::Char('E') => self
@@ -5361,10 +5401,34 @@ impl Explorer {
 
     /// Repack the current HDF5 checkpoint into a new file: prompt for the output
     /// name, then run the conversion with a progress screen.
+    /// Toggle read-only ⇄ writable (the `W` key), gating the `R` repack. A remote
+    /// (`--ssh-read`) source can never be written, so there it explains why rather
+    /// than toggling. Available from every browsing screen (the badge is too).
+    fn toggle_access(&self, term: &mut crate::tui::LiveTerminal) {
+        if self.remote_read.is_some() {
+            let _ = term.draw(|f| {
+                self.render_tree_frame(f, true);
+                UI::render_float_notice(
+                    f,
+                    "Read-only",
+                    "Remote (--ssh-read) sources are always read-only. Copy the checkpoint \
+                     locally to enable writes.",
+                )
+            });
+            let _ = event::read();
+            return;
+        }
+        self.access.set(match self.access.get() {
+            Access::ReadOnly => Access::Writable,
+            Access::Writable => Access::ReadOnly,
+        });
+    }
+
     fn repack_checkpoint(&self, term: &mut crate::tui::LiveTerminal) {
         let Some(input) = self.repack_input() else {
             let _ = term.draw(|f| {
-                UI::render_message(
+                self.render_tree_frame(f, true);
+                UI::render_float_notice(
                     f,
                     "Repack unavailable",
                     "Repacking is available only for a single HDF5 checkpoint (.h5/.hdf5).",
@@ -5373,6 +5437,21 @@ impl Explorer {
             let _ = event::read();
             return;
         };
+        // Read-only mode (the default) blocks conversions: repacking writes a new
+        // file, so require the user to opt into writes first.
+        if self.effective_access() == Access::ReadOnly {
+            let _ = term.draw(|f| {
+                self.render_tree_frame(f, true);
+                UI::render_float_notice(
+                    f,
+                    "Read-only mode",
+                    "Repacking is blocked in read-only mode (the default). Press W to enable \
+                     writes — or start with --start-writable — then press R again.",
+                )
+            });
+            let _ = event::read();
+            return;
+        }
         let default = default_repacked_name(&input);
         let Some(output) = self.prompt_output_path(term, &default) else {
             return;
@@ -6011,6 +6090,10 @@ impl Explorer {
                 parts.push("--ssh-venv".to_string());
                 parts.push(shell_quote(&remote.venv));
             }
+        }
+        // Round-trip the writable toggle so `y` reopens in the same mode.
+        if self.effective_access() == Access::Writable {
+            parts.push("--start-writable".to_string());
         }
         parts
     }

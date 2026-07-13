@@ -191,6 +191,13 @@ fn plain_tree() {
     settings().bind(|| insta::assert_snapshot!(plain(&[])));
 }
 
+/// The tree started writable (`--start-writable`) shows the loud `⚡ WRITABLE ⚡`
+/// badge on the bottom line instead of the default green `read-only`.
+#[test]
+fn plain_tree_writable() {
+    settings().bind(|| insta::assert_snapshot!(plain(&["--start-writable"])));
+}
+
 /// Run a one-shot `--print-*` export (no `--plain`) and capture stdout.
 fn export(extra_args: &[&str]) -> String {
     ensure_fixture();
@@ -366,7 +373,9 @@ fn y_roundtrips() {
         vec!["--tensor", t, "--values", "--slice", "1"],
         vec!["--tensor", t, "--values", "--overview", "--base", "hex"],
         vec!["--tensor", t, "--heatmap"],
-        vec!["--health"], // the health-check popup over the tree
+        vec!["--health"],         // the health-check popup over the tree
+        vec!["--start-writable"], // writable badge on the tree
+        vec!["--start-writable", "--tensor", t], // writable badge on the detail screen
     ] {
         assert_y_roundtrip(FIXTURE, &extra);
     }
