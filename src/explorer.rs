@@ -566,6 +566,9 @@ pub struct Explorer {
     /// `model.safetensors.index.json` (derived from the health reports); their
     /// tensors are flagged in the tree and detail screens.
     unindexed: HashSet<String>,
+    /// Whether the mouse is currently hovering the read-only badge, which floats
+    /// its hint pop-up. Toggled by the browsing loops on mouse-move.
+    readonly_hover: Cell<bool>,
 }
 
 impl Explorer {
@@ -626,6 +629,7 @@ impl Explorer {
             sample_cache: RefCell::new(None),
             preload,
             unindexed,
+            readonly_hover: Cell::new(false),
         }
     }
 
@@ -1956,6 +1960,7 @@ impl Explorer {
             packing_schemas: &self.packing_schemas,
             copied_flash: self.copied_flash.as_ref().map(|(what, _)| what.as_str()),
             interactive,
+            readonly_hover: self.readonly_hover.get(),
         };
         *self.clickable.borrow_mut() = UI::render_tree(frame, &config);
     }
@@ -2407,6 +2412,7 @@ impl Explorer {
             self.schema_for(&tensor.name),
             overlay,
         );
+        UI::render_readonly_badge(frame, self.readonly_hover.get());
     }
 
     /// Render a tensor's detail screen to plain text via an in-memory Ratatui
@@ -2485,6 +2491,7 @@ impl Explorer {
             Some(Overlay::Notice(m)) => UI::render_notice_box(frame, m),
             None => {}
         }
+        UI::render_readonly_badge(frame, self.readonly_hover.get());
         Ok(info)
     }
 
@@ -2789,6 +2796,12 @@ impl Explorer {
                     MouseEventKind::ScrollUp => {
                         self.copied_flash = None;
                         self.scroll_offset = self.scroll_offset.saturating_sub(WHEEL_STEP)
+                    }
+                    // Hovering the read-only badge floats its hint; moving off hides it.
+                    MouseEventKind::Moved => {
+                        self.readonly_hover.set(size.is_some_and(|sz| {
+                            UI::readonly_badge_hit(sz.width, sz.height, col, row)
+                        }));
                     }
                     _ => {}
                 }
@@ -3981,6 +3994,14 @@ impl Explorer {
                             None => continue,
                         }
                     } else {
+                        // Hovering the read-only badge floats its hint; moving off it
+                        // (or any other motion) hides it again on the next redraw.
+                        if matches!(m.kind, MouseEventKind::Moved) {
+                            let hit = term.size().ok().is_some_and(|sz| {
+                                UI::readonly_badge_hit(sz.width, sz.height, m.column, m.row)
+                            });
+                            self.readonly_hover.set(hit);
+                        }
                         continue;
                     }
                 }
@@ -4754,6 +4775,13 @@ impl Explorer {
                         MouseEventKind::ScrollDown if slices > 1 => slice = (slice + 1) % slices,
                         MouseEventKind::ScrollUp if slices > 1 => {
                             slice = (slice + slices - 1) % slices
+                        }
+                        // Hovering the read-only badge floats its hint.
+                        MouseEventKind::Moved => {
+                            let hit = term.size().ok().is_some_and(|sz| {
+                                UI::readonly_badge_hit(sz.width, sz.height, m.column, m.row)
+                            });
+                            self.readonly_hover.set(hit);
                         }
                         _ => {}
                     },

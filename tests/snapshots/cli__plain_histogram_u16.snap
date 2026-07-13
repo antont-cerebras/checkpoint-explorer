@@ -41,4 +41,4 @@ Histogram: 60 values  (<time>)
 
 Press m for a heatmap, v for numeric values, h for a histogram, b to set its bin count, d to reinterpret the dtype,
 r to reshape, c to copy, y to copy the command, l for the legend,
-⌫ / \ to step back / forward, any other key to return...
+⌫ / \ to step back / forward, any other key to return...                                                      read-only

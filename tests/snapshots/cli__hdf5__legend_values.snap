@@ -1,6 +1,5 @@
 ---
 source: tests/cli.rs
-assertion_line: 420
 expression: "plain(&[\"--tensor\", &t, \"--values\", \"--legend\"])"
 ---
 Values: model.layers.0.block_sparse_moe.experts.down_proj.weight                                                     [×]
@@ -16,15 +15,30 @@ expert 0 of 30 — stored word 0, field 0/5 (3-bit) — [ ] step · / index or %
 
 m heatmap · ← → first/last cols · ↑ ↓ first/last rows · +Shift one end · [ ] slice · / index or % · d dtype · r reshape
 · e window · z zebra: rows · b base: dec · c copy · y copy cmd · l legend · ⌫ back · \ fwd · any other key to return...
+        ╭ Legend — numeric values ─────────────────────────────────────────────────────────────────────────────╮
+        │   12  34    row / column indices into the full tensor (dimmed), not data values                      │
+        │   ⋯         columns were skipped here (the gap between the first and last columns)                   │
+        │   ⋮         rows were skipped here                                                                   │
+        │   ⋱         both rows and columns were skipped (the corner)                                          │
+        │   1.2e-3    floats use scientific notation; integers print plain                                     │
+        │   3f800000  press b to cycle the base: dec / hex / oct / bin (raw stored bits)                       │
+        │    12  34   zebra striping traces a row or column (cycle rows/cols/off with z)                       │
+        │                                                                                                      │
+        │    read-only       this tool only reads — it never writes, modifies, or deletes your files           │
+        │    metadata-only   a remote source: only header metadata is loaded; data views need the file locally │
+        │                                                                                                      │
+        │ Click or press any key to close.                                                                     │
+        ╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
 
-                 ╭ Legend — numeric values ───────────────────────────────────────────────────────────╮
-                 │   12  34    row / column indices into the full tensor (dimmed), not data values    │
-                 │   ⋯         columns were skipped here (the gap between the first and last columns) │
-                 │   ⋮         rows were skipped here                                                 │
-                 │   ⋱         both rows and columns were skipped (the corner)                        │
-                 │   1.2e-3    floats use scientific notation; integers print plain                   │
-                 │   3f800000  press b to cycle the base: dec / hex / oct / bin (raw stored bits)     │
-                 │    12  34   zebra striping traces a row or column (cycle rows/cols/off with z)     │
-                 │                                                                                    │
-                 │ Click or press any key to close.                                                   │
-                 ╰────────────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                              read-only

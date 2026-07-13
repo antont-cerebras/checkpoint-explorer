@@ -239,6 +239,10 @@ impl RemoteRead {
 /// sentinel-tagged JSON line. The URI is embedded as a JSON string literal (valid
 /// Python), so nothing needs quoting at the shell. (Safetensors dirs/files don't
 /// use this — they're read over SFTP; see [`crate::sftp`].)
+///
+/// **Read-only:** the script only *loads* (lazily) and writes its output to
+/// stdout — it never opens a file for writing, calls `cstorch.save`/`torch.save`,
+/// or otherwise mutates the checkpoint. The remote checkpoint is never modified.
 fn dump_script(src: &str) -> String {
     let src_lit = serde_json::to_string(src).unwrap_or_else(|_| "\"\"".into());
     const TEMPLATE: &str = r#"

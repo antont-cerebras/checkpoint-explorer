@@ -1,6 +1,5 @@
 ---
 source: tests/cli.rs
-assertion_line: 413
 expression: "plain(&[\"--tensor\", &t, \"--legend\"])"
 ---
 Tensor Details                                                                                                       [×]
@@ -15,17 +14,31 @@ Chunks: (2, 3, 4) × 3
 File: [FIXTURE]
 
 Statistics: press s to scan the full tensor
-
-Press m for a heatmap, v for numeric values, h for a histogram, b to set its bin count, d to reinterpret the dtype,
-r to re╭ Legend — tensor details ──────────────────────────────────────────────────────────────────────────────╮
-⌫ / \ t│   ⇩ lz4   on-disk compression codec; the N× beside it is the ratio (logical ÷ stored)                 │
-       │   as      the active dtype reinterpretation (press d), e.g. 'BF16 as u4'                              │
-       │   A – B   a byte range within the file (the tensor's data offsets)                                    │
+       ╭ Legend — tensor details ──────────────────────────────────────────────────────────────────────────────╮
+Press m│   ⇩ lz4   on-disk compression codec; the N× beside it is the ratio (logical ÷ stored)                 │pe,
+r to re│   as      the active dtype reinterpretation (press d), e.g. 'BF16 as u4'                              │
+⌫ / \ t│   A – B   a byte range within the file (the tensor's data offsets)                                    │
        │   ·       separates fields on a line                                                                  │
        │   ✚       this tensor is an extra: on disk but not listed in the index (model.safetensors.index.json) │
        │   ⠋       a statistics scan is running (press s to start; any key cancels)                            │
        │                                                                                                       │
        │   Statistics:  zeros = fraction of exactly-zero values · non-finite = count of NaN/∞                  │
        │                                                                                                       │
+       │    read-only       this tool only reads — it never writes, modifies, or deletes your files            │
+       │    metadata-only   a remote source: only header metadata is loaded; data views need the file locally  │
+       │                                                                                                       │
        │ Click or press any key to close.                                                                      │
        ╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                              read-only
