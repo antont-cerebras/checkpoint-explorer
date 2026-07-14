@@ -21,11 +21,12 @@ subcommands for comparing and health-checking checkpoints.
   NaN/Inf) — computed by streaming the tensor in bounded blocks, so it works on
   **multi-GB** tensors without loading them into RAM.
 - 📊 **The whole checkpoint at a glance.** Press `s` for a
-  [**stats popup**](#checkpoint-statistics-s): total params / size (on-disk vs.
-  logical), the largest / smallest / typical tensor, the dtype mix, and the
-  per-layer and per-**MoE-expert** breakdown — including whether experts are
-  stored fused or unfused. Header-only, so it's instant even on a many-shard
-  model.
+  [**stats popup**](#checkpoint-statistics-s): total params / size, the largest /
+  smallest / typical tensor, the dtype mix, and the per-layer and
+  per-**MoE-expert** breakdown — including whether experts are stored fused or
+  unfused. Header-only, so it's instant even on a many-shard model — plus the
+  *true* on-disk footprint from the filesystem (`st_blocks`), so **ZFS/btrfs
+  compression and sparse holes** show up, local or over SSH.
 - 🧩 **Quantized weights, decoded.** [Reinterpret packed dtypes](#dtype-override)
   on the fly — 4-bit `u4`/`i4` nibbles, or fused-codebook **MoE experts**
   (`unpacked`, e.g. `u3×5`) — so quantized checkpoints show their true values and
@@ -484,8 +485,9 @@ The per-tensor stats above answer "what's *in* this tensor?"; press `s` on the
 **tree** for the complementary question — "what *is* this checkpoint?" — as a
 popup summarising the whole model at a glance:
 
-- **Overview** — number of files/shards, tensors, total parameters, and total
-  size (on-disk vs. logical, with the compression ratio for compressed HDF5).
+- **Overview** — the architecture (`model_type` from `config.json`, when
+  present), number of files/shards, tensors, total parameters, and total size
+  (on-disk vs. logical, with the compression ratio for compressed HDF5).
 - **Tensor size** — the largest and smallest tensor (named), plus the average
   and median size, so an outlier stands out.
 - **Layers** — the repeated `…layers.<i>.…` stack: how many layers, and the
@@ -496,7 +498,15 @@ popup summarising the whole model at a glance:
   parameters / bytes in a single expert, the same way layers are broken down.
 - **By dtype** — the dtype mix, each with its tensor count and byte share, so a
   quantized / mixed-precision checkpoint shows exactly how much is in each type.
-- **Architecture** — the `model_type` from `config.json`, when present.
+- **On disk (filesystem)** — the *true* footprint from the OS (`st_blocks`),
+  overall and per shard (listing only the shards the filesystem actually shrank,
+  folding the rest into a count), next to the apparent size. Unlike every count above (which
+  is logical: shape × dtype), this reflects **filesystem compression (ZFS/btrfs)
+  and sparse-file holes** — so a mostly-zero checkpoint that squashes on ZFS
+  shows its real disk usage. For `--ssh-read` dirs it's measured by a single
+  read-only `stat` on the remote host (SFTP carries no block count); it's omitted
+  for `s3://` and in the deterministic `--plain` render (a live measurement isn't
+  reproducible).
 
 It's derived from the metadata already in memory (shapes and dtypes, no data
 read), so it's instant even on a multi-GB, multi-shard checkpoint. The body

@@ -747,7 +747,8 @@ fn run_check(
                 .with_context(|| format!("reading {src}"));
             bars.finish(0, out.is_ok());
             bars.join();
-            let (tensors, metadata) = out?;
+            // `check` ignores the on-disk footprint (it's a health report).
+            let (tensors, metadata, _disk) = out?;
             // The checkpoint's config.json, fetched over the same session (no
             // second prompt) so the config check runs remotely too.
             let config = r.read_config(&session, &src);
@@ -775,7 +776,7 @@ fn run_check(
             if files.is_empty() {
                 anyhow::bail!("no checkpoint files found");
             }
-            let (tensors, metadata, config) = Explorer::gather_checkpoint(&files, None)?;
+            let (tensors, metadata, config, _disk) = Explorer::gather_checkpoint(&files, None)?;
             let label = paths
                 .iter()
                 .map(|p| p.display().to_string())
@@ -1115,7 +1116,7 @@ fn run_diff(
             anyhow::bail!("no checkpoint files found at {}", path.display());
         }
         // `diff` compares structure only — the config sidecar isn't needed here.
-        let (tensors, metadata, _config) = Explorer::gather_checkpoint(&files, None)?;
+        let (tensors, metadata, _config, _disk) = Explorer::gather_checkpoint(&files, None)?;
         Ok((tensors, metadata))
     };
 
@@ -1142,7 +1143,8 @@ fn run_diff(
                         .read(session, src, &password, progress.as_deref())
                         .with_context(|| format!("reading {src}"));
                     bars.finish(i, out.is_ok());
-                    out
+                    // `diff` compares structure, not the on-disk footprint.
+                    out.map(|(tensors, metadata, _disk)| (tensors, metadata))
                 };
             let (ra, rb) = std::thread::scope(|s| {
                 let (oref, nref): (&str, &str) = (&old_str, &new_str);

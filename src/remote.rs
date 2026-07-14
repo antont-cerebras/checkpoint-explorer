@@ -20,7 +20,17 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::progress::LoadProgress;
 use crate::sftp::RemoteSession;
+use crate::stats::{DiskUsage, ShardDisk};
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo};
+
+/// A remote read's result: tensors, metadata, `config.json`, and the shards'
+/// on-disk footprint (all but the tensors optional).
+type FetchedCheckpoint = (
+    Vec<TensorInfo>,
+    Vec<MetadataInfo>,
+    Option<crate::config::ModelConfig>,
+    Option<DiskUsage>,
+);
 
 /// Line prefix the remote script tags its JSON with, so we can pick it out of any
 /// motd / cstorch chatter on the SSH stdout.
@@ -76,14 +86,7 @@ impl RemoteRead {
     /// cstorch checkpoint (no HF `config.json`) or when the sidecar is
     /// absent/unreadable. For several reads sharing one session/prompt (e.g.
     /// `diff`), use [`Self::open_with`] + [`Self::read`] directly.
-    pub fn fetch_with_config(
-        &self,
-        src: &str,
-    ) -> Result<(
-        Vec<TensorInfo>,
-        Vec<MetadataInfo>,
-        Option<crate::config::ModelConfig>,
-    )> {
+    pub fn fetch_with_config(&self, src: &str) -> Result<FetchedCheckpoint> {
         let mut password = None;
         let session = self.open_with(&mut password)?;
         eprintln!("checkpoint-explorer: reading tensor metadata over ssh …");
@@ -92,9 +95,9 @@ impl RemoteRead {
         let out = self.read(&session, src, &password, progress.as_deref());
         bars.finish(0, out.is_ok());
         bars.join();
-        let (tensors, metadata) = out?;
+        let (tensors, metadata, disk) = out?;
         let config = self.read_config(&session, src);
-        Ok((tensors, metadata, config))
+        Ok((tensors, metadata, config, disk))
     }
 
     /// Fetch + parse the remote `config.json` for `src` over an already-open
@@ -130,9 +133,12 @@ impl RemoteRead {
         src: &str,
         password: &Option<String>,
         progress: Option<&LoadProgress>,
-    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>, Option<DiskUsage>)> {
         if src.starts_with("s3://") {
-            self.read_cstorch(session, src, progress)
+            // An s3:// cstorch checkpoint isn't a local filesystem path, so there's
+            // no block allocation to measure.
+            let (t, m) = self.read_cstorch(session, src, progress)?;
+            Ok((t, m, None))
         } else {
             self.read_dir(session, src, password, progress)
         }
@@ -156,7 +162,7 @@ impl RemoteRead {
         path: &str,
         password: &Option<String>,
         progress: Option<&LoadProgress>,
-    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>, Option<DiskUsage>)> {
         use std::sync::atomic::AtomicUsize;
 
         let files = session.list_shards(path)?;
@@ -208,7 +214,23 @@ impl RemoteRead {
                 self.source_path(path)
             );
         }
-        Ok((tensors, metadata))
+        // Best-effort filesystem footprint of the shards (one read-only `stat`
+        // over SSH). A failure here — no `stat`, non-GNU, restricted shell — just
+        // drops the on-disk section from the stats popup; it never fails the load.
+        let disk = session
+            .allocated_sizes(&files)
+            .ok()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(p, apparent, allocated)| ShardDisk {
+                        name: crate::stats::shard_name(&p),
+                        apparent,
+                        allocated,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .and_then(DiskUsage::from_shards);
+        Ok((tensors, metadata, disk))
     }
 
     /// The `source_path` stamped on each remote tensor: an `s3://…` URI as-is, or a

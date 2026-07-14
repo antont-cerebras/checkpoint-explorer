@@ -150,6 +150,38 @@ impl RemoteSession {
         read_all(&sftp, path)
     }
 
+    /// The on-disk footprint of each path via a single read-only `stat` syscall
+    /// over an SSH exec channel — SFTP carries no block-allocation field, so this
+    /// is the only way to see remote **ZFS/btrfs compression or sparse holes**.
+    /// Returns `(path, apparent, allocated)` per line: `allocated = st_blocks ×
+    /// block-size`, `apparent = st_size`. Uses GNU coreutils `stat`; the caller
+    /// treats any error (missing `stat`, non-GNU, a vanished file) as "unknown".
+    pub fn allocated_sizes(&self, paths: &[String]) -> Result<Vec<(String, u64, u64)>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `%b` blocks · `%B` bytes-per-block · `%s` apparent size · `%n` the path.
+        let args: String = paths
+            .iter()
+            .map(|p| format!(" {}", shell_single_quote(p)))
+            .collect();
+        let command = format!("stat -c '%b %B %s %n' --{args}");
+        let mut rows = Vec::new();
+        self.exec_capture(&command, "", |line| {
+            // "<blocks> <blocksize> <size> <path…>" — the path (`%n`) is last and
+            // may contain spaces, so only the first three fields are numbers.
+            let mut it = line.trim().splitn(4, ' ');
+            if let (Some(b), Some(bs), Some(sz), Some(name)) =
+                (it.next(), it.next(), it.next(), it.next())
+                && let (Ok(b), Ok(bs), Ok(sz)) =
+                    (b.parse::<u64>(), bs.parse::<u64>(), sz.parse::<u64>())
+            {
+                rows.push((name.to_string(), sz, b * bs));
+            }
+        })?;
+        Ok(rows)
+    }
+
     /// Claim shards from the shared `next` counter and read+parse each header over
     /// one SFTP channel, returning `(index, tensors, metadata)` per shard claimed.
     /// Several sessions sharing one `next` split the shards dynamically
@@ -389,6 +421,13 @@ fn list_shards(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<String>> {
         }
     }
     Ok(files)
+}
+
+/// Wrap a string in single quotes for a POSIX shell, escaping any embedded
+/// single quote as `'\''` — so a path with spaces or shell metacharacters is
+/// passed to the remote `stat` as one literal argument.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Open a remote file **read-only**. This is the *only* way this module opens a
