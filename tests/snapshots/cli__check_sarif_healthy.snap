@@ -41,6 +41,13 @@ expression: out
               }
             },
             {
+              "id": "config",
+              "name": "Config consistency",
+              "shortDescription": {
+                "text": "tensor tree matches config.json"
+              }
+            },
+            {
               "id": "files",
               "name": "Files & sharding",
               "shortDescription": {

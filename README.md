@@ -662,6 +662,16 @@ The **structural** checks read only headers, so they're cheap and work over
   by role (the name with layer/expert indices blanked), so a checkpoint's
   legitimate mix of dtypes-by-role — weights BF16, quant scales F16, codebooks
   F32 — is **not** flagged; only a within-role outlier is.
+- **Config consistency** — cross-checks `config.json` (read from beside the
+  checkpoint, or fetched over `--ssh-read`) against the tensor tree: the
+  **layer count** (`num_hidden_layers`), **experts per layer** (`num_experts`),
+  the **tied/untied LM head** (`tie_word_embeddings`), the **embedding shape**
+  (`vocab_size` × `hidden_size`), and **QK-norm** (`use_qk_norm`). Catches a
+  config that doesn't match the weights, or a checkpoint built against the wrong
+  one. The checks are name-based, so they hold up on quantized/packed weights;
+  the shape check is a soft warning for the same reason. On a pass the report
+  shows what matched, e.g. `qwen3_moe: 48 layers · 128 experts/layer · untied
+  lm_head · vocab 151936 · qk-norm`.
 - **Files & sharding** — the `model.safetensors.index.json` matches the files on
   disk (the same index/health check the explorer runs), and `…-<i>-of-<N>` shard
   numbering is complete.

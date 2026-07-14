@@ -1800,7 +1800,7 @@ impl UI {
                 Status::Na => ("⊘", palette::DIM),
             };
             let mut trailer_text = match r.status() {
-                Status::Pass => format!("— {}", r.note),
+                Status::Pass => format!("— {}", r.summary.as_deref().unwrap_or(r.note)),
                 Status::Na => "— n/a for this checkpoint".to_string(),
                 _ => format!("({})", count_phrase(r.errors(), r.warnings())),
             };

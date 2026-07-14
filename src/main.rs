@@ -1,5 +1,6 @@
 mod check;
 mod codec;
+mod config;
 #[cfg(feature = "hdf5")]
 mod convert;
 mod diff;
@@ -728,6 +729,9 @@ fn run_check(
             bars.finish(0, out.is_ok());
             bars.join();
             let (tensors, metadata) = out?;
+            // The checkpoint's config.json, fetched over the same session (no
+            // second prompt) so the config check runs remotely too.
+            let config = r.read_config(&session, &src);
             // No local files/health over SSH — the file/shard check is n/a.
             Ok(check::run(
                 src.clone(),
@@ -735,6 +739,7 @@ fn run_check(
                 &metadata,
                 &[],
                 &[],
+                config.as_ref(),
                 &filter,
                 false,
                 jobs,
@@ -751,14 +756,22 @@ fn run_check(
             if files.is_empty() {
                 anyhow::bail!("no checkpoint files found");
             }
-            let (tensors, metadata) = Explorer::gather_checkpoint(&files, None)?;
+            let (tensors, metadata, config) = Explorer::gather_checkpoint(&files, None)?;
             let label = paths
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
             Ok(check::run(
-                label, &tensors, &metadata, &files, &health, &filter, values, jobs,
+                label,
+                &tensors,
+                &metadata,
+                &files,
+                &health,
+                config.as_ref(),
+                &filter,
+                values,
+                jobs,
             ))
         })()
         .map_err(|e: anyhow::Error| {
@@ -1082,7 +1095,9 @@ fn run_diff(
         if files.is_empty() {
             anyhow::bail!("no checkpoint files found at {}", path.display());
         }
-        Explorer::gather_checkpoint(&files, None)
+        // `diff` compares structure only — the config sidecar isn't needed here.
+        let (tensors, metadata, _config) = Explorer::gather_checkpoint(&files, None)?;
+        Ok((tensors, metadata))
     };
 
     let (old_str, new_str) = (old.to_string_lossy(), new.to_string_lossy());

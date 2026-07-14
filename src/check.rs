@@ -82,6 +82,10 @@ pub struct CheckResult {
     /// Wall-clock time the check took, shown beside it — set only for the value
     /// scan (the one check slow enough to be worth timing).
     pub elapsed: Option<std::time::Duration>,
+    /// A dynamic one-line summary shown *in place of* `note` when the check
+    /// passes — lets a check report what it actually verified (e.g. the config
+    /// check's "48 layers · 128 experts/layer"). `None` falls back to `note`.
+    pub summary: Option<String>,
 }
 
 impl CheckResult {
@@ -93,6 +97,7 @@ impl CheckResult {
             applicable: false,
             findings: Vec::new(),
             elapsed: None,
+            summary: None,
         }
     }
     fn done(
@@ -108,6 +113,7 @@ impl CheckResult {
             applicable: true,
             findings,
             elapsed: None,
+            summary: None,
         }
     }
     pub fn errors(&self) -> usize {
@@ -246,7 +252,10 @@ impl CheckReport {
             };
             let title = format!("{:<width$}", r.title);
             let trailer = match r.status() {
-                Status::Pass => paint(&format!("— {}", r.note), color, DIM),
+                Status::Pass => {
+                    let text = r.summary.as_deref().unwrap_or(r.note);
+                    paint(&format!("— {text}"), color, DIM)
+                }
                 Status::Na => paint("— n/a for this checkpoint", color, DIM),
                 _ => paint(
                     &format!("({})", count_phrase(r.errors(), r.warnings())),
@@ -457,6 +466,7 @@ pub fn run(
     metadata: &[MetadataInfo],
     files: &[std::path::PathBuf],
     health: &[HealthReport],
+    config: Option<&crate::config::ModelConfig>,
     filter: &NameFilter,
     values: bool,
     jobs: usize,
@@ -467,6 +477,7 @@ pub fn run(
         check_hdf5(tensors),
         check_layers(tensors),
         check_shapes_dtypes(tensors),
+        check_config(tensors, config),
         check_files(files, health),
     ];
     if values {
@@ -847,6 +858,164 @@ fn role_key(name: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// The number of transformer blocks in the tensor tree: the size of the
+/// `…layers.<i>` index stack (preferring a family whose prefix ends in `layers`,
+/// else the largest index family). `None` when there's no such stack.
+fn detected_layer_count(tensors: &[TensorInfo]) -> Option<usize> {
+    let mut fam: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+    for t in tensors {
+        if let Some((prefix, idx, _)) = split_layer_index(&t.name) {
+            fam.entry(prefix).or_default().insert(idx);
+        }
+    }
+    let chosen = fam
+        .iter()
+        .find(|(prefix, _)| prefix.rsplit('.').next() == Some("layers"))
+        .or_else(|| fam.iter().max_by_key(|(_, idxs)| idxs.len()))?;
+    chosen.1.iter().next_back().map(|&m| m + 1)
+}
+
+/// The expert index in a MoE tensor name — the segment right after `experts`, as
+/// in `…mlp.experts.<e>.down_proj.weight`. `None` when the name has no expert.
+fn expert_index(name: &str) -> Option<usize> {
+    let parts: Vec<&str> = name.split('.').collect();
+    let pos = parts.iter().position(|&p| p == "experts")?;
+    parts.get(pos + 1)?.parse().ok()
+}
+
+/// The number of experts (max expert index + 1) seen across the checkpoint.
+fn detected_expert_count(tensors: &[TensorInfo]) -> Option<usize> {
+    tensors
+        .iter()
+        .filter_map(|t| expert_index(&t.name))
+        .max()
+        .map(|m| m + 1)
+}
+
+/// Config ↔ tensor-tree consistency: cross-check `config.json` against the tensor
+/// names/shapes — layer & expert counts, the tied/untied LM head, the embedding
+/// shape, and QK-norm — catching a config that doesn't match the weights (or a
+/// checkpoint assembled against the wrong config). Name-based, so it holds up on
+/// quantized/packed weights; the shape check is a soft warning for the same reason.
+fn check_config(
+    tensors: &[TensorInfo],
+    config: Option<&crate::config::ModelConfig>,
+) -> CheckResult {
+    const ID: &str = "config";
+    const TITLE: &str = "Config consistency";
+    const NOTE: &str = "tensor tree matches config.json";
+
+    let Some(cfg) = config else {
+        return CheckResult::na(ID, TITLE, NOTE);
+    };
+    let mut findings = Vec::new();
+    // The facts we positively verified, joined into the pass-line summary.
+    let mut facts: Vec<String> = Vec::new();
+
+    // Layer count.
+    if let Some(want) = cfg.num_hidden_layers {
+        match detected_layer_count(tensors) {
+            Some(got) if got as u64 == want => facts.push(format!("{want} layers")),
+            Some(got) => findings.push(Finding::error(
+                None,
+                format!("config says {want} layers, but the tensor tree has {got}"),
+            )),
+            None => {}
+        }
+    }
+
+    // Expert count (MoE).
+    if let Some(want) = cfg.num_experts {
+        match detected_expert_count(tensors) {
+            Some(got) if got as u64 == want => facts.push(format!("{want} experts/layer")),
+            Some(got) => findings.push(Finding::error(
+                None,
+                format!("config says {want} experts, but the tensor tree has {got}"),
+            )),
+            // Config declares experts but none are named `…experts.<n>…`.
+            None if want > 0 => findings.push(Finding::error(
+                None,
+                format!("config says {want} experts, but no expert tensors were found"),
+            )),
+            None => {}
+        }
+    }
+
+    // Tied vs untied LM head.
+    if let Some(tied) = cfg.tie_word_embeddings {
+        let has_head = tensors
+            .iter()
+            .any(|t| t.name == "lm_head.weight" || t.name.ends_with(".lm_head.weight"));
+        match (tied, has_head) {
+            (false, true) => facts.push("untied lm_head".into()),
+            (true, false) => facts.push("tied lm_head".into()),
+            (false, false) => findings.push(Finding::warning(
+                Some("lm_head".into()),
+                "config sets tie_word_embeddings=false, but no lm_head weight was found".into(),
+            )),
+            (true, true) => findings.push(Finding::warning(
+                Some("lm_head".into()),
+                "config sets tie_word_embeddings=true, but a separate lm_head weight is present"
+                    .into(),
+            )),
+        }
+    }
+
+    // Embedding shape vs vocab_size × hidden_size (soft: quantized embeddings pack
+    // to a different stored shape).
+    if let (Some(vs), Some(hs)) = (cfg.vocab_size, cfg.hidden_size)
+        && let Some(embed) = tensors.iter().find(|t| t.name.contains("embed_tokens"))
+    {
+        let dims: Vec<u64> = embed.shape.iter().map(|&d| d as u64).collect();
+        if dims.contains(&vs) && dims.contains(&hs) {
+            facts.push(format!("vocab {vs}"));
+        } else {
+            findings.push(Finding::warning(
+                Some(embed.name.clone()),
+                format!(
+                    "shape {} doesn't match config vocab_size={vs} × hidden_size={hs} (or the embedding is packed)",
+                    format_shape(&embed.shape)
+                ),
+            ));
+        }
+    }
+
+    // QK-norm tensors present iff config enables it.
+    if let Some(want) = cfg.use_qk_norm {
+        let has = tensors
+            .iter()
+            .any(|t| t.name.contains("q_norm") || t.name.contains("k_norm"));
+        match (want, has) {
+            (true, true) => facts.push("qk-norm".into()),
+            (true, false) => findings.push(Finding::warning(
+                None,
+                "config sets use_qk_norm=true, but no q_norm/k_norm tensors were found".into(),
+            )),
+            (false, true) => findings.push(Finding::warning(
+                None,
+                "q_norm/k_norm tensors are present, but config sets use_qk_norm=false".into(),
+            )),
+            (false, false) => {}
+        }
+    }
+
+    // Nothing in the config was checkable against these tensors.
+    if facts.is_empty() && findings.is_empty() {
+        return CheckResult::na(ID, TITLE, NOTE);
+    }
+    findings.sort_by(sort_key);
+    let mut result = CheckResult::done(ID, TITLE, NOTE, findings);
+    if !facts.is_empty() {
+        let arch = cfg
+            .model_type
+            .as_deref()
+            .map(|m| format!("{m}: "))
+            .unwrap_or_default();
+        result.summary = Some(format!("{arch}{}", facts.join(" · ")));
+    }
+    result
 }
 
 /// File/index correspondence: fold in the `model.safetensors.index.json` health
@@ -1309,5 +1478,77 @@ mod tests {
         };
         assert_eq!(with_error.exit_code(false), 1);
         assert_eq!(with_error.exit_code(true), 1);
+    }
+
+    /// A 2-layer, 2-expert MoE stack with an untied head and matching embedding.
+    fn moe_tensors() -> Vec<TensorInfo> {
+        let mut tensors = Vec::new();
+        for l in [0, 1] {
+            for e in [0, 1] {
+                tensors.push(ti(
+                    &format!("model.layers.{l}.mlp.experts.{e}.down_proj.weight"),
+                    "F16",
+                    &[2, 2],
+                ));
+            }
+        }
+        tensors.push(ti("lm_head.weight", "F16", &[10, 4]));
+        tensors.push(ti("model.embed_tokens.weight", "F16", &[10, 4]));
+        tensors
+    }
+
+    #[test]
+    fn config_passes_and_summarizes_a_match() {
+        let cfg = crate::config::ModelConfig {
+            model_type: Some("qwen3_moe".into()),
+            num_hidden_layers: Some(2),
+            num_experts: Some(2),
+            vocab_size: Some(10),
+            hidden_size: Some(4),
+            tie_word_embeddings: Some(false),
+            use_qk_norm: Some(false),
+        };
+        let r = check_config(&moe_tensors(), Some(&cfg));
+        assert!(r.applicable);
+        assert_eq!(r.errors(), 0);
+        assert_eq!(r.warnings(), 0);
+        let summary = r.summary.expect("a passing config check summarizes facts");
+        assert!(summary.contains("2 layers"), "{summary}");
+        assert!(summary.contains("2 experts/layer"), "{summary}");
+        assert!(summary.contains("untied lm_head"), "{summary}");
+        assert!(summary.contains("qwen3_moe"), "{summary}");
+    }
+
+    #[test]
+    fn config_flags_layer_and_expert_mismatch() {
+        // The tensors have 2 layers × 2 experts; the config claims 3 × 4.
+        let cfg = crate::config::ModelConfig {
+            num_hidden_layers: Some(3),
+            num_experts: Some(4),
+            ..Default::default()
+        };
+        let r = check_config(&moe_tensors(), Some(&cfg));
+        assert_eq!(r.errors(), 2, "layer + expert count mismatch");
+        assert!(r.findings.iter().any(|f| f.message.contains("3 layers")));
+        assert!(r.findings.iter().any(|f| f.message.contains("4 experts")));
+    }
+
+    #[test]
+    fn config_warns_on_tie_and_qk_norm_inconsistency() {
+        // Config says weights are tied (no lm_head expected) and qk-norm is on, but
+        // the tensors have a separate lm_head and no q_norm/k_norm.
+        let cfg = crate::config::ModelConfig {
+            tie_word_embeddings: Some(true),
+            use_qk_norm: Some(true),
+            ..Default::default()
+        };
+        let r = check_config(&moe_tensors(), Some(&cfg));
+        assert_eq!(r.errors(), 0);
+        assert_eq!(r.warnings(), 2, "tied-but-has-head + qk-norm-missing");
+    }
+
+    #[test]
+    fn config_check_is_na_without_config() {
+        assert!(!check_config(&[ti("w", "F16", &[2])], None).applicable);
     }
 }
