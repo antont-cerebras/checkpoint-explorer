@@ -41,4 +41,4 @@ Search  down_proj█          9 matches  Enter view · Tab in tree · Esc exit
 
 
  ▪ model.layers.0.block_sparse_moe.experts.down_proj.weight
-   [FIXTURE]                  read-only
+   [FIXTURE]  read-only
