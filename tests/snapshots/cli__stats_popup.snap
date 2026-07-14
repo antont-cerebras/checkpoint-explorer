@@ -1,0 +1,44 @@
+---
+source: tests/cli.rs
+expression: "plain(&[\"--stats\"])"
+---
+Checkpoint Explorer - [FIXTURE] (1/1)                                                          [×]
+↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · PgUp/PgDn page · Enter/Space expand · E/C all · / search
+l legend · h health · s stats · c copy screen · t copy tree · f copy file · n copy name · y copy command · ⌫/\ back/fwd
+q quit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+▾ [FIXTURE] (▦ 7, 124 params, 272 B)
+  ▸ 🔧 Metadata (▦ 0, 0 B)
+  · lm_head.weight [I32, (2,╭ Checkpoint stats ────────────────────────────────────────────╮
+  ▾ model (▦ 6, 240 B)      │ Overview                                                     │
+    · embed_tokens.weight [F│   Files        1 safetensors file                            │
+    ▸ layers.0 (▦ 3, 168 B) │   Tensors      7                                             │
+    · norm.weight [F32, (4),│   Parameters   124                                           │
+    · scale.u8 [U8, (8), 8 B│   Size         272 B                                         │
+                            │                                                              │
+                            │ Tensor size                                                  │
+                            │   Largest      120 B     model.layers.0.mlp.down_proj.weight │
+                            │   Smallest     8 B       model.scale.u8                      │
+                            │   Average      38 B                                          │
+                            │   Median       32 B                                          │
+                            │                                                              │
+                            │ Layers  ×1                                                   │
+                            │   Params       80 each · 80 total                            │
+                            │   Size         168 B each · 168 B total                      │
+                            │                                                              │
+                            │ By dtype                                                     │
+                            │   U16     120 B  1 tensor                                    │
+                            │   F16      48 B  1 tensor                                    │
+                            │   BF16     32 B  1 tensor                                    │
+                            │   F32      32 B  2 tensors                                   │
+                            │   I32      32 B  1 tensor                                    │
+                            │   U8        8 B  1 tensor                                    │
+                            │ c copy screen · r copy report · y copy command · Esc dismiss │
+                            ╰──────────────────────────────────────────────────────────────╯
+
+
+
+
+
+ ▪ [FIXTURE]
+                                                                                                              read-only

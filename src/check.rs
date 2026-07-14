@@ -683,7 +683,7 @@ fn check_hdf5(tensors: &[TensorInfo]) -> CheckResult {
 /// Split a tensor name at its first all-digit, dot-delimited segment — the
 /// conventional layer index in `model.layers.<i>.mlp.…`. Returns
 /// `(prefix, index, suffix)`, or `None` when there's no such segment.
-fn split_layer_index(name: &str) -> Option<(String, usize, String)> {
+pub(crate) fn split_layer_index(name: &str) -> Option<(String, usize, String)> {
     let parts: Vec<&str> = name.split('.').collect();
     let pos = parts
         .iter()
@@ -901,7 +901,7 @@ fn detected_layer_count(tensors: &[TensorInfo]) -> Option<usize> {
 
 /// The expert index in a MoE tensor name — the segment right after `experts`, as
 /// in `…mlp.experts.<e>.down_proj.weight`. `None` when the name has no expert.
-fn expert_index(name: &str) -> Option<usize> {
+pub(crate) fn expert_index(name: &str) -> Option<usize> {
     let parts: Vec<&str> = name.split('.').collect();
     let pos = parts.iter().position(|&p| p == "experts")?;
     parts.get(pos + 1)?.parse().ok()

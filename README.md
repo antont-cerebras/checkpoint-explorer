@@ -20,6 +20,12 @@ subcommands for comparing and health-checking checkpoints.
   whole-tensor [**statistics**](#statistics) (min/max, mean, std, % zeros,
   NaN/Inf) — computed by streaming the tensor in bounded blocks, so it works on
   **multi-GB** tensors without loading them into RAM.
+- 📊 **The whole checkpoint at a glance.** Press `s` for a
+  [**stats popup**](#checkpoint-statistics-s): total params / size (on-disk vs.
+  logical), the largest / smallest / typical tensor, the dtype mix, and the
+  per-layer and per-**MoE-expert** breakdown — including whether experts are
+  stored fused or unfused. Header-only, so it's instant even on a many-shard
+  model.
 - 🧩 **Quantized weights, decoded.** [Reinterpret packed dtypes](#dtype-override)
   on the fly — 4-bit `u4`/`i4` nibbles, or fused-codebook **MoE experts**
   (`unpacked`, e.g. `u3×5`) — so quantized checkpoints show their true values and
@@ -225,6 +231,8 @@ without `--tensor` is reported as ambiguous.
 | `--tree-state <expanded\|collapsed>` | Open the tree fully expanded / collapsed (the `E` / `C` keys) |
 | `--search <QUERY>` | Open the tree in search mode filtered to QUERY (the `/` key) |
 | `--legend` | Overlay the opened screen's legend (the `l` key); most useful with `--plain` |
+| `--health` | Open straight into the health-check popup on the tree (the `h` key) |
+| `--stats` | Open straight into the checkpoint-stats popup on the tree (the `s` key) |
 | `--dtype <DTYPE>` | Reinterpret the dtype: `u4`, `i4`, `unpacked` (fused-codebook unmerge; needs a packing schema), or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
 | `--shape <DIMS>` | Reinterpret the shape (same element count): `10,100` / `10x100`; one dim may be `-1`/`*`/`_` to infer |
 | `--edge[=RFRAC,CFRAC]` (alias `--edges`) / `--overview` / `--window[=ROW,COL]` | Force the edges submode (optional head/tail split fractions `0..1`) / the overview / the contiguous window (optional top-left `ROW,COL`) |
@@ -297,7 +305,7 @@ what it does (handy while you're still learning the keys).
 | `f` | Copy the selected row's File path (tensor file, or a group/root's file or directory) |
 | `n` | Copy the selected tensor's Name to the clipboard |
 | `y` | Show and copy the CLI command that reopens this exact screen — file, tensor (or metadata entry), dtype/shape overrides, view, layout, zebra, base, slice (works on every screen) |
-| `s` | (Detail screen) compute the tensor's statistics on demand |
+| `s` | **Detail screen:** compute the tensor's statistics on demand · **Tree:** float the [checkpoint-stats popup](#checkpoint-statistics-s) — overall sizes / params, the dtype mix, and the per-layer / per-expert breakdown; `r` copies the report, `c` the screen, `y` the reopen command (`--stats`) |
 | `h` | **Detail screen:** show the value histogram · **Tree:** run the health checks and float the report in a popup — `v` runs the value-tier data scan (progress bar; `Esc` cancels), `r` copies the report, `c` the screen, `y` the reopen command (`--health`); same checks as the [`check`](#checking-checkpoints-check) subcommand (auto-suggested when an index/file mismatch is detected) |
 | `R` | Repack the current HDF5 checkpoint into a new file (HDF5 only) |
 | `Backspace` / `\` | Step **back** / **forward** through the screens you've visited (browser-style history) — e.g. reopen a view you just left |
@@ -469,6 +477,32 @@ NumPy `.npy` files hold a single array (named after the file); `.npz` archives
 expose each member array by name, and compressed archives
 (`np.savez_compressed`) are decompressed on demand. Fortran-ordered arrays are
 read correctly but shown transposed (their dimensions reversed).
+
+#### Checkpoint statistics (`s`)
+
+The per-tensor stats above answer "what's *in* this tensor?"; press `s` on the
+**tree** for the complementary question — "what *is* this checkpoint?" — as a
+popup summarising the whole model at a glance:
+
+- **Overview** — number of files/shards, tensors, total parameters, and total
+  size (on-disk vs. logical, with the compression ratio for compressed HDF5).
+- **Tensor size** — the largest and smallest tensor (named), plus the average
+  and median size, so an outlier stands out.
+- **Layers** — the repeated `…layers.<i>.…` stack: how many layers, and the
+  parameters / bytes in each (and in total).
+- **Experts (MoE)** — for mixture-of-experts checkpoints: experts per layer,
+  whether they're stored **fused** (stacked into one tensor per projection) or
+  **unfused** (a tensor per expert) — and whether gate & up are fused — plus the
+  parameters / bytes in a single expert, the same way layers are broken down.
+- **By dtype** — the dtype mix, each with its tensor count and byte share, so a
+  quantized / mixed-precision checkpoint shows exactly how much is in each type.
+- **Architecture** — the `model_type` from `config.json`, when present.
+
+It's derived from the metadata already in memory (shapes and dtypes, no data
+read), so it's instant even on a multi-GB, multi-shard checkpoint. The body
+scrolls (`↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End`, wheel) when it's taller than the
+popup; `r` copies the report as plain text, `c` copies the screen, `y` copies the
+command that reopens it (`--stats`), and `Esc` or a click dismisses.
 
 #### Dtype override
 
