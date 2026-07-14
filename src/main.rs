@@ -544,6 +544,18 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    // libhdf5 takes an flock() on every file it opens, which fails with errno 11
+    // (EAGAIN) on filesystems that don't support it — NFS especially, exactly
+    // where big checkpoints tend to live. We only ever read/repack (never share a
+    // writer), so the lock buys nothing: disable it before the first HDF5 call,
+    // unless the user set the variable themselves. No-op on the pure-Rust build.
+    #[cfg(feature = "hdf5")]
+    if std::env::var_os("HDF5_USE_FILE_LOCKING").is_none() {
+        // SAFE: first statement in `main`, before any threads spawn or any HDF5
+        // call runs (libhdf5 reads this only at its lazy init).
+        unsafe { std::env::set_var("HDF5_USE_FILE_LOCKING", "FALSE") };
+    }
+
     let cli = Cli::parse();
 
     match cli.command {

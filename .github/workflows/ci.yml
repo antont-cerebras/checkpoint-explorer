@@ -53,4 +53,10 @@ jobs:
 
       # Run tests (the HDF5 reader's tests require its feature)
       - name: Run tests
+        env:
+          # libhdf5 takes an flock() on every file it opens; CI runners' overlay
+          # filesystems can return EAGAIN (errno 11) for that, failing the
+          # convert/HDF5 tests. Reads don't need the lock — disable it, matching
+          # the local test gate (the binary does the same at startup).
+          HDF5_USE_FILE_LOCKING: "FALSE"
         run: cargo test --workspace --all-features --verbose
