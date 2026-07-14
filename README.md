@@ -278,6 +278,10 @@ checkpoint-explorer model.safetensors --print-tensors --name '!*.bias'
 
 ### Keyboard Controls
 
+Every shortcut shown in the footer is also a **clickable button** — click it to
+run the action, or **hover it with the mouse to pop up a help bubble** explaining
+what it does (handy while you're still learning the keys).
+
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` | Navigate up/down through the tree |

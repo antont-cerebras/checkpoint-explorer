@@ -99,10 +99,77 @@ fn data_view_regions(
 
 /// True when `(col, row)` falls inside a clickable region.
 pub fn region_hit(regions: &[(Rect, KeyEvent)], col: u16, row: u16) -> Option<KeyEvent> {
+    region_at(regions, col, row).map(|(_, k)| k)
+}
+
+/// The clickable region (its rect and key) under `(col, row)`, if any — like
+/// [`region_hit`] but keeps the rect too, so a hover can anchor a help bubble to
+/// the chip it points at.
+pub fn region_at(regions: &[(Rect, KeyEvent)], col: u16, row: u16) -> Option<(Rect, KeyEvent)> {
     regions
         .iter()
         .find(|(r, _)| col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height)
-        .map(|(_, k)| *k)
+        .copied()
+}
+
+/// Which screen a footer shortcut sits on, so [`shortcut_help`] can disambiguate
+/// keys that mean different things per screen (`h`, `b`, `r`, the arrows).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HelpCtx {
+    Tree,
+    Detail,
+    Data,
+}
+
+/// A one-line help description for a footer shortcut `key` on screen `ctx`, shown
+/// as a bubble when the mouse hovers the chip. `None` for keys with no help.
+pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
+    use HelpCtx::{Data, Detail, Tree};
+    use KeyCode::{Backspace, Char, Down, Left, PageDown, PageUp, Right, Up};
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let help = match (ctx, key.code) {
+        // Tree navigation.
+        (Tree, Up | Down) if shift => "Jump to the previous / next sibling at this depth.",
+        (Tree, Up | Down) => "Move the selection up / down one row.",
+        (Tree, Left | Right) => "Collapse to the parent group, or step into the child.",
+        (Tree, PageUp | PageDown) => "Scroll the tree by one screenful.",
+        (Tree, KeyCode::Enter | Char(' ')) => {
+            "Open the selected tensor, or expand / collapse a group."
+        }
+        (Tree, Char('E')) => "Expand every group in the tree.",
+        (Tree, Char('C')) => "Collapse every group in the tree.",
+        (Tree, Char('/')) => "Search: filter tensors by name as you type.",
+        (Tree, Char('h')) => "Run the checkpoint health checks and show the report.",
+        (Tree, Char('t')) => "Copy the tree or a flat tensor list — text or JSON (opens a menu).",
+        (Tree, Char('f')) => "Copy the selected row's file path.",
+        (Tree, Char('n')) => "Copy the selected tensor's name.",
+        (Tree, Char('R')) => "Repack this HDF5 checkpoint into a new file with another codec.",
+        (Tree, Char('q')) => "Quit the explorer.",
+        // Detail screen.
+        (Detail | Data, Char('m')) => "Show the tensor as a heatmap.",
+        (Detail | Data, Char('v')) => "Show the tensor as a grid of numeric values.",
+        (Detail, Char('h')) => "Compute and show the value histogram.",
+        (Detail, Char('b' | 'B')) => "Set the histogram's bucket count.",
+        (Detail, Char('s')) => "Compute exact whole-tensor statistics (min/max, mean, std, …).",
+        (Detail | Data, Char('d')) => "Reinterpret the stored dtype (e.g. u4, i4, bf16, f32).",
+        (Detail | Data, Char('r' | 'R')) => "Reshape the tensor's dimensions (row-major).",
+        // Data view.
+        (Data, Char('e' | 'E')) => "Cycle the layout: overview → edges → window.",
+        (Data, Char('z' | 'Z')) => "Cycle zebra striping: rows → columns → off.",
+        (Data, Char('b' | 'B')) => "Cycle the numeral base: dec → hex → oct → bin.",
+        (Data, Char(']') | Char('[')) => "Step to the next / previous slice.",
+        (Data, Up | Down | Left | Right) => {
+            "Pan the view (Shift = one screenful, Ctrl = to the edge)."
+        }
+        // Common to every screen.
+        (_, Char('l')) => "Show the legend for this screen's symbols and keys.",
+        (_, Char('c')) => "Copy the whole screen's text to the clipboard.",
+        (_, Char('y')) => "Copy the CLI command that reopens this exact screen.",
+        (_, Backspace) => "Step back through view history.",
+        (_, Char('\\')) => "Step forward through view history.",
+        _ => return None,
+    };
+    Some(help)
 }
 
 /// A still-forming scan's progress indicator: a spinner glyph, the elapsed time,
@@ -2277,6 +2344,70 @@ fn render_readonly_hint(frame: &mut Frame) {
         .render(inner, frame.buffer_mut());
 }
 
+/// Greedy word-wrap of a short help string into lines no wider than `width`.
+fn wrap_help(text: &str, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur.chars().count() + 1 + word.chars().count() <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            lines.push(Line::from(std::mem::take(&mut cur)));
+            cur.push_str(word);
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(Line::from(cur));
+    }
+    lines
+}
+
+/// A help bubble for a footer shortcut chip, floated adjacent to the chip
+/// (`anchor`) — just above it, or below it when the chip hugs the top (as the
+/// tree's hints do). Word-wrapped and clamped on-screen. The caller draws the
+/// screen first, then this over it, only while the mouse hovers the chip.
+pub fn render_shortcut_bubble(frame: &mut Frame, anchor: Rect, help: &str) {
+    let area = frame.area();
+    let wrap_w = 52.min((area.width as usize).saturating_sub(4)).max(8);
+    let lines = wrap_help(help, wrap_w);
+    if lines.is_empty() {
+        return;
+    }
+    let inner_w = lines.iter().map(Line::width).max().unwrap_or(0);
+    let box_w = ((inner_w + 4) as u16).min(area.width); // 2 borders + 2 padding
+    let box_h = ((lines.len() + 2) as u16).min(area.height); // 2 borders
+    // Prefer just above the chip; drop below it when there isn't room above.
+    let y = if anchor.y >= box_h {
+        anchor.y - box_h
+    } else {
+        (anchor.y + anchor.height).min(area.height.saturating_sub(box_h))
+    };
+    // Left-align to the chip, nudged left as needed to stay fully on-screen.
+    let x = anchor.x.min(area.width.saturating_sub(box_w));
+    let rect = Rect {
+        x,
+        y,
+        width: box_w,
+        height: box_h,
+    };
+    Clear.render(rect, frame.buffer_mut());
+    let panel = Style::default().bg(palette::PANEL_BG);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(palette::KEY))
+        .padding(Padding::horizontal(1))
+        .style(panel);
+    let inner = block.inner(rect);
+    block.render(rect, frame.buffer_mut());
+    Paragraph::new(lines)
+        .style(panel)
+        .render(inner, frame.buffer_mut());
+}
+
 /// A full-width pop-up framed with only top+bottom borders (the `title` rides the
 /// top rule) over the live frame, centred vertically. Its body rows stay flush at
 /// column 0 — used by the copied-command pop-up so the command can still be
@@ -4409,6 +4540,41 @@ mod tests {
         assert!(
             !plain.contains('█') && !plain.contains('│'),
             "headless dump must show no scroll bar:\n{plain}"
+        );
+    }
+
+    #[test]
+    fn shortcut_help_is_context_aware() {
+        // The same key means different things on different screens.
+        assert_eq!(
+            shortcut_help(hint_key('h'), HelpCtx::Tree),
+            Some("Run the checkpoint health checks and show the report."),
+        );
+        assert_eq!(
+            shortcut_help(hint_key('h'), HelpCtx::Detail),
+            Some("Compute and show the value histogram."),
+        );
+        // A common key resolves on any screen; an unknown key has no bubble.
+        assert!(shortcut_help(hint_key('l'), HelpCtx::Data).is_some());
+        assert_eq!(shortcut_help(hint_key('☺'), HelpCtx::Tree), None);
+    }
+
+    #[test]
+    fn shortcut_bubble_shows_the_help_text() {
+        let anchor = Rect {
+            x: 4,
+            y: 1,
+            width: 1,
+            height: 1,
+        };
+        let out = crate::tui::headless_render(80, 20, |f| {
+            render_shortcut_bubble(f, anchor, "Expand every group in the tree.");
+        })
+        .unwrap();
+        let plain = strip_ansi_codes(&out);
+        assert!(
+            plain.contains("Expand every group in the tree."),
+            "bubble should show the help text:\n{plain}"
         );
     }
 }
