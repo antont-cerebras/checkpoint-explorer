@@ -23,7 +23,7 @@ use crate::sample::{HistShared, Histogram, PackingSchema, SampleMode, Stats, Vie
 use crate::tree::{
     Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key,
 };
-use crate::ui::{DrawConfig, Legend, NumBase, Overlay, StatsView, StripeMode, UI};
+use crate::ui::{DrawConfig, HelpCtx, Legend, NumBase, Overlay, StatsView, StripeMode, UI};
 use crate::utils::base64_encode;
 use ratatui::text::{Line, Span};
 
@@ -569,6 +569,10 @@ pub struct Explorer {
     /// Whether the mouse is currently hovering the read-only badge, which floats
     /// its hint pop-up. Toggled by the browsing loops on mouse-move.
     readonly_hover: Cell<bool>,
+    /// The footer shortcut chip the mouse is hovering (its on-screen rect + help
+    /// text), which floats a help bubble beside it. Set on mouse-move, cleared on
+    /// any other event so it never lingers onto the next screen.
+    hovered_shortcut: Cell<Option<(ratatui::layout::Rect, &'static str)>>,
 }
 
 impl Explorer {
@@ -630,6 +634,24 @@ impl Explorer {
             preload,
             unindexed,
             readonly_hover: Cell::new(false),
+            hovered_shortcut: Cell::new(None),
+        }
+    }
+
+    /// Update the hovered-shortcut help from a mouse position: the footer chip
+    /// under `(col, row)` on screen `ctx` (with a help string), else `None`.
+    /// Feeds the help bubble drawn by the render paths.
+    fn update_shortcut_hover(&self, ctx: HelpCtx, col: u16, row: u16) {
+        let hovered = crate::ui::region_at(&self.clickable.borrow(), col, row)
+            .and_then(|(rect, key)| crate::ui::shortcut_help(key, ctx).map(|h| (rect, h)));
+        self.hovered_shortcut.set(hovered);
+    }
+
+    /// Composite the hovered shortcut's help bubble, if any — drawn last on every
+    /// screen so it floats over the footer chips.
+    fn render_shortcut_hover(&self, frame: &mut ratatui::Frame) {
+        if let Some((rect, help)) = self.hovered_shortcut.get() {
+            crate::ui::render_shortcut_bubble(frame, rect, help);
         }
     }
 
@@ -1963,6 +1985,7 @@ impl Explorer {
             readonly_hover: self.readonly_hover.get(),
         };
         *self.clickable.borrow_mut() = UI::render_tree(frame, &config);
+        self.render_shortcut_hover(frame);
     }
 
     /// Render the tree to plain text via an in-memory Ratatui backend — the
@@ -2413,6 +2436,7 @@ impl Explorer {
             overlay,
         );
         UI::render_readonly_badge(frame, self.readonly_hover.get());
+        self.render_shortcut_hover(frame);
     }
 
     /// Render a tensor's detail screen to plain text via an in-memory Ratatui
@@ -2492,6 +2516,7 @@ impl Explorer {
             None => {}
         }
         UI::render_readonly_badge(frame, self.readonly_hover.get());
+        self.render_shortcut_hover(frame);
         Ok(info)
     }
 
@@ -2681,8 +2706,10 @@ impl Explorer {
                 event::read()?
             };
             // Any input clears a prior layout hint; a fresh wrong-layout key re-sets
-            // it below.
+            // it below. A shortcut-help bubble likewise clears on any input and is
+            // re-set only by the mouse-move handler below (so it never lingers).
             layout_hint = None;
+            self.hovered_shortcut.set(None);
 
             // Mouse: a click on a footer hint chip or the `[×]` acts like its key
             // (routed through the key match below); a click on a tree row selects
@@ -2797,11 +2824,13 @@ impl Explorer {
                         self.copied_flash = None;
                         self.scroll_offset = self.scroll_offset.saturating_sub(WHEEL_STEP)
                     }
-                    // Hovering the read-only badge floats its hint; moving off hides it.
+                    // Hovering the read-only badge floats its hint; a footer chip
+                    // floats its help bubble; moving off either hides it.
                     MouseEventKind::Moved => {
                         self.readonly_hover.set(size.is_some_and(|sz| {
                             UI::readonly_badge_hit(sz.width, sz.height, col, row)
                         }));
+                        self.update_shortcut_hover(HelpCtx::Tree, col, row);
                     }
                     _ => {}
                 }
@@ -3963,6 +3992,9 @@ impl Explorer {
             if fresh {
                 copied_since = None;
             }
+            // The shortcut-help bubble clears on any input, re-set only by the
+            // mouse-move handler below, so it never lingers past a hover.
+            self.hovered_shortcut.set(None);
             // While a pop-up overlay is up, any key dismisses it (Ctrl-C still
             // quits) rather than acting as a screen command; the loop then
             // redraws the detail without it.
@@ -3994,13 +4026,15 @@ impl Explorer {
                             None => continue,
                         }
                     } else {
-                        // Hovering the read-only badge floats its hint; moving off it
-                        // (or any other motion) hides it again on the next redraw.
+                        // Hovering the read-only badge floats its hint; a footer chip
+                        // floats its help bubble; moving off (or any other motion)
+                        // hides them again on the next redraw.
                         if matches!(m.kind, MouseEventKind::Moved) {
                             let hit = term.size().ok().is_some_and(|sz| {
                                 UI::readonly_badge_hit(sz.width, sz.height, m.column, m.row)
                             });
                             self.readonly_hover.set(hit);
+                            self.update_shortcut_hover(HelpCtx::Detail, m.column, m.row);
                         }
                         continue;
                     }
@@ -4527,8 +4561,10 @@ impl Explorer {
             }
             loop {
                 // Any input clears a prior layout hint; a fresh wrong-layout key
-                // re-sets it below.
+                // re-sets it below. The shortcut-help bubble likewise clears on any
+                // input and is re-set only by the mouse-move handler.
                 layout_hint = None;
+                self.hovered_shortcut.set(None);
                 match pending {
                     Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
                     // A non-Latin key (wrong layout) can't match a shortcut; flash a
@@ -4776,12 +4812,14 @@ impl Explorer {
                         MouseEventKind::ScrollUp if slices > 1 => {
                             slice = (slice + slices - 1) % slices
                         }
-                        // Hovering the read-only badge floats its hint.
+                        // Hovering the read-only badge floats its hint; a footer chip
+                        // floats its help bubble.
                         MouseEventKind::Moved => {
                             let hit = term.size().ok().is_some_and(|sz| {
                                 UI::readonly_badge_hit(sz.width, sz.height, m.column, m.row)
                             });
                             self.readonly_hover.set(hit);
+                            self.update_shortcut_hover(HelpCtx::Data, m.column, m.row);
                         }
                         _ => {}
                     },
