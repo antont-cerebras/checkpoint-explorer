@@ -8,6 +8,7 @@ checkpoint-explorer check: [FIXTURE]
   ⊘ HDF5 integrity        — n/a for this checkpoint
   ⊘ Layer completeness    — n/a for this checkpoint
   ✓ Shape / dtype sanity  — no duplicate names, no empty tensors, dtype uniform within each role
+  ⊘ Config consistency    — n/a for this checkpoint
   ⊘ Files & sharding      — n/a for this checkpoint
   · Value scan            — skipped (pass --values to scan tensor data)
   OK — no metadata issues found

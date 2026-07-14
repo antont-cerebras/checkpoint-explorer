@@ -142,6 +142,14 @@ impl RemoteSession {
         list_shards(&sftp, path)
     }
 
+    /// Read a whole small remote file — a metadata sidecar like `config.json` —
+    /// over SFTP, strictly read-only ([`open_readonly`]). Never used for tensor
+    /// data (that stays on the host); the file is expected to be a few KB.
+    pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        let sftp = self.session.sftp().context("opening the SFTP subsystem")?;
+        read_all(&sftp, path)
+    }
+
     /// Claim shards from the shared `next` counter and read+parse each header over
     /// one SFTP channel, returning `(index, tensors, metadata)` per shard claimed.
     /// Several sessions sharing one `next` split the shards dynamically

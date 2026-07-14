@@ -31,6 +31,12 @@ expression: out
     },
     {
       "findings": [],
+      "id": "config",
+      "status": "na",
+      "title": "Config consistency"
+    },
+    {
+      "findings": [],
       "id": "files",
       "status": "na",
       "title": "Files & sharding"

@@ -70,18 +70,45 @@ impl RemoteRead {
     }
 
     /// Read a remote checkpoint's structure over a fresh SSH session (one auth),
-    /// with a progress spinner. For several reads sharing one session/prompt (e.g.
+    /// with a progress spinner, and also fetch its `config.json` over the *same*
+    /// session (no second auth prompt) so the `check`/health config-consistency
+    /// check runs against a remote checkpoint too. `None` config for an `s3://`
+    /// cstorch checkpoint (no HF `config.json`) or when the sidecar is
+    /// absent/unreadable. For several reads sharing one session/prompt (e.g.
     /// `diff`), use [`Self::open_with`] + [`Self::read`] directly.
-    pub fn fetch(&self, src: &str) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+    pub fn fetch_with_config(
+        &self,
+        src: &str,
+    ) -> Result<(
+        Vec<TensorInfo>,
+        Vec<MetadataInfo>,
+        Option<crate::config::ModelConfig>,
+    )> {
         let mut password = None;
-        let session = self.open_with(&mut password)?; // password prompt (before the spinner)
+        let session = self.open_with(&mut password)?;
         eprintln!("checkpoint-explorer: reading tensor metadata over ssh …");
         let bars = crate::progress::Bars::start(vec![src.to_string()]);
         let progress = bars.progress(0);
         let out = self.read(&session, src, &password, progress.as_deref());
         bars.finish(0, out.is_ok());
         bars.join();
-        out
+        let (tensors, metadata) = out?;
+        let config = self.read_config(&session, src);
+        Ok((tensors, metadata, config))
+    }
+
+    /// Fetch + parse the remote `config.json` for `src` over an already-open
+    /// session. `None` for `s3://` (no HF config) or on any read/parse failure —
+    /// the config check then reports `n/a` rather than erroring the whole load.
+    pub fn read_config(
+        &self,
+        session: &RemoteSession,
+        src: &str,
+    ) -> Option<crate::config::ModelConfig> {
+        let path = crate::config::remote_path(src)?;
+        let bytes = session.read_file(&path).ok()?;
+        let text = String::from_utf8(bytes).ok()?;
+        crate::config::ModelConfig::parse(&text).filter(crate::config::ModelConfig::is_meaningful)
     }
 
     /// Open an authenticated SSH session to the host, reusing/recording a password

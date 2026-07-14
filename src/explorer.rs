@@ -469,6 +469,9 @@ pub struct Explorer {
     files: Vec<PathBuf>,
     tensors: Vec<TensorInfo>,
     metadata: Vec<MetadataInfo>,
+    /// The checkpoint's `config.json` (local sidecar or fetched over SSH), when
+    /// present — cross-checked against the tensor tree by the config check.
+    config: Option<crate::config::ModelConfig>,
     /// When set (`--ssh-read`), remote `s3://…` sources have their metadata read
     /// over SSH via cstorch on the remote, instead of directly (metadata-only).
     remote_read: Option<crate::remote::RemoteRead>,
@@ -596,6 +599,7 @@ impl Explorer {
             files,
             tensors: Vec::new(),
             metadata: Vec::new(),
+            config: None,
             remote_read: None,
             full_loaded: false,
             tree: Vec::new(),
@@ -873,9 +877,10 @@ impl Explorer {
             }
             frame += 1;
         }
-        let (tensors, metadata) = handle
+        let (tensors, metadata, config) = handle
             .join()
             .map_err(|_| anyhow::anyhow!("checkpoint loader thread panicked"))??;
+        self.config = config;
         self.finalize_load(tensors, metadata);
         Ok(())
     }
@@ -886,7 +891,9 @@ impl Explorer {
     fn load_quiet(&mut self) -> Result<()> {
         self.tensors.clear();
         self.metadata.clear();
-        let (tensors, metadata) = Self::gather_checkpoint(&self.files, self.remote_read.as_ref())?;
+        let (tensors, metadata, config) =
+            Self::gather_checkpoint(&self.files, self.remote_read.as_ref())?;
+        self.config = config;
         self.finalize_load(tensors, metadata);
         Ok(())
     }
@@ -1287,18 +1294,26 @@ impl Explorer {
     pub(crate) fn gather_checkpoint(
         files: &[PathBuf],
         remote: Option<&crate::remote::RemoteRead>,
-    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+    ) -> Result<(
+        Vec<TensorInfo>,
+        Vec<MetadataInfo>,
+        Option<crate::config::ModelConfig>,
+    )> {
         let mut tensors: Vec<TensorInfo> = Vec::new();
         let mut metadata: Vec<MetadataInfo> = Vec::new();
+        // The checkpoint's `config.json` (for the config-consistency check):
+        // fetched over SSH beside the remote read, or read locally below.
+        let mut config: Option<crate::config::ModelConfig> = None;
         for file_path in files {
             let as_str = file_path.to_string_lossy();
             // `--ssh-read`: every source is read on the remote (an s3:// cstorch
             // checkpoint, or a remote safetensors directory/file), keeping the
             // credentials and data there.
             if let Some(r) = remote {
-                let (t, m) = r.fetch(&as_str)?;
+                let (t, m, cfg) = r.fetch_with_config(&as_str)?;
                 tensors.extend(t);
                 metadata.extend(m);
+                config = config.or(cfg);
                 continue;
             }
             // Without --ssh-read a bare s3:// URI has no local credentials to read.
@@ -1335,7 +1350,11 @@ impl Explorer {
             tensors.extend(t);
             metadata.extend(m);
         }
-        Ok((tensors, metadata))
+        // Local checkpoint: read the sidecar `config.json` from its directory.
+        if remote.is_none() {
+            config = crate::config::load_local(files);
+        }
+        Ok((tensors, metadata, config))
     }
 
     fn build_tree(&mut self) {
@@ -1551,6 +1570,7 @@ impl Explorer {
                     &self.metadata,
                     &self.files,
                     &self.health_reports,
+                    self.config.as_ref(),
                     &crate::filter::NameFilter::default(),
                     false,
                     1,
@@ -5768,6 +5788,7 @@ impl Explorer {
             &self.metadata,
             &self.files,
             &self.health_reports,
+            self.config.as_ref(),
             &crate::filter::NameFilter::default(),
             false,
             1,
