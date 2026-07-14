@@ -576,6 +576,9 @@ pub struct Explorer {
     /// text), which floats a help bubble beside it. Set on mouse-move, cleared on
     /// any other event so it never lingers onto the next screen.
     hovered_shortcut: Cell<Option<(ratatui::layout::Rect, &'static str)>>,
+    /// Whether the mouse is hovering the `⚠ index` health badge, floating its
+    /// help bubble. Toggled by the tree loop on mouse-move.
+    health_hover: Cell<bool>,
 }
 
 impl Explorer {
@@ -639,6 +642,7 @@ impl Explorer {
             unindexed,
             readonly_hover: Cell::new(false),
             hovered_shortcut: Cell::new(None),
+            health_hover: Cell::new(false),
         }
     }
 
@@ -2003,6 +2007,7 @@ impl Explorer {
             copied_flash: self.copied_flash.as_ref().map(|(what, _)| what.as_str()),
             interactive,
             readonly_hover: self.readonly_hover.get(),
+            health_hover: self.health_hover.get(),
         };
         *self.clickable.borrow_mut() = UI::render_tree(frame, &config);
         self.render_shortcut_hover(frame);
@@ -2764,9 +2769,21 @@ impl Explorer {
                             scrollbar_drag = true;
                             continue;
                         }
-                        let hit = crate::ui::region_hit(&self.clickable.borrow(), col, row);
+                        // A click on the health badge opens the report (its hover
+                        // bubble invites it) — same as pressing `h`; otherwise a
+                        // hit on a footer chip / `[×]` acts like its key.
+                        let health_click = !self.health_reports.is_empty()
+                            && !self.search_mode
+                            && size.is_some_and(|sz| {
+                                UI::health_badge_hit(sz.width, sz.height, col, row)
+                            });
+                        let hit = if health_click {
+                            Some(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+                        } else {
+                            crate::ui::region_hit(&self.clickable.borrow(), col, row)
+                        };
                         if let Some(k) = hit {
-                            synth = Some(k); // clicked a hint chip / [×]
+                            synth = Some(k); // clicked the health badge / a hint chip / [×]
                         } else if let Some(sz) = size {
                             let body_top =
                                 UI::tree_header_rows(sz.width, self.search_mode, self.can_repack())
@@ -2844,12 +2861,19 @@ impl Explorer {
                         self.copied_flash = None;
                         self.scroll_offset = self.scroll_offset.saturating_sub(WHEEL_STEP)
                     }
-                    // Hovering the read-only badge floats its hint; a footer chip
-                    // floats its help bubble; moving off either hides it.
+                    // Hovering the read-only badge floats its hint; the health
+                    // badge floats its help bubble; a footer chip floats its own;
+                    // moving off any of them hides it.
                     MouseEventKind::Moved => {
                         self.readonly_hover.set(size.is_some_and(|sz| {
                             UI::readonly_badge_hit(sz.width, sz.height, col, row)
                         }));
+                        self.health_hover.set(
+                            !self.health_reports.is_empty()
+                                && size.is_some_and(|sz| {
+                                    UI::health_badge_hit(sz.width, sz.height, col, row)
+                                }),
+                        );
                         self.update_shortcut_hover(HelpCtx::Tree, col, row);
                     }
                     _ => {}

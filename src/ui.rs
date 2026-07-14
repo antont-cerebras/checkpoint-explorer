@@ -194,6 +194,10 @@ mod palette {
     pub const INPUT_BG: Color = Color::Indexed(4);
     /// Something missing / wrong / out of range.
     pub const ERROR: Color = Color::Indexed(9);
+    /// Filled-red *background* for an alert badge (white text on it) — high
+    /// luminance contrast that reads clearly on the grey status bar, where any
+    /// red *foreground* stays muddy against the mid-grey. The health badge.
+    pub const ALERT: Color = Color::Indexed(160);
     /// Something present but unexpected (a softer alert than [`ERROR`]).
     pub const WARN: Color = Color::Indexed(11);
     /// The bottom status bar (foreground on background).
@@ -270,9 +274,11 @@ pub struct DrawConfig<'a> {
     /// Second status line, below `status_bar`: a tensor's source file (empty for
     /// groups).
     pub status_secondary: &'a str,
-    /// Whether a checkpoint health issue was detected (shows a header hint to
-    /// press `h` for the report).
+    /// Whether a checkpoint health issue was detected — shows the `⚠ health`
+    /// alert badge beside the read-only badge (press `h` for the report).
     pub health_warning: bool,
+    /// Whether the mouse is hovering the health badge, floating its help bubble.
+    pub health_hover: bool,
     /// Whether the loaded checkpoint can be repacked (a single HDF5 file), which
     /// gates the `R` hint.
     pub can_repack: bool,
@@ -499,6 +505,32 @@ pub struct UI;
 /// modifies a checkpoint (local or remote), so the badge is unconditional.
 const READONLY_BADGE: &str = " read-only ";
 
+/// The short health-alert badge, drawn just left of the read-only badge on the
+/// tree's bottom line when the index/file health check found a problem.
+const HEALTH_BADGE: &str = " ⚠ health ";
+
+/// Default-background columns left between the health and read-only badges, so
+/// the two `STATUS_BG` chips read as separate badges rather than one bar.
+const BADGE_GAP: u16 = 2;
+
+/// Where the health badge sits — left of the read-only badge on the bottom row,
+/// separated by [`BADGE_GAP`] — using each badge's *display* width (the ⚠ glyph
+/// is wide). `None` if the frame is too narrow/short for both. Shared by the
+/// renderer and the hover hit-test so they can't drift.
+fn health_badge_rect(width: u16, height: u16) -> Option<Rect> {
+    use unicode_width::UnicodeWidthStr;
+    let (readonly_w, health_w) = (READONLY_BADGE.width() as u16, HEALTH_BADGE.width() as u16);
+    if height == 0 || width <= readonly_w + BADGE_GAP + health_w {
+        return None;
+    }
+    Some(Rect {
+        x: width - readonly_w - BADGE_GAP - health_w,
+        y: height - 1,
+        width: health_w,
+        height: 1,
+    })
+}
+
 impl UI {
     /// Draw the persistent `read-only` badge on the very bottom status line,
     /// right-aligned. Rendered last on every view (tree / detail / data) so it
@@ -536,6 +568,44 @@ impl UI {
     pub fn readonly_badge_hit(width: u16, height: u16, col: u16, row: u16) -> bool {
         let badge_w = READONLY_BADGE.chars().count() as u16;
         width > badge_w && height > 0 && row == height - 1 && col >= width - badge_w
+    }
+
+    /// Draw the short `⚠ health` alert badge on the bottom status line, just
+    /// left of the read-only badge — a stale index / dropped shard, surfaced
+    /// without opening the report. When `hover` is set, float a help bubble above
+    /// it explaining the alert. Caller gates on the health warning being present.
+    pub fn render_health_badge(frame: &mut Frame, hover: bool) {
+        let area = frame.area();
+        let Some(rect) = health_badge_rect(area.width, area.height) else {
+            return;
+        };
+        Paragraph::new(Line::from(Span::styled(
+            HEALTH_BADGE,
+            Style::default()
+                .bg(palette::ALERT)
+                .fg(palette::STATUS_FG)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .render(rect, frame.buffer_mut());
+        if hover {
+            // Title + border match the badge (as the read-only bubble mirrors its
+            // badge): the alert red and the `⚠ health` label.
+            render_hover_bubble(
+                frame,
+                rect,
+                palette::ALERT,
+                Some(HEALTH_BADGE),
+                "Index / file mismatch — the checkpoint's index.json doesn't match \
+                 the files on disk. Click (or press h) for the health report.",
+            );
+        }
+    }
+
+    /// Is the point `(col, row)` over the health badge? Mirrors
+    /// [`Self::readonly_badge_hit`] for the health alert's hover bubble.
+    pub fn health_badge_hit(width: u16, height: u16, col: u16, row: u16) -> bool {
+        health_badge_rect(width, height)
+            .is_some_and(|r| row == r.y && col >= r.x && col < r.x + r.width)
     }
 
     /// How many tree rows are visible at once (one screenful), used to size a
@@ -616,25 +686,14 @@ impl UI {
         // --- header + tree rows (the region above the 2-line status bar) ---
         let mut lines: Vec<Line> = Vec::new();
 
-        // Title (+ optional health warning).
-        let mut title = vec![Span::raw(format!(
+        // Title. (A health-check warning is surfaced on the status bar instead —
+        // see the `⚠ health` alert beside the read-only badge below.)
+        let title = vec![Span::raw(format!(
             "Checkpoint Explorer - {} ({}/{})",
             config.current_file,
             config.file_idx + 1,
             config.total_files
         ))];
-        if config.health_warning {
-            title.push(Span::styled(
-                "   ⚠ index/file mismatch — press ",
-                Style::default().fg(palette::ERROR),
-            ));
-            title.push(Span::styled(
-                "h",
-                Style::default()
-                    .fg(palette::KEY)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
         lines.push(Line::from(title));
 
         // Hint line(s), or the search bar when searching.
@@ -748,9 +807,15 @@ impl UI {
 
         // --- bottom two-line status bar ---
         // Reserve room on the right of the bottom status line for the persistent
-        // read-only badge (drawn by `render_readonly_badge` below), so the status
-        // text never runs under it.
-        let max_text = (width as usize).saturating_sub(6 + READONLY_BADGE.chars().count());
+        // badges drawn there — the read-only badge, plus (when the health check
+        // flagged a problem) the short `⚠ health` badge to its left — so the status
+        // text never runs under either.
+        use unicode_width::UnicodeWidthStr;
+        let mut reserve = READONLY_BADGE.width();
+        if config.health_warning {
+            reserve += HEALTH_BADGE.width() + BADGE_GAP as usize;
+        }
+        let max_text = (width as usize).saturating_sub(6 + reserve);
         let row0 = if config.search_mode && config.tree.is_empty() {
             Line::from(vec![
                 Span::raw(format!(
@@ -835,6 +900,11 @@ impl UI {
         }
 
         Self::render_readonly_badge(frame, config.readonly_hover);
+        // A short `⚠ health` health-alert badge just left of the read-only badge
+        // (local only; a stale index / dropped shard), with an on-hover bubble.
+        if config.health_warning {
+            Self::render_health_badge(frame, config.health_hover);
+        }
 
         // Clickable regions: each footer chip (the hint block starts at row 1,
         // below the title) plus the top-right `[×]` (→ quit the tree).
@@ -2366,27 +2436,39 @@ fn wrap_help(text: &str, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// A help bubble for a footer shortcut chip, floated adjacent to the chip
-/// (`anchor`) — just above it, or below it when the chip hugs the top (as the
-/// tree's hints do). Word-wrapped and clamped on-screen. The caller draws the
-/// screen first, then this over it, only while the mouse hovers the chip.
-pub fn render_shortcut_bubble(frame: &mut Frame, anchor: Rect, help: &str) {
+/// A hover help bubble floated adjacent to `anchor` — just above it, or below
+/// when it hugs the top (as the tree's hints do) — with a `border` colour and an
+/// optional `title` riding the border (both matching the element it describes).
+/// Word-wrapped and clamped on-screen; the caller draws the screen first.
+fn render_hover_bubble(
+    frame: &mut Frame,
+    anchor: Rect,
+    border: Color,
+    title: Option<&str>,
+    help: &str,
+) {
     let area = frame.area();
     let wrap_w = 52.min((area.width as usize).saturating_sub(4)).max(8);
     let lines = wrap_help(help, wrap_w);
     if lines.is_empty() {
         return;
     }
-    let inner_w = lines.iter().map(Line::width).max().unwrap_or(0);
+    let title_w = title.map(|t| t.chars().count() + 2).unwrap_or(0);
+    let inner_w = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(0)
+        .max(title_w);
     let box_w = ((inner_w + 4) as u16).min(area.width); // 2 borders + 2 padding
     let box_h = ((lines.len() + 2) as u16).min(area.height); // 2 borders
-    // Prefer just above the chip; drop below it when there isn't room above.
+    // Prefer just above the anchor; drop below it when there isn't room above.
     let y = if anchor.y >= box_h {
         anchor.y - box_h
     } else {
         (anchor.y + anchor.height).min(area.height.saturating_sub(box_h))
     };
-    // Left-align to the chip, nudged left as needed to stay fully on-screen.
+    // Left-align to the anchor, nudged left as needed to stay fully on-screen.
     let x = anchor.x.min(area.width.saturating_sub(box_w));
     let rect = Rect {
         x,
@@ -2396,16 +2478,28 @@ pub fn render_shortcut_bubble(frame: &mut Frame, anchor: Rect, help: &str) {
     };
     Clear.render(rect, frame.buffer_mut());
     let panel = Style::default().bg(palette::PANEL_BG);
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(palette::KEY))
+        .border_style(Style::default().fg(border))
         .padding(Padding::horizontal(1))
         .style(panel);
+    if let Some(t) = title {
+        block = block.title(Span::styled(
+            t.to_string(),
+            Style::default().fg(border).add_modifier(Modifier::BOLD),
+        ));
+    }
     let inner = block.inner(rect);
     block.render(rect, frame.buffer_mut());
     Paragraph::new(lines)
         .style(panel)
         .render(inner, frame.buffer_mut());
+}
+
+/// A help bubble for a footer shortcut chip (no title, key-cyan border), floated
+/// adjacent to the chip. See [`render_hover_bubble`].
+pub fn render_shortcut_bubble(frame: &mut Frame, anchor: Rect, help: &str) {
+    render_hover_bubble(frame, anchor, palette::KEY, None, help);
 }
 
 /// A full-width pop-up framed with only top+bottom borders (the `title` rides the
@@ -4503,6 +4597,7 @@ mod tests {
                 copied_flash: None,
                 interactive,
                 readonly_hover: false,
+                health_hover: false,
             }
         }
 
@@ -4576,5 +4671,89 @@ mod tests {
             plain.contains("Expand every group in the tree."),
             "bubble should show the help text:\n{plain}"
         );
+    }
+
+    #[test]
+    fn health_badge_sits_by_the_read_only_badge_with_a_hover_bubble() {
+        let nodes: Vec<(TreeNode, usize)> = Vec::new();
+        let unindexed = HashSet::new();
+        let schemas = HashMap::new();
+        let mk = |health_hover: bool| DrawConfig {
+            tree: &nodes,
+            current_file: "model",
+            file_idx: 0,
+            total_files: 1,
+            metadata_only: false,
+            selected_idx: 0,
+            scroll_offset: 0,
+            search_mode: false,
+            search_query: "",
+            search_cursor: 0,
+            status_icon: "▪",
+            status_bar: "model.safetensors",
+            status_secondary: "",
+            health_warning: true,
+            health_hover,
+            can_repack: false,
+            unindexed: &unindexed,
+            packing_schemas: &schemas,
+            copied_flash: None,
+            interactive: true,
+            readonly_hover: false,
+        };
+
+        // Not hovering: the short `⚠ health` badge shows on the bottom line, on the
+        // same row as `read-only` and to its left — never in the title.
+        let out = crate::tui::headless_render(120, 40, |f| {
+            UI::render_tree(f, &mk(false));
+        })
+        .unwrap();
+        let plain = strip_ansi_codes(&out);
+        let lines: Vec<&str> = plain.lines().collect();
+        assert!(
+            !lines[0].contains('⚠'),
+            "no alert in the title: {:?}",
+            lines[0]
+        );
+        let badge_row = lines
+            .iter()
+            .find(|l| l.contains("read-only"))
+            .expect("the read-only badge renders");
+        assert!(
+            badge_row.contains("⚠ health"),
+            "the health badge should share the read-only line: {badge_row:?}"
+        );
+        assert!(
+            badge_row.find("⚠ health") < badge_row.find("read-only"),
+            "the health badge should sit left of read-only: {badge_row:?}"
+        );
+        // No hover → no help bubble.
+        assert!(
+            !plain.contains("Index / file mismatch"),
+            "bubble only on hover:\n{plain}"
+        );
+
+        // Hovering the badge floats its help bubble.
+        let hovered = crate::tui::headless_render(120, 40, |f| {
+            UI::render_tree(f, &mk(true));
+        })
+        .unwrap();
+        assert!(
+            strip_ansi_codes(&hovered).contains("Index / file mismatch"),
+            "hovering the health badge should float its help bubble:\n{hovered}"
+        );
+    }
+
+    #[test]
+    fn health_badge_hit_matches_its_drawn_rect() {
+        // On a 120×40 frame the badge sits on the bottom row, just left of the
+        // read-only badge — the same rect the click handler tests.
+        assert!(UI::health_badge_hit(120, 40, 100, 39), "over the badge");
+        assert!(!UI::health_badge_hit(120, 40, 100, 38), "wrong row");
+        assert!(
+            !UI::health_badge_hit(120, 40, 114, 39),
+            "that's the read-only badge"
+        );
+        assert!(!UI::health_badge_hit(8, 40, 4, 39), "too narrow → no badge");
     }
 }
