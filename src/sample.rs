@@ -1510,12 +1510,40 @@ impl DiffAcc {
 /// stored dtypes may differ (so it measures requantization drift, e.g. F16 → BF16,
 /// or compares the unpacked 3-bit fields). Streams matching row-blocks via
 /// [`TensorReader::read_region`], so memory stays bounded regardless of size.
+/// The outer-row windows to read when comparing a tensor: consecutive
+/// `block`-sized windows over the whole outer dimension (a full read), or — when
+/// `sample_rows` is `Some` and smaller than `outer` — up to [`SAMPLE_PROBES`]
+/// evenly-spaced probe windows summing to ~`sample_rows` rows, so a large tensor
+/// is compared from a cheap spatial sample instead of end-to-end.
+fn diff_row_windows(outer: usize, block: usize, sample_rows: Option<usize>) -> Vec<(usize, usize)> {
+    /// How many evenly-spaced probe windows a sampled compare reads, so a change
+    /// localized anywhere along the tensor still has a good chance of being hit.
+    const SAMPLE_PROBES: usize = 16;
+    match sample_rows {
+        Some(rows) if rows < outer => {
+            let probes = SAMPLE_PROBES.min(rows.max(1));
+            let per = (rows / probes).max(1);
+            (0..probes)
+                .map(|p| {
+                    let lo = (p * outer) / probes;
+                    (lo, (lo + per).min(outer))
+                })
+                .collect()
+        }
+        _ => (0..outer)
+            .step_by(block)
+            .map(|lo| (lo, (lo + block).min(outer)))
+            .collect(),
+    }
+}
+
 pub(crate) fn compare_values(
     a: &TensorInfo,
     a_schema: Option<&PackingSchema>,
     b: &TensorInfo,
     b_schema: Option<&PackingSchema>,
     view: ViewDtype,
+    sample: Option<usize>,
 ) -> Result<ValueDiff, String> {
     let ra = open_reader(a)?;
     let rb = open_reader(b)?;
@@ -1538,16 +1566,15 @@ pub(crate) fn compare_values(
         let inner: usize = shape[1..].iter().product::<usize>().max(1);
         let outer = shape[0];
         let block = (STATS_BLOCK_ELEMS / inner).max(1);
-        let mut i = 0;
-        while i < outer {
-            let hi = (i + block).min(outer);
+        // Which outer-row windows to read: the whole tensor block-by-block, or —
+        // with `sample` — a few evenly-spaced probes summing to ~`sample` elements.
+        for (lo, hi) in diff_row_windows(outer, block, sample.map(|s| (s / inner).max(1))) {
             let mut ranges: Vec<Range<usize>> = Vec::with_capacity(shape.len());
-            ranges.push(i..hi);
+            ranges.push(lo..hi);
             ranges.extend(shape[1..].iter().map(|&d| 0..d));
             let ba = ra.read_region(&ranges)?;
             let bb = rb.read_region(&ranges)?;
-            acc.add_block(&ba, &bb, &da, &db, (hi - i) * inner);
-            i = hi;
+            acc.add_block(&ba, &bb, &da, &db, (hi - lo) * inner);
         }
     }
 
@@ -2402,6 +2429,38 @@ fn f16_to_f64(bits: u16) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_row_windows_full_covers_everything() {
+        // No sample: consecutive block-sized windows tiling the whole outer dim.
+        let w = diff_row_windows(100, 10, None);
+        assert_eq!(w.first(), Some(&(0, 10)));
+        assert_eq!(w.last(), Some(&(90, 100)));
+        assert_eq!(w.iter().map(|(a, b)| b - a).sum::<usize>(), 100);
+    }
+
+    #[test]
+    fn diff_row_windows_samples_evenly_and_cheaply() {
+        // A budget far below the tensor → a few evenly-spaced probes, well under
+        // the full row count, all in range and non-overlapping (ascending, gapped).
+        let w = diff_row_windows(10_000, 8, Some(32));
+        assert!(w.len() <= 16 && !w.is_empty());
+        let rows: usize = w.iter().map(|(a, b)| b - a).sum();
+        assert!(
+            rows <= 32,
+            "sampled {rows} rows — far fewer than the 10k total"
+        );
+        assert!(w.iter().all(|&(lo, hi)| lo < hi && hi <= 10_000));
+        assert!(
+            w.windows(2).all(|p| p[0].1 <= p[1].0),
+            "probes ordered, no overlap"
+        );
+        // A budget that meets/exceeds the size falls back to a full read.
+        assert_eq!(
+            diff_row_windows(50, 8, Some(1000)),
+            diff_row_windows(50, 8, None)
+        );
+    }
 
     /// Manual benchmark for the window-pan hot path: compares re-opening the
     /// reader on every pan (current `sample_tensor` behaviour) against reusing a

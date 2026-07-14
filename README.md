@@ -561,6 +561,14 @@ checkpoint-explorer diff old.safetensors new.safetensors
 # Also compare element values (not just dtype/shape): promotes a values-only
 # change to a difference and reports max/mean |Δ|. Reads the data.
 checkpoint-explorer diff old.safetensors new.safetensors --values
+
+# Faster, approximate value diff: instead of reading each tensor end-to-end,
+# compare only a ~65536-element sample spread across it (16 evenly-spaced
+# probes). Great for a quick "did the weights change?" over huge checkpoints;
+# a change that misses every probe reads as identical. `--sample N` sets the
+# per-tensor budget. Scope it with --name for the quickest check.
+checkpoint-explorer diff old/ new/ --sample
+checkpoint-explorer diff old/ new/ --sample 4096 --name '*.mlp.experts.*'
 ```
 
 A remote structural diff of two `s3://` cstorch checkpoints — read over a single

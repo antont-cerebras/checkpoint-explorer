@@ -439,6 +439,19 @@ enum Command {
         /// count per dtype.
         #[arg(long, value_name = "N", value_parser = parse_bins)]
         bins: Option<usize>,
+        /// Faster, approximate element-value diff: instead of reading each tensor
+        /// end-to-end (like --values), compare only a ~N-element sample spread
+        /// across it (16 evenly-spaced probes). Great for a quick "did the weights
+        /// change?" over huge checkpoints; a change that misses every probe reads
+        /// as identical. `--sample` alone uses ~65536; `--sample N` sets the budget.
+        #[arg(
+            long,
+            value_name = "N",
+            num_args = 0..=1,
+            default_missing_value = "65536",
+            conflicts_with_all = ["values", "histogram"],
+        )]
+        sample: Option<usize>,
         /// List every changed entry instead of collapsing ones that share a name
         /// template and the same change (e.g. the same per-layer dtype change) into
         /// one line with a count and index range.
@@ -577,6 +590,7 @@ fn main() -> Result<()> {
             dtype,
             histogram,
             bins,
+            sample,
             full,
             no_color,
             name,
@@ -615,8 +629,11 @@ fn main() -> Result<()> {
                 // compared (like --only-tensors, but for a filtered run).
                 metadata: !only_tensors && !filtered,
                 group: !full,
-                values,
+                // A sampled compare (`--sample`) is a value compare too — it drives
+                // the same per-change value section, just from a sample.
+                values: values || sample.is_some(),
                 histogram,
+                sample,
                 filtered,
             };
             let view = dtype.unwrap_or(sample::ViewDtype::Stored);
@@ -634,6 +651,7 @@ fn main() -> Result<()> {
                 tensor.as_deref(),
                 view,
                 bins,
+                sample,
                 opts,
                 &filter,
                 jobs,
@@ -824,6 +842,9 @@ fn color_enabled(no_color: bool) -> bool {
 struct ValueCtx<'a> {
     view: sample::ViewDtype,
     bins: Option<usize>,
+    /// Element budget per tensor for a sampled value compare (`--sample`); `None`
+    /// reads the whole tensor.
+    sample: Option<usize>,
     old_schemas: &'a HashMap<String, sample::PackingSchema>,
     new_schemas: &'a HashMap<String, sample::PackingSchema>,
 }
@@ -1096,6 +1117,7 @@ fn run_diff(
     tensor: Option<&str>,
     view: sample::ViewDtype,
     bins: Option<usize>,
+    sample: Option<usize>,
     opts: diff::DiffOpts,
     filter: &diff::TensorFilter,
     jobs: usize,
@@ -1168,7 +1190,7 @@ fn run_diff(
     // Packing schemas (for the `unpacked` view) come from the full metadata —
     // independent of `--only-tensors`, which only hides the metadata *diff*. Only
     // needed when values / distributions are compared.
-    let compares_data = opts.values || opts.histogram || tensor.is_some();
+    let compares_data = opts.values || opts.histogram || sample.is_some() || tensor.is_some();
     let (old_schemas, new_schemas) = if compares_data {
         (
             sample::parse_packing_schemas(&old_t, &old_m),
@@ -1180,6 +1202,7 @@ fn run_diff(
     let ctx = ValueCtx {
         view,
         bins,
+        sample,
         old_schemas: &old_schemas,
         new_schemas: &new_schemas,
     };
@@ -1319,6 +1342,7 @@ fn tensor_values(a: &TensorInfo, b: &TensorInfo, ctx: &ValueCtx) -> Option<sampl
         b,
         ctx.new_schemas.get(&b.name),
         ctx.view,
+        ctx.sample,
     )
     .ok()
 }
@@ -1420,6 +1444,7 @@ fn value_cmp(a: &TensorInfo, b: &TensorInfo, ctx: &ValueCtx) -> diff::ValueCmp {
         b,
         ctx.new_schemas.get(&b.name),
         ctx.view,
+        ctx.sample,
     ) {
         Ok(vd) if vd.differing == 0 => diff::ValueCmp::Identical,
         Ok(vd) => diff::ValueCmp::Differ(vd),

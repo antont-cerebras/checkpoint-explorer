@@ -41,6 +41,10 @@ pub struct DiffOpts {
     /// Value distributions were compared (`--histogram`): show a per-change
     /// total-variation-distance summary.
     pub histogram: bool,
+    /// Element values were compared from a per-tensor *sample* (`--sample N`)
+    /// rather than in full: the value stats are approximate, so the scope note
+    /// says so. `Some(N)` is the element budget; implies `values`.
+    pub sample: Option<usize>,
     /// A [`TensorFilter`] scoped the diff to a subset of tensors — the metadata
     /// section's "not compared" note names this (rather than `--only-tensors`) so
     /// it's clear why the whole checkpoint wasn't diffed.
@@ -677,10 +681,18 @@ impl DiffReport {
 
         // Spell out what was (and wasn't) compared, and what the -/+/~ markers on
         // the summary and the entries below mean.
-        let scope = if opts.values {
-            "scope: tensor structure (name, dtype, shape) + element values"
-        } else {
-            "scope: tensor structure (name, dtype, shape) — element values not compared"
+        let sampled = opts.sample.map(|n| {
+            format!(
+                "scope: tensor structure (name, dtype, shape) + a ~{n}-element sample of \
+                 each tensor's values (approximate — an unsampled change reads as identical)"
+            )
+        });
+        let scope = match (&sampled, opts.values) {
+            (Some(note), _) => note.as_str(),
+            (None, true) => "scope: tensor structure (name, dtype, shape) + element values",
+            (None, false) => {
+                "scope: tensor structure (name, dtype, shape) — element values not compared"
+            }
         };
         let _ = writeln!(s, "{}", paint(scope, opts.color, DIM));
         let _ = writeln!(
@@ -1938,6 +1950,7 @@ mod tests {
         group: true,
         values: false,
         histogram: false,
+        sample: None,
         filtered: false,
     };
 
@@ -1947,6 +1960,7 @@ mod tests {
         group: true,
         values: false,
         histogram: false,
+        sample: None,
         filtered: false,
     };
 
