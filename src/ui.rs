@@ -140,6 +140,9 @@ pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
         (Tree, Char('C')) => "Collapse every group in the tree.",
         (Tree, Char('/')) => "Search: filter tensors by name as you type.",
         (Tree, Char('h')) => "Run the checkpoint health checks and show the report.",
+        (Tree, Char('s')) => {
+            "Show overall checkpoint stats: sizes, params, dtype mix, layers, experts."
+        }
         (Tree, Char('t')) => "Copy the tree or a flat tensor list — text or JSON (opens a menu).",
         (Tree, Char('f')) => "Copy the selected row's file path.",
         (Tree, Char('n')) => "Copy the selected tensor's name.",
@@ -1976,6 +1979,184 @@ impl UI {
         )
     }
 
+    /// The overall-checkpoint stats popup (the `s` key on the tree). Returns the
+    /// max scroll offset, like [`Self::render_check_report`], so the caller can
+    /// clamp its scroll state to what actually fit.
+    pub fn render_stats(
+        frame: &mut Frame,
+        s: &crate::stats::CheckpointStats,
+        copied: Option<&'static str>,
+        scroll: usize,
+    ) -> usize {
+        use crate::stats::ExpertStorage;
+        let bg = palette::PANEL_BG;
+        let sty = |t: String, style: Style| Span::styled(t, style.bg(bg));
+        let plain = |t: String| sty(t, Style::default());
+        let dim = |t: String| sty(t, Style::default().fg(palette::DIM));
+
+        // A section header, then indented "label   value" rows. Labels align to a
+        // fixed column so the values line up down the popup.
+        const LW: usize = 12;
+        let header = |t: &str| {
+            Line::from(sty(
+                t.to_string(),
+                Style::default()
+                    .fg(palette::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        };
+        // A header with a dim trailer (e.g. "Layers  ×48").
+        let header_tail = |t: &str, tail: String| {
+            Line::from(vec![
+                sty(
+                    t.to_string(),
+                    Style::default()
+                        .fg(palette::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                dim(tail),
+            ])
+        };
+        // Pad the label to `LW`, then a guaranteed separator space — so a label
+        // that exactly fills `LW` (e.g. "Architecture") still has a gap before it.
+        let row = |label: &str, mut value: Vec<Span<'static>>| {
+            let mut spans = vec![plain(format!("  {label:<LW$} "))];
+            spans.append(&mut value);
+            Line::from(spans)
+        };
+        // "<size> each · <size> total", the shared shape of the layer/expert rows.
+        let each_total = |each: usize, total: usize, fmt: fn(usize) -> String| {
+            vec![
+                plain(fmt(each)),
+                dim(" each · ".into()),
+                plain(fmt(total)),
+                dim(" total".into()),
+            ]
+        };
+
+        let mut lines: Vec<Line> = Vec::new();
+
+        // ── Overview ──────────────────────────────────────────────────────────
+        lines.push(header("Overview"));
+        if let Some(mt) = &s.model_type {
+            lines.push(row("Architecture", vec![plain(mt.clone())]));
+        }
+        lines.push(row(
+            "Files",
+            vec![plain(format!(
+                "{} {}{}",
+                s.n_files,
+                s.file_noun,
+                if s.n_files == 1 { "" } else { "s" }
+            ))],
+        ));
+        lines.push(row("Tensors", vec![plain(format!("{}", s.n_tensors))]));
+        lines.push(row("Parameters", vec![plain(format_parameters(s.params))]));
+        // On-disk vs logical, with a compression ratio when they differ.
+        let size_value = if s.compressed && s.disk_bytes > 0 {
+            vec![
+                plain(format_size(s.disk_bytes)),
+                dim(" on disk · ".into()),
+                plain(format_size(s.logical_bytes)),
+                dim(format!(
+                    " logical ({:.2}× smaller)",
+                    s.logical_bytes as f64 / s.disk_bytes as f64
+                )),
+            ]
+        } else {
+            vec![plain(format_size(s.logical_bytes))]
+        };
+        lines.push(row("Size", size_value));
+
+        // ── Tensor sizes ────────────────────────────────────────────────────
+        lines.push(Line::from(sty(String::new(), Style::default())));
+        lines.push(header("Tensor size"));
+        let named = |n: &crate::stats::NamedSize| {
+            vec![
+                plain(format!("{:<9} ", format_size(n.bytes))),
+                dim(n.name.clone()),
+            ]
+        };
+        if let Some(l) = &s.largest {
+            lines.push(row("Largest", named(l)));
+        }
+        if let Some(sm) = &s.smallest {
+            lines.push(row("Smallest", named(sm)));
+        }
+        lines.push(row("Average", vec![plain(format_size(s.mean_bytes))]));
+        lines.push(row("Median", vec![plain(format_size(s.median_bytes))]));
+
+        // ── Layers ───────────────────────────────────────────────────────────
+        if let Some(l) = &s.layers {
+            lines.push(Line::from(sty(String::new(), Style::default())));
+            lines.push(header_tail("Layers", format!("  ×{}", l.count)));
+            lines.push(row(
+                "Params",
+                each_total(l.params_each(), l.params, format_parameters),
+            ));
+            lines.push(row(
+                "Size",
+                each_total(l.bytes_each(), l.bytes, format_size),
+            ));
+        }
+
+        // ── Experts (MoE) ─────────────────────────────────────────────────────
+        if let Some(x) = &s.experts {
+            lines.push(Line::from(sty(String::new(), Style::default())));
+            let count = if x.per_layer > 0 {
+                format!("  ×{} per layer", x.per_layer)
+            } else {
+                String::new()
+            };
+            lines.push(header_tail("Experts", count));
+            let mut storage = x.storage.label().to_string();
+            if x.gate_up_fused {
+                storage.push_str(" · gate+up fused");
+            }
+            lines.push(row("Storage", vec![plain(storage)]));
+            // Per-expert averages are only meaningful once we know the layout.
+            if x.per_layer > 0 || x.storage == ExpertStorage::Unfused {
+                lines.push(row(
+                    "Params",
+                    each_total(x.params_each(), x.params, format_parameters),
+                ));
+                lines.push(row(
+                    "Size",
+                    each_total(x.bytes_each(), x.bytes, format_size),
+                ));
+            }
+        }
+
+        // ── dtype mix ─────────────────────────────────────────────────────────
+        if !s.dtypes.is_empty() {
+            lines.push(Line::from(sty(String::new(), Style::default())));
+            lines.push(header("By dtype"));
+            let dw = s.dtypes.iter().map(|d| d.dtype.len()).max().unwrap_or(0);
+            for d in &s.dtypes {
+                lines.push(Line::from(vec![
+                    sty(
+                        format!("  {:<dw$}  ", d.dtype),
+                        Style::default().fg(palette::DTYPE),
+                    ),
+                    plain(format!("{:>7}", format_size(d.bytes))),
+                    dim(format!(
+                        "  {} tensor{}",
+                        d.count,
+                        if d.count == 1 { "" } else { "s" }
+                    )),
+                ]));
+            }
+        }
+
+        render_scroll_popup(
+            frame,
+            "Checkpoint stats",
+            lines,
+            stats_footer_line(copied, bg),
+            scroll,
+        )
+    }
+
     /// Borderless band shown when a chosen export is too big for the terminal
     /// clipboard: it copies the concrete CLI command that reproduces it instead
     /// and shows it on its own full-width line(s) at column 0 (so a long path
@@ -2310,6 +2491,43 @@ fn check_footer_line(state: &CheckPopup, bg: Color) -> Line<'static> {
             Line::from(spans)
         }
     }
+}
+
+/// Footer for the stats popup: a "✓ copied …" flash, or the key hints.
+fn stats_footer_line(copied: Option<&'static str>, bg: Color) -> Line<'static> {
+    if let Some(what) = copied {
+        return Line::from(Span::styled(
+            format!("✓ copied {what} to the clipboard"),
+            Style::default().fg(palette::SUCCESS).bg(bg),
+        ));
+    }
+    let key = |k: &str| {
+        Span::styled(
+            k.to_string(),
+            Style::default()
+                .fg(palette::KEY)
+                .add_modifier(Modifier::BOLD)
+                .bg(bg),
+        )
+    };
+    let dim = |s: &str| Span::styled(s.to_string(), Style::default().fg(palette::DIM).bg(bg));
+    let mut spans = Vec::new();
+    for (i, (k, label)) in [
+        ("c", " copy screen"),
+        ("r", " copy report"),
+        ("y", " copy command"),
+        ("Esc", " dismiss"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        if i > 0 {
+            spans.push(dim(" · "));
+        }
+        spans.push(key(k));
+        spans.push(dim(label));
+    }
+    Line::from(spans)
 }
 
 /// A centred, content-sized pop-up over the frame: a rounded [`Block`] (accent
@@ -3504,6 +3722,7 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<Chi
         (vec![Seg::Key("/", hint_key('/'))], "search"),
         (vec![Seg::Key("l", hint_key('l'))], "legend"),
         (vec![Seg::Key("h", hint_key('h'))], "health"),
+        (vec![Seg::Key("s", hint_key('s'))], "stats"),
         (vec![Seg::Key("c", hint_key('c'))], "copy screen"),
         (vec![Seg::Key("t", hint_key('t'))], "copy tree"),
         (vec![Seg::Key("f", hint_key('f'))], "copy file"),
@@ -4668,8 +4887,16 @@ mod tests {
         assert_eq!(sb.offset_at(sb.top + sb.rows - 1), sb.max_offset);
         assert_eq!(sb.offset_at(0), 0);
         assert_eq!(sb.offset_at(sb.top + sb.rows + 99), sb.max_offset);
+        // The middle track row maps near the middle offset (25 = max_offset/2).
+        // A discrete bar only lands on multiples of one track-step, so the closest
+        // position to the true centre is within a step — the tolerance tracks the
+        // viewport height rather than assuming a fixed parity.
         let mid = sb.offset_at(sb.top + (sb.rows - 1) / 2);
-        assert!((mid as i64 - 25).abs() <= 1, "midpoint offset {mid} ≈ 25");
+        let step = (sb.max_offset as f64 / f64::from(sb.rows - 1)).ceil() as i64;
+        assert!(
+            (mid as i64 - 25).abs() <= step,
+            "midpoint offset {mid} ≈ 25 (±{step})"
+        );
 
         // Hit-testing: only the bar's own column, within the track rows.
         assert!(sb.hit(79, sb.top));

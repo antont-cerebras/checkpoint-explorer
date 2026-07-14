@@ -20,6 +20,7 @@ mod remote;
 mod s3;
 mod sample;
 mod sftp;
+mod stats;
 mod tree;
 mod tui;
 mod ui;
@@ -296,6 +297,12 @@ struct ExploreArgs {
         help = "Open straight into the health-check popup on the tree (the `h` key)"
     )]
     health: bool,
+
+    #[arg(
+        long,
+        help = "Open straight into the checkpoint-stats popup on the tree (the `s` key)"
+    )]
+    stats: bool,
 
     #[arg(
         long,
@@ -1572,7 +1579,8 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.tree_state.is_some()
         || args.search.is_some()
         || args.legend
-        || args.health;
+        || args.health
+        || args.stats;
     let view = if args.values {
         OpenView::Values
     } else if args.heatmap {
@@ -1617,6 +1625,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.search.is_some()
         || args.legend
         || args.health
+        || args.stats
         || args.exit;
     let open = wants_open.then_some(OpenRequest {
         tensor: args.tensor,
@@ -1637,6 +1646,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         search: args.search,
         legend: args.legend,
         health: args.health,
+        stats: args.stats,
         exit_after: args.exit,
     });
 

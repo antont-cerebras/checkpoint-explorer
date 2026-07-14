@@ -258,6 +258,9 @@ pub struct OpenRequest {
     /// Open straight into the health-check popup on the tree (`--health`, the `h`
     /// key). Part of `y`'s round-trip: the popup's `y` copies this command.
     pub health: bool,
+    /// Open straight into the checkpoint-stats popup on the tree (`--stats`, the
+    /// `s` key). Part of `y`'s round-trip: the popup's `y` copies this command.
+    pub stats: bool,
     /// Render the view once and exit without interactive navigation.
     pub exit_after: bool,
 }
@@ -1580,6 +1583,7 @@ impl Explorer {
         };
         let want_legend = self.open.as_ref().is_some_and(|r| r.legend);
         let want_health = self.open.as_ref().is_some_and(|r| r.health);
+        let want_stats_popup = self.open.as_ref().is_some_and(|r| r.stats);
         if let Some(n) = bins {
             self.histogram_bins.set(Some(n));
         }
@@ -1604,6 +1608,9 @@ impl Explorer {
             let mut cmd = self.reopen_command(&screen, want_stats, want_hist);
             if want_health {
                 cmd = format!("{cmd} --health");
+            }
+            if want_stats_popup {
+                cmd = format!("{cmd} --stats");
             }
             println!("{cmd}");
             return Ok(());
@@ -1631,6 +1638,10 @@ impl Explorer {
                     1,
                 )
             });
+            // `--stats`: composite the checkpoint-stats popup over the tree.
+            let stats = want_stats_popup.then(|| {
+                crate::stats::CheckpointStats::compute(&self.tensors, self.config.as_ref())
+            });
             let text = crate::tui::headless_render(120, 40, |f| {
                 self.render_tree_frame(f, false); // headless: no scroll bar
                 if want_legend {
@@ -1646,6 +1657,9 @@ impl Explorer {
                         },
                         0,
                     );
+                }
+                if let Some(stats) = &stats {
+                    UI::render_stats(f, stats, None, 0);
                 }
             })?;
             println!("{text}");
@@ -1906,8 +1920,9 @@ impl Explorer {
         let mut history = vec![Screen::Tree];
         let mut cursor = 0usize;
 
-        // `--health` opens straight into the health-check popup once the tree is up.
+        // `--health` / `--stats` open straight into their popup once the tree is up.
         let want_health = self.open.as_ref().is_some_and(|r| r.health);
+        let want_stats_popup = self.open.as_ref().is_some_and(|r| r.stats);
 
         // A `--tensor` request seeds the history with that screen — or, with
         // `--exit`, renders it once and quits without entering the navigator.
@@ -1951,12 +1966,18 @@ impl Explorer {
             self.load_all_files()?;
         }
 
-        // `--health`: float the health-check popup over the tree before handing
-        // off to the navigator (dismissing it drops into the normal tree).
+        // `--health` / `--stats`: float the requested popup over the tree before
+        // handing off to the navigator (dismissing it drops into the normal tree).
         if want_health {
             self.ensure_full_load()?;
             let mut term = self.terminal.take().expect("interactive loop owns it");
             self.show_check_report(&mut term);
+            self.terminal = Some(term);
+        }
+        if want_stats_popup {
+            self.ensure_full_load()?;
+            let mut term = self.terminal.take().expect("interactive loop owns it");
+            self.show_stats(&mut term);
             self.terminal = Some(term);
         }
 
@@ -3000,6 +3021,16 @@ impl Explorer {
                     } if !self.search_mode => {
                         let mut term = self.terminal.take().expect("interactive loop owns it");
                         self.show_check_report(&mut term);
+                        self.terminal = Some(term);
+                    }
+                    // `s` floats the overall-checkpoint stats popup (sizes, params,
+                    // dtype mix, layer / MoE-expert structure).
+                    KeyEvent {
+                        code: KeyCode::Char('s'),
+                        ..
+                    } if !self.search_mode => {
+                        let mut term = self.terminal.take().expect("interactive loop owns it");
+                        self.show_stats(&mut term);
                         self.terminal = Some(term);
                     }
                     // `l` opens the legend for the tree's glyphs.
@@ -6014,6 +6045,127 @@ impl Explorer {
                 }
                 // Motion refreshes the hover bubbles behind the popup, so they
                 // stay live; drag/resize are ignored.
+                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Moved) => {
+                    if let Ok(sz) = term.size() {
+                        self.update_hovers(HelpCtx::Tree, sz.width, sz.height, m.column, m.row);
+                    }
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+    }
+
+    /// Float the overall-checkpoint stats popup over the tree (the `s` key).
+    /// It's read-only: `y` copies the CLI command that reopens it (`--stats`),
+    /// `c` copies the whole screen, `Esc` or a click dismisses, Ctrl-C quits; the
+    /// body scrolls (↑/↓, PgUp/PgDn, Home/End, wheel) when it's taller than the
+    /// popup, and mouse motion keeps the hover bubbles behind it live.
+    fn show_stats(&self, term: &mut crate::tui::LiveTerminal) {
+        let stats = crate::stats::CheckpointStats::compute(&self.tensors, self.config.as_ref());
+
+        // What was just copied (and when), so the footer can flash it briefly.
+        let mut copied_at: Option<(std::time::Instant, &'static str)> = None;
+        // A non-Latin key (wrong keyboard layout) shows a hint, as on other screens.
+        let mut layout_hint: Option<char> = None;
+        let mut scroll = 0usize;
+        let mut scroll_max;
+
+        loop {
+            let copied = copied_at
+                .filter(|(t, _)| t.elapsed() < COPY_FLASH)
+                .map(|(_, what)| what);
+            let hint = layout_hint;
+            let max_cell = std::cell::Cell::new(0usize);
+            if term
+                .draw(|f| {
+                    self.render_tree_frame(f, true);
+                    max_cell.set(UI::render_stats(f, &stats, copied, scroll));
+                    if let Some(c) = hint {
+                        UI::render_notice(f, &layout_hint_msg(c));
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
+            // Clamp to what actually fit (the popup / terminal size can change).
+            scroll_max = max_cell.get();
+            scroll = scroll.min(scroll_max);
+
+            // While the copy flash is up, wake to clear it when it expires; else
+            // block until the next event.
+            let event = if copied.is_some() {
+                let left =
+                    COPY_FLASH.saturating_sub(copied_at.map_or(COPY_FLASH, |(t, _)| t.elapsed()));
+                if event::poll(left).unwrap_or(false) {
+                    event::read().ok()
+                } else {
+                    copied_at = None; // flash expired — redraw without it
+                    continue;
+                }
+            } else {
+                event::read().ok()
+            };
+
+            layout_hint = None;
+            match event {
+                Some(Event::Key(key)) => {
+                    if is_ctrl_c(&key) {
+                        quit_immediately();
+                    }
+                    let now = std::time::Instant::now();
+                    match key.code {
+                        // `y` copies the command that reopens this popup.
+                        KeyCode::Char('y') => {
+                            let cmd = format!("{} --stats", self.command_for_tree());
+                            if copy_to_clipboard(&cmd) {
+                                copied_at = Some((now, "command"));
+                            }
+                        }
+                        // `c` copies the whole screen — the tree with this popup
+                        // composited on top, at the live terminal size.
+                        KeyCode::Char('c') => {
+                            let (w, h) = term
+                                .size()
+                                .map(|s| (s.width, s.height))
+                                .unwrap_or((120, 40));
+                            let screen = crate::tui::headless_render(w, h, |f| {
+                                self.render_tree_frame(f, false);
+                                UI::render_stats(f, &stats, None, scroll);
+                            });
+                            if let Ok(text) = screen
+                                && copy_to_clipboard(&text)
+                            {
+                                copied_at = Some((now, "screen"));
+                            }
+                        }
+                        // `r` copies just the stats as plain text.
+                        KeyCode::Char('r') => {
+                            if copy_to_clipboard(&stats.render()) {
+                                copied_at = Some((now, "report"));
+                            }
+                        }
+                        // Scroll the body when it's taller than the popup.
+                        KeyCode::Up => scroll = scroll.saturating_sub(1),
+                        KeyCode::Down => scroll = (scroll + 1).min(scroll_max),
+                        KeyCode::PageUp => scroll = scroll.saturating_sub(SCROLL_PAGE),
+                        KeyCode::PageDown => scroll = (scroll + SCROLL_PAGE).min(scroll_max),
+                        KeyCode::Home => scroll = 0,
+                        KeyCode::End => scroll = scroll_max,
+                        KeyCode::Esc => break,
+                        _ => layout_hint = wrong_layout_char(&key),
+                    }
+                }
+                // Dismiss on a click (Down, not the trailing Up).
+                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => break,
+                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::ScrollUp) => {
+                    scroll = scroll.saturating_sub(WHEEL_STEP)
+                }
+                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::ScrollDown) => {
+                    scroll = (scroll + WHEEL_STEP).min(scroll_max)
+                }
+                // Motion refreshes the hover bubbles behind the popup.
                 Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Moved) => {
                     if let Ok(sz) = term.size() {
                         self.update_hovers(HelpCtx::Tree, sz.width, sz.height, m.column, m.row);

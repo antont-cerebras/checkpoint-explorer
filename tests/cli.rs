@@ -196,6 +196,12 @@ fn plain_tree() {
     settings().bind(|| insta::assert_snapshot!(plain(&[])));
 }
 
+/// The `s` popup: overall checkpoint stats composited over the tree.
+#[test]
+fn stats_popup() {
+    settings().bind(|| insta::assert_snapshot!(plain(&["--stats"])));
+}
+
 /// Run a one-shot `--print-*` export (no `--plain`) and capture stdout.
 fn export(extra_args: &[&str]) -> String {
     ensure_fixture();
@@ -372,6 +378,7 @@ fn y_roundtrips() {
         vec!["--tensor", t, "--values", "--overview", "--base", "hex"],
         vec!["--tensor", t, "--heatmap"],
         vec!["--health"], // the health-check popup over the tree
+        vec!["--stats"],  // the checkpoint-stats popup over the tree
     ] {
         assert_y_roundtrip(FIXTURE, &extra);
     }
@@ -592,10 +599,18 @@ mod hdf5 {
             vec!["--tensor", &dp, "--values", "--slice", "2"],
             vec!["--tensor", &dp, "--heatmap"],
             vec!["--health"], // the health-check popup over the tree
+            vec!["--stats"],  // the checkpoint-stats popup over the tree
         ];
         for extra in cases {
             super::assert_y_roundtrip(H5, extra);
         }
+    }
+
+    /// The `s` popup on a compressed MoE checkpoint: exercises the compression
+    /// ratio (on-disk vs. logical) and the fused-experts section.
+    #[test]
+    fn stats_popup() {
+        settings().bind(|| insta::assert_snapshot!(plain(&["--stats"])));
     }
 
     // Pin the actual command `y` copies for each screen (documents the round-trip
