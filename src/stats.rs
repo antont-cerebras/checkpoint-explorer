@@ -100,6 +100,77 @@ pub struct DtypeStat {
     pub bytes: usize,
 }
 
+/// One shard file's on-disk footprint: its apparent size vs. the blocks the
+/// filesystem actually allocated. `allocated < apparent` means the filesystem
+/// (e.g. ZFS/btrfs transparent compression, or sparse-file holes) is squeezing
+/// it — a saving invisible to the logical byte counts above.
+#[derive(Debug, Clone)]
+pub struct ShardDisk {
+    /// The shard's basename, for display.
+    pub name: String,
+    /// Apparent size (`st_size`) — the nominal file length.
+    pub apparent: u64,
+    /// Bytes the filesystem actually allocated (`st_blocks × 512`).
+    pub allocated: u64,
+}
+
+/// Filesystem allocation across the checkpoint's shard files — the true on-disk
+/// footprint, gathered from the OS `stat` (`st_blocks`) rather than the logical
+/// byte counts. `None` when it can't be measured (remote `s3://`, a failed stat,
+/// or a non-Unix host).
+#[derive(Debug, Clone)]
+pub struct DiskUsage {
+    pub shards: Vec<ShardDisk>,
+    pub total_apparent: u64,
+    pub total_allocated: u64,
+}
+
+impl DiskUsage {
+    /// Build from per-shard rows, summing the totals. `None` if empty.
+    pub fn from_shards(shards: Vec<ShardDisk>) -> Option<DiskUsage> {
+        if shards.is_empty() {
+            return None;
+        }
+        let total_apparent = shards.iter().map(|s| s.apparent).sum();
+        let total_allocated = shards.iter().map(|s| s.allocated).sum();
+        Some(DiskUsage {
+            shards,
+            total_apparent,
+            total_allocated,
+        })
+    }
+
+    /// Stat local files through the OS (`st_blocks × 512`). Paths that don't stat
+    /// (e.g. a remote scp-form path, or one that's since vanished) are skipped.
+    #[cfg(unix)]
+    pub fn from_local(paths: &[&str]) -> Option<DiskUsage> {
+        use std::os::unix::fs::MetadataExt;
+        let shards = paths
+            .iter()
+            .filter_map(|p| {
+                let md = std::fs::metadata(p).ok()?;
+                Some(ShardDisk {
+                    name: shard_name(p),
+                    apparent: md.len(),
+                    allocated: md.blocks() * 512,
+                })
+            })
+            .collect();
+        DiskUsage::from_shards(shards)
+    }
+
+    #[cfg(not(unix))]
+    pub fn from_local(_paths: &[&str]) -> Option<DiskUsage> {
+        None
+    }
+}
+
+/// A path's final component — the shard's filename. Splits on `/` and `:` so an
+/// scp-form remote path (`host:/dir/shard.safetensors`) also reduces to the name.
+pub fn shard_name(path: &str) -> String {
+    path.rsplit(['/', ':']).next().unwrap_or(path).to_string()
+}
+
 /// Everything the `s` popup shows, computed once when the popup opens.
 #[derive(Debug, Clone)]
 pub struct CheckpointStats {
@@ -126,12 +197,15 @@ pub struct CheckpointStats {
     pub experts: Option<ExpertStats>,
     /// `config.json`'s `model_type`, when a config was found.
     pub model_type: Option<String>,
+    /// True on-disk footprint from the filesystem, when measurable.
+    pub disk: Option<DiskUsage>,
 }
 
 impl CheckpointStats {
     pub fn compute(
         tensors: &[TensorInfo],
         config: Option<&crate::config::ModelConfig>,
+        disk: Option<DiskUsage>,
     ) -> CheckpointStats {
         let n_tensors = tensors.len();
         let params: usize = tensors.iter().map(|t| t.num_elements).sum();
@@ -210,6 +284,7 @@ impl CheckpointStats {
             layers: layer_stats(tensors),
             experts: expert_stats(tensors, config),
             model_type: config.and_then(|c| c.model_type.clone()),
+            disk,
         }
     }
 
@@ -336,7 +411,66 @@ impl CheckpointStats {
             }
         }
 
+        // On disk (filesystem allocation) — the true footprint, ZFS/sparse-aware.
+        if let Some(d) = &self.disk {
+            out.push(String::new());
+            out.push("On disk (filesystem)".into());
+            out.push(row(
+                "Allocated",
+                format!(
+                    "{}  ({} apparent, {})",
+                    format_size(d.total_allocated as usize),
+                    format_size(d.total_apparent as usize),
+                    ratio_phrase(d.total_apparent, d.total_allocated),
+                ),
+            ));
+            // Per-shard rows, but only for shards the filesystem actually shrank
+            // — listing every unchanged shard just buries the ones that matter.
+            if d.shards.len() > 1 {
+                let savers: Vec<&ShardDisk> = d
+                    .shards
+                    .iter()
+                    .filter(|s| has_saving(s.apparent, s.allocated))
+                    .collect();
+                let nw = savers.iter().map(|s| s.name.len()).max().unwrap_or(0);
+                for s in &savers {
+                    out.push(format!(
+                        "  {:<nw$}  {:>9} → {:>9}  ({})",
+                        s.name,
+                        format_size(s.apparent as usize),
+                        format_size(s.allocated as usize),
+                        ratio_phrase(s.apparent, s.allocated),
+                    ));
+                }
+                let hidden = d.shards.len() - savers.len();
+                if hidden > 0 {
+                    out.push(format!(
+                        "  … {hidden} shard{} with no filesystem saving",
+                        if hidden == 1 { "" } else { "s" }
+                    ));
+                }
+            }
+        }
+
         out.join("\n")
+    }
+}
+
+/// Whether the filesystem saved a *meaningful* amount on this file — at least
+/// ~1%, so files the filesystem left untouched (and trivial block-rounding
+/// differences) don't clutter the per-shard list; only real savings are worth a
+/// row.
+pub(crate) fn has_saving(apparent: u64, allocated: u64) -> bool {
+    allocated < apparent && (apparent - allocated).saturating_mul(100) >= apparent
+}
+
+/// "N.N× smaller" when the filesystem shrank the file, else "no filesystem
+/// saving" — describing `allocated` relative to `apparent`.
+pub(crate) fn ratio_phrase(apparent: u64, allocated: u64) -> String {
+    if allocated == 0 || allocated >= apparent {
+        "no filesystem saving".to_string()
+    } else {
+        format!("{:.2}× smaller", apparent as f64 / allocated as f64)
     }
 }
 
@@ -467,7 +601,7 @@ mod tests {
             ti("big", "F32", &[100, 100], 4), // 10_000 elems, 40_000 B
             ti("small", "F32", &[2], 4),      // 2 elems, 8 B
         ];
-        let s = CheckpointStats::compute(&tensors, None);
+        let s = CheckpointStats::compute(&tensors, None, None);
         assert_eq!(s.n_tensors, 3);
         assert_eq!(s.params, 10_102);
         assert_eq!(s.logical_bytes, 40_408);
@@ -486,7 +620,7 @@ mod tests {
             ti("b", "BF16", &[1000], 2),    // 2000 B
             ti("c", "F8_E4M3", &[1000], 1), // 1000 B
         ];
-        let s = CheckpointStats::compute(&tensors, None);
+        let s = CheckpointStats::compute(&tensors, None, None);
         assert_eq!(s.dtypes.len(), 2);
         assert_eq!(s.dtypes[0].dtype, "BF16");
         assert_eq!(s.dtypes[0].count, 2);
@@ -502,7 +636,7 @@ mod tests {
             ti("model.layers.1.mlp.weight", "F32", &[10], 4),
             ti("model.layers.2.mlp.weight", "F32", &[10], 4),
         ];
-        let s = CheckpointStats::compute(&tensors, None);
+        let s = CheckpointStats::compute(&tensors, None, None);
         let l = s.layers.unwrap();
         assert_eq!(l.count, 3);
         assert_eq!(l.params, 30);
@@ -523,7 +657,7 @@ mod tests {
                 ));
             }
         }
-        let s = CheckpointStats::compute(&tensors, None);
+        let s = CheckpointStats::compute(&tensors, None, None);
         let x = s.experts.unwrap();
         assert_eq!(x.storage, ExpertStorage::Unfused);
         assert_eq!(x.per_layer, 4);
@@ -549,7 +683,7 @@ mod tests {
                 4,
             ),
         ];
-        let s = CheckpointStats::compute(&tensors, None);
+        let s = CheckpointStats::compute(&tensors, None, None);
         let x = s.experts.unwrap();
         assert_eq!(x.storage, ExpertStorage::Fused);
         assert_eq!(x.per_layer, 8); // leading dim of the stacked tensor
@@ -560,7 +694,11 @@ mod tests {
     #[test]
     fn dense_checkpoint_has_no_experts() {
         let tensors = vec![ti("model.layers.0.mlp.weight", "F32", &[10], 4)];
-        assert!(CheckpointStats::compute(&tensors, None).experts.is_none());
+        assert!(
+            CheckpointStats::compute(&tensors, None, None)
+                .experts
+                .is_none()
+        );
     }
 
     #[test]
@@ -579,7 +717,7 @@ mod tests {
             tie_word_embeddings: None,
             use_qk_norm: None,
         };
-        let report = CheckpointStats::compute(&tensors, Some(&config)).render();
+        let report = CheckpointStats::compute(&tensors, Some(&config), None).render();
 
         // Median is its own labelled row, not folded into Average's parens.
         assert!(report.contains("\n  Median"), "report:\n{report}");
@@ -599,5 +737,80 @@ mod tests {
             arch < sizes,
             "architecture should be in the Overview section"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_local_stats_real_files() {
+        // Stat two files that certainly exist in the repo; the allocated size is
+        // whatever the filesystem reports, but the totals must add up and a
+        // present file's allocation is non-zero.
+        let paths = ["Cargo.toml", "src/stats.rs"];
+        let du = DiskUsage::from_local(&paths).expect("both files stat");
+        assert_eq!(du.shards.len(), 2);
+        assert_eq!(
+            du.total_apparent,
+            du.shards.iter().map(|s| s.apparent).sum::<u64>()
+        );
+        assert_eq!(
+            du.total_allocated,
+            du.shards.iter().map(|s| s.allocated).sum::<u64>()
+        );
+        assert!(du.shards.iter().all(|s| s.allocated > 0));
+        // A path that doesn't stat is skipped, not fatal.
+        assert!(DiskUsage::from_local(&["definitely/not/here.xyz"]).is_none());
+    }
+
+    #[test]
+    fn report_on_disk_lists_only_savers() {
+        let tensors = vec![ti("w", "F32", &[10], 4)];
+        // One shard squeezed 4× (a real saving) among two the filesystem left
+        // alone (allocated ≥ apparent) — deterministic, so the wording is pinned.
+        let disk = DiskUsage::from_shards(vec![
+            ShardDisk {
+                name: "shard-saver.safetensors".into(),
+                apparent: 4 * 1024 * 1024,
+                allocated: 1024 * 1024,
+            },
+            ShardDisk {
+                name: "shard-plain.safetensors".into(),
+                apparent: 4 * 1024 * 1024,
+                allocated: 4 * 1024 * 1024,
+            },
+            ShardDisk {
+                name: "shard-bigger.safetensors".into(),
+                apparent: 4 * 1024 * 1024,
+                allocated: 4 * 1024 * 1024 + 4096, // block rounding — larger on disk
+            },
+        ]);
+        let report = CheckpointStats::compute(&tensors, None, disk).render();
+        assert!(report.contains("On disk (filesystem)"), "report:\n{report}");
+        assert!(report.contains("Allocated"), "report:\n{report}");
+        // Only the shard with a real saving is listed…
+        assert!(
+            report.contains("shard-saver.safetensors"),
+            "report:\n{report}"
+        );
+        assert!(report.contains("4.00× smaller"), "report:\n{report}");
+        // …the untouched / larger-on-disk shards are folded into a count.
+        assert!(!report.contains("shard-plain"), "report:\n{report}");
+        assert!(!report.contains("shard-bigger"), "report:\n{report}");
+        assert!(
+            report.contains("2 shards with no filesystem saving"),
+            "report:\n{report}"
+        );
+    }
+
+    #[test]
+    fn ratio_and_saving_predicates() {
+        // Allocated ≥ apparent (small file rounded up to a block) → no saving.
+        assert_eq!(ratio_phrase(888, 4096), "no filesystem saving");
+        assert_eq!(ratio_phrase(0, 0), "no filesystem saving");
+        assert_eq!(ratio_phrase(1000, 500), "2.00× smaller");
+        // A real (≥1%) saving counts; a larger-on-disk or trivial one doesn't.
+        assert!(has_saving(1000, 500));
+        assert!(!has_saving(1000, 1000));
+        assert!(!has_saving(1000, 1200)); // allocated larger
+        assert!(!has_saving(1000, 999)); // 0.1% — below the threshold
     }
 }

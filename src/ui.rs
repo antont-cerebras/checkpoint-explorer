@@ -2148,6 +2148,55 @@ impl UI {
             }
         }
 
+        // ── On disk (filesystem allocation) ────────────────────────────────────
+        if let Some(d) = &s.disk {
+            lines.push(Line::from(sty(String::new(), Style::default())));
+            lines.push(header("On disk (filesystem)"));
+            lines.push(row(
+                "Allocated",
+                vec![
+                    plain(format_size(d.total_allocated as usize)),
+                    dim(format!(
+                        "  ({} apparent, {})",
+                        format_size(d.total_apparent as usize),
+                        crate::stats::ratio_phrase(d.total_apparent, d.total_allocated),
+                    )),
+                ],
+            ));
+            // Per-shard rows, but only for shards the filesystem actually shrank
+            // — listing every unchanged shard just buries the ones that matter.
+            if d.shards.len() > 1 {
+                let savers: Vec<&crate::stats::ShardDisk> = d
+                    .shards
+                    .iter()
+                    .filter(|sh| crate::stats::has_saving(sh.apparent, sh.allocated))
+                    .collect();
+                let nw = savers.iter().map(|sh| sh.name.len()).max().unwrap_or(0);
+                for sh in &savers {
+                    lines.push(Line::from(vec![
+                        sty(
+                            format!("  {:<nw$}  ", sh.name),
+                            Style::default().fg(palette::META),
+                        ),
+                        plain(format!("{:>9}", format_size(sh.apparent as usize))),
+                        dim(" → ".into()),
+                        plain(format!("{:>9}", format_size(sh.allocated as usize))),
+                        dim(format!(
+                            "  ({})",
+                            crate::stats::ratio_phrase(sh.apparent, sh.allocated)
+                        )),
+                    ]));
+                }
+                let hidden = d.shards.len() - savers.len();
+                if hidden > 0 {
+                    lines.push(Line::from(dim(format!(
+                        "  … {hidden} shard{} with no filesystem saving",
+                        if hidden == 1 { "" } else { "s" }
+                    ))));
+                }
+            }
+        }
+
         render_scroll_popup(
             frame,
             "Checkpoint stats",
@@ -4864,6 +4913,46 @@ mod tests {
         assert_eq!(NumBase::Hex.digits(8), 2);
         assert_eq!(NumBase::Hex.digits(4), 1);
         assert_eq!(NumBase::Octal.digits(8), 3);
+    }
+
+    #[test]
+    fn stats_popup_renders_on_disk_section() {
+        use crate::stats::{CheckpointStats, DiskUsage, ShardDisk};
+        let tensors = vec![TensorInfo {
+            name: "w".into(),
+            dtype: "F32".into(),
+            shape: vec![4],
+            size_bytes: 16,
+            num_elements: 4,
+            storage: Storage::Unknown,
+            source_path: "m.safetensors".into(),
+            layout: Layout::None,
+        }];
+        // One shard squeezed 4× among two the filesystem left alone.
+        let disk = DiskUsage::from_shards(vec![
+            ShardDisk {
+                name: "shard-saver.safetensors".into(),
+                apparent: 4 << 20,
+                allocated: 1 << 20,
+            },
+            ShardDisk {
+                name: "shard-plain.safetensors".into(),
+                apparent: 4 << 20,
+                allocated: 4 << 20,
+            },
+        ]);
+        let stats = CheckpointStats::compute(&tensors, None, disk);
+        let text = crate::tui::headless_render(100, 50, |f| {
+            UI::render_stats(f, &stats, None, 0);
+        })
+        .unwrap();
+        assert!(text.contains("On disk (filesystem)"), "{text}");
+        assert!(text.contains("Allocated"), "{text}");
+        // Only the real saver is listed; the untouched shard is folded into a count.
+        assert!(text.contains("shard-saver.safetensors"), "{text}");
+        assert!(text.contains("4.00×"), "{text}");
+        assert!(!text.contains("shard-plain"), "{text}");
+        assert!(text.contains("1 shard with no filesystem saving"), "{text}");
     }
 
     #[test]

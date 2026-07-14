@@ -313,6 +313,15 @@ const COPY_FLASH: std::time::Duration = std::time::Duration::from_secs(2);
 /// click (which opens it); a lone click just selects it (visible feedback).
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// What [`Explorer::gather_checkpoint`] returns: tensors, metadata, the parsed
+/// `config.json`, and the shards' on-disk footprint (the last three optional).
+type CheckpointParts = (
+    Vec<TensorInfo>,
+    Vec<MetadataInfo>,
+    Option<crate::config::ModelConfig>,
+    Option<crate::stats::DiskUsage>,
+);
+
 /// Rows the tree viewport scrolls per mouse-wheel notch (independent of the
 /// selection, like a normal scrollable list).
 const WHEEL_STEP: usize = 3;
@@ -489,6 +498,11 @@ pub struct Explorer {
     scroll_offset: usize,
     flattened_tree: Vec<(TreeNode, usize)>,
     total_parameters: usize,
+    /// The remote shards' on-disk footprint, captured during the `--ssh-read`
+    /// load while the session was live (SFTP carries no block count, so it can't
+    /// be re-derived later without another connection). `None` for local
+    /// checkpoints (statted lazily) and for `s3://` / hosts without GNU `stat`.
+    remote_disk: Option<crate::stats::DiskUsage>,
     search_query: String,
     /// Caret position within `search_query`, as a character index in `0..=len`.
     search_cursor: usize,
@@ -615,6 +629,7 @@ impl Explorer {
             scroll_offset: 0,
             flattened_tree: Vec::new(),
             total_parameters: 0,
+            remote_disk: None,
             search_query: String::new(),
             search_cursor: 0,
             search_mode: false,
@@ -935,10 +950,11 @@ impl Explorer {
             }
             frame += 1;
         }
-        let (tensors, metadata, config) = handle
+        let (tensors, metadata, config, disk) = handle
             .join()
             .map_err(|_| anyhow::anyhow!("checkpoint loader thread panicked"))??;
         self.config = config;
+        self.remote_disk = disk;
         self.finalize_load(tensors, metadata);
         Ok(())
     }
@@ -949,9 +965,10 @@ impl Explorer {
     fn load_quiet(&mut self) -> Result<()> {
         self.tensors.clear();
         self.metadata.clear();
-        let (tensors, metadata, config) =
+        let (tensors, metadata, config, disk) =
             Self::gather_checkpoint(&self.files, self.remote_read.as_ref())?;
         self.config = config;
+        self.remote_disk = disk;
         self.finalize_load(tensors, metadata);
         Ok(())
     }
@@ -1352,26 +1369,28 @@ impl Explorer {
     pub(crate) fn gather_checkpoint(
         files: &[PathBuf],
         remote: Option<&crate::remote::RemoteRead>,
-    ) -> Result<(
-        Vec<TensorInfo>,
-        Vec<MetadataInfo>,
-        Option<crate::config::ModelConfig>,
-    )> {
+    ) -> Result<CheckpointParts> {
         let mut tensors: Vec<TensorInfo> = Vec::new();
         let mut metadata: Vec<MetadataInfo> = Vec::new();
         // The checkpoint's `config.json` (for the config-consistency check):
         // fetched over SSH beside the remote read, or read locally below.
         let mut config: Option<crate::config::ModelConfig> = None;
+        // Remote shards' on-disk footprint (local files are statted lazily when
+        // the stats popup opens; the remote session is only live during the read).
+        let mut disk_shards: Vec<crate::stats::ShardDisk> = Vec::new();
         for file_path in files {
             let as_str = file_path.to_string_lossy();
             // `--ssh-read`: every source is read on the remote (an s3:// cstorch
             // checkpoint, or a remote safetensors directory/file), keeping the
             // credentials and data there.
             if let Some(r) = remote {
-                let (t, m, cfg) = r.fetch_with_config(&as_str)?;
+                let (t, m, cfg, disk) = r.fetch_with_config(&as_str)?;
                 tensors.extend(t);
                 metadata.extend(m);
                 config = config.or(cfg);
+                if let Some(d) = disk {
+                    disk_shards.extend(d.shards);
+                }
                 continue;
             }
             // Without --ssh-read a bare s3:// URI has no local credentials to read.
@@ -1412,7 +1431,12 @@ impl Explorer {
         if remote.is_none() {
             config = crate::config::load_local(files);
         }
-        Ok((tensors, metadata, config))
+        Ok((
+            tensors,
+            metadata,
+            config,
+            crate::stats::DiskUsage::from_shards(disk_shards),
+        ))
     }
 
     fn build_tree(&mut self) {
@@ -1638,9 +1662,13 @@ impl Explorer {
                     1,
                 )
             });
-            // `--stats`: composite the checkpoint-stats popup over the tree.
+            // `--stats`: composite the checkpoint-stats popup over the tree. The
+            // on-disk footprint is a live, machine-specific measurement (block
+            // size / ZFS), so it's left out of this deterministic headless render
+            // (`--plain`, `--emit-command`) — the interactive popup and its `r`
+            // report show it.
             let stats = want_stats_popup.then(|| {
-                crate::stats::CheckpointStats::compute(&self.tensors, self.config.as_ref())
+                crate::stats::CheckpointStats::compute(&self.tensors, self.config.as_ref(), None)
             });
             let text = crate::tui::headless_render(120, 40, |f| {
                 self.render_tree_frame(f, false); // headless: no scroll bar
@@ -6056,13 +6084,34 @@ impl Explorer {
         }
     }
 
+    /// The checkpoint's true on-disk footprint for the stats popup. Remote reads
+    /// captured it at load time (the session is gone now); local checkpoints are
+    /// statted here — cheap, and it picks up any change since load.
+    fn disk_usage(&self) -> Option<crate::stats::DiskUsage> {
+        if self.remote_read.is_some() {
+            return self.remote_disk.clone();
+        }
+        let mut paths: Vec<&str> = self
+            .tensors
+            .iter()
+            .map(|t| t.source_path.as_str())
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        crate::stats::DiskUsage::from_local(&paths)
+    }
+
     /// Float the overall-checkpoint stats popup over the tree (the `s` key).
     /// It's read-only: `y` copies the CLI command that reopens it (`--stats`),
     /// `c` copies the whole screen, `Esc` or a click dismisses, Ctrl-C quits; the
     /// body scrolls (↑/↓, PgUp/PgDn, Home/End, wheel) when it's taller than the
     /// popup, and mouse motion keeps the hover bubbles behind it live.
     fn show_stats(&self, term: &mut crate::tui::LiveTerminal) {
-        let stats = crate::stats::CheckpointStats::compute(&self.tensors, self.config.as_ref());
+        let stats = crate::stats::CheckpointStats::compute(
+            &self.tensors,
+            self.config.as_ref(),
+            self.disk_usage(),
+        );
 
         // What was just copied (and when), so the footer can flash it briefly.
         let mut copied_at: Option<(std::time::Instant, &'static str)> = None;
