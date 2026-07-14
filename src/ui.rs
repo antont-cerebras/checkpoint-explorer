@@ -2242,9 +2242,9 @@ fn render_popup_box(
 fn render_readonly_hint(frame: &mut Frame) {
     let area = frame.area();
     let body = [
-        "This tool only ever reads your checkpoint —",
-        "it never writes, modifies, or deletes anything.",
-        "Safe to point at production files, local or remote.",
+        "The checkpoint you open is never modified —",
+        "browsing only ever reads it. (Repack / convert",
+        "write a new file, leaving the original untouched.)",
     ];
     let inner_w = body.iter().map(|l| l.chars().count()).max().unwrap_or(0);
     let box_w = ((inner_w + 4) as u16).min(area.width); // 2 borders + 2 padding
@@ -2572,7 +2572,9 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
                 .fg(palette::SUCCESS)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("      this tool only reads — it never writes, modifies, or deletes your files"),
+        Span::raw(
+            "      browsing never modifies the checkpoint — repack / convert write a new file",
+        ),
     ]));
     lines.push(Line::from(vec![
         Span::raw("  "),
