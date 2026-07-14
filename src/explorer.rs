@@ -655,6 +655,55 @@ impl Explorer {
         self.hovered_shortcut.set(hovered);
     }
 
+    /// Refresh every hover-bubble state from the mouse position `(col, row)` on a
+    /// frame of `width`×`height`: the read-only badge, the health badge (tree
+    /// only), and the footer shortcut chip under the cursor. Called on every
+    /// mouse-move — by the browsing loops *and* the pop-up loops, so the bubbles
+    /// stay live (rather than freezing) while a pop-up floats over the tree.
+    fn update_hovers(&self, ctx: HelpCtx, width: u16, height: u16, col: u16, row: u16) {
+        self.readonly_hover
+            .set(UI::readonly_badge_hit(width, height, col, row));
+        self.health_hover.set(
+            ctx == HelpCtx::Tree
+                && !self.health_reports.is_empty()
+                && UI::health_badge_hit(width, height, col, row),
+        );
+        self.update_shortcut_hover(ctx, col, row);
+    }
+
+    /// Float a tree pop-up until a key or click dismisses it, redrawing `draw`
+    /// each iteration so the underlying hover bubbles stay live: a mouse-move
+    /// refreshes them (read-only / health badge, footer chip) instead of freezing
+    /// whatever the cursor was over when the pop-up opened. Ctrl-C still quits;
+    /// wheel/drag are ignored (so the command text can be selected by hand).
+    fn float_until_dismissed(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        mut draw: impl FnMut(&mut ratatui::Frame),
+    ) {
+        loop {
+            if term.draw(|f| draw(f)).is_err() {
+                return;
+            }
+            match event::read() {
+                Ok(Event::Key(key)) => {
+                    if is_ctrl_c(&key) {
+                        quit_immediately();
+                    }
+                    return;
+                }
+                Ok(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => return,
+                Ok(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Moved) => {
+                    if let Ok(sz) = term.size() {
+                        self.update_hovers(HelpCtx::Tree, sz.width, sz.height, m.column, m.row);
+                    }
+                }
+                Ok(_) => {}       // other mouse / resize: redraw
+                Err(_) => return, // input closed
+            }
+        }
+    }
+
     /// Composite the hovered shortcut's help bubble, if any — drawn last on every
     /// screen so it floats over the footer chips.
     fn render_shortcut_hover(&self, frame: &mut ratatui::Frame) {
@@ -2385,15 +2434,10 @@ impl Explorer {
         } else {
             let command = self.export_command(choice);
             copy_to_clipboard(&command); // the command itself is small — always fits
-            if term
-                .draw(|f| {
-                    self.render_tree_frame(f, true);
-                    UI::render_export_band(f, &command);
-                })
-                .is_ok()
-            {
-                wait_for_dismiss();
-            }
+            self.float_until_dismissed(term, |f| {
+                self.render_tree_frame(f, true);
+                UI::render_export_band(f, &command);
+            });
         }
     }
 
@@ -2731,8 +2775,9 @@ impl Explorer {
                 event::read()?
             };
             // Any input clears a prior layout hint; a fresh wrong-layout key re-sets
-            // it below. A shortcut-help bubble likewise clears on any input and is
-            // re-set only by the mouse-move handler below (so it never lingers).
+            // it below. The shortcut bubble also clears (its chip may not exist on
+            // the next screen); the badge hovers persist and are refreshed by the
+            // mouse-move handler, so they stay live over a pop-up too.
             layout_hint = None;
             self.hovered_shortcut.set(None);
 
@@ -2861,20 +2906,12 @@ impl Explorer {
                         self.copied_flash = None;
                         self.scroll_offset = self.scroll_offset.saturating_sub(WHEEL_STEP)
                     }
-                    // Hovering the read-only badge floats its hint; the health
-                    // badge floats its help bubble; a footer chip floats its own;
-                    // moving off any of them hides it.
+                    // Hovering the read-only / health badge floats its hint; a
+                    // footer chip floats its help; moving off any hides it.
                     MouseEventKind::Moved => {
-                        self.readonly_hover.set(size.is_some_and(|sz| {
-                            UI::readonly_badge_hit(sz.width, sz.height, col, row)
-                        }));
-                        self.health_hover.set(
-                            !self.health_reports.is_empty()
-                                && size.is_some_and(|sz| {
-                                    UI::health_badge_hit(sz.width, sz.height, col, row)
-                                }),
-                        );
-                        self.update_shortcut_hover(HelpCtx::Tree, col, row);
+                        if let Some(sz) = size {
+                            self.update_hovers(HelpCtx::Tree, sz.width, sz.height, col, row);
+                        }
                     }
                     _ => {}
                 }
@@ -4036,15 +4073,17 @@ impl Explorer {
             if fresh {
                 copied_since = None;
             }
-            // The shortcut-help bubble clears on any input, re-set only by the
-            // mouse-move handler below, so it never lingers past a hover.
+            // The shortcut bubble clears on any input (its chip may be gone on the
+            // next screen); the read-only badge hover persists and is refreshed by
+            // the mouse-move handler, so it stays live over an overlay too.
             self.hovered_shortcut.set(None);
             // While a pop-up overlay is up, any key dismisses it (Ctrl-C still
             // quits) rather than acting as a screen command; the loop then
             // redraws the detail without it.
             if overlay.is_some() {
-                // A key or a mouse click dismisses the pop-up; mouse motion / drag
-                // / wheel is ignored so a modifier-drag to select doesn't close it.
+                // A key or a mouse click dismisses the pop-up; motion refreshes the
+                // hover bubbles behind it (so they stay live); drag/wheel are
+                // ignored so a modifier-drag to select doesn't close it.
                 match &ev {
                     Ok(Event::Key(key)) => {
                         if is_ctrl_c(key) {
@@ -4054,6 +4093,17 @@ impl Explorer {
                     }
                     Ok(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => {
                         overlay = None;
+                    }
+                    Ok(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Moved) => {
+                        if let Ok(sz) = term.size() {
+                            self.update_hovers(
+                                HelpCtx::Detail,
+                                sz.width,
+                                sz.height,
+                                m.column,
+                                m.row,
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -4073,12 +4123,16 @@ impl Explorer {
                         // Hovering the read-only badge floats its hint; a footer chip
                         // floats its help bubble; moving off (or any other motion)
                         // hides them again on the next redraw.
-                        if matches!(m.kind, MouseEventKind::Moved) {
-                            let hit = term.size().ok().is_some_and(|sz| {
-                                UI::readonly_badge_hit(sz.width, sz.height, m.column, m.row)
-                            });
-                            self.readonly_hover.set(hit);
-                            self.update_shortcut_hover(HelpCtx::Detail, m.column, m.row);
+                        if matches!(m.kind, MouseEventKind::Moved)
+                            && let Ok(sz) = term.size()
+                        {
+                            self.update_hovers(
+                                HelpCtx::Detail,
+                                sz.width,
+                                sz.height,
+                                m.column,
+                                m.row,
+                            );
                         }
                         continue;
                     }
@@ -4587,8 +4641,9 @@ impl Explorer {
             // quits) rather than acting as a screen command; the loop then redraws
             // the data view without it.
             if overlay.is_some() {
-                // A key or a mouse click dismisses the pop-up; mouse motion / drag
-                // / wheel is ignored so a modifier-drag to select doesn't close it.
+                // A key or a mouse click dismisses the pop-up; motion refreshes the
+                // hover bubbles behind it (so they stay live); drag/wheel are
+                // ignored so a modifier-drag to select doesn't close it.
                 match &pending {
                     Ok(Event::Key(key)) => {
                         if is_ctrl_c(key) {
@@ -4599,14 +4654,20 @@ impl Explorer {
                     Ok(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => {
                         overlay = None;
                     }
+                    Ok(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Moved) => {
+                        if let Ok(sz) = term.size() {
+                            self.update_hovers(HelpCtx::Data, sz.width, sz.height, m.column, m.row);
+                        }
+                    }
                     _ => {}
                 }
                 continue;
             }
             loop {
                 // Any input clears a prior layout hint; a fresh wrong-layout key
-                // re-sets it below. The shortcut-help bubble likewise clears on any
-                // input and is re-set only by the mouse-move handler.
+                // re-sets it below. The shortcut bubble also clears; the read-only
+                // badge hover persists and is refreshed by the mouse-move handler,
+                // so it stays live over an overlay too.
                 layout_hint = None;
                 self.hovered_shortcut.set(None);
                 match pending {
@@ -4859,11 +4920,15 @@ impl Explorer {
                         // Hovering the read-only badge floats its hint; a footer chip
                         // floats its help bubble.
                         MouseEventKind::Moved => {
-                            let hit = term.size().ok().is_some_and(|sz| {
-                                UI::readonly_badge_hit(sz.width, sz.height, m.column, m.row)
-                            });
-                            self.readonly_hover.set(hit);
-                            self.update_shortcut_hover(HelpCtx::Data, m.column, m.row);
+                            if let Ok(sz) = term.size() {
+                                self.update_hovers(
+                                    HelpCtx::Data,
+                                    sz.width,
+                                    sz.height,
+                                    m.column,
+                                    m.row,
+                                );
+                            }
                         }
                         _ => {}
                     },
@@ -5776,16 +5841,11 @@ impl Explorer {
             pause.store(false, Ordering::Relaxed);
         }
         // Float the legend band over a fresh tree frame (the band composites last
-        // so the tree stays visible behind it).
-        if term
-            .draw(|f| {
-                self.render_tree_frame(f, true);
-                UI::render_legend_band(f, legend);
-            })
-            .is_ok()
-        {
-            wait_for_dismiss();
-        }
+        // so the tree stays visible behind it), keeping the hover bubbles live.
+        self.float_until_dismissed(term, |f| {
+            self.render_tree_frame(f, true);
+            UI::render_legend_band(f, legend);
+        });
     }
 
     /// Run the health checks and float the report over the tree: `v` runs the
@@ -5924,9 +5984,15 @@ impl Explorer {
                         _ => layout_hint = wrong_layout_char(&key),
                     }
                 }
-                // Dismiss on a click (Down, not the trailing Up); ignore
-                // motion/drag/wheel/resize.
+                // Dismiss on a click (Down, not the trailing Up).
                 Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => break,
+                // Motion refreshes the hover bubbles behind the popup, so they
+                // stay live; drag/wheel/resize are ignored.
+                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Moved) => {
+                    if let Ok(sz) = term.size() {
+                        self.update_hovers(HelpCtx::Tree, sz.width, sz.height, m.column, m.row);
+                    }
+                }
                 Some(_) => {}
                 None => break,
             }
@@ -6022,18 +6088,13 @@ impl Explorer {
             pause.store(false, Ordering::Relaxed);
         }
         // Float the CLI-command band over a fresh tree frame (composited last so
-        // the tree stays visible behind it).
-        if term
-            .draw(|f| {
-                self.render_tree_frame(f, true);
-                UI::render_command_band(f, command);
-            })
-            .is_ok()
-        {
-            // Wait for a key (mouse events are ignored) so the command text can be
-            // selected with the mouse without the pop-up closing.
-            wait_for_dismiss();
-        }
+        // the tree stays visible behind it), keeping the hover bubbles live. A
+        // key or click dismisses; wheel/drag are ignored so the command text can
+        // still be selected with the mouse without the pop-up closing.
+        self.float_until_dismissed(term, |f| {
+            self.render_tree_frame(f, true);
+            UI::render_command_band(f, command);
+        });
     }
 
     /// The host to fold into an scp-style positional (`host:/path`) so the reopen
