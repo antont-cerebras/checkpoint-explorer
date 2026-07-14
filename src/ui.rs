@@ -1833,11 +1833,14 @@ impl UI {
     /// (so every span sits on the popup's panel background, matching the box) —
     /// coloured marks per check, indented findings, a verdict, and a `state`-driven
     /// footer. While scanning, the "Value scan" row becomes an animated spinner.
+    /// Render the health-check popup, its body scrolled by `scroll` rows (the
+    /// footer stays pinned). Returns the max valid scroll so the caller can clamp.
     pub fn render_check_report(
         frame: &mut Frame,
         report: &crate::check::CheckReport,
         state: CheckPopup,
-    ) {
+        scroll: usize,
+    ) -> usize {
         use crate::check::{Severity, Status, count_phrase, fmt_elapsed};
         let bg = palette::PANEL_BG;
         // Every span carries the panel background, so text and box match.
@@ -1962,10 +1965,15 @@ impl UI {
             verdict,
         ]));
 
-        lines.push(Line::default());
-        lines.push(check_footer_line(&state, bg));
-
-        render_popup_box(frame, "Health check", lines, Backdrop::Float, None);
+        // The key-hint footer stays pinned while the body (checks + findings)
+        // scrolls, so a report with many findings never overflows the popup.
+        render_scroll_popup(
+            frame,
+            "Health check",
+            lines,
+            check_footer_line(&state, bg),
+            scroll,
+        )
     }
 
     /// Borderless band shown when a chosen export is too big for the terminal
@@ -2371,6 +2379,110 @@ fn render_popup_box(
         .style(panel)
         .render(inner, frame.buffer_mut());
     inner
+}
+
+/// A floating popup with a vertically-scrollable `body` and a pinned `footer`
+/// row, sized to fit the frame (never taller than it). `scroll` is the first
+/// visible body row (clamped internally); returns the maximum valid scroll so the
+/// caller can clamp its own offset. When the body overflows, a dim indicator row
+/// (range + scroll keys) sits just above the footer.
+fn render_scroll_popup(
+    frame: &mut Frame,
+    title: &str,
+    body: Vec<Line<'static>>,
+    footer: Line<'static>,
+    scroll: usize,
+) -> usize {
+    let area = frame.area();
+    let panel = Style::default().bg(palette::PANEL_BG);
+    let total = body.len();
+
+    // Height first (independent of width): fit the content, but never taller than
+    // the frame (1-row margin top+bottom). The footer takes the last inner row;
+    // when the body doesn't fit in the rest, reserve one more for the scroll
+    // indicator.
+    let max_box_h = area.height.saturating_sub(2).max(3);
+    let box_h = ((total + 3) as u16).min(max_box_h); // body + footer + 2 borders
+    let inner_h = box_h.saturating_sub(2) as usize;
+    let overflow = total > inner_h.saturating_sub(1);
+    let visible = inner_h.saturating_sub(1 + usize::from(overflow));
+    let max_scroll = total.saturating_sub(visible);
+    let scroll = scroll.min(max_scroll);
+    let indicator = overflow.then(|| {
+        format!(
+            "↑↓ PgUp/PgDn scroll · {}–{} of {total}",
+            scroll + 1,
+            scroll + visible
+        )
+    });
+
+    // Width sizes to the widest of the body, footer, title, and the indicator (so
+    // the indicator isn't clipped when the body lines are short).
+    let inner_w = body
+        .iter()
+        .chain(std::iter::once(&footer))
+        .map(Line::width)
+        .max()
+        .unwrap_or(0)
+        .max(title.chars().count() + 2)
+        .max(
+            indicator
+                .as_deref()
+                .map(str::chars)
+                .map_or(0, |c| c.count()),
+        );
+    let box_w = ((inner_w + 4) as u16).min(area.width); // 2 borders + 2 padding
+
+    let rect = Rect {
+        x: area.width.saturating_sub(box_w) / 2,
+        y: area.height.saturating_sub(box_h) / 2,
+        width: box_w,
+        height: box_h,
+    };
+    Clear.render(rect, frame.buffer_mut());
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(palette::ACCENT))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default()
+                .fg(palette::KEY)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .padding(Padding::horizontal(1))
+        .style(panel);
+    let inner = block.inner(rect);
+    block.render(rect, frame.buffer_mut());
+
+    let window: Vec<Line> = body.into_iter().skip(scroll).take(visible).collect();
+    Paragraph::new(window).style(panel).render(
+        Rect {
+            height: visible as u16,
+            ..inner
+        },
+        frame.buffer_mut(),
+    );
+    if let Some(hint) = indicator {
+        Paragraph::new(Line::from(dim_span(hint)))
+            .style(panel)
+            .render(
+                Rect {
+                    y: inner.y + visible as u16,
+                    height: 1,
+                    ..inner
+                },
+                frame.buffer_mut(),
+            );
+    }
+    Paragraph::new(footer).style(panel).render(
+        Rect {
+            y: inner.y + inner.height - 1,
+            height: 1,
+            ..inner
+        },
+        frame.buffer_mut(),
+    );
+    max_scroll
 }
 
 /// A small hint pop-up for the read-only badge, anchored bottom-right just above
@@ -4755,5 +4867,31 @@ mod tests {
             "that's the read-only badge"
         );
         assert!(!UI::health_badge_hit(8, 40, 4, 39), "too narrow → no badge");
+    }
+
+    #[test]
+    fn scroll_popup_reports_overflow() {
+        let body: Vec<Line> = (0..50).map(|i| Line::from(format!("row {i}"))).collect();
+        let footer = Line::from("footer");
+
+        // Tall frame: the whole body fits → nothing to scroll.
+        let mut fits_max = usize::MAX;
+        crate::tui::headless_render(40, 60, |f| {
+            fits_max = render_scroll_popup(f, "T", body.clone(), footer.clone(), 0);
+        })
+        .unwrap();
+        assert_eq!(fits_max, 0, "a 50-row body in a 60-row frame fits");
+
+        // Short frame: the body overflows → scrollable, and the indicator shows.
+        let mut small_max = 0;
+        let out = crate::tui::headless_render(40, 12, |f| {
+            small_max = render_scroll_popup(f, "T", body.clone(), footer.clone(), 0);
+        })
+        .unwrap();
+        assert!(small_max > 0, "a 50-row body in a 12-row frame must scroll");
+        assert!(
+            strip_ansi_codes(&out).contains("of 50"),
+            "the overflow indicator shows the total:\n{out}"
+        );
     }
 }

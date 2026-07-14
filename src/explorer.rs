@@ -313,6 +313,8 @@ const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 /// Rows the tree viewport scrolls per mouse-wheel notch (independent of the
 /// selection, like a normal scrollable list).
 const WHEEL_STEP: usize = 3;
+/// Rows a PageUp/PageDown scrolls the health-report popup body.
+const SCROLL_PAGE: usize = 10;
 
 /// A statistics scan running on a worker thread for a data view's current
 /// `(tensor, view)`. The view stays fully interactive while it runs; the main
@@ -1642,6 +1644,7 @@ impl Explorer {
                             copied: None,
                             can_scan: false,
                         },
+                        0,
                     );
                 }
             })?;
@@ -5882,6 +5885,10 @@ impl Explorer {
         let mut copied_at: Option<(std::time::Instant, &'static str)> = None;
         // A non-Latin key (wrong keyboard layout) shows a hint, as on other screens.
         let mut layout_hint: Option<char> = None;
+        // First visible body row, and the last-rendered max scroll (set by each
+        // draw, then used to clamp scroll input).
+        let mut scroll = 0usize;
+        let mut scroll_max;
 
         loop {
             let copied = copied_at
@@ -5892,10 +5899,11 @@ impl Explorer {
             let can_scan = self.remote_read.is_none() && !report.values;
             let state = CheckPopup::Idle { copied, can_scan };
             let hint = layout_hint;
+            let max_cell = std::cell::Cell::new(0usize);
             if term
                 .draw(|f| {
                     self.render_tree_frame(f, true);
-                    UI::render_check_report(f, &report, state);
+                    max_cell.set(UI::render_check_report(f, &report, state, scroll));
                     if let Some(c) = hint {
                         UI::render_notice(f, &layout_hint_msg(c));
                     }
@@ -5904,6 +5912,9 @@ impl Explorer {
             {
                 break;
             }
+            // Clamp to what actually fit (the report / terminal size can change).
+            scroll_max = max_cell.get();
+            scroll = scroll.min(scroll_max);
 
             // While the copy flash is up, wake to clear it when it expires; else
             // block until the next event.
@@ -5962,6 +5973,7 @@ impl Explorer {
                                         copied: None,
                                         can_scan,
                                     },
+                                    scroll,
                                 );
                             });
                             if let Ok(text) = screen
@@ -5977,6 +5989,13 @@ impl Explorer {
                                 copied_at = Some((now, "report"));
                             }
                         }
+                        // Scroll the body when the report is taller than the popup.
+                        KeyCode::Up => scroll = scroll.saturating_sub(1),
+                        KeyCode::Down => scroll = (scroll + 1).min(scroll_max),
+                        KeyCode::PageUp => scroll = scroll.saturating_sub(SCROLL_PAGE),
+                        KeyCode::PageDown => scroll = (scroll + SCROLL_PAGE).min(scroll_max),
+                        KeyCode::Home => scroll = 0,
+                        KeyCode::End => scroll = scroll_max,
                         // `Esc` dismisses; other keys are ignored (it's a popup, not
                         // a modal — a stray key shouldn't close it) — but a non-Latin
                         // key (wrong layout) gets the same hint as elsewhere.
@@ -5986,8 +6005,15 @@ impl Explorer {
                 }
                 // Dismiss on a click (Down, not the trailing Up).
                 Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => break,
+                // The wheel scrolls the report body.
+                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::ScrollUp) => {
+                    scroll = scroll.saturating_sub(WHEEL_STEP)
+                }
+                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::ScrollDown) => {
+                    scroll = (scroll + WHEEL_STEP).min(scroll_max)
+                }
                 // Motion refreshes the hover bubbles behind the popup, so they
-                // stay live; drag/wheel/resize are ignored.
+                // stay live; drag/resize are ignored.
                 Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Moved) => {
                     if let Ok(sz) = term.size() {
                         self.update_hovers(HelpCtx::Tree, sz.width, sz.height, m.column, m.row);
@@ -6039,7 +6065,12 @@ impl Explorer {
             if term
                 .draw(|f| {
                     self.render_tree_frame(f, true);
-                    UI::render_check_report(f, report, CheckPopup::Scanning { done, total, frame });
+                    UI::render_check_report(
+                        f,
+                        report,
+                        CheckPopup::Scanning { done, total, frame },
+                        0,
+                    );
                 })
                 .is_err()
             {
