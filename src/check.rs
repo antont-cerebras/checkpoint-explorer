@@ -701,7 +701,11 @@ fn check_layers(tensors: &[TensorInfo]) -> CheckResult {
     const TITLE: &str = "Layer completeness";
     const NOTE: &str = "layer indices contiguous, tensor set uniform across layers";
 
-    // prefix -> (index -> set of per-layer suffixes)
+    // prefix -> (index -> set of per-layer sub-tensor *roles*). The suffix has its
+    // own numeric indices blanked (`role_key`) — chiefly the MoE expert index — so
+    // a layer is compared at the role level: a dense layer among MoE layers reads
+    // as missing one role (`mlp.experts.*.down_proj.weight`), not one finding per
+    // expert (which buried the report under thousands of near-identical lines).
     let mut fam: BTreeMap<String, BTreeMap<usize, BTreeSet<String>>> = BTreeMap::new();
     for t in tensors {
         if let Some((prefix, idx, suffix)) = split_layer_index(&t.name) {
@@ -709,7 +713,7 @@ fn check_layers(tensors: &[TensorInfo]) -> CheckResult {
                 .or_default()
                 .entry(idx)
                 .or_default()
-                .insert(suffix);
+                .insert(role_key(&suffix));
         }
     }
 
@@ -728,13 +732,29 @@ fn check_layers(tensors: &[TensorInfo]) -> CheckResult {
         // Index gaps.
         let missing: Vec<usize> = (0..=max).filter(|i| !idxmap.contains_key(i)).collect();
         if !missing.is_empty() {
-            findings.push(Finding::error(
-                Some(prefix.clone()),
-                format!(
-                    "{prefix}.*: missing layer {} (present 0–{max})",
-                    fmt_indices(&missing)
-                ),
-            ));
+            // The subject already names the stack — the message needn't repeat it.
+            let subject = Some(format!("{prefix}.*"));
+            let gaps = fmt_indices(&missing);
+            // Show the indices that *are* present (run-collapsed), not the `0–max`
+            // extent: `0–2` would read as if 1 were present too, contradicting the
+            // gap it's reporting.
+            let present: Vec<usize> = idxmap.keys().copied().collect();
+            let have = fmt_indices(&present);
+            // A gap in the transformer block stack (`…layers.<i>`) is a dropped
+            // layer — a real error. A gap in some *other* indexed stack (e.g. an
+            // `nn.Sequential` projector) is usually just a paramless module, which
+            // stores no tensors — a soft warning, not a failure.
+            if prefix.rsplit('.').next() == Some("layers") {
+                findings.push(Finding::error(
+                    subject,
+                    format!("missing layer {gaps} (have {have})"),
+                ));
+            } else {
+                findings.push(Finding::warning(
+                    subject,
+                    format!("index {gaps} absent (have {have}) — may be a paramless module"),
+                ));
+            }
         }
 
         // Per-layer uniformity, measured against the most common sub-tensor set.
@@ -753,9 +773,11 @@ fn check_layers(tensors: &[TensorInfo]) -> CheckResult {
                 .map(|(&i, _)| i)
                 .collect();
             if !absent.is_empty() {
+                // The subject names the role; the message needn't repeat it (that
+                // doubled the line length and truncated the report).
                 findings.push(Finding::warning(
                     Some(format!("{prefix}.*.{suffix}")),
-                    format!("layer {} missing '{suffix}'", fmt_indices(&absent)),
+                    format!("missing from layer {}", fmt_indices(&absent)),
                 ));
             }
         }
@@ -1357,7 +1379,9 @@ mod tests {
         let r = check_layers(&tensors);
         assert_eq!(r.errors(), 0);
         assert_eq!(r.warnings(), 1);
-        assert!(r.findings.iter().any(|f| f.message.contains("attn.weight")));
+        assert!(r.findings.iter().any(|f| f.subject.as_deref()
+            == Some("model.layers.*.attn.weight")
+            && f.message.contains("missing from layer 2")));
     }
 
     #[test]
@@ -1420,6 +1444,68 @@ mod tests {
         let r = check_layers(&tensors);
         assert!(r.applicable); // no longer n/a
         assert_eq!(r.findings.len(), 0); // both layers present and uniform
+    }
+
+    #[test]
+    fn layers_collapse_expert_indices_in_moe() {
+        // A dense layer 0 among MoE layers 1–2 (4 experts × 2 projs each). The
+        // uniformity check collapses expert indices to a role, so layer 0 reads as
+        // missing 2 roles (down_proj, gate_proj) — not 8 individual expert tensors,
+        // which used to bury the report under thousands of near-identical lines.
+        let mut tensors = Vec::new();
+        for l in [0, 1, 2] {
+            tensors.push(ti(
+                &format!("model.layers.{l}.self_attn.q_proj.weight"),
+                "F16",
+                &[4, 4],
+            ));
+        }
+        for l in [1, 2] {
+            for e in 0..4 {
+                for proj in ["down_proj", "gate_proj"] {
+                    tensors.push(ti(
+                        &format!("model.layers.{l}.mlp.experts.{e}.{proj}.weight"),
+                        "F16",
+                        &[4, 4],
+                    ));
+                }
+            }
+        }
+        let r = check_layers(&tensors);
+        assert!(r.applicable);
+        assert_eq!(r.errors(), 0, "layer indices 0–2 are contiguous");
+        assert_eq!(
+            r.warnings(),
+            2,
+            "one warning per expert *role*, not per expert"
+        );
+        assert!(
+            r.findings.iter().all(|f| f
+                .subject
+                .as_deref()
+                .is_some_and(|s| s.contains("mlp.experts.*"))),
+            "findings name the collapsed role in the subject"
+        );
+    }
+
+    #[test]
+    fn layers_gap_in_a_non_block_stack_is_a_soft_warning() {
+        // A projector `nn.Sequential` with a paramless module at index 1 (stores
+        // no tensors): only 0 and 2 are present. That gap is a warning, not the
+        // dropped-layer error a gap in the `…layers.<i>` block stack would be.
+        let tensors = vec![
+            ti("mm_projector.proj.0.weight", "F16", &[4, 4]),
+            ti("mm_projector.proj.2.weight", "F16", &[4, 4]),
+        ];
+        let r = check_layers(&tensors);
+        assert!(r.applicable);
+        assert_eq!(r.errors(), 0, "a non-'layers' stack gap isn't a hard error");
+        assert_eq!(r.warnings(), 1);
+        let msg = &r.findings[0].message;
+        assert!(msg.contains("paramless"), "{msg}");
+        // Names the indices actually present, not a `0–2` span that would read as
+        // if 1 (the absent one) were present too.
+        assert!(msg.contains("have 0, 2") && !msg.contains("0–2"), "{msg}");
     }
 
     #[test]
