@@ -11,8 +11,8 @@ R repack · q q╭ Checkpoint stats ──────────────�
   ▸ 🔧 Metadat│   Size         1.2 KiB on disk · 2.0 KiB logical (1.65× smaller)                         │
   · lm_head.we│                                                                                          │
   ▾ model (▦ 2│ ▤ Files  ×1                                                                              │
-    · embed_to│   Largest      2.0 KiB                                                                   │
-    ▸ layers (│   Smallest     2.0 KiB                                                                   │
+    · embed_to│   Largest      2.0 KiB   [FIXTURE]                                                       │
+    ▸ layers (│   Smallest     2.0 KiB   [FIXTURE]                                                       │
     · norm.wei│   Average      2.0 KiB                                                                   │
     · scale.i8│   Median       2.0 KiB                                                                   │
               │                                                                                          │

@@ -115,8 +115,10 @@ pub struct FileStats {
     pub count: usize,
     /// Singular noun for a file — "safetensors file" vs. a plain "file".
     pub noun: &'static str,
-    pub largest: usize,
-    pub smallest: usize,
+    /// Largest / smallest file by logical size, named (the shard basename) like
+    /// the per-tensor rows. `None` only when there are no files.
+    pub largest: Option<NamedSize>,
+    pub smallest: Option<NamedSize>,
     pub mean: usize,
     pub median: usize,
 }
@@ -249,15 +251,21 @@ impl CheckpointStats {
         } else {
             "file"
         };
-        let mut file_sizes: Vec<usize> = per_file.into_values().collect();
-        file_sizes.sort_unstable();
+        // Sort by size, breaking ties by path so the named largest/smallest are
+        // deterministic (the map's iteration order isn't).
+        let mut sized: Vec<(&str, usize)> = per_file.into_iter().collect();
+        sized.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+        let named = |&(path, bytes): &(&str, usize)| NamedSize {
+            name: shard_name(path),
+            bytes,
+        };
         let files = FileStats {
-            count: file_sizes.len(),
+            count: sized.len(),
             noun,
-            largest: file_sizes.last().copied().unwrap_or(0),
-            smallest: file_sizes.first().copied().unwrap_or(0),
-            mean: logical_bytes.checked_div(file_sizes.len()).unwrap_or(0),
-            median: file_sizes.get(file_sizes.len() / 2).copied().unwrap_or(0),
+            largest: sized.last().map(named),
+            smallest: sized.first().map(named),
+            mean: logical_bytes.checked_div(sized.len()).unwrap_or(0),
+            median: sized.get(sized.len() / 2).map(|&(_, s)| s).unwrap_or(0),
         };
 
         let largest = tensors
@@ -356,8 +364,18 @@ impl CheckpointStats {
             "{GLYPH_FILES} Files  ×{} {}",
             self.files.count, self.files.noun
         ));
-        out.push(row("Largest", format_size(self.files.largest)));
-        out.push(row("Smallest", format_size(self.files.smallest)));
+        if let Some(l) = &self.files.largest {
+            out.push(row(
+                "Largest",
+                format!("{:<9} {}", format_size(l.bytes), l.name),
+            ));
+        }
+        if let Some(sm) = &self.files.smallest {
+            out.push(row(
+                "Smallest",
+                format!("{:<9} {}", format_size(sm.bytes), sm.name),
+            ));
+        }
         out.push(row("Average", format_size(self.files.mean)));
         out.push(row("Median", format_size(self.files.median)));
 
@@ -645,6 +663,35 @@ mod tests {
         assert_eq!(s.smallest.unwrap().name, "small");
         assert_eq!(s.mean_bytes, 40_408 / 3);
         assert_eq!(s.median_bytes, 400); // middle of {8, 400, 40000}
+    }
+
+    #[test]
+    fn file_extremes_are_named() {
+        // A tensor of `elems` F32 elements (4 B each) living in shard `path`.
+        let at = |name: &str, elems: usize, path: &str| TensorInfo {
+            name: name.into(),
+            dtype: "F32".into(),
+            shape: vec![elems],
+            size_bytes: elems * 4,
+            num_elements: elems,
+            storage: Storage::Unknown,
+            source_path: path.into(),
+            layout: Layout::None,
+        };
+        // Two shards of different total size — the file stats name each (by
+        // basename), like the per-tensor largest/smallest rows.
+        let tensors = vec![
+            at("a", 1000, "/m/model-00001-of-00002.safetensors"), // 4000 B
+            at("b", 10, "/m/model-00002-of-00002.safetensors"),   // 40 B
+        ];
+        let s = CheckpointStats::compute(&tensors, None, None);
+        assert_eq!(s.files.count, 2);
+        let largest = s.files.largest.unwrap();
+        assert_eq!(largest.name, "model-00001-of-00002.safetensors");
+        assert_eq!(largest.bytes, 4000);
+        let smallest = s.files.smallest.unwrap();
+        assert_eq!(smallest.name, "model-00002-of-00002.safetensors");
+        assert_eq!(smallest.bytes, 40);
     }
 
     #[test]
