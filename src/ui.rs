@@ -2638,7 +2638,10 @@ fn check_footer_line(state: &CheckPopup, fold: Option<bool>, bg: Color) -> Line<
                 .bg(bg),
         )
     };
+    // Descriptions in the default foreground, only " · "/"cancel"-style connective
+    // text dimmed — matching the tree view's footer style.
     let dim = |s: &str| Span::styled(s.to_string(), Style::default().fg(palette::DIM).bg(bg));
+    let label = |s: &str| Span::styled(s.to_string(), Style::default().bg(bg));
     match *state {
         CheckPopup::Scanning { done, total, .. } => {
             const W: usize = 18;
@@ -2658,7 +2661,7 @@ fn check_footer_line(state: &CheckPopup, fold: Option<bool>, bg: Color) -> Line<
                 ),
                 Span::styled(format!("  {done}/{total}   "), Style::default().bg(bg)),
                 key("Esc"),
-                dim(" cancel"),
+                label(" cancel"),
             ])
         }
         CheckPopup::Idle {
@@ -2685,12 +2688,12 @@ fn check_footer_line(state: &CheckPopup, fold: Option<bool>, bg: Color) -> Line<
             items.push(("y", " copy command"));
             items.push(("Esc", " dismiss"));
             let mut spans = Vec::new();
-            for (i, (k, label)) in items.iter().enumerate() {
+            for (i, (k, lbl)) in items.iter().enumerate() {
                 if i > 0 {
                     spans.push(dim(" · "));
                 }
                 spans.push(key(k));
-                spans.push(dim(label));
+                spans.push(label(lbl));
             }
             Line::from(spans)
         }
@@ -2714,7 +2717,10 @@ fn stats_footer_line(copied: Option<&'static str>, fold: Option<bool>, bg: Color
                 .bg(bg),
         )
     };
+    // Descriptions in the default foreground and only the " · " separators dimmed,
+    // matching the tree view's footer (the other footers follow its style).
     let dim = |s: &str| Span::styled(s.to_string(), Style::default().fg(palette::DIM).bg(bg));
+    let label = |s: &str| Span::styled(s.to_string(), Style::default().bg(bg));
     let mut items: Vec<(&str, &str)> = Vec::new();
     // The per-shard fold key, when there's a breakdown to fold — a footer hint
     // (not inline) so it matches the other keys and stays visible either way.
@@ -2728,12 +2734,12 @@ fn stats_footer_line(copied: Option<&'static str>, fold: Option<bool>, bg: Color
     items.push(("y", " copy command"));
     items.push(("Esc", " dismiss"));
     let mut spans = Vec::new();
-    for (i, (k, label)) in items.iter().enumerate() {
+    for (i, (k, lbl)) in items.iter().enumerate() {
         if i > 0 {
             spans.push(dim(" · "));
         }
         spans.push(key(k));
-        spans.push(dim(label));
+        spans.push(label(lbl));
     }
     Line::from(spans)
 }
@@ -3091,6 +3097,19 @@ fn render_bottom_band(frame: &mut Frame, prompt: Line<'static>, feedback: Line<'
     if area.height < 2 {
         return;
     }
+    // Clear the two rows first: the band overlays the live data view, whose own
+    // footer sits on these same rows. A `Paragraph` only paints its glyphs, so
+    // without this the footer bled through past the (often shorter) band text —
+    // e.g. the dtype menu left "…irst/last rows" showing behind it.
+    Clear.render(
+        Rect {
+            x: 0,
+            y: area.height - 2,
+            width: area.width,
+            height: 2,
+        },
+        frame.buffer_mut(),
+    );
     Paragraph::new(prompt).render(
         Rect {
             x: 0,
@@ -5018,6 +5037,50 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn bottom_band_clears_the_rows_it_overlays() {
+        // The band (dtype menu / slice / reshape prompts) overlays the live data
+        // view, whose footer sits on the same bottom rows. It must clear them, or
+        // the footer bleeds through past the shorter band text.
+        let out = crate::tui::headless_render(80, 8, |f| {
+            let a = f.area();
+            let footer = "LEFT_edge_of_footer ······································· TAIL_MARKER";
+            Paragraph::new(footer).render(
+                Rect {
+                    x: 0,
+                    y: a.height - 2,
+                    width: a.width,
+                    height: 1,
+                },
+                f.buffer_mut(),
+            );
+            Paragraph::new("SECOND_ROW_MARKER").render(
+                Rect {
+                    x: 0,
+                    y: a.height - 1,
+                    width: a.width,
+                    height: 1,
+                },
+                f.buffer_mut(),
+            );
+            render_bottom_band(f, Line::from("short prompt"), Line::from("short feedback"));
+        })
+        .unwrap();
+        assert!(out.contains("short prompt"), "band prompt shown:\n{out}");
+        assert!(
+            out.contains("short feedback"),
+            "band feedback shown:\n{out}"
+        );
+        assert!(
+            !out.contains("TAIL_MARKER"),
+            "footer tail bled through the band:\n{out}"
+        );
+        assert!(
+            !out.contains("SECOND_ROW_MARKER"),
+            "footer second row bled through the band:\n{out}"
+        );
     }
 
     #[test]
