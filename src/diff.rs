@@ -117,32 +117,53 @@ fn totals_line(
 }
 
 /// Render a changed tensor's `old` and `new` signatures, colouring only what
-/// actually differs — the dtype (if it changed) and the individual shape
-/// dimensions that changed — old side red, new green, so the eye lands on the
-/// change. When the ranks differ the whole shape is coloured (dims don't line up).
-/// No colour when `color` is off.
+/// actually differs — the dtype (if it changed) and the shape dimensions that
+/// changed — old side red, new green, so the eye lands on the change.
+///
+/// The shape diff is **squeeze-aware**: `size-1` dimensions are "impedance" (an
+/// export/packing artefact — e.g. `(7168, 8192)` vs `(7168, 1, 36864)`), so they
+/// don't count as a shape change. The real dimensions are aligned ignoring the
+/// singletons — so here only `8192 → 36864` is coloured, `7168` stays plain, and
+/// the inserted `1` is dimmed — instead of the whole shape reading as changed just
+/// because the rank differs. Only when the *squeezed* ranks differ (a genuine
+/// rank change) is the whole shape coloured. No colour when `color` is off.
 fn render_change(old: &TensorSig, new: &TensorSig, color: bool) -> (String, String) {
     let dtype_changed = old.dtype != new.dtype;
-    let same_rank = old.shape.len() == new.shape.len();
-    let one = |sig: &TensorSig, other: &[usize], code: &str| {
+    let squeeze =
+        |shape: &[usize]| -> Vec<usize> { shape.iter().copied().filter(|&d| d != 1).collect() };
+    let old_sq = squeeze(&old.shape);
+    let new_sq = squeeze(&new.shape);
+    // Real dims line up only when the same number survive the squeeze.
+    let aligned = old_sq.len() == new_sq.len();
+    let one = |sig: &TensorSig, other_sq: &[usize], code: &str| {
         let dtype = paint(&sig.dtype, color && dtype_changed, code);
         let shape = if !color {
             format_shape(&sig.shape)
-        } else if !same_rank {
+        } else if !aligned {
+            // Genuine rank change (beyond singletons) — dims don't line up.
             paint(&format_shape(&sig.shape), true, code)
         } else {
-            // Colour each dimension only where it differs from the other side.
+            // Walk the real (non-1) dims against the other side's real dims; a
+            // size-1 dim is dimmed impedance, never a change.
+            let mut i = 0;
             let dims: Vec<String> = sig
                 .shape
                 .iter()
-                .zip(other)
-                .map(|(d, o)| paint(&d.to_string(), d != o, code))
+                .map(|&d| {
+                    if d == 1 {
+                        paint("1", true, DIM)
+                    } else {
+                        let differs = other_sq.get(i) != Some(&d);
+                        i += 1;
+                        paint(&d.to_string(), differs, code)
+                    }
+                })
                 .collect();
             format!("({})", dims.join(", "))
         };
         format!("{dtype} {shape}")
     };
-    (one(old, &new.shape, RED), one(new, &old.shape, GREEN))
+    (one(old, &new_sq, RED), one(new, &old_sq, GREEN))
 }
 
 /// Split a name into a template (each run of digits → a `{}` placeholder) and the
@@ -1714,6 +1735,35 @@ mod tests {
         let (o, _n) = render_change(&sig("F16", &[4, 8]), &sig("F16", &[2, 8]), true);
         assert!(!o.contains(&format!("{RED}F16"))); // dtype unchanged → not coloured
         assert!(o.contains(&format!("({RED}4{RESET}, 8)"))); // only dim0 coloured
+    }
+
+    #[test]
+    fn change_treats_size_one_dims_as_impedance_not_a_shape_change() {
+        // (7168, 8192) → (7168, 1, 36864): the inserted `1` is an artefact, so the
+        // real dims align as 7168↔7168 (same) and 8192↔36864 (changed).
+        let (o, n) = render_change(
+            &sig("BF16", &[7168, 8192]),
+            &sig("F16", &[7168, 1, 36864]),
+            true,
+        );
+        // 7168 is unchanged on both sides — plain, not coloured.
+        assert!(o.contains("(7168, ") && n.contains("(7168, "));
+        assert!(!o.contains(&format!("{RED}7168")) && !n.contains(&format!("{GREEN}7168")));
+        // Only the genuinely different dim is coloured.
+        assert!(o.contains(&format!("{RED}8192{RESET}")));
+        assert!(n.contains(&format!("{GREEN}36864{RESET}")));
+        // The singleton is dimmed impedance, not a green "added" dim.
+        assert!(n.contains(&format!("{DIM}1{RESET}")));
+        assert!(!n.contains(&format!("{GREEN}1{RESET}")));
+    }
+
+    #[test]
+    fn change_colours_whole_shape_only_on_a_real_rank_change() {
+        // A rank change that survives the squeeze (2 real dims → 3) still colours
+        // the whole shape, since the dimensions genuinely don't line up.
+        let (o, n) = render_change(&sig("F16", &[4, 8]), &sig("F16", &[4, 8, 2]), true);
+        assert!(o.contains(&format!("{RED}(4, 8){RESET}")));
+        assert!(n.contains(&format!("{GREEN}(4, 8, 2){RESET}")));
     }
 
     #[test]
