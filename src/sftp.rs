@@ -334,8 +334,12 @@ fn authenticate(
     if methods.contains("password") {
         let pw = match password {
             Some(p) => p.clone(),
-            None => rpassword::prompt_password(format!("{user}@{host}'s password: "))
-                .context("reading password")?,
+            None => {
+                let pw = rpassword::prompt_password(format!("{user}@{host}'s password: "))
+                    .context("reading password")?;
+                reset_prompt_column();
+                pw
+            }
         };
         if session.userauth_password(user, &pw).is_ok() && session.authenticated() {
             *password = Some(pw);
@@ -397,6 +401,7 @@ impl ssh2::KeyboardInteractivePrompt for Prompter<'_> {
                     cached.clone()
                 } else {
                     let entered = rpassword::prompt_password(p.text.as_ref()).unwrap_or_default();
+                    reset_prompt_column();
                     *self.password = Some(entered.clone());
                     entered
                 }
@@ -489,6 +494,23 @@ fn merge_shard_lists(indexed: &[String], on_disk: &[String], listed: bool) -> Ve
         }
     }
     files
+}
+
+/// After an interactive password prompt, return the cursor to column 0.
+///
+/// `rpassword` ends the prompt by writing a bare line-feed as it restores the
+/// terminal — with `OPOST`/`ONLCR` off, that drops the cursor to the next row but
+/// keeps the prompt's *column*. The following "reading …" notice would then print
+/// indented under the prompt instead of at the left margin (the progress-bar
+/// frames start with their own `\r`, so only the notice is affected). A carriage
+/// return fixes it; it's a no-op when the prompt already returned to column 0.
+/// Only on a terminal, so a redirected stderr log gets no stray control byte.
+fn reset_prompt_column() {
+    if std::io::stderr().is_terminal() {
+        let mut err = std::io::stderr();
+        let _ = err.write_all(b"\r");
+        let _ = err.flush();
+    }
 }
 
 /// Wrap a string in single quotes for a POSIX shell, escaping any embedded
