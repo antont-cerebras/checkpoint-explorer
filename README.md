@@ -508,9 +508,9 @@ popup summarising the whole model at a glance:
   overall and per shard. Unlike every count above (which is logical: shape ×
   dtype), this reflects **filesystem compression (ZFS/btrfs) and sparse-file
   holes** — so a mostly-zero checkpoint that squashes on ZFS shows its real disk
-  usage. The per-shard list is **folded by default** (press `f`, or click the
-  row, to expand) and lists only the shards the filesystem actually shrank,
-  folding the rest into a count. For `--ssh-read` dirs it's measured by a single
+  usage. The per-shard list is **folded by default** to a one-line summary
+  (`N of M smaller`); press `f`, or click the row, to expand it to **every**
+  shard's apparent → allocated size. For `--ssh-read` dirs it's measured by a single
   read-only `stat` on the remote host (SFTP carries no block count); it's omitted
   for `s3://` and in the deterministic `--plain` render (a live measurement isn't
   reproducible).

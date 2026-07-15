@@ -2307,8 +2307,11 @@ impl UI {
                     dim(tail),
                 ]));
                 if shards_expanded {
-                    let nw = savers.iter().map(|sh| sh.name.len()).max().unwrap_or(0);
-                    for sh in &savers {
+                    // Unfolding shows *every* shard (savers and not) — the folded
+                    // summary already gave the "N of M smaller" headline, so the
+                    // expanded view is the full breakdown, not a filtered one.
+                    let nw = d.shards.iter().map(|sh| sh.name.len()).max().unwrap_or(0);
+                    for sh in &d.shards {
                         lines.push(Line::from(vec![
                             sty(
                                 format!("    {:<nw$}  ", sh.name),
@@ -2322,13 +2325,6 @@ impl UI {
                                 crate::stats::ratio_phrase(sh.apparent, sh.allocated)
                             )),
                         ]));
-                    }
-                    let hidden = d.shards.len() - savers.len();
-                    if hidden > 0 {
-                        lines.push(Line::from(dim(format!(
-                            "    … {hidden} shard{} with no filesystem saving",
-                            if hidden == 1 { "" } else { "s" }
-                        ))));
                     }
                 }
             }
@@ -5115,7 +5111,7 @@ mod tests {
         ]);
         let stats = CheckpointStats::compute(&tensors, None, disk);
 
-        // Expanded: only the real saver is listed; the untouched shard is a count.
+        // Expanded: *every* shard is listed — the saver and the untouched one.
         let expanded = crate::tui::headless_render(100, 50, |f| {
             UI::render_stats(f, &stats, None, 0, true);
         })
@@ -5124,9 +5120,9 @@ mod tests {
         assert!(expanded.contains("Allocated"), "{expanded}");
         assert!(expanded.contains("shard-saver.safetensors"), "{expanded}");
         assert!(expanded.contains("4.00×"), "{expanded}");
-        assert!(!expanded.contains("shard-plain"), "{expanded}");
+        assert!(expanded.contains("shard-plain.safetensors"), "{expanded}");
         assert!(
-            expanded.contains("1 shard with no filesystem saving"),
+            !expanded.contains("shard with no filesystem saving"),
             "{expanded}"
         );
 
