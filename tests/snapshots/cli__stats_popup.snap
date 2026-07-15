@@ -13,8 +13,8 @@ q quit
   ▾ model (▦ 6, 240 B)      │   Size         272 B                                         │
     · embed_tokens.weight [F│                                                              │
     ▸ layers.0 (▦ 3, 168 B) │ ▤ Files  ×1 safetensors                                      │
-    · norm.weight [F32, (4),│   Largest      272 B                                         │
-    · scale.u8 [U8, (8), 8 B│   Smallest     272 B                                         │
+    · norm.weight [F32, (4),│   Largest      272 B     [FIXTURE]                    │
+    · scale.u8 [U8, (8), 8 B│   Smallest     272 B     [FIXTURE]                    │
                             │   Average      272 B                                         │
                             │   Median       272 B                                         │
                             │                                                              │

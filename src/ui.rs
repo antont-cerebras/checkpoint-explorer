@@ -2171,8 +2171,20 @@ impl UI {
             format!("×{}", s.files.count),
             kind,
         ));
-        lines.push(row("Largest", vec![plain(format_size(s.files.largest))]));
-        lines.push(row("Smallest", vec![plain(format_size(s.files.smallest))]));
+        // A `size  name` value, size padded and the name dimmed — shared by the
+        // per-file and per-tensor largest/smallest rows so they read alike.
+        let named = |n: &crate::stats::NamedSize| {
+            vec![
+                plain(format!("{:<9} ", format_size(n.bytes))),
+                dim(n.name.clone()),
+            ]
+        };
+        if let Some(l) = &s.files.largest {
+            lines.push(row("Largest", named(l)));
+        }
+        if let Some(sm) = &s.files.smallest {
+            lines.push(row("Smallest", named(sm)));
+        }
         lines.push(row("Average", vec![plain(format_size(s.files.mean))]));
         lines.push(row("Median", vec![plain(format_size(s.files.median))]));
 
@@ -2184,12 +2196,6 @@ impl UI {
             format!("×{}", s.n_tensors),
             "",
         ));
-        let named = |n: &crate::stats::NamedSize| {
-            vec![
-                plain(format!("{:<9} ", format_size(n.bytes))),
-                dim(n.name.clone()),
-            ]
-        };
         if let Some(l) = &s.largest {
             lines.push(row("Largest", named(l)));
         }
