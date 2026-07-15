@@ -172,6 +172,7 @@ impl RemoteRead {
         // Now the shard count is known — the bar switches from spinner to filling.
         if let Some(p) = progress {
             p.set_total(files.len());
+            p.set_unit(crate::progress::Unit::Shards);
         }
         // Stamp each tensor with *its own* shard's scp-style path (not the dir), so
         // the status line / `f` shows the exact file and it's usable with scp.
@@ -266,6 +267,7 @@ impl RemoteRead {
             {
                 p.set_total(total);
                 p.set_done(done);
+                p.set_unit(crate::progress::Unit::Tensors);
             }
         })?;
         let json = out

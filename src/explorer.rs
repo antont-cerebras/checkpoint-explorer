@@ -261,6 +261,9 @@ pub struct OpenRequest {
     /// Open straight into the checkpoint-stats popup on the tree (`--stats`, the
     /// `s` key). Part of `y`'s round-trip: the popup's `y` copies this command.
     pub stats: bool,
+    /// Like `stats`, but with the on-disk per-shard breakdown expanded
+    /// (`--stats-shards`, the popup's `f` toggle). Round-trips through `y`.
+    pub stats_shards: bool,
     /// Render the view once and exit without interactive navigation.
     pub exit_after: bool,
 }
@@ -598,6 +601,9 @@ pub struct Explorer {
     /// Whether the mouse is hovering the `⚠ index` health badge, floating its
     /// help bubble. Toggled by the tree loop on mouse-move.
     health_hover: Cell<bool>,
+    /// Whether the mouse is hovering the `metadata-only` badge (remote only),
+    /// floating its help bubble. Toggled by the tree loop on mouse-move.
+    metadata_hover: Cell<bool>,
 }
 
 impl Explorer {
@@ -663,6 +669,7 @@ impl Explorer {
             readonly_hover: Cell::new(false),
             hovered_shortcut: Cell::new(None),
             health_hover: Cell::new(false),
+            metadata_hover: Cell::new(false),
         }
     }
 
@@ -687,6 +694,11 @@ impl Explorer {
             ctx == HelpCtx::Tree
                 && !self.health_reports.is_empty()
                 && UI::health_badge_hit(width, height, col, row),
+        );
+        self.metadata_hover.set(
+            ctx == HelpCtx::Tree
+                && self.remote_read.is_some()
+                && UI::metadata_badge_hit(width, height, !self.health_reports.is_empty(), col, row),
         );
         self.update_shortcut_hover(ctx, col, row);
     }
@@ -1607,7 +1619,8 @@ impl Explorer {
         };
         let want_legend = self.open.as_ref().is_some_and(|r| r.legend);
         let want_health = self.open.as_ref().is_some_and(|r| r.health);
-        let want_stats_popup = self.open.as_ref().is_some_and(|r| r.stats);
+        let want_stats_shards = self.open.as_ref().is_some_and(|r| r.stats_shards);
+        let want_stats_popup = want_stats_shards || self.open.as_ref().is_some_and(|r| r.stats);
         if let Some(n) = bins {
             self.histogram_bins.set(Some(n));
         }
@@ -1634,7 +1647,14 @@ impl Explorer {
                 cmd = format!("{cmd} --health");
             }
             if want_stats_popup {
-                cmd = format!("{cmd} --stats");
+                cmd = format!(
+                    "{cmd} {}",
+                    if want_stats_shards {
+                        "--stats-shards"
+                    } else {
+                        "--stats"
+                    }
+                );
             }
             println!("{cmd}");
             return Ok(());
@@ -1687,7 +1707,7 @@ impl Explorer {
                     );
                 }
                 if let Some(stats) = &stats {
-                    UI::render_stats(f, stats, None, 0);
+                    UI::render_stats(f, stats, None, 0, want_stats_shards);
                 }
             })?;
             println!("{text}");
@@ -1950,7 +1970,8 @@ impl Explorer {
 
         // `--health` / `--stats` open straight into their popup once the tree is up.
         let want_health = self.open.as_ref().is_some_and(|r| r.health);
-        let want_stats_popup = self.open.as_ref().is_some_and(|r| r.stats);
+        let want_stats_shards = self.open.as_ref().is_some_and(|r| r.stats_shards);
+        let want_stats_popup = want_stats_shards || self.open.as_ref().is_some_and(|r| r.stats);
 
         // A `--tensor` request seeds the history with that screen — or, with
         // `--exit`, renders it once and quits without entering the navigator.
@@ -2005,7 +2026,7 @@ impl Explorer {
         if want_stats_popup {
             self.ensure_full_load()?;
             let mut term = self.terminal.take().expect("interactive loop owns it");
-            self.show_stats(&mut term);
+            self.show_stats(&mut term, want_stats_shards);
             self.terminal = Some(term);
         }
 
@@ -2109,6 +2130,7 @@ impl Explorer {
             interactive,
             readonly_hover: self.readonly_hover.get(),
             health_hover: self.health_hover.get(),
+            metadata_hover: self.metadata_hover.get(),
         };
         *self.clickable.borrow_mut() = UI::render_tree(frame, &config);
         self.render_shortcut_hover(frame);
@@ -2714,13 +2736,7 @@ impl Explorer {
     }
 
     fn update_tree_scroll(&mut self, width: u16, height: u16) {
-        let body = UI::tree_visible_rows(
-            width,
-            height,
-            self.search_mode,
-            self.can_repack(),
-            self.remote_read.is_some(),
-        );
+        let body = UI::tree_visible_rows(width, height, self.search_mode, self.can_repack());
         let sel = self.selected_idx;
         self.scroll_offset = if sel >= self.scroll_offset + body {
             sel.saturating_sub(body - 1)
@@ -2799,7 +2815,6 @@ impl Explorer {
                         sz.height,
                         self.search_mode,
                         self.can_repack(),
-                        self.remote_read.is_some(),
                     );
                     let total = self.current_tree_len();
                     self.scroll_offset = self.scroll_offset.min(total.saturating_sub(body));
@@ -2857,7 +2872,6 @@ impl Explorer {
                                 sz.height,
                                 self.search_mode,
                                 self.can_repack(),
-                                self.remote_read.is_some(),
                                 self.current_tree_len(),
                             )
                             && sb.hit(col, row)
@@ -2939,7 +2953,6 @@ impl Explorer {
                                 sz.height,
                                 self.search_mode,
                                 self.can_repack(),
-                                self.remote_read.is_some(),
                                 self.current_tree_len(),
                             )
                         {
@@ -3058,7 +3071,7 @@ impl Explorer {
                         ..
                     } if !self.search_mode => {
                         let mut term = self.terminal.take().expect("interactive loop owns it");
-                        self.show_stats(&mut term);
+                        self.show_stats(&mut term, false);
                         self.terminal = Some(term);
                     }
                     // `l` opens the legend for the tree's glyphs.
@@ -3334,7 +3347,7 @@ impl Explorer {
     /// matches what's currently visible.
     fn page_rows(&self) -> usize {
         let height = terminal::size().map(|(_, h)| h).unwrap_or(40);
-        UI::visible_tree_rows(height, self.remote_read.is_some())
+        UI::visible_tree_rows(height)
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -6102,11 +6115,14 @@ impl Explorer {
     }
 
     /// Float the overall-checkpoint stats popup over the tree (the `s` key).
-    /// It's read-only: `y` copies the CLI command that reopens it (`--stats`),
-    /// `c` copies the whole screen, `Esc` or a click dismisses, Ctrl-C quits; the
-    /// body scrolls (↑/↓, PgUp/PgDn, Home/End, wheel) when it's taller than the
-    /// popup, and mouse motion keeps the hover bubbles behind it live.
-    fn show_stats(&self, term: &mut crate::tui::LiveTerminal) {
+    /// It's read-only: `f` (or a click on the row) folds/unfolds the on-disk
+    /// per-shard breakdown, `r` copies the report, `c` the whole screen, `y` the
+    /// CLI command that reopens it (`--stats` / `--stats-shards`), `Esc` or a
+    /// click elsewhere dismisses, Ctrl-C quits; the body scrolls (↑/↓, PgUp/PgDn,
+    /// Home/End, wheel) when it's taller than the popup, and mouse motion keeps
+    /// the hover bubbles behind it live. `shards_expanded` is the initial fold
+    /// state (`--stats-shards`).
+    fn show_stats(&self, term: &mut crate::tui::LiveTerminal, mut shards_expanded: bool) {
         let stats = crate::stats::CheckpointStats::compute(
             &self.tensors,
             self.config.as_ref(),
@@ -6129,7 +6145,12 @@ impl Explorer {
             if term
                 .draw(|f| {
                     self.render_tree_frame(f, true);
-                    max_cell.set(UI::render_stats(f, &stats, copied, scroll));
+                    let (max, regions) =
+                        UI::render_stats(f, &stats, copied, scroll, shards_expanded);
+                    max_cell.set(max);
+                    // The popup owns the clickable map while it's up (the fold
+                    // toggle), overriding the tree's chips behind it.
+                    *self.clickable.borrow_mut() = regions;
                     if let Some(c) = hint {
                         UI::render_notice(f, &layout_hint_msg(c));
                     }
@@ -6165,9 +6186,15 @@ impl Explorer {
                     }
                     let now = std::time::Instant::now();
                     match key.code {
-                        // `y` copies the command that reopens this popup.
+                        // `y` copies the command that reopens this popup, in its
+                        // current fold state.
                         KeyCode::Char('y') => {
-                            let cmd = format!("{} --stats", self.command_for_tree());
+                            let flag = if shards_expanded {
+                                "--stats-shards"
+                            } else {
+                                "--stats"
+                            };
+                            let cmd = format!("{} {flag}", self.command_for_tree());
                             if copy_to_clipboard(&cmd) {
                                 copied_at = Some((now, "command"));
                             }
@@ -6181,7 +6208,7 @@ impl Explorer {
                                 .unwrap_or((120, 40));
                             let screen = crate::tui::headless_render(w, h, |f| {
                                 self.render_tree_frame(f, false);
-                                UI::render_stats(f, &stats, None, scroll);
+                                UI::render_stats(f, &stats, None, scroll, shards_expanded);
                             });
                             if let Ok(text) = screen
                                 && copy_to_clipboard(&text)
@@ -6189,12 +6216,15 @@ impl Explorer {
                                 copied_at = Some((now, "screen"));
                             }
                         }
-                        // `r` copies just the stats as plain text.
+                        // `r` copies just the stats as plain text (matching the
+                        // current fold state).
                         KeyCode::Char('r') => {
-                            if copy_to_clipboard(&stats.render()) {
+                            if copy_to_clipboard(&stats.render(shards_expanded)) {
                                 copied_at = Some((now, "report"));
                             }
                         }
+                        // `f` folds / unfolds the on-disk per-shard breakdown.
+                        KeyCode::Char('f') => shards_expanded = !shards_expanded,
                         // Scroll the body when it's taller than the popup.
                         KeyCode::Up => scroll = scroll.saturating_sub(1),
                         KeyCode::Down => scroll = (scroll + 1).min(scroll_max),
@@ -6206,8 +6236,15 @@ impl Explorer {
                         _ => layout_hint = wrong_layout_char(&key),
                     }
                 }
-                // Dismiss on a click (Down, not the trailing Up).
-                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => break,
+                // A click on the fold toggle folds/unfolds; a click anywhere else
+                // dismisses (the popup convention).
+                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => {
+                    if crate::ui::region_hit(&self.clickable.borrow(), m.column, m.row).is_some() {
+                        shards_expanded = !shards_expanded;
+                    } else {
+                        break;
+                    }
+                }
                 Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::ScrollUp) => {
                     scroll = scroll.saturating_sub(WHEEL_STEP)
                 }

@@ -20,6 +20,16 @@ use std::time::{Duration, Instant};
 pub struct LoadProgress {
     done: AtomicUsize,
     total: AtomicUsize,
+    /// What the count counts, for the bar's label (0 = unlabelled).
+    unit: AtomicU8,
+}
+
+/// What a [`LoadProgress`] count measures — shown after the `done/total` on the
+/// bar so it's clear (e.g. `64/64 shards`, not a bare `64/64`).
+#[derive(Clone, Copy)]
+pub enum Unit {
+    Shards,
+    Tensors,
 }
 
 impl LoadProgress {
@@ -30,6 +40,24 @@ impl LoadProgress {
     /// Record how many units the load comprises, once that's known.
     pub fn set_total(&self, total: usize) {
         self.total.store(total, Ordering::Relaxed);
+    }
+
+    /// Label the count's unit (for the bar); call once the reader knows it.
+    pub fn set_unit(&self, unit: Unit) {
+        let code = match unit {
+            Unit::Shards => 1,
+            Unit::Tensors => 2,
+        };
+        self.unit.store(code, Ordering::Relaxed);
+    }
+
+    /// The unit label for the bar (`""` when unset).
+    pub fn unit_label(&self) -> &'static str {
+        match self.unit.load(Ordering::Relaxed) {
+            1 => " shards",
+            2 => " tensors",
+            _ => "",
+        }
     }
 
     /// Mark one more unit complete.
@@ -211,13 +239,14 @@ fn spawn(
                 // A `[███░░░] done/total` bar once the total is known (e.g. after a
                 // remote dir is listed); until then just the spinner + timer.
                 let (done, total) = progress[k].snapshot();
+                let unit = progress[k].unit_label();
                 let bar = if total > 0 {
                     // Determinate: a thin bar in the TUI `LineGauge` style
                     // (`symbols::line::THICK`) — done part in the mark's colour, the
-                    // rest dim — plus the `done/total` count.
+                    // rest dim — plus the `done/total` count and its unit.
                     let filled = filled_cols(done, total, BAR_COLS);
                     format!(
-                        "  {color}{}{RESET}{DIM}{}{RESET} {done}/{total}",
+                        "  {color}{}{RESET}{DIM}{}{RESET} {done}/{total}{unit}",
                         "━".repeat(filled),
                         "━".repeat(BAR_COLS - filled),
                     )
@@ -257,16 +286,19 @@ fn spawn(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadProgress, filled_cols, sweep_pos, truncate_middle};
+    use super::{LoadProgress, Unit, filled_cols, sweep_pos, truncate_middle};
 
     #[test]
     fn load_progress_tracks_done_and_total() {
         let p = LoadProgress::new();
         assert_eq!(p.snapshot(), (0, 0)); // total unknown until set
+        assert_eq!(p.unit_label(), ""); // no unit until labelled
         p.set_total(48);
+        p.set_unit(Unit::Shards);
         p.advance();
         p.advance();
         assert_eq!(p.snapshot(), (2, 48));
+        assert_eq!(p.unit_label(), " shards");
     }
 
     #[test]

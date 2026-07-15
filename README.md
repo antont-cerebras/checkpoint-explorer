@@ -187,9 +187,11 @@ checkpoint-explorer usernode:/opt/cerebras/inference/models/some-model-4bit
 > `save`/write). So it's safe to point at production checkpoints — it cannot
 > accidentally alter or delete anything on the host.
 
-This is **metadata-only** (structure + dtype + shape); the data views (heatmap /
-numeric grid / histogram / statistics) need the bytes locally, so copy the
-checkpoint down to preview its values. `diff` takes `--ssh-read` too, for a
+This is **metadata-only** (structure + dtype + shape) — flagged by a
+`metadata-only` badge on the tree's status line (beside the read-only / health
+badges; hover it for the why). The data views (heatmap / numeric grid / histogram
+/ statistics) need the bytes locally, so copy the checkpoint down to preview its
+values. `diff` takes `--ssh-read` too, for a
 structural (dtype/shape) comparison of two remote checkpoints:
 ```bash
 checkpoint-explorer diff --ssh-read lab@usernode /opt/…/model-a /opt/…/model-b
@@ -234,6 +236,7 @@ without `--tensor` is reported as ambiguous.
 | `--legend` | Overlay the opened screen's legend (the `l` key); most useful with `--plain` |
 | `--health` | Open straight into the health-check popup on the tree (the `h` key) |
 | `--stats` | Open straight into the checkpoint-stats popup on the tree (the `s` key) |
+| `--stats-shards` | Like `--stats`, but with the on-disk per-shard breakdown expanded (the popup's `f` toggle) |
 | `--dtype <DTYPE>` | Reinterpret the dtype: `u4`, `i4`, `unpacked` (fused-codebook unmerge; needs a packing schema), or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
 | `--shape <DIMS>` | Reinterpret the shape (same element count): `10,100` / `10x100`; one dim may be `-1`/`*`/`_` to infer |
 | `--edge[=RFRAC,CFRAC]` (alias `--edges`) / `--overview` / `--window[=ROW,COL]` | Force the edges submode (optional head/tail split fractions `0..1`) / the overview / the contiguous window (optional top-left `ROW,COL`) |
@@ -306,7 +309,7 @@ what it does (handy while you're still learning the keys).
 | `f` | Copy the selected row's File path (tensor file, or a group/root's file or directory) |
 | `n` | Copy the selected tensor's Name to the clipboard |
 | `y` | Show and copy the CLI command that reopens this exact screen — file, tensor (or metadata entry), dtype/shape overrides, view, layout, zebra, base, slice (works on every screen) |
-| `s` | **Detail screen:** compute the tensor's statistics on demand · **Tree:** float the [checkpoint-stats popup](#checkpoint-statistics-s) — overall sizes / params, the dtype mix, and the per-layer / per-expert breakdown; `r` copies the report, `c` the screen, `y` the reopen command (`--stats`) |
+| `s` | **Detail screen:** compute the tensor's statistics on demand · **Tree:** float the [checkpoint-stats popup](#checkpoint-statistics-s) — per-file / per-tensor sizes, params, the dtype mix, and the per-layer / per-expert breakdown; `f` folds/unfolds the on-disk per-shard list, `r` copies the report, `c` the screen, `y` the reopen command (`--stats`) |
 | `h` | **Detail screen:** show the value histogram · **Tree:** run the health checks and float the report in a popup — `v` runs the value-tier data scan (progress bar; `Esc` cancels), `r` copies the report, `c` the screen, `y` the reopen command (`--health`); same checks as the [`check`](#checking-checkpoints-check) subcommand (auto-suggested when an index/file mismatch is detected) |
 | `R` | Repack the current HDF5 checkpoint into a new file (HDF5 only) |
 | `Backspace` / `\` | Step **back** / **forward** through the screens you've visited (browser-style history) — e.g. reopen a view you just left |
@@ -486,10 +489,12 @@ The per-tensor stats above answer "what's *in* this tensor?"; press `s` on the
 popup summarising the whole model at a glance:
 
 - **Overview** — the architecture (`model_type` from `config.json`, when
-  present), number of files/shards, tensors, total parameters, and total size
-  (on-disk vs. logical, with the compression ratio for compressed HDF5).
-- **Tensor size** — the largest and smallest tensor (named), plus the average
-  and median size, so an outlier stands out.
+  present), total parameters, and total size (on-disk vs. logical, with the
+  compression ratio for compressed HDF5).
+- **Files** — how many shards, and the largest / smallest / average / median
+  shard size, so an unbalanced split stands out.
+- **Tensors** — the tensor count, plus the largest and smallest tensor (named)
+  and the average / median size, so an outlier stands out.
 - **Layers** — the repeated `…layers.<i>.…` stack: how many layers, and the
   parameters / bytes in each (and in total).
 - **Experts (MoE)** — for mixture-of-experts checkpoints: experts per layer,
@@ -499,11 +504,12 @@ popup summarising the whole model at a glance:
 - **By dtype** — the dtype mix, each with its tensor count and byte share, so a
   quantized / mixed-precision checkpoint shows exactly how much is in each type.
 - **On disk (filesystem)** — the *true* footprint from the OS (`st_blocks`),
-  overall and per shard (listing only the shards the filesystem actually shrank,
-  folding the rest into a count), next to the apparent size. Unlike every count above (which
-  is logical: shape × dtype), this reflects **filesystem compression (ZFS/btrfs)
-  and sparse-file holes** — so a mostly-zero checkpoint that squashes on ZFS
-  shows its real disk usage. For `--ssh-read` dirs it's measured by a single
+  overall and per shard. Unlike every count above (which is logical: shape ×
+  dtype), this reflects **filesystem compression (ZFS/btrfs) and sparse-file
+  holes** — so a mostly-zero checkpoint that squashes on ZFS shows its real disk
+  usage. The per-shard list is **folded by default** (press `f`, or click the
+  row, to expand) and lists only the shards the filesystem actually shrank,
+  folding the rest into a count. For `--ssh-read` dirs it's measured by a single
   read-only `stat` on the remote host (SFTP carries no block count); it's omitted
   for `s3://` and in the deterministic `--plain` render (a live measurement isn't
   reproducible).
@@ -511,8 +517,9 @@ popup summarising the whole model at a glance:
 It's derived from the metadata already in memory (shapes and dtypes, no data
 read), so it's instant even on a multi-GB, multi-shard checkpoint. The body
 scrolls (`↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End`, wheel) when it's taller than the
-popup; `r` copies the report as plain text, `c` copies the screen, `y` copies the
-command that reopens it (`--stats`), and `Esc` or a click dismisses.
+popup; `f` folds/unfolds the per-shard list, `r` copies the report as plain text,
+`c` copies the screen, `y` copies the command that reopens it (`--stats`, or
+`--stats-shards` when the list is expanded), and `Esc` or a click dismisses.
 
 #### Dtype override
 
