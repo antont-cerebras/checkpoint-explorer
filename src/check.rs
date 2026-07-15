@@ -41,6 +41,7 @@ pub enum Severity {
 }
 
 /// A single problem a check turned up.
+#[derive(Clone)]
 pub struct Finding {
     pub severity: Severity,
     /// The tensor / file the finding concerns, when it's about one thing.
@@ -66,6 +67,7 @@ impl Finding {
 }
 
 /// The outcome of one named check.
+#[derive(Clone)]
 pub struct CheckResult {
     /// Stable machine id, e.g. `byte_ranges` — surfaced by the upcoming
     /// `--format json` output.
@@ -131,6 +133,7 @@ impl CheckResult {
 }
 
 /// The full report for one checkpoint.
+#[derive(Clone)]
 pub struct CheckReport {
     pub label: String,
     pub n_files: usize,
@@ -1333,6 +1336,45 @@ mod tests {
             source_path: "model.hdf5".into(),
             ..ti(name, "F32", shape)
         }
+    }
+
+    #[test]
+    fn popup_renders_every_finding() {
+        // The popup shows the full findings list (scrollable) — nothing is capped
+        // or hidden, so a big report is complete.
+        let findings: Vec<Finding> = (0..250)
+            .map(|i| Finding::error(Some(format!("tensor-{i:04}")), "bad byte range".into()))
+            .collect();
+        let report = CheckReport {
+            label: "x".into(),
+            n_files: 1,
+            n_tensors: 250,
+            params: 1,
+            values: false,
+            results: vec![CheckResult::done(
+                "id",
+                "Byte-range integrity",
+                "n",
+                findings,
+            )],
+        };
+        let out = crate::tui::headless_render(200, 400, |f| {
+            crate::ui::UI::render_check_report(
+                f,
+                &report,
+                crate::ui::CheckPopup::Idle {
+                    copied: None,
+                    can_scan: false,
+                },
+                0,
+            );
+        })
+        .unwrap();
+        assert!(out.contains("tensor-0000"), "first finding shown");
+        assert!(
+            out.contains("tensor-0249"),
+            "last finding shown too (no cap)"
+        );
     }
 
     #[test]

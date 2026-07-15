@@ -328,6 +328,13 @@ type CheckpointParts = (
     Vec<crate::health::HealthReport>,
 );
 
+/// The bottom status bar's text: `(icon, primary line, secondary line)`.
+type StatusBar = (&'static str, String, String);
+/// The selected node's distinct source files, cached with its key — the
+/// selection index, tree length, and search mode (see
+/// [`Explorer::selected_source_files`]).
+type GroupFilesCache = Option<(usize, usize, bool, std::collections::BTreeSet<String>)>;
+
 /// Rows the tree viewport scrolls per mouse-wheel notch (independent of the
 /// selection, like a normal scrollable list).
 const WHEEL_STEP: usize = 3;
@@ -607,6 +614,17 @@ pub struct Explorer {
     /// Whether the mouse is hovering the `metadata-only` badge (remote only),
     /// floating its help bubble. Toggled by the tree loop on mouse-move.
     metadata_hover: Cell<bool>,
+    /// Derived reports cached for the session — the loaded checkpoint is
+    /// immutable, so the health-check report (`h`) and the stats (`s`) are each
+    /// an O(tensors) pass computed once and reused, rather than recomputed every
+    /// time the popup opens.
+    cached_check: RefCell<Option<crate::check::CheckReport>>,
+    checkpoint_stats_cache: RefCell<Option<crate::stats::CheckpointStats>>,
+    /// The selected node's distinct source files (keyed by selection index, tree
+    /// length, and search mode), so a selected *group* isn't re-walked
+    /// (`collect_source_paths`, O(tensors)) on every status-bar redraw *and* every
+    /// `f`/`t` copy — the walk happens once per selection and both reuse it.
+    cached_group_files: RefCell<GroupFilesCache>,
 }
 
 impl Explorer {
@@ -673,6 +691,9 @@ impl Explorer {
             hovered_shortcut: Cell::new(None),
             health_hover: Cell::new(false),
             metadata_hover: Cell::new(false),
+            cached_check: RefCell::new(None),
+            checkpoint_stats_cache: RefCell::new(None),
+            cached_group_files: RefCell::new(None),
         }
     }
 
@@ -996,6 +1017,11 @@ impl Explorer {
     fn finalize_load(&mut self, tensors: Vec<TensorInfo>, metadata: Vec<MetadataInfo>) {
         self.tensors = tensors;
         self.metadata = metadata;
+        // The derived reports (health / stats) are keyed to the tensors — drop any
+        // cached from a prior load so they're recomputed against the new set.
+        *self.cached_check.borrow_mut() = None;
+        *self.checkpoint_stats_cache.borrow_mut() = None;
+        *self.cached_group_files.borrow_mut() = None;
 
         // Deduplicate tensors by name
         let mut seen_names = HashSet::new();
@@ -3263,7 +3289,38 @@ impl Explorer {
     /// file; for a group the primary is its source file(s)/directory and the
     /// secondary is blank. (A copy confirmation flashes as a separate bottom-line
     /// overlay — see `copied_flash` — so it never hides this path/name.)
-    fn status_bar(&self) -> (&'static str, String, String) {
+    /// The selected node's distinct source files — walked once per selection and
+    /// cached, since a group selection otherwise re-walks its whole subtree
+    /// (`collect_source_paths`, O(tensors)) on every status-bar render *and* every
+    /// `f`/`t` copy. The key (selection index, tree length, search mode) changes
+    /// whenever the selection or tree structure (expand/collapse/search) does.
+    fn selected_source_files(&self) -> BTreeSet<String> {
+        let tree = if self.search_mode {
+            &self.filtered_tree
+        } else {
+            &self.flattened_tree
+        };
+        let key = (self.selected_idx, tree.len(), self.search_mode);
+        if let Some(c) = self.cached_group_files.borrow().as_ref()
+            && (c.0, c.1, c.2) == key
+        {
+            return c.3.clone();
+        }
+        let mut files = BTreeSet::new();
+        match tree.get(self.selected_idx) {
+            Some((node @ TreeNode::Group { .. }, _)) => collect_source_paths(node, &mut files),
+            Some((TreeNode::Tensor { info, .. }, _)) => {
+                files.insert(info.source_path.clone());
+            }
+            _ => {}
+        }
+        *self.cached_group_files.borrow_mut() = Some((key.0, key.1, key.2, files.clone()));
+        files
+    }
+
+    /// The bottom status bar for the current selection. The group case reuses the
+    /// cached [`Self::selected_source_files`] walk, so it's cheap every frame.
+    fn status_bar(&self) -> StatusBar {
         let tree = if self.search_mode {
             &self.filtered_tree
         } else {
@@ -3279,23 +3336,28 @@ impl Explorer {
             // `n` copies the name, `f` the file.
             TreeNode::Tensor { info, .. } => ("▪", info.name.clone(), info.source_path.clone()),
             TreeNode::Group { .. } => {
-                let mut files = BTreeSet::new();
-                collect_source_paths(node, &mut files);
-                let primary = match files.len() {
-                    0 => return ("", String::new(), String::new()),
-                    1 => ("▪", files.into_iter().next().unwrap()),
-                    n => match common_dir(&files) {
-                        // When the files share a directory, show that instead of
-                        // a long list — most checkpoints live in one folder.
-                        Some(dir) => ("▸", format!("{n} files in {dir}")),
-                        None => {
-                            let first = file_name(files.iter().next().unwrap());
-                            let last = file_name(files.iter().next_back().unwrap());
-                            ("▸", format!("stored across {n} files: {first} … {last}"))
-                        }
-                    },
-                };
-                (primary.0, primary.1, String::new())
+                let files = self.selected_source_files();
+                match files.len() {
+                    0 => ("", String::new(), String::new()),
+                    1 => (
+                        "▪",
+                        files.into_iter().next().unwrap_or_default(),
+                        String::new(),
+                    ),
+                    // When the files share a directory, show that instead of a long
+                    // list — most checkpoints live in one folder.
+                    n => {
+                        let primary = match common_dir(&files) {
+                            Some(dir) => format!("{n} files in {dir}"),
+                            None => {
+                                let first = file_name(files.iter().next().unwrap());
+                                let last = file_name(files.iter().next_back().unwrap());
+                                format!("stored across {n} files: {first} … {last}")
+                            }
+                        };
+                        ("▸", primary, String::new())
+                    }
+                }
             }
             // The full metadata path on the first line (the tree row shows only
             // the short `…__metadata__` label); the value preview on the second.
@@ -3315,9 +3377,10 @@ impl Explorer {
         };
         let path = match node {
             TreeNode::Tensor { info, .. } => Some(info.source_path.clone()),
+            // Reuse the cached per-selection walk (see `selected_source_files`) so
+            // `f` on a big group doesn't re-traverse the whole subtree.
             TreeNode::Group { .. } => {
-                let mut files = BTreeSet::new();
-                collect_source_paths(node, &mut files);
+                let files = self.selected_source_files();
                 match files.len() {
                     0 => None,
                     1 => files.into_iter().next(),
@@ -5945,24 +6008,38 @@ impl Explorer {
     fn show_check_report(&self, term: &mut crate::tui::LiveTerminal) {
         use crate::ui::CheckPopup;
 
-        let label = self
-            .files
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        // Structural (header-only) checks first — fast and non-blocking.
-        let mut report = crate::check::run(
-            label,
-            &self.tensors,
-            &self.metadata,
-            &self.files,
-            &self.health_reports,
-            self.config.as_ref(),
-            &crate::filter::NameFilter::default(),
-            false,
-            1,
-        );
+        // Reuse the report computed on a previous open — the checkpoint is
+        // immutable, so the structural checks (an O(tensors) pass) don't change.
+        // The first open computes them; on a big checkpoint that's a beat, so draw
+        // an immediate "running checks" notice for feedback rather than freezing on
+        // the tree.
+        let mut report = self.cached_check.borrow().clone();
+        if report.is_none() {
+            let _ = term.draw(|f| {
+                self.render_tree_frame(f, true);
+                UI::render_notice(f, "Running health checks…");
+            });
+            let label = self
+                .files
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let computed = crate::check::run(
+                label,
+                &self.tensors,
+                &self.metadata,
+                &self.files,
+                &self.health_reports,
+                self.config.as_ref(),
+                &crate::filter::NameFilter::default(),
+                false,
+                1,
+            );
+            *self.cached_check.borrow_mut() = Some(computed.clone());
+            report = Some(computed);
+        }
+        let mut report = report.expect("just computed or cached");
 
         // What was just copied (and when), so the footer can flash it briefly.
         let mut copied_at: Option<(std::time::Instant, &'static str)> = None;
@@ -6028,6 +6105,8 @@ impl Explorer {
                         // spinner + progress bar meanwhile, and `Esc` cancels.
                         KeyCode::Char('v') if can_scan => {
                             self.run_value_scan(term, &mut report);
+                            // Keep the cache in step, so a re-open shows the scan.
+                            *self.cached_check.borrow_mut() = Some(report.clone());
                             copied_at = None;
                         }
                         // `y` copies the command that reopens this popup from the CLI
@@ -6134,11 +6213,20 @@ impl Explorer {
     /// the hover bubbles behind it live. `shards_expanded` is the initial fold
     /// state (`--stats-shards`).
     fn show_stats(&self, term: &mut crate::tui::LiveTerminal, mut shards_expanded: bool) {
-        let stats = crate::stats::CheckpointStats::compute(
-            &self.tensors,
-            self.config.as_ref(),
-            self.disk_usage(),
-        );
+        // Reuse the stats computed on a previous open — an O(tensors) pass over an
+        // immutable checkpoint, so it's computed once and cached. The `borrow()`
+        // is released on its own line (not held across `compute`, which
+        // `borrow_mut`s to store the result).
+        let cached = self.checkpoint_stats_cache.borrow().clone();
+        let stats = cached.unwrap_or_else(|| {
+            let s = crate::stats::CheckpointStats::compute(
+                &self.tensors,
+                self.config.as_ref(),
+                self.disk_usage(),
+            );
+            *self.checkpoint_stats_cache.borrow_mut() = Some(s.clone());
+            s
+        });
 
         // What was just copied (and when), so the footer can flash it briefly.
         let mut copied_at: Option<(std::time::Instant, &'static str)> = None;
