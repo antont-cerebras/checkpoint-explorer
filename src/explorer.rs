@@ -258,6 +258,9 @@ pub struct OpenRequest {
     /// Open straight into the health-check popup on the tree (`--health`, the `h`
     /// key). Part of `y`'s round-trip: the popup's `y` copies this command.
     pub health: bool,
+    /// Like `health`, but with the per-finding detail expanded (`--health-findings`,
+    /// the popup's `f` toggle). Round-trips through `y`.
+    pub health_findings: bool,
     /// Open straight into the checkpoint-stats popup on the tree (`--stats`, the
     /// `s` key). Part of `y`'s round-trip: the popup's `y` copies this command.
     pub stats: bool,
@@ -1655,7 +1658,8 @@ impl Explorer {
             None => (false, false, None),
         };
         let want_legend = self.open.as_ref().is_some_and(|r| r.legend);
-        let want_health = self.open.as_ref().is_some_and(|r| r.health);
+        let want_health_findings = self.open.as_ref().is_some_and(|r| r.health_findings);
+        let want_health = want_health_findings || self.open.as_ref().is_some_and(|r| r.health);
         let want_stats_shards = self.open.as_ref().is_some_and(|r| r.stats_shards);
         let want_stats_popup = want_stats_shards || self.open.as_ref().is_some_and(|r| r.stats);
         if let Some(n) = bins {
@@ -1681,7 +1685,14 @@ impl Explorer {
         if emit_command {
             let mut cmd = self.reopen_command(&screen, want_stats, want_hist);
             if want_health {
-                cmd = format!("{cmd} --health");
+                cmd = format!(
+                    "{cmd} {}",
+                    if want_health_findings {
+                        "--health-findings"
+                    } else {
+                        "--health"
+                    }
+                );
             }
             if want_stats_popup {
                 cmd = format!(
@@ -1741,6 +1752,7 @@ impl Explorer {
                             can_scan: false,
                         },
                         0,
+                        want_health_findings,
                     );
                 }
                 if let Some(stats) = &stats {
@@ -2006,7 +2018,8 @@ impl Explorer {
         let mut cursor = 0usize;
 
         // `--health` / `--stats` open straight into their popup once the tree is up.
-        let want_health = self.open.as_ref().is_some_and(|r| r.health);
+        let want_health_findings = self.open.as_ref().is_some_and(|r| r.health_findings);
+        let want_health = want_health_findings || self.open.as_ref().is_some_and(|r| r.health);
         let want_stats_shards = self.open.as_ref().is_some_and(|r| r.stats_shards);
         let want_stats_popup = want_stats_shards || self.open.as_ref().is_some_and(|r| r.stats);
 
@@ -2057,7 +2070,7 @@ impl Explorer {
         if want_health {
             self.ensure_full_load()?;
             let mut term = self.terminal.take().expect("interactive loop owns it");
-            self.show_check_report(&mut term);
+            self.show_check_report(&mut term, want_health_findings);
             self.terminal = Some(term);
         }
         if want_stats_popup {
@@ -3098,7 +3111,7 @@ impl Explorer {
                         ..
                     } if !self.search_mode => {
                         let mut term = self.terminal.take().expect("interactive loop owns it");
-                        self.show_check_report(&mut term);
+                        self.show_check_report(&mut term, false);
                         self.terminal = Some(term);
                     }
                     // `s` floats the overall-checkpoint stats popup (sizes, params,
@@ -6005,7 +6018,10 @@ impl Explorer {
     ///
     /// The structural checks are header-only and run up front; the `--values`
     /// scan reads every tensor's bytes on a background thread (local only).
-    fn show_check_report(&self, term: &mut crate::tui::LiveTerminal) {
+    /// `expanded` is the initial fold state of the per-finding detail (`f` toggles
+    /// it, like the stats popup's per-shard fold; `--health-findings` opens it
+    /// expanded).
+    fn show_check_report(&self, term: &mut crate::tui::LiveTerminal, mut expanded: bool) {
         use crate::ui::CheckPopup;
 
         // Reuse the report computed on a previous open — the checkpoint is
@@ -6063,7 +6079,11 @@ impl Explorer {
             if term
                 .draw(|f| {
                     self.render_tree_frame(f, true);
-                    max_cell.set(UI::render_check_report(f, &report, state, scroll));
+                    let (max, regions) =
+                        UI::render_check_report(f, &report, state, scroll, expanded);
+                    max_cell.set(max);
+                    // The popup owns the clickable map while up (the fold toggle).
+                    *self.clickable.borrow_mut() = regions;
                     if let Some(c) = hint {
                         UI::render_notice(f, &layout_hint_msg(c));
                     }
@@ -6104,15 +6124,22 @@ impl Explorer {
                         // `v` runs the value scan on a worker; the popup animates a
                         // spinner + progress bar meanwhile, and `Esc` cancels.
                         KeyCode::Char('v') if can_scan => {
-                            self.run_value_scan(term, &mut report);
+                            self.run_value_scan(term, &mut report, expanded);
                             // Keep the cache in step, so a re-open shows the scan.
                             *self.cached_check.borrow_mut() = Some(report.clone());
                             copied_at = None;
                         }
+                        // `f` folds / unfolds the per-finding detail.
+                        KeyCode::Char('f') => expanded = !expanded,
                         // `y` copies the command that reopens this popup from the CLI
-                        // (the app-wide "copy command" convention).
+                        // (the app-wide "copy command" convention), in its fold state.
                         KeyCode::Char('y') => {
-                            let cmd = format!("{} --health", self.command_for_tree());
+                            let flag = if expanded {
+                                "--health-findings"
+                            } else {
+                                "--health"
+                            };
+                            let cmd = format!("{} {flag}", self.command_for_tree());
                             if copy_to_clipboard(&cmd) {
                                 copied_at = Some((now, "command"));
                             }
@@ -6136,6 +6163,7 @@ impl Explorer {
                                         can_scan,
                                     },
                                     scroll,
+                                    expanded,
                                 );
                             });
                             if let Ok(text) = screen
@@ -6165,8 +6193,15 @@ impl Explorer {
                         _ => layout_hint = wrong_layout_char(&key),
                     }
                 }
-                // Dismiss on a click (Down, not the trailing Up).
-                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => break,
+                // A click on the fold toggle folds/unfolds; a click elsewhere
+                // dismisses (the popup convention).
+                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => {
+                    if crate::ui::region_hit(&self.clickable.borrow(), m.column, m.row).is_some() {
+                        expanded = !expanded;
+                    } else {
+                        break;
+                    }
+                }
                 // The wheel scrolls the report body.
                 Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::ScrollUp) => {
                     scroll = scroll.saturating_sub(WHEEL_STEP)
@@ -6370,6 +6405,7 @@ impl Explorer {
         &self,
         term: &mut crate::tui::LiveTerminal,
         report: &mut crate::check::CheckReport,
+        expanded: bool,
     ) {
         use crate::ui::CheckPopup;
 
@@ -6407,6 +6443,7 @@ impl Explorer {
                         report,
                         CheckPopup::Scanning { done, total, frame },
                         0,
+                        expanded,
                     );
                 })
                 .is_err()

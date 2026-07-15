@@ -1890,11 +1890,14 @@ impl UI {
         report: &crate::check::CheckReport,
         state: CheckPopup,
         scroll: usize,
-    ) -> usize {
+        expanded: bool,
+    ) -> (usize, Vec<(Rect, KeyEvent)>) {
         use crate::check::{Severity, Status, count_phrase, fmt_elapsed};
         let bg = palette::PANEL_BG;
         // Every span carries the panel background, so text and box match.
         let sty = |s: String, style: Style| Span::styled(s, style.bg(bg));
+        // Body-line indices of the per-check findings toggles (all clickable → `f`).
+        let mut fold_lines: Vec<usize> = Vec::new();
 
         // Title column width, including the synthetic "Value scan" row.
         let width = report
@@ -1939,24 +1942,49 @@ impl UI {
                 trailer,
                 bg,
             ));
-            for f in &r.findings {
-                let (fm, fc) = match f.severity {
-                    Severity::Error => ("✗", palette::ERROR),
-                    Severity::Warning => ("⚠", palette::WARN),
-                };
-                let mut spans = vec![
-                    sty("      ".into(), Style::default()),
-                    sty(fm.into(), Style::default().fg(fc)),
-                    sty(" ".into(), Style::default()),
-                ];
-                if let Some(subj) = &f.subject {
-                    spans.push(sty(
-                        format!("{subj}  "),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ));
+            // The per-finding detail is folded away by default (like the stats
+            // popup's per-shard list). Under each check with findings sits a
+            // toggle aligned with the check title; `f` (or a click on it, either
+            // state) reveals the full list. The `f` hint lives in the footer, with
+            // the other keys, so it stays put and consistently styled.
+            if !r.findings.is_empty() {
+                let arrow = if expanded { "▾" } else { "▸" };
+                fold_lines.push(lines.len());
+                lines.push(Line::from(vec![
+                    sty(
+                        format!("    {arrow} "),
+                        Style::default().fg(palette::ACCENT),
+                    ),
+                    sty(
+                        format!(
+                            "{} finding{}",
+                            r.findings.len(),
+                            if r.findings.len() == 1 { "" } else { "s" }
+                        ),
+                        Style::default().fg(palette::DIM),
+                    ),
+                ]));
+                if expanded {
+                    for f in &r.findings {
+                        let (fm, fc) = match f.severity {
+                            Severity::Error => ("✗", palette::ERROR),
+                            Severity::Warning => ("⚠", palette::WARN),
+                        };
+                        let mut spans = vec![
+                            sty("      ".into(), Style::default()),
+                            sty(fm.into(), Style::default().fg(fc)),
+                            sty(" ".into(), Style::default()),
+                        ];
+                        if let Some(subj) = &f.subject {
+                            spans.push(sty(
+                                format!("{subj}  "),
+                                Style::default().add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                        spans.push(sty(f.message.clone(), Style::default()));
+                        lines.push(Line::from(spans));
+                    }
                 }
-                spans.push(sty(f.message.clone(), Style::default()));
-                lines.push(Line::from(spans));
             }
         }
 
@@ -2022,17 +2050,24 @@ impl UI {
             verdict,
         ]));
 
+        // Every per-check findings toggle is clickable (→ `f`), so a click folds
+        // or unfolds in either state.
+        let clickable: Vec<(usize, KeyEvent)> = fold_lines
+            .iter()
+            .map(|&i| (i, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)))
+            .collect();
+        // The `f` fold hint goes in the footer (only when there are findings).
+        let fold = (!fold_lines.is_empty()).then_some(expanded);
         // The key-hint footer stays pinned while the body (checks + findings)
         // scrolls, so a report with many findings never overflows the popup.
         render_scroll_popup(
             frame,
             "Health check",
             lines,
-            check_footer_line(&state, bg),
+            check_footer_line(&state, fold, bg),
             scroll,
-            &[],
+            &clickable,
         )
-        .0
     }
 
     /// The overall-checkpoint stats popup (the `s` key on the tree). Returns the
@@ -2258,20 +2293,18 @@ impl UI {
                     .filter(|sh| crate::stats::has_saving(sh.apparent, sh.allocated))
                     .collect();
                 let arrow = if shards_expanded { "▾" } else { "▸" };
-                let hint = if shards_expanded {
-                    "  (f to fold)".to_string()
+                // The `f` hint lives in the footer with the other keys; the toggle
+                // itself just labels the breakdown (and, folded, the saver count).
+                let tail = if shards_expanded {
+                    String::new()
                 } else {
-                    format!(
-                        "  ({} of {} smaller · f to expand)",
-                        savers.len(),
-                        d.shards.len()
-                    )
+                    format!("  ({} of {} smaller)", savers.len(), d.shards.len())
                 };
                 fold_line = Some(lines.len());
                 lines.push(Line::from(vec![
                     sty(format!("  {arrow} "), Style::default().fg(palette::ACCENT)),
                     plain("per-shard breakdown".into()),
-                    dim(hint),
+                    dim(tail),
                 ]));
                 if shards_expanded {
                     let nw = savers.iter().map(|sh| sh.name.len()).max().unwrap_or(0);
@@ -2306,11 +2339,13 @@ impl UI {
             .map(|i| (i, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)))
             .into_iter()
             .collect();
+        // The `f` fold hint goes in the footer (only when there's a breakdown).
+        let fold = fold_line.map(|_| shards_expanded);
         render_scroll_popup(
             frame,
             "Checkpoint stats",
             lines,
-            stats_footer_line(copied, bg),
+            stats_footer_line(copied, fold, bg),
             scroll,
             &clickable,
         )
@@ -2591,7 +2626,7 @@ fn check_row(
 /// The popup footer: the value-scan bar while scanning, a copy confirmation right
 /// after `y`, or the key hints — with the key glyphs bold/accented (not dimmed)
 /// so it's clear they're actionable.
-fn check_footer_line(state: &CheckPopup, bg: Color) -> Line<'static> {
+fn check_footer_line(state: &CheckPopup, fold: Option<bool>, bg: Color) -> Line<'static> {
     let key = |k: &str| {
         Span::styled(
             k.to_string(),
@@ -2632,6 +2667,14 @@ fn check_footer_line(state: &CheckPopup, bg: Color) -> Line<'static> {
         )),
         CheckPopup::Idle { can_scan, .. } => {
             let mut items: Vec<(&str, &str)> = Vec::new();
+            // The findings-fold key, when there are findings to fold — a footer
+            // hint (not inline text) so it matches the other keys and stays visible
+            // whether folded or expanded.
+            match fold {
+                Some(true) => items.push(("f", " fold findings")),
+                Some(false) => items.push(("f", " expand findings")),
+                None => {}
+            }
             if can_scan {
                 items.push(("v", " value scan"));
             }
@@ -2653,7 +2696,7 @@ fn check_footer_line(state: &CheckPopup, bg: Color) -> Line<'static> {
 }
 
 /// Footer for the stats popup: a "✓ copied …" flash, or the key hints.
-fn stats_footer_line(copied: Option<&'static str>, bg: Color) -> Line<'static> {
+fn stats_footer_line(copied: Option<&'static str>, fold: Option<bool>, bg: Color) -> Line<'static> {
     if let Some(what) = copied {
         return Line::from(Span::styled(
             format!("✓ copied {what} to the clipboard"),
@@ -2670,16 +2713,20 @@ fn stats_footer_line(copied: Option<&'static str>, bg: Color) -> Line<'static> {
         )
     };
     let dim = |s: &str| Span::styled(s.to_string(), Style::default().fg(palette::DIM).bg(bg));
+    let mut items: Vec<(&str, &str)> = Vec::new();
+    // The per-shard fold key, when there's a breakdown to fold — a footer hint
+    // (not inline) so it matches the other keys and stays visible either way.
+    match fold {
+        Some(true) => items.push(("f", " fold shards")),
+        Some(false) => items.push(("f", " expand shards")),
+        None => {}
+    }
+    items.push(("c", " copy screen"));
+    items.push(("r", " copy report"));
+    items.push(("y", " copy command"));
+    items.push(("Esc", " dismiss"));
     let mut spans = Vec::new();
-    for (i, (k, label)) in [
-        ("c", " copy screen"),
-        ("r", " copy report"),
-        ("y", " copy command"),
-        ("Esc", " dismiss"),
-    ]
-    .iter()
-    .enumerate()
-    {
+    for (i, (k, label)) in items.iter().enumerate() {
         if i > 0 {
             spans.push(dim(" · "));
         }
