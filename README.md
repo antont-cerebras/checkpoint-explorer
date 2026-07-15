@@ -657,6 +657,31 @@ filter [name~*_proj.weight] matched 18624 of 31251 tensor(s):
     ...
 ```
 
+**Reconciling different naming schemes (`--map`).** When two checkpoints are the
+same model under **different tensor names** — a common case across export
+pipelines — a plain diff is a useless wall of "everything removed + everything
+added". A rename rule rewrites the **old** (left) checkpoint's names into the
+new one's scheme *before* comparing, so corresponding tensors line up and you see
+the real deltas (dtype / shape / count) instead. Each rule is a regex →
+replacement (`REGEX=>REPLACEMENT`, `$1` for captures), applied in order — so one
+rule can rewrite a shared segment across every layer at once:
+
+```bash
+# gpt-oss (mlp.experts) vs a block_sparse_moe-named checkpoint
+checkpoint-explorer diff old/ new/ \
+  --map '\.mlp\.experts\.=>.block_sparse_moe.experts.' \
+  --map 'experts\.(down|gate_up)_proj$=>experts.${1}_proj.weight'
+
+# Or load the rules from a file (merged after any --map). A '.json' file is a
+# JSON array of [pattern, replacement] pairs; any other extension is one
+# 'REGEX=>REPLACEMENT' rule per line ('#' comments and blank lines ignored).
+checkpoint-explorer diff old/ new/ --map-from rename.txt
+```
+
+A note on **stderr** reports how many rules were applied; if a rule is broad
+enough to map two tensors onto one name, that collision is warned about (the last
+wins). `--map` is a whole-checkpoint concern, so it's ignored with `--tensor`.
+
 Value comparison (`--values` / `--histogram`) reads each tensor's data, so it
 runs **in parallel** — `--jobs N` sets how many tensors are compared at once
 (default: number of logical CPUs; `-j 1` = sequential). In a terminal a spinner

@@ -504,6 +504,21 @@ enum Command {
         /// Path to the cstorch virtualenv on the --ssh-read host (default: ~/venv).
         #[arg(long = "ssh-venv", value_name = "PATH")]
         ssh_venv: Option<String>,
+        /// Rename rule applied to the OLD checkpoint's tensor names before diffing,
+        /// so tensors under a different naming scheme line up instead of showing as
+        /// removed+added. Format 'REGEX=>REPLACEMENT' (regex, with $1 captures);
+        /// repeatable, and rules apply in order. E.g. to diff a gpt-oss checkpoint
+        /// against a block_sparse_moe-named one:
+        ///   --map '\.mlp\.experts\.=>.block_sparse_moe.experts.'
+        ///   --map 'experts\.(down|gate_up)_proj$=>experts.${1}_proj.weight'
+        #[arg(long = "map", value_name = "REGEX=>REPL")]
+        map: Vec<String>,
+        /// Load rename rules from a file (see --map), merged after any --map. A
+        /// '.json' file is a JSON array of [pattern, replacement] pairs; any other
+        /// extension is one 'REGEX=>REPLACEMENT' rule per line ('#' comments and
+        /// blank lines ignored).
+        #[arg(long = "map-from", value_name = "FILE")]
+        map_from: Option<PathBuf>,
     },
 
     /// Run health checks on a checkpoint and report any problems.
@@ -606,6 +621,8 @@ fn main() -> Result<()> {
             jobs,
             ssh_read,
             ssh_venv,
+            map,
+            map_from,
         }) => {
             // `diff`-style exit codes (0 same / 1 differ / 2 trouble) don't map to
             // the `Result` convention `main` uses elsewhere, so exit explicitly.
@@ -628,6 +645,13 @@ fn main() -> Result<()> {
                 }
             };
             let filtered = filter.is_active();
+            let name_map = match build_name_map(&map, map_from.as_deref()) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("checkpoint-explorer diff: {e:#}");
+                    std::process::exit(2);
+                }
+            };
             let opts = diff::DiffOpts {
                 color: color_enabled(no_color),
                 // A tensor filter scopes the diff to a subset, so metadata isn't
@@ -655,6 +679,7 @@ fn main() -> Result<()> {
                 bins,
                 opts,
                 &filter,
+                &name_map,
                 jobs,
                 remote.as_ref(),
             );
@@ -913,6 +938,35 @@ fn build_tensor_filter(
     })
 }
 
+/// Build a [`diff::NameMap`] from the `diff` rename flags: the `--map` rules first
+/// (each a `PATTERN=>REPLACEMENT` line), then `--map-from`, whose extension picks
+/// the format — a `.json` file is a JSON array of `[pattern, replacement]` pairs,
+/// anything else is the same plain-text `PATTERN=>REPLACEMENT`-per-line form as
+/// `--map` (and as `--names-from`). Errors (bad rule, unreadable/invalid file, bad
+/// regex) bubble up to a `2` exit.
+fn build_name_map(map: &[String], map_from: Option<&Path>) -> Result<diff::NameMap> {
+    let mut pairs = diff::NameMap::parse_rules(map.iter().map(String::as_str))?;
+    if let Some(path) = map_from {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("reading --map-from {}", path.display()))?;
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+        {
+            let json: Vec<(String, String)> = serde_json::from_str(&text).with_context(|| {
+                format!(
+                    "parsing --map-from {} as JSON [[pattern, replacement], …]",
+                    path.display()
+                )
+            })?;
+            pairs.extend(json);
+        } else {
+            pairs.extend(diff::NameMap::parse_rules(text.lines())?);
+        }
+    }
+    diff::NameMap::from_pairs(pairs)
+}
+
 /// Braille spinner frames (matches the interactive stats scan).
 const DIFF_SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -1121,6 +1175,7 @@ fn run_diff(
     bins: Option<usize>,
     opts: diff::DiffOpts,
     filter: &diff::TensorFilter,
+    name_map: &diff::NameMap,
     jobs: usize,
     remote: Option<&crate::remote::RemoteRead>,
 ) -> i32 {
@@ -1216,6 +1271,9 @@ fn run_diff(
         if filter.is_active() {
             eprintln!("checkpoint-explorer diff: --tensor takes precedence; filters ignored");
         }
+        if !name_map.is_empty() {
+            eprintln!("checkpoint-explorer diff: --map is ignored with --tensor");
+        }
         return run_diff_tensor(&old_label, &new_label, name, &old_t, &new_t, &ctx, opts);
     }
 
@@ -1227,6 +1285,23 @@ fn run_diff(
     let new_meta: &[MetadataInfo] = if opts.metadata { &new_m } else { &empty };
     let mut old_sum = diff::CheckpointSummary::from_loaded(&old_t, old_meta);
     let mut new_sum = diff::CheckpointSummary::from_loaded(&new_t, new_meta);
+    // Rename rules (`--map` / `--map-from`) rewrite the OLD side's tensor names
+    // into the NEW side's naming scheme, so corresponding tensors line up in the
+    // comparison below instead of showing as a removed/added pair. Applied before
+    // the filter (which matches on the post-rename names, as they appear in the
+    // report). A rule broad enough to collide two names onto one is warned about.
+    if !name_map.is_empty() {
+        let collisions = name_map.remap_summary(&mut old_sum);
+        eprintln!(
+            "checkpoint-explorer diff: applied {} rename rule(s) to {old_label}",
+            name_map.len()
+        );
+        for target in &collisions {
+            eprintln!(
+                "checkpoint-explorer diff: warning: a rename rule maps multiple tensors onto {target:?} (keeping the last)"
+            );
+        }
+    }
     // Total distinct tensors across both sides *before* filtering, so the filter's
     // match line can show "matched M of N" (context for whether M looks right).
     let total_tensors = old_sum
@@ -1241,8 +1316,12 @@ fn run_diff(
     let report = if opts.values || opts.histogram {
         use rayon::prelude::*;
         // Read each common same-shape tensor and compare values and/or distribution.
-        let old_map: HashMap<&str, &TensorInfo> =
-            old_t.iter().map(|t| (t.name.as_str(), t)).collect();
+        // The old side is keyed by its *post-rename* name (the same names `common`
+        // is drawn from), so a mapped tensor still finds its on-disk data.
+        let old_map: HashMap<String, &TensorInfo> = old_t
+            .iter()
+            .map(|t| (name_map.map(&t.name).into_owned(), t))
+            .collect();
         let new_map: HashMap<&str, &TensorInfo> =
             new_t.iter().map(|t| (t.name.as_str(), t)).collect();
         // The tensors present on both sides — the ones we actually read/compare.

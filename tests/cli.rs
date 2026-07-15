@@ -1063,6 +1063,111 @@ fn diff_filter_reports_matched_schema_on_stderr() {
     );
 }
 
+const MAP_OLD: &str = "tests/fixtures/diff_map_old.safetensors";
+const MAP_NEW: &str = "tests/fixtures/diff_map_new.safetensors";
+
+/// Two checkpoints holding the same three per-layer tensors under *different*
+/// naming schemes: OLD uses `…mlp.experts.down_proj`, NEW uses
+/// `…block_sparse_moe.experts.down_proj.weight`. A `--map` rename rule that keeps
+/// the layer index should line them up.
+fn ensure_map_fixtures() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let old_names: Vec<String> = (0..3)
+            .map(|i| format!("model.layers.{i}.mlp.experts.down_proj"))
+            .collect();
+        let new_names: Vec<String> = (0..3)
+            .map(|i| format!("model.layers.{i}.block_sparse_moe.experts.down_proj.weight"))
+            .collect();
+        let old: Vec<(&str, Dtype, Vec<usize>, u8)> = old_names
+            .iter()
+            .map(|n| (n.as_str(), Dtype::BF16, vec![2, 3], 0u8))
+            .collect();
+        let new: Vec<(&str, Dtype, Vec<usize>, u8)> = new_names
+            .iter()
+            .map(|n| (n.as_str(), Dtype::BF16, vec![2, 3], 0u8))
+            .collect();
+        write_st(MAP_OLD, &old, &[]);
+        write_st(MAP_NEW, &new, &[]);
+    });
+}
+
+#[test]
+fn diff_map_aligns_renamed_tensors() {
+    ensure_map_fixtures();
+    // Without a map, every tensor differs by name → all removed + all added.
+    let (out, code) = run_diff(&[MAP_OLD, MAP_NEW]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("tensors: -3 +3 ~0"), "{out}");
+
+    // A rename rule that preserves the layer index lines them up (unchanged).
+    let (out, code) = run_diff(&[
+        MAP_OLD,
+        MAP_NEW,
+        "--map",
+        r"\.mlp\.experts\.down_proj$=>.block_sparse_moe.experts.down_proj.weight",
+    ]);
+    assert_eq!(code, 0, "map should align the renamed tensors; {out}");
+    assert!(out.contains("tensors: -0 +0 ~0"), "{out}");
+}
+
+#[test]
+fn diff_map_from_plain_and_json_files() {
+    ensure_map_fixtures();
+    let dir = std::env::temp_dir();
+
+    // Plain-text rules file: 'PATTERN=>REPL' per line, '#' comments ignored.
+    let plain = dir.join("ce_diff_map_rules.txt");
+    std::fs::write(
+        &plain,
+        "# gpt-oss rename\n\
+         \\.mlp\\.experts\\.down_proj$ => .block_sparse_moe.experts.down_proj.weight\n",
+    )
+    .unwrap();
+    let (out, code) = run_diff(&[MAP_OLD, MAP_NEW, "--map-from", plain.to_str().unwrap()]);
+    assert_eq!(code, 0, "plain rules file should align; {out}");
+    assert!(out.contains("tensors: -0 +0 ~0"), "{out}");
+
+    // JSON array of [pattern, replacement] pairs (backslashes escaped for JSON).
+    let json = dir.join("ce_diff_map_rules.json");
+    std::fs::write(
+        &json,
+        r#"[["\\.mlp\\.experts\\.down_proj$", ".block_sparse_moe.experts.down_proj.weight"]]"#,
+    )
+    .unwrap();
+    let (out, code) = run_diff(&[MAP_OLD, MAP_NEW, "--map-from", json.to_str().unwrap()]);
+    assert_eq!(code, 0, "json rules file should align; {out}");
+    assert!(out.contains("tensors: -0 +0 ~0"), "{out}");
+}
+
+#[test]
+fn diff_map_bad_regex_exits_2() {
+    ensure_map_fixtures();
+    let (_out, code) = run_diff(&[MAP_OLD, MAP_NEW, "--map", "([unclosed=>x"]);
+    assert_eq!(code, 2, "an invalid --map regex should exit 2");
+}
+
+#[test]
+fn diff_map_collision_warns_on_stderr() {
+    ensure_map_fixtures();
+    // A rule that drops the layer index collapses all three layers onto one name.
+    let out = Command::new(env!("CARGO_BIN_EXE_checkpoint-explorer"))
+        .args([
+            "diff",
+            MAP_OLD,
+            MAP_NEW,
+            "--map",
+            r"model\.layers\.\d+\.=>model.layers.X.",
+        ])
+        .output()
+        .expect("run diff");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("maps multiple tensors onto"),
+        "a colliding rename should warn; stderr:\n{err}"
+    );
+}
+
 #[test]
 fn diff_tensor_dtype_view_changes_decode() {
     ensure_diff_fixtures();
