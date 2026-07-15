@@ -463,21 +463,17 @@ impl CheckpointStats {
                     .filter(|s| has_saving(s.apparent, s.allocated))
                     .collect();
                 if shards_expanded {
-                    let nw = savers.iter().map(|s| s.name.len()).max().unwrap_or(0);
-                    for s in &savers {
+                    // Unfolding shows *every* shard (savers and not) — the folded
+                    // summary already gave the "N of M smaller" headline, so the
+                    // expanded view is the full breakdown, not a filtered one.
+                    let nw = d.shards.iter().map(|s| s.name.len()).max().unwrap_or(0);
+                    for s in &d.shards {
                         out.push(format!(
                             "    {:<nw$}  {:>9} → {:>9}  ({})",
                             s.name,
                             format_size(s.apparent as usize),
                             format_size(s.allocated as usize),
                             ratio_phrase(s.apparent, s.allocated),
-                        ));
-                    }
-                    let hidden = d.shards.len() - savers.len();
-                    if hidden > 0 {
-                        out.push(format!(
-                            "    … {hidden} shard{} with no filesystem saving",
-                            if hidden == 1 { "" } else { "s" }
                         ));
                     }
                 } else {
@@ -800,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn report_on_disk_lists_only_savers() {
+    fn report_on_disk_folds_to_a_summary_and_unfolds_to_every_shard() {
         let tensors = vec![ti("w", "F32", &[10], 4)];
         // One shard squeezed 4× (a real saving) among two the filesystem left
         // alone (allocated ≥ apparent) — deterministic, so the wording is pinned.
@@ -821,21 +817,37 @@ mod tests {
                 allocated: 4 * 1024 * 1024 + 4096, // block rounding — larger on disk
             },
         ]);
-        let report = CheckpointStats::compute(&tensors, None, disk).render(true);
-        assert!(report.contains("On disk (filesystem)"), "report:\n{report}");
-        assert!(report.contains("Allocated"), "report:\n{report}");
-        // Only the shard with a real saving is listed…
+        let stats = CheckpointStats::compute(&tensors, None, disk);
+
+        // Folded (default): a one-line summary with the saver count, no shard rows.
+        let folded = stats.render(false);
+        assert!(folded.contains("On disk (filesystem)"), "report:\n{folded}");
         assert!(
-            report.contains("shard-saver.safetensors"),
-            "report:\n{report}"
+            folded.contains("per-shard breakdown (1 of 3 smaller)"),
+            "report:\n{folded}"
         );
-        assert!(report.contains("4.00× smaller"), "report:\n{report}");
-        // …the untouched / larger-on-disk shards are folded into a count.
-        assert!(!report.contains("shard-plain"), "report:\n{report}");
-        assert!(!report.contains("shard-bigger"), "report:\n{report}");
+        assert!(!folded.contains("shard-saver"), "report:\n{folded}");
+
+        // Unfolded: *every* shard is listed — savers and not — not just the savers.
+        let expanded = stats.render(true);
         assert!(
-            report.contains("2 shards with no filesystem saving"),
-            "report:\n{report}"
+            expanded.contains("shard-saver.safetensors"),
+            "report:\n{expanded}"
+        );
+        assert!(expanded.contains("4.00× smaller"), "report:\n{expanded}");
+        assert!(
+            expanded.contains("shard-plain.safetensors"),
+            "report:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("shard-bigger.safetensors"),
+            "report:\n{expanded}"
+        );
+        // The old "N shards with no filesystem saving" collapse line is gone
+        // (the per-shard rows still carry "(no filesystem saving)" individually).
+        assert!(
+            !expanded.contains("shards with no filesystem saving"),
+            "report:\n{expanded}"
         );
     }
 
