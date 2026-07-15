@@ -344,6 +344,30 @@ const WHEEL_STEP: usize = 3;
 /// Rows a PageUp/PageDown scrolls the health-report popup body.
 const SCROLL_PAGE: usize = 10;
 
+/// Max gap between two presses of the same navigation key for the second to count
+/// as auto-repeat (a held key) rather than a fresh tap — comfortably above the OS
+/// repeat interval (~30/s) plus a frame's render, below a human's tap cadence.
+const SCROLL_REPEAT_WINDOW: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Steps to move for a held **PageUp/PageDown** (per screenful), which cover a lot
+/// of ground: a short grace at 1:1, then doubling every few repeats for as long as
+/// it's held, with no low plateau — so velocity keeps building the longer you hold.
+/// The only cap (`1 << 13`) is an overflow guard; a screenful times this already
+/// crosses any real tree in a frame, and `move_selection` clamps to the ends.
+fn accel_step_page(streak: u32) -> usize {
+    let ramp = (streak.saturating_sub(2) / 3).min(13);
+    1usize << ramp
+}
+
+/// Rows/cols to move for a held **arrow** (per row/column) — deliberately gentler
+/// than [`accel_step_page`] so row-by-row movement stays controllable: a longer
+/// grace, slower doubling, and a low cap (32) for a brisk-but-not-teleporting top
+/// speed. Big jumps are what PageUp/PageDown are for.
+fn accel_step_row(streak: u32) -> usize {
+    let ramp = (streak.saturating_sub(3) / 4).min(5);
+    1usize << ramp
+}
+
 /// A statistics scan running on a worker thread for a data view's current
 /// `(tensor, view)`. The view stays fully interactive while it runs; the main
 /// loop polls [`Self::handle`], caches the result when it lands, and animates the
@@ -586,6 +610,11 @@ pub struct Explorer {
     /// `Shift`+arrow press can stride by one screenful.
     win_page_rows: Cell<usize>,
     win_page_cols: Cell<usize>,
+    /// Held-key scroll acceleration: the last navigation key, when it fired, and
+    /// how many consecutive fast repeats (terminal auto-repeat) it's had — so
+    /// holding ↑/↓ (tree) or an arrow (data view) ramps the step up. See
+    /// [`Explorer::held_step`].
+    scroll_accel: Cell<Option<(KeyCode, std::time::Instant, u32)>>,
     /// The numeric grid's zebra striping (rows / columns / off). Session-
     /// remembered; cycled with `z`.
     data_view_stripe: Cell<StripeMode>,
@@ -682,6 +711,7 @@ impl Explorer {
             data_view_win_col: Cell::new(0),
             win_page_rows: Cell::new(1),
             win_page_cols: Cell::new(1),
+            scroll_accel: Cell::new(None),
             data_view_stripe: Cell::new(StripeMode::default()),
             data_view_base: Cell::new(NumBase::default()),
             open,
@@ -3217,11 +3247,17 @@ impl Explorer {
                     } => self.move_to_sibling(true),
                     KeyEvent {
                         code: KeyCode::Up, ..
-                    } => self.move_selection(-1),
+                    } => {
+                        let step = self.held_step(KeyCode::Up, accel_step_row) as i32;
+                        self.move_selection(-step);
+                    }
                     KeyEvent {
                         code: KeyCode::Down,
                         ..
-                    } => self.move_selection(1),
+                    } => {
+                        let step = self.held_step(KeyCode::Down, accel_step_row) as i32;
+                        self.move_selection(step);
+                    }
                     // While searching, the arrows edit the query: Shift+←/→ jump
                     // the text caret to the start/end, plain ←/→ move it one
                     // character at a time.
@@ -3261,15 +3297,27 @@ impl Explorer {
                         self.selected_idx = self.filtered_tree.len().saturating_sub(1);
                     }
                     // PageUp/PageDown move the cursor by one screenful — both while
-                    // browsing the tree and in the search results list.
+                    // browsing the tree and in the search results list — and by
+                    // several screenfuls while held (so paging through a big tree
+                    // accelerates, like the arrow keys).
                     KeyEvent {
                         code: KeyCode::PageUp,
                         ..
-                    } => self.move_selection(-(self.page_rows() as i32)),
+                    } => {
+                        let step = (self.page_rows()
+                            * self.held_step(KeyCode::PageUp, accel_step_page))
+                            as i32;
+                        self.move_selection(-step);
+                    }
                     KeyEvent {
                         code: KeyCode::PageDown,
                         ..
-                    } => self.move_selection(self.page_rows() as i32),
+                    } => {
+                        let step = (self.page_rows()
+                            * self.held_step(KeyCode::PageDown, accel_step_page))
+                            as i32;
+                        self.move_selection(step);
+                    }
                     // ← jumps to the parent group; → enters the group (its
                     // first child), expanding it first if collapsed.
                     KeyEvent {
@@ -3474,6 +3522,27 @@ impl Explorer {
     fn page_rows(&self) -> usize {
         let height = terminal::size().map(|(_, h)| h).unwrap_or(40);
         UI::visible_tree_rows(height)
+    }
+
+    /// The step (rows/cols) one press of navigation key `code` should move,
+    /// accelerating while the key is held. A terminal has no key-up event —
+    /// holding a key just streams repeats at the OS auto-repeat rate — so a run
+    /// of the *same* key arriving faster than a human taps (within
+    /// [`SCROLL_REPEAT_WINDOW`]) is treated as "held" and the step ramps up per
+    /// `curve` ([`accel_step_row`] for arrows, [`accel_step_page`] for paging); a
+    /// different key, or a pause, resets it to 1 so tapping stays 1:1.
+    fn held_step(&self, code: KeyCode, curve: fn(u32) -> usize) -> usize {
+        let now = std::time::Instant::now();
+        let streak = match self.scroll_accel.get() {
+            Some((last, at, n))
+                if last == code && now.duration_since(at) <= SCROLL_REPEAT_WINDOW =>
+            {
+                n + 1
+            }
+            _ => 0,
+        };
+        self.scroll_accel.set(Some((code, now, streak)));
+        curve(streak)
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -4897,13 +4966,14 @@ impl Explorer {
                         // Pan the window along one axis. Ctrl jumps fully to an
                         // edge (`usize::MAX` is clamped back to the last position
                         // on the next draw), Shift strides one screenful, a plain
-                        // arrow moves a single row/column.
-                        let pan = |cell: &Cell<usize>, forward: bool, page: usize| {
+                        // arrow moves `plain` rows/columns — 1 for a tap, more while
+                        // the arrow is held (see `held_step`).
+                        let pan = |cell: &Cell<usize>, forward: bool, page: usize, plain: usize| {
                             let cur = cell.get();
                             let next = if ctrl {
                                 if forward { usize::MAX } else { 0 }
                             } else {
-                                let step = if shift { page.max(1) } else { 1 };
+                                let step = if shift { page.max(1) } else { plain.max(1) };
                                 if forward {
                                     cur.saturating_add(step)
                                 } else {
@@ -4954,18 +5024,30 @@ impl Explorer {
                             // (Shift strides a screenful; Ctrl+arrow also jumps to
                             // an edge on terminals that send it); slice stepping
                             // stays on `[` / `]` and `/`.
-                            KeyCode::Up if window => {
-                                pan(&self.data_view_win_row, false, self.win_page_rows.get())
-                            }
-                            KeyCode::Down if window => {
-                                pan(&self.data_view_win_row, true, self.win_page_rows.get())
-                            }
-                            KeyCode::Left if window => {
-                                pan(&self.data_view_win_col, false, self.win_page_cols.get())
-                            }
-                            KeyCode::Right if window => {
-                                pan(&self.data_view_win_col, true, self.win_page_cols.get())
-                            }
+                            KeyCode::Up if window => pan(
+                                &self.data_view_win_row,
+                                false,
+                                self.win_page_rows.get(),
+                                self.held_step(KeyCode::Up, accel_step_row),
+                            ),
+                            KeyCode::Down if window => pan(
+                                &self.data_view_win_row,
+                                true,
+                                self.win_page_rows.get(),
+                                self.held_step(KeyCode::Down, accel_step_row),
+                            ),
+                            KeyCode::Left if window => pan(
+                                &self.data_view_win_col,
+                                false,
+                                self.win_page_cols.get(),
+                                self.held_step(KeyCode::Left, accel_step_row),
+                            ),
+                            KeyCode::Right if window => pan(
+                                &self.data_view_win_col,
+                                true,
+                                self.win_page_cols.get(),
+                                self.held_step(KeyCode::Right, accel_step_row),
+                            ),
                             // Jump straight to an edge (clamped on the next draw):
                             // Home/End to the first/last column, PageUp/PageDown to
                             // the first/last row. Plain navigation keys, so they
@@ -7103,6 +7185,36 @@ fn copy_to_clipboard(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_key_scroll_accelerates_then_resets() {
+        // Both curves start at a 1:1 grace and keep building the longer the key is
+        // held (no low plateau); the page curve is far more aggressive than the
+        // gentle arrow curve, which caps low so row movement stays controllable.
+        assert_eq!(accel_step_row(0), 1);
+        assert_eq!(accel_step_page(0), 1);
+        assert!(accel_step_row(20) > accel_step_row(8));
+        assert!(accel_step_page(20) > accel_step_page(8));
+        assert_eq!(accel_step_row(1_000), 32, "arrows cap low");
+        assert!(
+            accel_step_page(40) > accel_step_row(1_000),
+            "paging accelerates well past the arrow cap"
+        );
+
+        let e = Explorer::new(Vec::new(), Vec::new(), None, false);
+        // Rapid repeats of the same key (all within the repeat window, since these
+        // calls are microseconds apart) ramp the step up.
+        let steps: Vec<usize> = (0..30)
+            .map(|_| e.held_step(KeyCode::Down, accel_step_row))
+            .collect();
+        assert_eq!(steps[0], 1, "first press is 1:1");
+        assert!(
+            *steps.last().unwrap() > 1,
+            "a held key accelerates: {steps:?}"
+        );
+        // A different key resets the streak — a tap the other way is precise again.
+        assert_eq!(e.held_step(KeyCode::Up, accel_step_row), 1);
+    }
 
     #[test]
     fn wrong_layout_char_flags_only_plain_non_latin_letters() {
