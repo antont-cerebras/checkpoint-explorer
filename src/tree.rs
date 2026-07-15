@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 /// How a tensor is stored on disk, for formats (like HDF5) that may compress.
@@ -100,6 +101,62 @@ impl TreeNode {
             TreeNode::Metadata { info } => &info.name,
         }
     }
+
+    /// A clone for the flattened display list. A `Group` keeps its header and its
+    /// *direct* children (needed to tell it has children and to detect a
+    /// numbered-layer stack), but each of those children is reduced to a stub with
+    /// no grandchildren — every descendant is already its own row in the flattened
+    /// list, so deep-cloning a whole subtree once per visible ancestor (the `Group`
+    /// clone recurses through all children) was the bulk of the build cost on big
+    /// checkpoints. Leaves clone whole (they hold no subtree).
+    fn flatten_row_clone(&self) -> TreeNode {
+        match self {
+            TreeNode::Group {
+                name,
+                children,
+                expanded,
+                tensor_count,
+                params,
+                total_size,
+                stored_size,
+            } => TreeNode::Group {
+                name: name.clone(),
+                children: children.iter().map(TreeNode::child_stub).collect(),
+                expanded: *expanded,
+                tensor_count: *tensor_count,
+                params: *params,
+                total_size: *total_size,
+                stored_size: *stored_size,
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// A direct-child stub for [`flatten_row_clone`]: a `Group` keeps its name and
+    /// kind (so `layer_count` still recognises a numbered stack) but drops its own
+    /// children; leaves clone whole.
+    fn child_stub(&self) -> TreeNode {
+        match self {
+            TreeNode::Group {
+                name,
+                expanded,
+                tensor_count,
+                params,
+                total_size,
+                stored_size,
+                ..
+            } => TreeNode::Group {
+                name: name.clone(),
+                children: Vec::new(),
+                expanded: *expanded,
+                tensor_count: *tensor_count,
+                params: *params,
+                total_size: *total_size,
+                stored_size: *stored_size,
+            },
+            other => other.clone(),
+        }
+    }
 }
 
 /// The last path segment of a tensor name, treating `.` and `__` as separators
@@ -166,6 +223,18 @@ pub enum NaturalSortItem {
     Number(u32),
 }
 
+/// Normalise a tensor name's path separators for tree grouping: map `__` → `.`
+/// so underscore-flattened `.npy` names fold like dotted ones. Borrows the name
+/// unchanged (no allocation) in the common case with no `__` — safetensors / HDF5
+/// / GGUF names — so tree building doesn't allocate a string per tensor per level.
+fn normalize_sep(name: &str) -> Cow<'_, str> {
+    if name.contains("__") {
+        Cow::Owned(name.replace("__", "."))
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
 pub struct TreeBuilder;
 
 impl TreeBuilder {
@@ -228,7 +297,7 @@ impl TreeBuilder {
             .collect();
         if !standalone.is_empty() {
             let mut children = standalone;
-            children.sort_by_key(|a| natural_sort_key(a.name()));
+            children.sort_by_cached_key(|a| natural_sort_key(a.name()));
             tree.insert(
                 0,
                 TreeNode::Group {
@@ -253,38 +322,41 @@ impl TreeBuilder {
     /// The tensor tree before "compact folders" runs. Kept separate so
     /// [`build_tree_mixed`] can weave metadata leaves in before compaction.
     fn build_tree_raw(tensors: &[TensorInfo]) -> Vec<TreeNode> {
-        let mut root_map: HashMap<String, Vec<TensorInfo>> = HashMap::new();
+        // Group by the first path segment, holding tensor *references* — a
+        // `TensorInfo` is cloned into the tree only once, at its leaf, instead of
+        // once per level of nesting (which dominated the build on big checkpoints).
+        let mut root_map: HashMap<String, Vec<&TensorInfo>> = HashMap::new();
 
         for tensor in tensors {
             // Group on `.` and `__`: dotted names (HDF5 / safetensors) fold as
             // before, while underscore-flattened `.npy` names like
             // `…_down_proj_weight__variant` fold on the `__` boundary. Mapping
             // `__` → `.` keeps the rest of the path logic uniform; single `_`
-            // (within a module name) is left untouched.
-            let path = tensor.name.replace("__", ".");
-            let parts: Vec<&str> = path.split('.').collect();
-            if parts.len() > 1 {
-                let prefix = parts[0].to_string();
-                root_map.entry(prefix).or_default().push(tensor.clone());
+            // (within a module name) is left untouched. `normalize_sep` only
+            // allocates when a `__` is present (the `.npy` case).
+            let norm = normalize_sep(&tensor.name);
+            let path: &str = &norm;
+            if path.contains('.') {
+                let prefix = path.split('.').next().unwrap_or("").to_string();
+                root_map.entry(prefix).or_default().push(tensor);
             } else {
                 root_map
                     .entry("_root".to_string())
                     .or_default()
-                    .push(tensor.clone());
+                    .push(tensor);
             }
         }
 
         let mut tree = Vec::new();
-        for (prefix, mut tensors) in root_map {
+        for (prefix, tensors) in root_map {
             if prefix == "_root" {
                 for tensor in tensors {
                     tree.push(TreeNode::Tensor {
-                        info: tensor,
+                        info: tensor.clone(),
                         label: None,
                     });
                 }
             } else {
-                tensors.sort_by_key(|a| natural_sort_key(&a.name));
                 let tensor_count = tensors.len();
                 let params = tensors.iter().map(|t| t.num_elements).sum();
                 let total_size = tensors.iter().map(|t| t.size_bytes).sum();
@@ -304,26 +376,25 @@ impl TreeBuilder {
             }
         }
 
-        tree.sort_by_key(|a| natural_sort_key(a.name()));
+        tree.sort_by_cached_key(|a| natural_sort_key(a.name()));
         tree
     }
 
-    fn build_subtree(tensors: &[TensorInfo], prefix: &str) -> Vec<TreeNode> {
-        let mut groups: HashMap<String, Vec<TensorInfo>> = HashMap::new();
-        let mut direct_tensors = Vec::new();
+    fn build_subtree(tensors: &[&TensorInfo], prefix: &str) -> Vec<TreeNode> {
+        let mut groups: HashMap<String, Vec<&TensorInfo>> = HashMap::new();
+        let mut direct_tensors: Vec<&TensorInfo> = Vec::new();
+        let dotted_prefix = format!("{prefix}.");
 
-        for tensor in tensors {
+        for &tensor in tensors {
             // Same `__` → `.` normalisation as `build_tree`, so the recursive
             // prefix-stripping treats both separators uniformly.
-            let path = tensor.name.replace("__", ".");
-            let remaining = path.strip_prefix(&format!("{prefix}.")).unwrap_or(&path);
-            let parts: Vec<&str> = remaining.split('.').collect();
+            let norm = normalize_sep(&tensor.name);
+            let path: &str = &norm;
+            let remaining = path.strip_prefix(&dotted_prefix).unwrap_or(path);
 
-            if parts.len() == 1 {
-                direct_tensors.push(tensor.clone());
-            } else {
-                let next_prefix = parts[0].to_string();
-                groups.entry(next_prefix).or_default().push(tensor.clone());
+            match remaining.split_once('.') {
+                None => direct_tensors.push(tensor),
+                Some((next, _)) => groups.entry(next.to_string()).or_default().push(tensor),
             }
         }
 
@@ -331,7 +402,7 @@ impl TreeBuilder {
 
         for tensor in direct_tensors {
             result.push(TreeNode::Tensor {
-                info: tensor,
+                info: tensor.clone(),
                 label: None,
             });
         }
@@ -355,7 +426,7 @@ impl TreeBuilder {
             });
         }
 
-        result.sort_by_key(|a| natural_sort_key(a.name()));
+        result.sort_by_cached_key(|a| natural_sort_key(a.name()));
         result
     }
 
@@ -425,7 +496,7 @@ impl TreeBuilder {
     }
 
     fn flatten_node(node: &TreeNode, depth: usize, flattened: &mut Vec<(TreeNode, usize)>) {
-        flattened.push((node.clone(), depth));
+        flattened.push((node.flatten_row_clone(), depth));
 
         if let TreeNode::Group {
             children, expanded, ..
@@ -558,7 +629,7 @@ fn insert_metadata(nodes: &mut Vec<TreeNode>, parent: &[&str], meta: MetadataInf
         }
     }
     nodes.push(TreeNode::Metadata { info: meta });
-    nodes.sort_by_key(|a| natural_sort_key(a.name()));
+    nodes.sort_by_cached_key(|a| natural_sort_key(a.name()));
 }
 
 #[cfg(test)]

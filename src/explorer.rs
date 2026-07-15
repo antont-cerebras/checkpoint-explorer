@@ -1059,7 +1059,10 @@ impl Explorer {
         self.tensors
             .retain(|tensor| seen_names.insert(tensor.name.clone()));
 
-        self.tensors.sort_by_key(|a| natural_sort_key(&a.name));
+        // `sort_by_cached_key`, not `sort_by_key`: the natural-sort key allocates a
+        // `Vec`, and `sort_by_key` would recompute it O(n log n) times.
+        self.tensors
+            .sort_by_cached_key(|a| natural_sort_key(&a.name));
         self.total_parameters = self.tensors.iter().map(|t| t.num_elements).sum::<usize>();
         self.packing_schemas = crate::sample::parse_packing_schemas(&self.tensors, &self.metadata);
         self.build_tree();
@@ -1569,6 +1572,14 @@ impl Explorer {
     fn flatten_tree(&mut self) {
         self.flattened_tree = TreeBuilder::flatten_tree(&self.tree);
         self.update_filtered_tree();
+    }
+
+    /// Expand/collapse the group at flattened index `idx` in place and re-flatten.
+    /// Toggles `self.tree` directly rather than cloning the whole tree first —
+    /// that full deep-clone made every expand/collapse lag on a big checkpoint.
+    fn toggle_group_at(&mut self, idx: usize) {
+        TreeBuilder::toggle_node_by_index(idx, &mut self.tree);
+        self.flatten_tree();
     }
 
     /// Move the tree cursor onto the leaf named `name` — a tensor or a metadata
@@ -3554,10 +3565,7 @@ impl Explorer {
             return;
         }
         if !expanded {
-            let mut tree_clone = self.tree.clone();
-            let _ = TreeBuilder::toggle_node_by_index(self.selected_idx, &mut tree_clone);
-            self.tree = tree_clone;
-            self.flatten_tree();
+            self.toggle_group_at(self.selected_idx);
         }
         // The first child is the next row, one level deeper.
         if let Some((_, child_depth)) = self.flattened_tree.get(self.selected_idx + 1)
@@ -3669,33 +3677,30 @@ impl Explorer {
             &self.flattened_tree
         };
 
-        if self.selected_idx < tree.len() {
-            let (selected_node, _) = &tree[self.selected_idx];
-
-            match selected_node {
-                TreeNode::Group { .. } => {
-                    // In search mode, groups shouldn't appear, but if they do, do nothing
-                    if !self.search_mode {
-                        let mut tree_clone = self.tree.clone();
-                        let _ =
-                            TreeBuilder::toggle_node_by_index(self.selected_idx, &mut tree_clone);
-                        self.tree = tree_clone;
-                        self.flatten_tree();
-                    }
-                }
-                TreeNode::Tensor { info, .. } => {
-                    return (
-                        Some(Screen::Detail {
-                            tensor: info.name.clone(),
-                            slice: 0,
-                        }),
-                        None,
-                    );
-                }
-                TreeNode::Metadata { info } => {
-                    return (None, Some(info.clone()));
-                }
+        let Some((selected_node, _)) = tree.get(self.selected_idx) else {
+            return (None, None);
+        };
+        // Tensor / metadata return owned data (the `tree` borrow ends here). A
+        // group falls through to the in-place toggle below, which needs `&mut
+        // self` — so it must run after the borrow, not inside the match.
+        match selected_node {
+            TreeNode::Tensor { info, .. } => {
+                return (
+                    Some(Screen::Detail {
+                        tensor: info.name.clone(),
+                        slice: 0,
+                    }),
+                    None,
+                );
             }
+            TreeNode::Metadata { info } => {
+                return (None, Some(info.clone()));
+            }
+            // In search mode groups shouldn't appear, but if one does, do nothing.
+            TreeNode::Group { .. } => {}
+        }
+        if !self.search_mode {
+            self.toggle_group_at(self.selected_idx);
         }
         (None, None)
     }
