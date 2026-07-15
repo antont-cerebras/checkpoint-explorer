@@ -1470,6 +1470,34 @@ mod tests {
     }
 
     #[test]
+    fn index_mismatch_from_a_health_report_fails() {
+        // A remote index/file mismatch arrives as a HealthReport (built by the
+        // remote read); Files & sharding folds it in and fails, just as for local.
+        let report = crate::health::HealthReport {
+            index_path: "host:/ckpt/model.safetensors.index.json".into(),
+            missing_files: vec!["model-00000-of-00014.safetensors".into()],
+            extra_files: vec!["model-00001-of-00073.safetensors".into()],
+            missing_tensors: Vec::new(),
+            extra_tensors: Vec::new(),
+        };
+        let res = check_files(&[], &[], std::slice::from_ref(&report));
+        assert!(
+            res.status() == Status::Fail,
+            "a missing referenced file fails"
+        );
+        let msgs: Vec<&str> = res.findings.iter().map(|f| f.message.as_str()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("missing on disk")),
+            "expected a missing-file finding, got {msgs:?}"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("not referenced by the index")),
+            "expected an extra-file finding, got {msgs:?}"
+        );
+    }
+
+    #[test]
     fn layers_checks_a_two_layer_stack() {
         // A 2-layer checkpoint (below the old ≥3 cutoff) is now validated.
         let mut tensors = Vec::new();
