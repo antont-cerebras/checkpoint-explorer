@@ -18,6 +18,8 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use std::collections::{BTreeSet, HashMap};
+
 use crate::progress::LoadProgress;
 use crate::sftp::RemoteSession;
 use crate::stats::{DiskUsage, ShardDisk};
@@ -32,6 +34,17 @@ type FetchedCheckpoint = (
     Option<DiskUsage>,
     Vec<crate::health::HealthReport>,
 );
+
+/// What [`RemoteRead::read`] returns: the tensors, metadata, the shards' on-disk
+/// footprint, and the index/file health — all from one pass (shard headers and the
+/// index read once), so the health check reuses what the read already parsed
+/// rather than fetching headers or the index a second time.
+pub struct RemoteCheckpoint {
+    pub tensors: Vec<TensorInfo>,
+    pub metadata: Vec<MetadataInfo>,
+    pub disk: Option<DiskUsage>,
+    pub health: Vec<crate::health::HealthReport>,
+}
 
 /// Line prefix the remote script tags its JSON with, so we can pick it out of any
 /// motd / cstorch chatter on the SSH stdout.
@@ -96,43 +109,11 @@ impl RemoteRead {
         let out = self.read(&session, src, &password, progress.as_deref());
         bars.finish(0, out.is_ok());
         bars.join();
-        let (tensors, metadata, disk) = out?;
+        let rc = out?;
         let config = self.read_config(&session, src);
-        let health = self.index_health(&session, src);
-        Ok((tensors, metadata, config, disk, health))
-    }
-
-    /// The file-level index/consistency health of a remote safetensors directory:
-    /// its `model.safetensors.index.json` `weight_map` vs. the files actually
-    /// present (over SFTP). Empty for `s3://`, a single file, no index, or when
-    /// everything lines up — so a botched/stale index (references shards that
-    /// aren't there) surfaces in the tree's health popup and `⚠ health` badge,
-    /// just as it does for a local checkpoint. Best-effort: any read failure
-    /// yields no report rather than erroring the load.
-    pub fn index_health(
-        &self,
-        session: &RemoteSession,
-        src: &str,
-    ) -> Vec<crate::health::HealthReport> {
-        if src.starts_with("s3://") {
-            return Vec::new();
-        }
-        let Some((index_path, missing_files, extra_files)) = session.index_file_mismatch(src)
-        else {
-            return Vec::new();
-        };
-        let report = crate::health::HealthReport {
-            index_path,
-            missing_files,
-            extra_files,
-            missing_tensors: Vec::new(),
-            extra_tensors: Vec::new(),
-        };
-        if report.has_issues() {
-            vec![report]
-        } else {
-            Vec::new()
-        }
+        // The index/file health was computed by `read` from the same pass (no
+        // second index read or header fetch).
+        Ok((rc.tensors, rc.metadata, config, rc.disk, rc.health))
     }
 
     /// Fetch + parse the remote `config.json` for `src` over an already-open
@@ -168,12 +149,17 @@ impl RemoteRead {
         src: &str,
         password: &Option<String>,
         progress: Option<&LoadProgress>,
-    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>, Option<DiskUsage>)> {
+    ) -> Result<RemoteCheckpoint> {
         if src.starts_with("s3://") {
             // An s3:// cstorch checkpoint isn't a local filesystem path, so there's
-            // no block allocation to measure.
-            let (t, m) = self.read_cstorch(session, src, progress)?;
-            Ok((t, m, None))
+            // no block allocation to measure, and it has no HF index to check.
+            let (tensors, metadata) = self.read_cstorch(session, src, progress)?;
+            Ok(RemoteCheckpoint {
+                tensors,
+                metadata,
+                disk: None,
+                health: Vec::new(),
+            })
         } else {
             self.read_dir(session, src, password, progress)
         }
@@ -197,10 +183,17 @@ impl RemoteRead {
         path: &str,
         password: &Option<String>,
         progress: Option<&LoadProgress>,
-    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>, Option<DiskUsage>)> {
+    ) -> Result<RemoteCheckpoint> {
         use std::sync::atomic::AtomicUsize;
 
-        let files = session.list_shards(path)?;
+        // One pass over the directory: the shard read order plus the index +
+        // listing the health check needs (read once, shared below).
+        let crate::sftp::ShardListing {
+            files,
+            index_path,
+            weight_map,
+            actual,
+        } = session.list_shards(path)?;
         if files.is_empty() {
             bail!("no safetensors files found at {}", self.source_path(path));
         }
@@ -266,7 +259,45 @@ impl RemoteRead {
                     .collect::<Vec<_>>()
             })
             .and_then(DiskUsage::from_shards);
-        Ok((tensors, metadata, disk))
+
+        // Index/file health from the same pass: the index we already read (its
+        // `weight_map`) and the directory listing (`actual`), compared against the
+        // tensor names the shard read already parsed — grouped by their shard's file
+        // name. No second index read, no re-read of any header. A botched/stale
+        // index (references shards that aren't there, or lists tensors a shard
+        // doesn't hold) surfaces in the tree's health popup and `⚠ health` badge,
+        // just as for a local checkpoint.
+        let health = match index_path {
+            Some(index_path) => {
+                let mut present_by_file: HashMap<String, BTreeSet<String>> = HashMap::new();
+                for t in &tensors {
+                    if let Some(name) = std::path::Path::new(&t.source_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                    {
+                        present_by_file
+                            .entry(name.to_string())
+                            .or_default()
+                            .insert(t.name.clone());
+                    }
+                }
+                let report =
+                    crate::health::reconcile(&index_path, &weight_map, &actual, &present_by_file);
+                if report.has_issues() {
+                    vec![report]
+                } else {
+                    Vec::new()
+                }
+            }
+            None => Vec::new(),
+        };
+
+        Ok(RemoteCheckpoint {
+            tensors,
+            metadata,
+            disk,
+            health,
+        })
     }
 
     /// The `source_path` stamped on each remote tensor: an `s3://…` URI as-is, or a
