@@ -386,14 +386,38 @@ impl ssh2::KeyboardInteractivePrompt for Prompter<'_> {
 }
 
 /// Enumerate the `.safetensors` shards of `path` (a directory or a single file):
-/// the index's `weight_map` if present, plus every `*.safetensors` in the
-/// directory (covers no-index dirs / extra shards), deduped in first-seen order.
+/// the index's `weight_map` order first, then every other `*.safetensors` in the
+/// directory (covers no-index dirs / extra shards like codebooks), deduped.
+///
+/// The directory listing is the source of truth for what exists — a stale
+/// `model.safetensors.index.json` (e.g. a re-sharded checkpoint that kept an old
+/// index, so `weight_map` names shards that were renamed away) must not make us
+/// try to open files that aren't there. So index entries are kept only when the
+/// listing confirms them; when the directory can't be listed at all, the index is
+/// trusted as the only signal we have.
 fn list_shards(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<String>> {
     if path.ends_with(".safetensors") {
         return Ok(vec![path.to_string()]);
     }
     let base = path.trim_end_matches('/');
-    let mut files: Vec<String> = Vec::new();
+
+    // The `.safetensors` files actually present, sorted — the truth.
+    let (on_disk, listed) = match sftp.readdir(Path::new(base)) {
+        Ok(entries) => {
+            let mut names: Vec<String> = entries
+                .iter()
+                .filter_map(|(p, _)| p.file_name().and_then(|n| n.to_str()))
+                .filter(|n| n.ends_with(".safetensors"))
+                .map(|n| format!("{base}/{n}"))
+                .collect();
+            names.sort();
+            (names, true)
+        }
+        Err(_) => (Vec::new(), false),
+    };
+
+    // The index gives the preferred shard order.
+    let mut indexed: Vec<String> = Vec::new();
     let index = format!("{base}/model.safetensors.index.json");
     if let Ok(bytes) = read_all(sftp, &index)
         && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -402,25 +426,29 @@ fn list_shards(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<String>> {
         let mut shards: Vec<&str> = wm.values().filter_map(|s| s.as_str()).collect();
         shards.sort_unstable();
         shards.dedup();
-        for s in shards {
-            files.push(format!("{base}/{s}"));
+        indexed = shards.into_iter().map(|s| format!("{base}/{s}")).collect();
+    }
+    Ok(merge_shard_lists(&indexed, &on_disk, listed))
+}
+
+/// Combine the index's shard order with the directory listing: keep index
+/// entries the listing confirms (or all of them, if the directory couldn't be
+/// listed — the index is then all we have), then append every other present
+/// `.safetensors`. Pure, so the stale-index handling is unit-tested without a
+/// live SFTP server.
+fn merge_shard_lists(indexed: &[String], on_disk: &[String], listed: bool) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for s in indexed {
+        if (!listed || on_disk.contains(s)) && !files.contains(s) {
+            files.push(s.clone());
         }
     }
-    if let Ok(entries) = sftp.readdir(Path::new(base)) {
-        let mut names: Vec<String> = entries
-            .iter()
-            .filter_map(|(p, _)| p.file_name().and_then(|n| n.to_str()))
-            .filter(|n| n.ends_with(".safetensors"))
-            .map(|n| format!("{base}/{n}"))
-            .collect();
-        names.sort();
-        for f in names {
-            if !files.contains(&f) {
-                files.push(f);
-            }
+    for f in on_disk {
+        if !files.contains(f) {
+            files.push(f.clone());
         }
     }
-    Ok(files)
+    files
 }
 
 /// Wrap a string in single quotes for a POSIX shell, escaping any embedded
@@ -488,5 +516,53 @@ mod tests {
         // bare host → default user + port 22
         let (_, h, p) = parse_target("box");
         assert_eq!((h.as_str(), p), ("box", 22));
+    }
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn stale_index_entries_are_dropped_for_the_real_files() {
+        // The index names shards that were re-sharded away (`…-of-00014`), but the
+        // directory holds a different set (`…-of-00073`, plus codebooks). Only the
+        // files that actually exist are read.
+        let indexed = v(&["d/model-00000-of-00014.safetensors"]);
+        let on_disk = v(&[
+            "d/codebooks.safetensors",
+            "d/model-00001-of-00073.safetensors",
+            "d/model-00002-of-00073.safetensors",
+        ]);
+        let got = merge_shard_lists(&indexed, &on_disk, true);
+        assert_eq!(got, on_disk); // bogus index entry gone, order = on-disk
+    }
+
+    #[test]
+    fn index_order_wins_then_extras_appended() {
+        // A correct index fixes the shard order; files it doesn't mention
+        // (codebooks) are appended after.
+        let indexed = v(&["d/model-00001.safetensors", "d/model-00002.safetensors"]);
+        let on_disk = v(&[
+            "d/codebooks.safetensors",
+            "d/model-00001.safetensors",
+            "d/model-00002.safetensors",
+        ]);
+        let got = merge_shard_lists(&indexed, &on_disk, true);
+        assert_eq!(
+            got,
+            v(&[
+                "d/model-00001.safetensors",
+                "d/model-00002.safetensors",
+                "d/codebooks.safetensors",
+            ])
+        );
+    }
+
+    #[test]
+    fn unlistable_dir_trusts_the_index() {
+        // If the directory can't be listed, the index is the only signal — keep it.
+        let indexed = v(&["d/model-00001.safetensors"]);
+        let got = merge_shard_lists(&indexed, &[], false);
+        assert_eq!(got, indexed);
     }
 }
