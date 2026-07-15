@@ -235,6 +235,7 @@ without `--tensor` is reported as ambiguous.
 | `--search <QUERY>` | Open the tree in search mode filtered to QUERY (the `/` key) |
 | `--legend` | Overlay the opened screen's legend (the `l` key); most useful with `--plain` |
 | `--health` | Open straight into the health-check popup on the tree (the `h` key) |
+| `--health-findings` | Like `--health`, but with the per-finding detail expanded (the popup's `f` toggle) |
 | `--stats` | Open straight into the checkpoint-stats popup on the tree (the `s` key) |
 | `--stats-shards` | Like `--stats`, but with the on-disk per-shard breakdown expanded (the popup's `f` toggle) |
 | `--dtype <DTYPE>` | Reinterpret the dtype: `u4`, `i4`, `unpacked` (fused-codebook unmerge; needs a packing schema), or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
@@ -310,7 +311,7 @@ what it does (handy while you're still learning the keys).
 | `n` | Copy the selected tensor's Name to the clipboard |
 | `y` | Show and copy the CLI command that reopens this exact screen — file, tensor (or metadata entry), dtype/shape overrides, view, layout, zebra, base, slice (works on every screen) |
 | `s` | **Detail screen:** compute the tensor's statistics on demand · **Tree:** float the [checkpoint-stats popup](#checkpoint-statistics-s) — per-file / per-tensor sizes, params, the dtype mix, and the per-layer / per-expert breakdown; `f` folds/unfolds the on-disk per-shard list, `r` copies the report, `c` the screen, `y` the reopen command (`--stats`) |
-| `h` | **Detail screen:** show the value histogram · **Tree:** run the health checks and float the report in a popup — `v` runs the value-tier data scan (progress bar; `Esc` cancels), `r` copies the report, `c` the screen, `y` the reopen command (`--health`); same checks as the [`check`](#checking-checkpoints-check) subcommand (auto-suggested when an index/file mismatch is detected) |
+| `h` | **Detail screen:** show the value histogram · **Tree:** run the health checks and float the report in a popup — `f` folds/unfolds the per-finding detail (folded by default), `v` runs the value-tier data scan (progress bar; `Esc` cancels), `r` copies the report, `c` the screen, `y` the reopen command (`--health`); same checks as the [`check`](#checking-checkpoints-check) subcommand (auto-suggested when an index/file mismatch is detected) |
 | `R` | Repack the current HDF5 checkpoint into a new file (HDF5 only) |
 | `Backspace` / `\` | Step **back** / **forward** through the screens you've visited (browser-style history) — e.g. reopen a view you just left |
 | `Esc` | Exit search mode |
@@ -736,12 +737,16 @@ Findings have two severities: **errors** always fail the run, **warnings** only
 fail it under `--strict`.
 
 The checks are also available **interactively**: press `h` in the tree browser
-(or launch with `--health`) to float the report in a popup. There, `v` runs the
-value-tier data scan (progress bar; `Esc` cancels), `r` copies the report, `c`
-copies the tree screen, and `y` copies the CLI command that reopens the popup
-(`… --health`); `Esc` or a click dismisses. (`v` is offered only for a local
-checkpoint — a remote `--ssh-read` source has no local bytes to scan.) When the
-explorer auto-detects an index/file mismatch on startup it points you to `h`.
+(or launch with `--health`) to float the report in a popup. Each check shows a
+pass/warn/fail row with its counts; the per-finding detail is **folded by
+default** — `f` (or a click on the toggle, like the stats popup's per-shard
+fold) unfolds the full list, and `--health-findings` opens it expanded. There,
+`v` runs the value-tier data scan (progress bar; `Esc` cancels), `r` copies the
+report, `c` copies the tree screen, and `y` copies the CLI command that reopens
+the popup (`… --health` / `--health-findings`); `Esc` or a click elsewhere
+dismisses. (`v` is offered only for a local checkpoint — a remote `--ssh-read`
+source has no local bytes to scan.) When the explorer auto-detects an index/file
+mismatch on startup it points you to `h`.
 
 ## Example Output
 

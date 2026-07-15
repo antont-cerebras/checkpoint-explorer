@@ -486,9 +486,17 @@ pub fn run(
     if values {
         results.push(check_values(tensors, metadata, filter, jobs));
     }
+    // The distinct files the tensors actually came from — the real shard count,
+    // whether local (`files` are the shards) or remote (`files` is just the one
+    // directory/URI passed in, so its `len()` would wrongly report 1).
+    let n_files = tensors
+        .iter()
+        .map(|t| t.source_path.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
     CheckReport {
         label,
-        n_files: files.len(),
+        n_files,
         n_tensors: tensors.len(),
         params,
         values,
@@ -1339,9 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn popup_renders_every_finding() {
-        // The popup shows the full findings list (scrollable) — nothing is capped
-        // or hidden, so a big report is complete.
+    fn popup_folds_findings_like_the_stats_popup() {
         let findings: Vec<Finding> = (0..250)
             .map(|i| Finding::error(Some(format!("tensor-{i:04}")), "bad byte range".into()))
             .collect();
@@ -1358,22 +1364,54 @@ mod tests {
                 findings,
             )],
         };
-        let out = crate::tui::headless_render(200, 400, |f| {
-            crate::ui::UI::render_check_report(
-                f,
-                &report,
-                crate::ui::CheckPopup::Idle {
-                    copied: None,
-                    can_scan: false,
-                },
-                0,
-            );
-        })
-        .unwrap();
-        assert!(out.contains("tensor-0000"), "first finding shown");
+        let render = |expanded| {
+            crate::tui::headless_render(200, 400, |f| {
+                crate::ui::UI::render_check_report(
+                    f,
+                    &report,
+                    crate::ui::CheckPopup::Idle {
+                        copied: None,
+                        can_scan: false,
+                    },
+                    0,
+                    expanded,
+                );
+            })
+            .unwrap()
+        };
+
+        // Folded (default): findings hidden behind a toggle line.
+        let folded = render(false);
         assert!(
-            out.contains("tensor-0249"),
+            folded.contains("250 findings"),
+            "fold toggle shows the count"
+        );
+        // The `f` hint lives in the footer, consistent with the other popups.
+        assert!(
+            folded.contains("expand findings"),
+            "footer hints `f` to expand:\n{folded}"
+        );
+        // Indented under the check title's first letter (4 spaces), not the deeper
+        // finding indent, so the toggle reads as the check's collapsed detail.
+        assert!(
+            folded.contains("    ▸ 250 findings"),
+            "toggle indented under the check title:\n{folded}"
+        );
+        assert!(
+            !folded.contains("tensor-0000"),
+            "findings hidden when folded"
+        );
+
+        // Expanded: the full list (nothing capped), plus a fold-back hint.
+        let expanded = render(true);
+        assert!(expanded.contains("tensor-0000"), "first finding shown");
+        assert!(
+            expanded.contains("tensor-0249"),
             "last finding shown too (no cap)"
+        );
+        assert!(
+            expanded.contains("fold findings"),
+            "footer offers folding back:\n{expanded}"
         );
     }
 

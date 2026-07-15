@@ -300,6 +300,12 @@ struct ExploreArgs {
 
     #[arg(
         long,
+        help = "Like --health, but with the per-finding detail expanded (the popup's `f` toggle)"
+    )]
+    health_findings: bool,
+
+    #[arg(
+        long,
         help = "Open straight into the checkpoint-stats popup on the tree (the `s` key)"
     )]
     stats: bool,
@@ -1592,6 +1598,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.search.is_some()
         || args.legend
         || args.health
+        || args.health_findings
         || args.stats
         || args.stats_shards;
     let view = if args.values {
@@ -1638,6 +1645,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.search.is_some()
         || args.legend
         || args.health
+        || args.health_findings
         || args.stats
         || args.stats_shards
         || args.exit;
@@ -1660,6 +1668,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         search: args.search,
         legend: args.legend,
         health: args.health,
+        health_findings: args.health_findings,
         stats: args.stats,
         stats_shards: args.stats_shards,
         exit_after: args.exit,
