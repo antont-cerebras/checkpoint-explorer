@@ -3408,6 +3408,36 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
             "  a remote source: only header metadata is loaded; data views need the file locally",
         ),
     ]));
+    // The `⚠ health` alert badge only appears on the tree's status line, so it's
+    // documented there: orange when the checkpoint has warnings only, red for a
+    // real error. Aligned with the badges above.
+    if matches!(legend, Legend::Tree) {
+        use unicode_width::UnicodeWidthStr;
+        let desc_col = 2 + METADATA_BADGE.width() + 2;
+        let health = |bg: Color, desc: &str| -> Line<'static> {
+            let pad = desc_col.saturating_sub(2 + HEALTH_BADGE.width()).max(1);
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    HEALTH_BADGE.to_string(),
+                    Style::default()
+                        .bg(bg)
+                        .fg(palette::STATUS_FG)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" ".repeat(pad)),
+                Span::raw(desc.to_string()),
+            ])
+        };
+        lines.push(health(
+            palette::WARN_BG,
+            "health: warnings only (e.g. files on disk the index doesn't list)",
+        ));
+        lines.push(health(
+            palette::ALERT,
+            "health: an error — a referenced file or tensor is missing on disk",
+        ));
+    }
 
     lines.push(Line::default());
     lines.push(Line::from(dim_span("Click or press any key to close.")));

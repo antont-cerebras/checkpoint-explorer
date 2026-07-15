@@ -11,11 +11,10 @@ R repack · q quit
   ▸ 🔧 Metadata (▦ 0, 0 B)
   · lm_head.weight [F16, (10, 4), 80 B → 27 B (⇩ gzip)]
   ▾ model (▦ 22, 2.0 KiB → 1.2 KiB)
-    · embed_tokens.weight [F16, (10, 4), 80 B → 27 B (⇩ gzip)]
-    ▸ la╭ Legend — checkpoint tree ────────────────────────────────────────────────────────────────────────────╮
-    · no│   ▾ ▸             a group, expanded / collapsed (Enter or Space toggles it)                          │
-    · sc│   ·               a tensor (a stored array)                                                          │
-        │   ✚               an extra tensor on disk but not listed in the index (model.safetensors.index.json) │
+    · em╭ Legend — checkpoint tree ────────────────────────────────────────────────────────────────────────────╮
+    ▸ la│   ▾ ▸             a group, expanded / collapsed (Enter or Space toggles it)                          │
+    · no│   ·               a tensor (a stored array)                                                          │
+    · sc│   ✚               an extra tensor on disk but not listed in the index (model.safetensors.index.json) │
         │   †               a metadata entry (shown beside its tensor, or in the Metadata group)               │
         │   ≡ N             number of layers (numbered sub-groups) in the group                                │
         │   ▦ N             number of tensors in the group / checkpoint                                        │
@@ -28,10 +27,11 @@ R repack · q quit
         │                                                                                                      │
         │    read-only       browsing never modifies the checkpoint — repack / convert write a new file        │
         │    metadata-only   a remote source: only header metadata is loaded; data views need the file locally │
+        │    ⚠ health        health: warnings only (e.g. files on disk the index doesn't list)                 │
+        │    ⚠ health        health: an error — a referenced file or tensor is missing on disk                 │
         │                                                                                                      │
         │ Click or press any key to close.                                                                     │
         ╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
-
 
 
 
