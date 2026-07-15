@@ -301,7 +301,8 @@ what it does (handy while you're still learning the keys).
 | `←` | Jump to the parent group |
 | `→` | Enter the group (expand if needed) and select its first child |
 | `Shift`+`↑` / `Shift`+`↓` | Jump to the previous / next sibling |
-| `Enter` / `Space` | Expand/collapse groups, view tensor details |
+| `Enter` | Expand/collapse the group, or open the tensor's details |
+| `Space` / `:` | Open the **command palette** — fuzzy-search and run any command (VS Code style, grouped `Copy: File path`, `View: Stats`, …) |
 | `E` / `C` | Expand all / collapse all groups |
 | `/` | Enter search mode to filter tensors |
 | `l` | Show a legend explaining the symbols on the current screen (works on every screen) |
@@ -361,7 +362,7 @@ Press `Enter` to open the highlighted result's details (you stay in search), and
 
 ### Tensor data preview
 
-From a tensor's detail screen (open it with `Enter`/`Space`), you can preview the
+From a tensor's detail screen (open it with `Enter`), you can preview the
 actual data of 1D/2D/3D tensors. Size-1 dimensions are ignored when counting
 those, so a tensor stored as e.g. `(128, 3088, 1, 748)` previews as the 3D
 `(128, 3088, 748)` it effectively is:
@@ -777,7 +778,7 @@ mismatch on startup it points you to `h`.
 
 ```
 Checkpoint Explorer - model.safetensors (1/1)
-↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · Enter/Space expand · E/C all · / search · l legend · c copy screen · f copy file · n copy name · y copy command · ⌫/\ back/fwd · q quit
+↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · Enter open · Space/: commands · E/C all · / search · l legend · h health · s stats · c copy screen · t copy tree · f copy file · n copy name · y copy command · ⌫/\ back/fwd · q quit
 ────────────────────────────────────────────────────────────────────────────────
 
 ▾ model.safetensors (▦ 342, 1.5B params, 1.2 GiB)

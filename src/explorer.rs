@@ -519,6 +519,60 @@ enum Nav {
     Quit,
 }
 
+/// A command the palette lists and runs, and the single action every tree
+/// shortcut dispatches through ([`Explorer::run_command`]). Keeping the command
+/// as data (rather than only a match arm) lets the palette enumerate the same set
+/// the keys do, and leaves room for future palette-only or global commands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cmd {
+    Search,
+    ExpandAll,
+    CollapseAll,
+    Stats,
+    Health,
+    Legend,
+    CopyScreen,
+    CopyTree,
+    CopyPath,
+    CopyName,
+    CopyCommand,
+    Repack,
+    Quit,
+}
+
+/// The tree screen's command registry, in palette order: `(command, group,
+/// title, the key that also runs it)`. The palette shows each as `Group: Title`
+/// (VS Code style); the one-line help beside it is looked up from
+/// [`crate::ui::shortcut_help`] by the key, so the palette and hover hints can't
+/// drift.
+const TREE_COMMANDS: &[(Cmd, &str, &str, char)] = &[
+    (Cmd::Search, "Tree", "Search by name", '/'),
+    (Cmd::ExpandAll, "Tree", "Expand all groups", 'E'),
+    (Cmd::CollapseAll, "Tree", "Collapse all groups", 'C'),
+    (Cmd::Stats, "View", "Checkpoint stats", 's'),
+    (Cmd::Health, "View", "Health report", 'h'),
+    (Cmd::Legend, "View", "Legend", 'l'),
+    (Cmd::CopyScreen, "Copy", "Screen text", 'c'),
+    (Cmd::CopyTree, "Copy", "Tree / tensor list…", 't'),
+    (Cmd::CopyPath, "Copy", "File path", 'f'),
+    (Cmd::CopyName, "Copy", "Tensor name", 'n'),
+    (Cmd::CopyCommand, "Copy", "Command to reopen this view", 'y'),
+    (Cmd::Repack, "File", "Repack HDF5 into a new codec…", 'R'),
+    (Cmd::Quit, "App", "Quit", 'q'),
+];
+
+/// A resolved command entry: `(command, group, title, key)`.
+type CmdEntry = (Cmd, &'static str, &'static str, char);
+
+/// The tree command bound to key `c`, if any — so the key handler and the palette
+/// share one key→command mapping (the registry table).
+fn tree_command_for_key(c: char) -> Option<Cmd> {
+    TREE_COMMANDS
+        .iter()
+        .find(|(_, _, _, key)| *key == c)
+        .map(|(cmd, _, _, _)| *cmd)
+}
+
 pub struct Explorer {
     files: Vec<PathBuf>,
     tensors: Vec<TensorInfo>,
@@ -2895,6 +2949,164 @@ impl Explorer {
         ));
     }
 
+    /// Run `f` with the live terminal temporarily taken out of `self` and handed
+    /// to it, then put back — the take/restore dance the pop-up commands share.
+    fn with_terminal<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self, &mut crate::tui::LiveTerminal) -> R,
+    ) -> R {
+        let mut term = self
+            .terminal
+            .take()
+            .expect("interactive loop owns the terminal");
+        let out = f(self, &mut term);
+        self.terminal = Some(term);
+        out
+    }
+
+    /// Perform a tree command, from its key or the palette. Returns `Some(Nav)` for
+    /// a command that leaves the tree (only `Quit` so far), else `None`. Pop-up
+    /// commands borrow the terminal via [`Self::with_terminal`].
+    fn run_command(&mut self, cmd: Cmd) -> Option<Nav> {
+        match cmd {
+            Cmd::Search => self.enter_search_mode(),
+            Cmd::ExpandAll => self.set_all_expanded(true),
+            Cmd::CollapseAll => self.set_all_expanded(false),
+            Cmd::CopyScreen => self.copy_tree_screen(),
+            Cmd::CopyPath => self.copy_selected_path(),
+            Cmd::CopyName => self.copy_selected_name(),
+            Cmd::Stats => self.with_terminal(|s, t| s.show_stats(t, false)),
+            Cmd::Health => self.with_terminal(|s, t| s.show_check_report(t, false)),
+            Cmd::Legend => self.with_terminal(|s, t| s.show_legend(t, Legend::Tree, None)),
+            Cmd::CopyTree => self.with_terminal(|s, t| s.copy_menu(t)),
+            Cmd::CopyCommand => {
+                let c = self.command_for_tree_selection();
+                self.with_terminal(|s, t| s.copy_command(t, &c, None));
+            }
+            Cmd::Repack => self.with_terminal(|s, t| s.repack_checkpoint(t)),
+            Cmd::Quit => return Some(Nav::Quit),
+        }
+        None
+    }
+
+    /// The commands available on the tree right now, in palette order — the static
+    /// registry minus any whose precondition fails (e.g. Repack needs an HDF5
+    /// source).
+    fn available_commands(&self) -> Vec<CmdEntry> {
+        TREE_COMMANDS
+            .iter()
+            .copied()
+            .filter(|(cmd, _, _, _)| match cmd {
+                Cmd::Repack => self.repack_input().is_some(),
+                _ => true,
+            })
+            .collect()
+    }
+
+    /// Float the command palette over the tree (Space or `:`): a fuzzy-filtered
+    /// picker of the available commands. Returns the chosen command — the caller
+    /// runs it after the terminal is handed back, so a pop-up command can reclaim
+    /// it — or `None` if dismissed.
+    fn command_palette(&mut self, term: &mut crate::tui::LiveTerminal) -> Option<Cmd> {
+        let all = self.available_commands();
+        let help = |key: char| {
+            crate::ui::shortcut_help(
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                HelpCtx::Tree,
+            )
+            .unwrap_or("")
+        };
+        let matcher = SkimMatcherV2::default();
+        let mut query = String::new();
+        let mut sel = 0usize;
+        let mut row_rects: Vec<ratatui::layout::Rect> = Vec::new();
+        loop {
+            // Filter + rank by fuzzy score over "Group Title help".
+            let filtered: Vec<CmdEntry> = if query.is_empty() {
+                all.clone()
+            } else {
+                let mut scored: Vec<(CmdEntry, i64)> = all
+                    .iter()
+                    .filter_map(|&(cmd, group, title, key)| {
+                        let hay = format!("{group} {title} {}", help(key));
+                        matcher
+                            .fuzzy_match(&hay, &query)
+                            .map(|s| ((cmd, group, title, key), s))
+                    })
+                    .collect();
+                // Highest fuzzy score first.
+                scored.sort_by_key(|&(_, score)| std::cmp::Reverse(score));
+                scored.into_iter().map(|(c, _)| c).collect()
+            };
+            if sel >= filtered.len() {
+                sel = filtered.len().saturating_sub(1);
+            }
+            let rows: Vec<(String, String, String, String)> = filtered
+                .iter()
+                .map(|&(_, group, title, key)| {
+                    (
+                        key.to_string(),
+                        group.to_string(),
+                        title.to_string(),
+                        help(key).to_string(),
+                    )
+                })
+                .collect();
+            if term
+                .draw(|f| {
+                    self.render_tree_frame(f, true);
+                    row_rects = UI::render_command_palette(f, &query, &rows, sel);
+                })
+                .is_err()
+            {
+                return None;
+            }
+            let hit = |col: u16, row: u16| -> Option<usize> {
+                row_rects
+                    .iter()
+                    .position(|r| row == r.y && col >= r.x && col < r.x + r.width)
+            };
+            match event::read() {
+                Ok(Event::Key(key)) => {
+                    if is_ctrl_c(&key) {
+                        quit_immediately();
+                    }
+                    match key.code {
+                        KeyCode::Esc => return None,
+                        KeyCode::Up => sel = sel.saturating_sub(1),
+                        KeyCode::Down if sel + 1 < filtered.len() => sel += 1,
+                        KeyCode::Enter => return filtered.get(sel).map(|&(c, _, _, _)| c),
+                        KeyCode::Backspace => {
+                            query.pop();
+                            sel = 0;
+                        }
+                        KeyCode::Char(c) => {
+                            query.push(c);
+                            sel = 0;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Event::Mouse(m)) => match m.kind {
+                    MouseEventKind::ScrollUp => sel = sel.saturating_sub(1),
+                    MouseEventKind::ScrollDown if sel + 1 < filtered.len() => sel += 1,
+                    MouseEventKind::Moved => {
+                        if let Some(i) = hit(m.column, m.row) {
+                            sel = i;
+                        }
+                    }
+                    MouseEventKind::Down(_) => match hit(m.column, m.row) {
+                        Some(i) => return filtered.get(i).map(|&(c, _, _, _)| c),
+                        None => return None,
+                    },
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// The tree browser. Handles in-place keys (navigation, search, expand) and
     /// returns a [`Nav`] when the user opens a tensor (`Enter`), moves through
     /// the screen history (Backspace / `\`), or quits.
@@ -3139,104 +3351,42 @@ impl Explorer {
                     continue;
                 }
                 match key_event {
-                    // `q` quits only outside search; while searching it is a
-                    // normal character (typed via the search Char(c) arm below),
-                    // so search is left with Esc.
-                    KeyEvent {
-                        code: KeyCode::Char('q'),
-                        ..
-                    } if !self.search_mode => return Ok(Nav::Quit),
+                    // Ctrl-C always quits (even mid-search).
                     KeyEvent {
                         code: KeyCode::Char('c'),
                         modifiers: KeyModifiers::CONTROL,
                         ..
                     } => return Ok(Nav::Quit),
-                    // `c` (no modifier) copies the screen's text; `t` copies the
-                    // whole (fully-expanded) tree; `f` copies the selected row's
-                    // source File. In search mode they fall through to the query.
+                    // Space or `:` opens the command palette (a fuzzy launcher for
+                    // every tree command; Enter still opens/toggles the row). The
+                    // chosen command runs after the palette hands the terminal back.
                     KeyEvent {
-                        code: KeyCode::Char('c'),
-                        ..
-                    } if !self.search_mode => self.copy_tree_screen(),
-                    KeyEvent {
-                        code: KeyCode::Char('t'),
+                        code: KeyCode::Char(' ') | KeyCode::Char(':'),
                         ..
                     } if !self.search_mode => {
-                        let mut term = self.terminal.take().expect("interactive loop owns it");
-                        self.copy_menu(&mut term);
-                        self.terminal = Some(term);
+                        if let Some(cmd) = self.with_terminal(|s, t| s.command_palette(t))
+                            && let Some(nav) = self.run_command(cmd)
+                        {
+                            return Ok(nav);
+                        }
                     }
+                    // Every other tree command dispatches through the registry
+                    // ([`run_command`]) — the same path the palette uses — so the
+                    // key and the palette entry can't drift. In search mode the
+                    // letters fall through to the query instead.
                     KeyEvent {
-                        code: KeyCode::Char('f'),
+                        code: KeyCode::Char(c),
+                        modifiers,
                         ..
-                    } if !self.search_mode => self.copy_selected_path(),
-                    // `n` copies the selected tensor's full name (shown in the
-                    // status bar; the tree row may abbreviate it).
-                    KeyEvent {
-                        code: KeyCode::Char('n'),
-                        ..
-                    } if !self.search_mode => self.copy_selected_name(),
-                    // `y` shows and copies the CLI command that reopens this view
-                    // — the highlighted tensor if one is selected, else the files.
-                    KeyEvent {
-                        code: KeyCode::Char('y'),
-                        ..
-                    } if !self.search_mode => {
-                        let mut term = self.terminal.take().expect("interactive loop owns it");
-                        self.copy_command(&mut term, &self.command_for_tree_selection(), None);
-                        self.terminal = Some(term);
+                    } if !self.search_mode
+                        && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && tree_command_for_key(c).is_some() =>
+                    {
+                        let cmd = tree_command_for_key(c).expect("guarded by is_some");
+                        if let Some(nav) = self.run_command(cmd) {
+                            return Ok(nav);
+                        }
                     }
-                    // `h` runs the health checks and floats the report (the check
-                    // popup; `v` there runs the value scan, `y` copies).
-                    KeyEvent {
-                        code: KeyCode::Char('h'),
-                        ..
-                    } if !self.search_mode => {
-                        let mut term = self.terminal.take().expect("interactive loop owns it");
-                        self.show_check_report(&mut term, false);
-                        self.terminal = Some(term);
-                    }
-                    // `s` floats the overall-checkpoint stats popup (sizes, params,
-                    // dtype mix, layer / MoE-expert structure).
-                    KeyEvent {
-                        code: KeyCode::Char('s'),
-                        ..
-                    } if !self.search_mode => {
-                        let mut term = self.terminal.take().expect("interactive loop owns it");
-                        self.show_stats(&mut term, false);
-                        self.terminal = Some(term);
-                    }
-                    // `l` opens the legend for the tree's glyphs.
-                    KeyEvent {
-                        code: KeyCode::Char('l'),
-                        ..
-                    } if !self.search_mode => {
-                        let mut term = self.terminal.take().expect("interactive loop owns it");
-                        self.show_legend(&mut term, Legend::Tree, None);
-                        self.terminal = Some(term);
-                    }
-                    // `E` / `C` expand / collapse every group at once.
-                    KeyEvent {
-                        code: KeyCode::Char('E'),
-                        ..
-                    } if !self.search_mode => self.set_all_expanded(true),
-                    KeyEvent {
-                        code: KeyCode::Char('C'),
-                        ..
-                    } if !self.search_mode => self.set_all_expanded(false),
-                    // `R` repacks the current HDF5 checkpoint into a new file.
-                    KeyEvent {
-                        code: KeyCode::Char('R'),
-                        ..
-                    } if !self.search_mode => {
-                        let mut term = self.terminal.take().expect("interactive loop owns it");
-                        self.repack_checkpoint(&mut term);
-                        self.terminal = Some(term);
-                    }
-                    KeyEvent {
-                        code: KeyCode::Char('/'),
-                        ..
-                    } if !self.search_mode => self.enter_search_mode(),
                     // While searching, '/' is ignored rather than typed into the query.
                     KeyEvent {
                         code: KeyCode::Char('/'),
@@ -3349,18 +3499,12 @@ impl Explorer {
                     } if self.search_mode => self.reveal_search_result(),
                     // Enter acts on the highlighted row in both modes: expand a
                     // group, or open a tensor detail (returned to the navigator).
+                    // (Space no longer does this — it opens the command palette,
+                    // handled earlier.)
                     KeyEvent {
                         code: KeyCode::Enter,
                         ..
                     } => {
-                        if let Some(nav) = self.activate_selection() {
-                            return Ok(nav);
-                        }
-                    }
-                    KeyEvent {
-                        code: KeyCode::Char(' '),
-                        ..
-                    } if !self.search_mode => {
                         if let Some(nav) = self.activate_selection() {
                             return Ok(nav);
                         }
@@ -7198,6 +7342,27 @@ fn copy_to_clipboard(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_registry_maps_keys_and_filters_unavailable() {
+        // The key handler and the palette share one key→command table.
+        assert_eq!(tree_command_for_key('s'), Some(Cmd::Stats));
+        assert_eq!(tree_command_for_key('/'), Some(Cmd::Search));
+        assert_eq!(tree_command_for_key('q'), Some(Cmd::Quit));
+        assert_eq!(tree_command_for_key('z'), None); // unbound
+
+        // A non-HDF5 checkpoint can't repack, so the palette omits that command
+        // but still offers the rest.
+        let e = Explorer::new(Vec::new(), Vec::new(), None, false);
+        let available: Vec<Cmd> = e.available_commands().iter().map(|&(c, ..)| c).collect();
+        assert!(available.contains(&Cmd::Stats));
+        assert!(available.contains(&Cmd::Quit));
+        assert!(
+            !available.contains(&Cmd::Repack),
+            "repack needs an HDF5 source: {available:?}"
+        );
+        assert_eq!(available.len(), TREE_COMMANDS.len() - 1);
+    }
 
     #[test]
     fn held_key_scroll_accelerates_then_resets() {
