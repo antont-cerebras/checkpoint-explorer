@@ -30,6 +30,7 @@ type FetchedCheckpoint = (
     Vec<MetadataInfo>,
     Option<crate::config::ModelConfig>,
     Option<DiskUsage>,
+    Vec<crate::health::HealthReport>,
 );
 
 /// Line prefix the remote script tags its JSON with, so we can pick it out of any
@@ -97,7 +98,41 @@ impl RemoteRead {
         bars.join();
         let (tensors, metadata, disk) = out?;
         let config = self.read_config(&session, src);
-        Ok((tensors, metadata, config, disk))
+        let health = self.index_health(&session, src);
+        Ok((tensors, metadata, config, disk, health))
+    }
+
+    /// The file-level index/consistency health of a remote safetensors directory:
+    /// its `model.safetensors.index.json` `weight_map` vs. the files actually
+    /// present (over SFTP). Empty for `s3://`, a single file, no index, or when
+    /// everything lines up — so a botched/stale index (references shards that
+    /// aren't there) surfaces in the tree's health popup and `⚠ health` badge,
+    /// just as it does for a local checkpoint. Best-effort: any read failure
+    /// yields no report rather than erroring the load.
+    pub fn index_health(
+        &self,
+        session: &RemoteSession,
+        src: &str,
+    ) -> Vec<crate::health::HealthReport> {
+        if src.starts_with("s3://") {
+            return Vec::new();
+        }
+        let Some((index_path, missing_files, extra_files)) = session.index_file_mismatch(src)
+        else {
+            return Vec::new();
+        };
+        let report = crate::health::HealthReport {
+            index_path,
+            missing_files,
+            extra_files,
+            missing_tensors: Vec::new(),
+            extra_tensors: Vec::new(),
+        };
+        if report.has_issues() {
+            vec![report]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Fetch + parse the remote `config.json` for `src` over an already-open

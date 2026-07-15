@@ -758,13 +758,15 @@ fn run_check(
             // The checkpoint's config.json, fetched over the same session (no
             // second prompt) so the config check runs remotely too.
             let config = r.read_config(&session, &src);
-            // No local files/health over SSH — the file/shard check is n/a.
+            // Index/file consistency over the same session, so `check` flags a
+            // botched/stale remote index just like a local one.
+            let health = r.index_health(&session, &src);
             Ok(check::run(
                 src.clone(),
                 &tensors,
                 &metadata,
                 &[],
-                &[],
+                &health,
                 config.as_ref(),
                 &filter,
                 false,
@@ -782,7 +784,8 @@ fn run_check(
             if files.is_empty() {
                 anyhow::bail!("no checkpoint files found");
             }
-            let (tensors, metadata, config, _disk) = Explorer::gather_checkpoint(&files, None)?;
+            let (tensors, metadata, config, _disk, _health) =
+                Explorer::gather_checkpoint(&files, None)?;
             let label = paths
                 .iter()
                 .map(|p| p.display().to_string())
@@ -1122,7 +1125,8 @@ fn run_diff(
             anyhow::bail!("no checkpoint files found at {}", path.display());
         }
         // `diff` compares structure only — the config sidecar isn't needed here.
-        let (tensors, metadata, _config, _disk) = Explorer::gather_checkpoint(&files, None)?;
+        let (tensors, metadata, _config, _disk, _health) =
+            Explorer::gather_checkpoint(&files, None)?;
         Ok((tensors, metadata))
     };
 

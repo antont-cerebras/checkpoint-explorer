@@ -317,12 +317,15 @@ const COPY_FLASH: std::time::Duration = std::time::Duration::from_secs(2);
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// What [`Explorer::gather_checkpoint`] returns: tensors, metadata, the parsed
-/// `config.json`, and the shards' on-disk footprint (the last three optional).
+/// `config.json`, the shards' on-disk footprint, and any remote health reports
+/// (index/file mismatch — empty for a local read, whose health is gathered up
+/// front instead).
 type CheckpointParts = (
     Vec<TensorInfo>,
     Vec<MetadataInfo>,
     Option<crate::config::ModelConfig>,
     Option<crate::stats::DiskUsage>,
+    Vec<crate::health::HealthReport>,
 );
 
 /// Rows the tree viewport scrolls per mouse-wheel notch (independent of the
@@ -962,11 +965,14 @@ impl Explorer {
             }
             frame += 1;
         }
-        let (tensors, metadata, config, disk) = handle
+        let (tensors, metadata, config, disk, health) = handle
             .join()
             .map_err(|_| anyhow::anyhow!("checkpoint loader thread panicked"))??;
         self.config = config;
         self.remote_disk = disk;
+        // Remote index/file health (empty for a local read, whose reports were
+        // gathered up front); fold it in so the popup and `⚠ health` badge show it.
+        self.health_reports.extend(health);
         self.finalize_load(tensors, metadata);
         Ok(())
     }
@@ -977,10 +983,11 @@ impl Explorer {
     fn load_quiet(&mut self) -> Result<()> {
         self.tensors.clear();
         self.metadata.clear();
-        let (tensors, metadata, config, disk) =
+        let (tensors, metadata, config, disk, health) =
             Self::gather_checkpoint(&self.files, self.remote_read.as_ref())?;
         self.config = config;
         self.remote_disk = disk;
+        self.health_reports.extend(health);
         self.finalize_load(tensors, metadata);
         Ok(())
     }
@@ -1390,19 +1397,22 @@ impl Explorer {
         // Remote shards' on-disk footprint (local files are statted lazily when
         // the stats popup opens; the remote session is only live during the read).
         let mut disk_shards: Vec<crate::stats::ShardDisk> = Vec::new();
+        // Remote index/file health (local health is gathered up front, in main).
+        let mut remote_health: Vec<crate::health::HealthReport> = Vec::new();
         for file_path in files {
             let as_str = file_path.to_string_lossy();
             // `--ssh-read`: every source is read on the remote (an s3:// cstorch
             // checkpoint, or a remote safetensors directory/file), keeping the
             // credentials and data there.
             if let Some(r) = remote {
-                let (t, m, cfg, disk) = r.fetch_with_config(&as_str)?;
+                let (t, m, cfg, disk, health) = r.fetch_with_config(&as_str)?;
                 tensors.extend(t);
                 metadata.extend(m);
                 config = config.or(cfg);
                 if let Some(d) = disk {
                     disk_shards.extend(d.shards);
                 }
+                remote_health.extend(health);
                 continue;
             }
             // Without --ssh-read a bare s3:// URI has no local credentials to read.
@@ -1448,6 +1458,7 @@ impl Explorer {
             metadata,
             config,
             crate::stats::DiskUsage::from_shards(disk_shards),
+            remote_health,
         ))
     }
 

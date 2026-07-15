@@ -142,6 +142,39 @@ impl RemoteSession {
         list_shards(&sftp, path)
     }
 
+    /// Compare a remote directory's `model.safetensors.index.json` `weight_map`
+    /// against the `.safetensors` files actually present, both over SFTP — the
+    /// file-level half of the local health check, for a remote checkpoint. Returns
+    /// `(index_path, missing, extra)`: files the index references but that aren't
+    /// on disk, and files on disk the index never mentions. `None` when there's no
+    /// index to check (a single file, or no `index.json`).
+    pub fn index_file_mismatch(&self, path: &str) -> Option<(String, Vec<String>, Vec<String>)> {
+        use std::collections::BTreeSet;
+        if path.ends_with(".safetensors") {
+            return None;
+        }
+        let sftp = self.session.sftp().ok()?;
+        let base = path.trim_end_matches('/');
+        let index_path = format!("{base}/model.safetensors.index.json");
+        let bytes = read_all(&sftp, &index_path).ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let wm = v.get("weight_map")?.as_object()?;
+        let referenced: BTreeSet<String> = wm
+            .values()
+            .filter_map(|f| f.as_str().map(str::to_string))
+            .collect();
+        let actual: BTreeSet<String> = sftp
+            .readdir(Path::new(base))
+            .ok()?
+            .iter()
+            .filter_map(|(p, _)| p.file_name().and_then(|n| n.to_str()))
+            .filter(|n| n.ends_with(".safetensors"))
+            .map(str::to_string)
+            .collect();
+        let (missing, extra) = index_file_diff(&referenced, &actual);
+        Some((index_path, missing, extra))
+    }
+
     /// Read a whole small remote file — a metadata sidecar like `config.json` —
     /// over SFTP, strictly read-only ([`open_readonly`]). Never used for tensor
     /// data (that stays on the host); the file is expected to be a few KB.
@@ -451,6 +484,19 @@ fn merge_shard_lists(indexed: &[String], on_disk: &[String], listed: bool) -> Ve
     files
 }
 
+/// The file-level index/disk mismatch: `(missing, extra)` — files the index
+/// `referenced` but that aren't in `actual`, and files in `actual` the index
+/// never mentioned. Pure, so the comparison is unit-tested without a live SFTP.
+fn index_file_diff(
+    referenced: &std::collections::BTreeSet<String>,
+    actual: &std::collections::BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    (
+        referenced.difference(actual).cloned().collect(),
+        actual.difference(referenced).cloned().collect(),
+    )
+}
+
 /// Wrap a string in single quotes for a POSIX shell, escaping any embedded
 /// single quote as `'\''` — so a path with spaces or shell metacharacters is
 /// passed to the remote `stat` as one literal argument.
@@ -564,5 +610,28 @@ mod tests {
         let indexed = v(&["d/model-00001.safetensors"]);
         let got = merge_shard_lists(&indexed, &[], false);
         assert_eq!(got, indexed);
+    }
+
+    #[test]
+    fn index_file_diff_flags_a_stale_index() {
+        use std::collections::BTreeSet;
+        let set = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        // The index names `-of-00014` shards; the directory holds `-of-00073`
+        // ones plus codebooks. Everything referenced is missing; everything on
+        // disk is unreferenced.
+        let referenced = set(&["model-00000-of-00014.safetensors"]);
+        let actual = set(&["codebooks.safetensors", "model-00001-of-00073.safetensors"]);
+        let (missing, extra) = index_file_diff(&referenced, &actual);
+        assert_eq!(missing, vec!["model-00000-of-00014.safetensors"]);
+        assert_eq!(
+            extra,
+            vec![
+                "codebooks.safetensors".to_string(),
+                "model-00001-of-00073.safetensors".to_string(),
+            ]
+        );
+        // A matching index → no findings.
+        let (m, e) = index_file_diff(&referenced, &referenced);
+        assert!(m.is_empty() && e.is_empty());
     }
 }
