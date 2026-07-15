@@ -5,26 +5,28 @@ expression: "plain(&[\"--stats\"])"
 Checkpoint Explorer - [FIXTURE] (1/1)                                                                 [×]
 ↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · PgUp/PgDn page · Enter/Space expand · E/C all · / search
 l legend · h health · s stats · c copy screen · t copy tree · f copy file · n copy name · y copy command · ⌫/\ back/fwd
-R repack · q quit
-────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-▾ [FIXTURE] (▦╭ Checkpoint stats ────────────────────────────────────────────────────────────────────────╮
-  ▸ 🔧 Metadat│ Overview                                                                                 │
-  · lm_head.we│   Files        1 file                                                                    │
-  ▾ model (▦ 2│   Tensors      23                                                                        │
-    · embed_to│   Parameters   988                                                                       │
-    ▸ layers (│   Size         1.2 KiB on disk · 2.0 KiB logical (1.65× smaller)                         │
-    · norm.wei│                                                                                          │
-    · scale.i8│ Tensor size                                                                              │
+R repack · q q╭ Checkpoint stats ────────────────────────────────────────────────────────────────────────╮
+──────────────│ Overview                                                                                 │──────────────
+▾ [FIXTURE] (▦│   Parameters   988                                                                       │
+  ▸ 🔧 Metadat│   Size         1.2 KiB on disk · 2.0 KiB logical (1.65× smaller)                         │
+  · lm_head.we│                                                                                          │
+  ▾ model (▦ 2│ ▤ Files  ×1                                                                              │
+    · embed_to│   Largest      2.0 KiB                                                                   │
+    ▸ layers (│   Smallest     2.0 KiB                                                                   │
+    · norm.wei│   Average      2.0 KiB                                                                   │
+    · scale.i8│   Median       2.0 KiB                                                                   │
+              │                                                                                          │
+              │ ▦ Tensors  ×23                                                                           │
               │   Largest      192 B     model.layers.2.block_sparse_moe.experts.down_proj.weight.qscale │
               │   Smallest     8 B       model.scale.i8                                                  │
               │   Average      91 B                                                                      │
               │   Median       64 B                                                                      │
               │                                                                                          │
-              │ Layers  ×3                                                                               │
+              │ ≡ Layers  ×3                                                                             │
               │   Params       298 each · 896 total                                                      │
               │   Size         637 B each · 1.9 KiB total                                                │
               │                                                                                          │
-              │ Experts  ×6 per layer                                                                    │
+              │ ◆ Experts  ×6 per layer                                                                  │
               │   Storage      fused (stacked tensors) · gate+up fused                                   │
               │   Params       45 each · 816 total                                                       │
               │   Size         90 B each · 1.6 KiB total                                                 │
@@ -37,8 +39,6 @@ R repack · q quit
               │   I8       8 B  1 tensor                                                                 │
               │ c copy screen · r copy report · y copy command · Esc dismiss                             │
               ╰──────────────────────────────────────────────────────────────────────────────────────────╯
-
-
 
  ▪ [FIXTURE]
                                                                                                               read-only

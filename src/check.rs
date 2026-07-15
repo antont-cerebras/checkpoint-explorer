@@ -478,7 +478,7 @@ pub fn run(
         check_layers(tensors),
         check_shapes_dtypes(tensors),
         check_config(tensors, config),
-        check_files(files, health),
+        check_files(tensors, files, health),
     ];
     if values {
         results.push(check_values(tensors, metadata, filter, jobs));
@@ -1041,8 +1041,15 @@ fn check_config(
 }
 
 /// File/index correspondence: fold in the `model.safetensors.index.json` health
-/// report(s), and verify `model-XXXXX-of-NNNNN` shard numbering is complete.
-fn check_files(files: &[std::path::PathBuf], health: &[HealthReport]) -> CheckResult {
+/// report(s), and verify `model-XXXXX-of-NNNNN` shard numbering is complete. The
+/// numbering check reads the shard filenames from both the on-disk file list and
+/// the tensors' `source_path`s, so it works for a **remote** checkpoint too (a
+/// missing shard shows up as a gap in the present shards' shared `-of-<N>`).
+fn check_files(
+    tensors: &[TensorInfo],
+    files: &[std::path::PathBuf],
+    health: &[HealthReport],
+) -> CheckResult {
     const ID: &str = "files";
     const TITLE: &str = "Files & sharding";
     const NOTE: &str = "index matches files on disk, shard numbering complete";
@@ -1079,13 +1086,21 @@ fn check_files(files: &[std::path::PathBuf], health: &[HealthReport]) -> CheckRe
         }
     }
 
-    // Shard numbering: parse `…-<idx>-of-<total>.safetensors`.
+    // Shard numbering: parse `…-<idx>-of-<total>.safetensors` from every shard
+    // filename we know — the on-disk file list (local) and the tensors'
+    // `source_path`s (which name the shards for a remote read too).
     let mut totals: BTreeSet<usize> = BTreeSet::new();
     let mut present: BTreeSet<usize> = BTreeSet::new();
-    for f in files {
-        if let Some(name) = f.file_name().and_then(|n| n.to_str())
-            && let Some((idx, total)) = parse_shard_name(name)
-        {
+    let names = files
+        .iter()
+        .filter_map(|f| f.file_name().and_then(|n| n.to_str()))
+        .chain(
+            tensors
+                .iter()
+                .filter_map(|t| t.source_path.rsplit(['/', ':']).next()),
+        );
+    for name in names {
+        if let Some((idx, total)) = parse_shard_name(name) {
             present.insert(idx);
             totals.insert(total);
         }
@@ -1431,6 +1446,27 @@ mod tests {
             "model.layers.*.mlp.experts.*.down_proj.weight.qscale"
         );
         assert_eq!(role_key("lm_head.weight"), "lm_head.weight");
+    }
+
+    #[test]
+    fn shard_numbering_checked_from_remote_source_paths() {
+        // A remote read has no local files or index health, but the tensors carry
+        // their shards' scp-form paths — so a missing shard (here shard 2 of 3,
+        // whose tensors never loaded) is still caught via the `-of-00003` naming.
+        let mut tensors = Vec::new();
+        for idx in [1usize, 3] {
+            let mut t = ti(&format!("model.layers.{idx}.w"), "F32", &[4]);
+            t.source_path = format!("host:/ckpt/model-{idx:05}-of-00003.safetensors");
+            tensors.push(t);
+        }
+        let res = check_files(&tensors, &[], &[]);
+        assert!(res.applicable, "shard numbering applies from source paths");
+        assert!(res.status() == Status::Fail, "a missing shard should fail");
+        let msgs: Vec<&str> = res.findings.iter().map(|f| f.message.as_str()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("missing shard 2")),
+            "expected a missing-shard finding, got {msgs:?}"
+        );
     }
 
     #[test]

@@ -300,6 +300,8 @@ pub struct DrawConfig<'a> {
     pub interactive: bool,
     /// Whether the mouse is hovering the read-only badge, floating its hint.
     pub readonly_hover: bool,
+    /// Whether the mouse is hovering the metadata-only badge (remote only).
+    pub metadata_hover: bool,
 }
 
 /// How a screen should render the statistics area: not computed yet, a scan in
@@ -461,13 +463,9 @@ pub enum Overlay {
 /// separator rule.
 const TREE_HEADER_HEIGHT: usize = 3;
 /// Rows of chrome below the tree list: the two-line status bar.
+/// Footer rows below the tree list: the two-line status bar. (The metadata-only
+/// state is now a badge on that bar, not a separate banner row.)
 const TREE_FOOTER_HEIGHT: usize = 2;
-
-/// Footer rows below the tree list: the two-line status bar, plus one more for the
-/// metadata-only banner when reading a remote (`--ssh-read`) checkpoint.
-fn tree_footer_height(metadata_only: bool) -> usize {
-    TREE_FOOTER_HEIGHT + usize::from(metadata_only)
-}
 
 /// Where the tree's vertical scroll bar sits and how a pointer over it maps to a
 /// scroll offset. Built by [`UI::tree_scrollbar`]; consumed by the renderer (to
@@ -512,26 +510,53 @@ const READONLY_BADGE: &str = " read-only ";
 /// tree's bottom line when the index/file health check found a problem.
 const HEALTH_BADGE: &str = " ⚠ health ";
 
-/// Default-background columns left between the health and read-only badges, so
-/// the two `STATUS_BG` chips read as separate badges rather than one bar.
+/// The metadata-only badge, drawn on the tree's bottom line (left of the health /
+/// read-only badges) when browsing a remote (`--ssh-read`) checkpoint: only header
+/// metadata is loaded, so the data views (heatmap / grid / …) can't open.
+const METADATA_BADGE: &str = " metadata-only ";
+
+/// Default-background columns left between adjacent badges, so the `STATUS_BG`
+/// chips read as separate badges rather than one bar.
 const BADGE_GAP: u16 = 2;
 
-/// Where the health badge sits — left of the read-only badge on the bottom row,
-/// separated by [`BADGE_GAP`] — using each badge's *display* width (the ⚠ glyph
-/// is wide). `None` if the frame is too narrow/short for both. Shared by the
-/// renderer and the hover hit-test so they can't drift.
-fn health_badge_rect(width: u16, height: u16) -> Option<Rect> {
-    use unicode_width::UnicodeWidthStr;
-    let (readonly_w, health_w) = (READONLY_BADGE.width() as u16, HEALTH_BADGE.width() as u16);
-    if height == 0 || width <= readonly_w + BADGE_GAP + health_w {
+/// A badge's rect on the bottom row, right-aligned after `right_w` columns already
+/// spoken for by the badges to its right (each followed by a [`BADGE_GAP`]).
+/// `None` if the frame is too narrow/short. Shared by the renderer and the hover
+/// hit-test so they can't drift.
+fn badge_rect(width: u16, height: u16, right_w: u16, badge_w: u16) -> Option<Rect> {
+    if height == 0 || width <= right_w + badge_w {
         return None;
     }
     Some(Rect {
-        x: width - readonly_w - BADGE_GAP - health_w,
+        x: width - right_w - badge_w,
         y: height - 1,
-        width: health_w,
+        width: badge_w,
         height: 1,
     })
+}
+
+/// Where the health badge sits — left of the read-only badge, using each badge's
+/// *display* width (the ⚠ glyph is wide).
+fn health_badge_rect(width: u16, height: u16) -> Option<Rect> {
+    use unicode_width::UnicodeWidthStr;
+    let readonly_w = READONLY_BADGE.width() as u16;
+    badge_rect(
+        width,
+        height,
+        readonly_w + BADGE_GAP,
+        HEALTH_BADGE.width() as u16,
+    )
+}
+
+/// Where the metadata-only badge sits — left of the read-only badge, and left of
+/// the health badge too when it's present (`health_present`).
+fn metadata_badge_rect(width: u16, height: u16, health_present: bool) -> Option<Rect> {
+    use unicode_width::UnicodeWidthStr;
+    let mut right_w = READONLY_BADGE.width() as u16 + BADGE_GAP;
+    if health_present {
+        right_w += HEALTH_BADGE.width() as u16 + BADGE_GAP;
+    }
+    badge_rect(width, height, right_w, METADATA_BADGE.width() as u16)
 }
 
 impl UI {
@@ -611,28 +636,67 @@ impl UI {
             .is_some_and(|r| row == r.y && col >= r.x && col < r.x + r.width)
     }
 
+    /// Draw the `metadata-only` badge on the tree's bottom line, left of the
+    /// health / read-only badges — a remote (`--ssh-read`) checkpoint whose data
+    /// views can't open. `health_present` shifts it left past the health badge.
+    /// When `hover` is set, float a bubble explaining the limitation.
+    pub fn render_metadata_badge(frame: &mut Frame, hover: bool, health_present: bool) {
+        let area = frame.area();
+        let Some(rect) = metadata_badge_rect(area.width, area.height, health_present) else {
+            return;
+        };
+        Paragraph::new(Line::from(Span::styled(
+            METADATA_BADGE,
+            Style::default()
+                .bg(palette::STATUS_BG)
+                .fg(palette::WARN)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .render(rect, frame.buffer_mut());
+        if hover {
+            render_hover_bubble(
+                frame,
+                rect,
+                palette::WARN,
+                Some(METADATA_BADGE),
+                "A remote source: only header metadata is loaded, so the data views \
+                 (heatmap / grid / histogram / statistics) need the file locally.",
+            );
+        }
+    }
+
+    /// Is the point `(col, row)` over the metadata-only badge?
+    pub fn metadata_badge_hit(
+        width: u16,
+        height: u16,
+        health_present: bool,
+        col: u16,
+        row: u16,
+    ) -> bool {
+        metadata_badge_rect(width, height, health_present)
+            .is_some_and(|r| row == r.y && col >= r.x && col < r.x + r.width)
+    }
+
     /// How many tree rows are visible at once (one screenful), used to size a
     /// PageUp/PageDown jump. `terminal_height` is the full terminal height.
-    pub fn visible_tree_rows(terminal_height: u16, metadata_only: bool) -> usize {
+    pub fn visible_tree_rows(terminal_height: u16) -> usize {
         (terminal_height as usize)
-            .saturating_sub(TREE_HEADER_HEIGHT + tree_footer_height(metadata_only))
+            .saturating_sub(TREE_HEADER_HEIGHT + TREE_FOOTER_HEIGHT)
             .max(1)
     }
 
     /// Body rows visible in the tree at the given size — used to compute the
     /// scroll offset so it stays consistent with [`Self::render_tree`]'s layout
-    /// (header = title + hint/search line(s) + rule; footer = the two status lines
-    /// plus, when browsing a remote checkpoint, the metadata-only banner).
+    /// (header = title + hint/search line(s) + rule; footer = the two status lines).
     pub fn tree_visible_rows(
         width: u16,
         height: u16,
         search_mode: bool,
         can_repack: bool,
-        metadata_only: bool,
     ) -> usize {
         let header = Self::tree_header_rows(width, search_mode, can_repack);
         (height as usize)
-            .saturating_sub(header + tree_footer_height(metadata_only))
+            .saturating_sub(header + TREE_FOOTER_HEIGHT)
             .max(1)
     }
 
@@ -659,10 +723,9 @@ impl UI {
         height: u16,
         search_mode: bool,
         can_repack: bool,
-        metadata_only: bool,
         total: usize,
     ) -> Option<TreeScrollbar> {
-        let rows = Self::tree_visible_rows(width, height, search_mode, can_repack, metadata_only);
+        let rows = Self::tree_visible_rows(width, height, search_mode, can_repack);
         if width < 2 || total <= rows {
             return None; // nothing to scroll (or no room for a bar + content)
         }
@@ -715,11 +778,8 @@ impl UI {
         )));
 
         let header_rows = lines.len();
-        let footer_rows = tree_footer_height(config.metadata_only);
+        let footer_rows = TREE_FOOTER_HEIGHT;
         let body_rows = (height as usize).saturating_sub(header_rows + footer_rows);
-        // The status bar sits above the optional metadata-only banner (the extra
-        // bottom row present only for a remote checkpoint).
-        let status_lift = u16::from(config.metadata_only);
 
         // A vertical scroll bar rides the rightmost column when the tree
         // overflows the viewport — but only in the live TUI; a headless
@@ -730,7 +790,6 @@ impl UI {
                 height,
                 config.search_mode,
                 config.can_repack,
-                config.metadata_only,
                 config.tree.len(),
             )
         } else {
@@ -818,6 +877,9 @@ impl UI {
         if config.health_warning {
             reserve += HEALTH_BADGE.width() + BADGE_GAP as usize;
         }
+        if config.metadata_only {
+            reserve += METADATA_BADGE.width() + BADGE_GAP as usize;
+        }
         let max_text = (width as usize).saturating_sub(6 + reserve);
         let row0 = if config.search_mode && config.tree.is_empty() {
             Line::from(vec![
@@ -847,7 +909,7 @@ impl UI {
         Paragraph::new(row0).render(
             Rect {
                 x: 0,
-                y: height.saturating_sub(2 + status_lift),
+                y: height.saturating_sub(2),
                 width,
                 height: 1,
             },
@@ -875,38 +937,23 @@ impl UI {
         Paragraph::new(row1).render(
             Rect {
                 x: 0,
-                y: height.saturating_sub(1 + status_lift),
+                y: height.saturating_sub(1),
                 width,
                 height: 1,
             },
             frame.buffer_mut(),
         );
 
-        // Metadata-only banner on the very bottom row (remote `--ssh-read` only).
-        if config.metadata_only {
-            Paragraph::new(Line::from(Span::styled(
-                " metadata-only — data views need the file locally ",
-                Style::default()
-                    .bg(palette::STATUS_BG)
-                    .fg(palette::WARN)
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .render(
-                Rect {
-                    x: 0,
-                    y: height.saturating_sub(1),
-                    width,
-                    height: 1,
-                },
-                frame.buffer_mut(),
-            );
-        }
-
+        // Right-aligned badges on the bottom status line: read-only (always), the
+        // `⚠ health` alert (local; a stale index / dropped shard), and
+        // `metadata-only` (remote — data views need the file locally). Each with
+        // an on-hover bubble; drawn left of one another in that order.
         Self::render_readonly_badge(frame, config.readonly_hover);
-        // A short `⚠ health` health-alert badge just left of the read-only badge
-        // (local only; a stale index / dropped shard), with an on-hover bubble.
         if config.health_warning {
             Self::render_health_badge(frame, config.health_hover);
+        }
+        if config.metadata_only {
+            Self::render_metadata_badge(frame, config.metadata_hover, config.health_warning);
         }
 
         // Clickable regions: each footer chip (the hint block starts at row 1,
@@ -1923,11 +1970,18 @@ impl UI {
                     palette::ACCENT,
                     sty("— scanning…".into(), Style::default().fg(palette::DIM)),
                 ),
-                _ => (
+                // Only suggest `v` when the scan is actually available — it isn't
+                // for a remote checkpoint (data stays on the host).
+                CheckPopup::Idle { can_scan, .. } => (
                     "·".into(),
                     palette::DIM,
                     sty(
-                        "— not run (press v)".into(),
+                        if can_scan {
+                            "— not run (press v)"
+                        } else {
+                            "— not run"
+                        }
+                        .into(),
                         Style::default().fg(palette::DIM),
                     ),
                 ),
@@ -1976,7 +2030,9 @@ impl UI {
             lines,
             check_footer_line(&state, bg),
             scroll,
+            &[],
         )
+        .0
     }
 
     /// The overall-checkpoint stats popup (the `s` key on the tree). Returns the
@@ -1987,7 +2043,8 @@ impl UI {
         s: &crate::stats::CheckpointStats,
         copied: Option<&'static str>,
         scroll: usize,
-    ) -> usize {
+        shards_expanded: bool,
+    ) -> (usize, Vec<(Rect, KeyEvent)>) {
         use crate::stats::ExpertStorage;
         let bg = palette::PANEL_BG;
         let sty = |t: String, style: Style| Span::styled(t, style.bg(bg));
@@ -2005,17 +2062,22 @@ impl UI {
                     .add_modifier(Modifier::BOLD),
             ))
         };
-        // A header with a dim trailer (e.g. "Layers  ×48").
-        let header_tail = |t: &str, tail: String| {
-            Line::from(vec![
-                sty(
-                    t.to_string(),
-                    Style::default()
-                        .fg(palette::ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                dim(tail),
-            ])
+        // A glyphed section header like the tree — "▦ Tensors  ×116175" — with the
+        // glyph + title in accent, the `count` plain (not dim, so it stands out),
+        // and a dim `qualifier` (e.g. " per layer", " safetensors").
+        let section = |glyph: &str, title: &str, count: String, qualifier: &str| {
+            let accent = Style::default().fg(palette::ACCENT);
+            let mut spans = vec![
+                sty(format!("{glyph} "), accent),
+                sty(title.to_string(), accent.add_modifier(Modifier::BOLD)),
+            ];
+            if !count.is_empty() {
+                spans.push(plain(format!("  {count}")));
+            }
+            if !qualifier.is_empty() {
+                spans.push(dim(qualifier.to_string()));
+            }
+            Line::from(spans)
         };
         // Pad the label to `LW`, then a guaranteed separator space — so a label
         // that exactly fills `LW` (e.g. "Architecture") still has a gap before it.
@@ -2035,22 +2097,15 @@ impl UI {
         };
 
         let mut lines: Vec<Line> = Vec::new();
+        // Body-line index of the per-shard fold toggle, once emitted (for click
+        // hit-testing).
+        let mut fold_line: Option<usize> = None;
 
         // ── Overview ──────────────────────────────────────────────────────────
         lines.push(header("Overview"));
         if let Some(mt) = &s.model_type {
             lines.push(row("Architecture", vec![plain(mt.clone())]));
         }
-        lines.push(row(
-            "Files",
-            vec![plain(format!(
-                "{} {}{}",
-                s.n_files,
-                s.file_noun,
-                if s.n_files == 1 { "" } else { "s" }
-            ))],
-        ));
-        lines.push(row("Tensors", vec![plain(format!("{}", s.n_tensors))]));
         lines.push(row("Parameters", vec![plain(format_parameters(s.params))]));
         // On-disk vs logical, with a compression ratio when they differ.
         let size_value = if s.compressed && s.disk_bytes > 0 {
@@ -2068,9 +2123,32 @@ impl UI {
         };
         lines.push(row("Size", size_value));
 
-        // ── Tensor sizes ────────────────────────────────────────────────────
+        // ── Files (per-shard logical size) ────────────────────────────────────
         lines.push(Line::from(sty(String::new(), Style::default())));
-        lines.push(header("Tensor size"));
+        let kind = if s.files.noun.starts_with("safetensors") {
+            " safetensors"
+        } else {
+            ""
+        };
+        lines.push(section(
+            crate::stats::GLYPH_FILES,
+            "Files",
+            format!("×{}", s.files.count),
+            kind,
+        ));
+        lines.push(row("Largest", vec![plain(format_size(s.files.largest))]));
+        lines.push(row("Smallest", vec![plain(format_size(s.files.smallest))]));
+        lines.push(row("Average", vec![plain(format_size(s.files.mean))]));
+        lines.push(row("Median", vec![plain(format_size(s.files.median))]));
+
+        // ── Tensors (count + size) ────────────────────────────────────────────
+        lines.push(Line::from(sty(String::new(), Style::default())));
+        lines.push(section(
+            crate::stats::GLYPH_TENSORS,
+            "Tensors",
+            format!("×{}", s.n_tensors),
+            "",
+        ));
         let named = |n: &crate::stats::NamedSize| {
             vec![
                 plain(format!("{:<9} ", format_size(n.bytes))),
@@ -2089,7 +2167,12 @@ impl UI {
         // ── Layers ───────────────────────────────────────────────────────────
         if let Some(l) = &s.layers {
             lines.push(Line::from(sty(String::new(), Style::default())));
-            lines.push(header_tail("Layers", format!("  ×{}", l.count)));
+            lines.push(section(
+                crate::stats::GLYPH_LAYERS,
+                "Layers",
+                format!("×{}", l.count),
+                "",
+            ));
             lines.push(row(
                 "Params",
                 each_total(l.params_each(), l.params, format_parameters),
@@ -2103,12 +2186,17 @@ impl UI {
         // ── Experts (MoE) ─────────────────────────────────────────────────────
         if let Some(x) = &s.experts {
             lines.push(Line::from(sty(String::new(), Style::default())));
-            let count = if x.per_layer > 0 {
-                format!("  ×{} per layer", x.per_layer)
+            let (count, qualifier) = if x.per_layer > 0 {
+                (format!("×{}", x.per_layer), " per layer")
             } else {
-                String::new()
+                (String::new(), "")
             };
-            lines.push(header_tail("Experts", count));
+            lines.push(section(
+                crate::stats::GLYPH_EXPERTS,
+                "Experts",
+                count,
+                qualifier,
+            ));
             let mut storage = x.storage.label().to_string();
             if x.gate_up_fused {
                 storage.push_str(" · gate+up fused");
@@ -2139,11 +2227,8 @@ impl UI {
                         Style::default().fg(palette::DTYPE),
                     ),
                     plain(format!("{:>7}", format_size(d.bytes))),
-                    dim(format!(
-                        "  {} tensor{}",
-                        d.count,
-                        if d.count == 1 { "" } else { "s" }
-                    )),
+                    plain(format!("  {}", d.count)),
+                    dim(format!(" tensor{}", if d.count == 1 { "" } else { "s" })),
                 ]));
             }
         }
@@ -2163,46 +2248,71 @@ impl UI {
                     )),
                 ],
             ));
-            // Per-shard rows, but only for shards the filesystem actually shrank
-            // — listing every unchanged shard just buries the ones that matter.
+            // The per-shard breakdown is folded away by default (a many-shard
+            // model is otherwise a wall of rows); a click on this line or `f`
+            // toggles it. Only shards the filesystem actually shrank are listed.
             if d.shards.len() > 1 {
                 let savers: Vec<&crate::stats::ShardDisk> = d
                     .shards
                     .iter()
                     .filter(|sh| crate::stats::has_saving(sh.apparent, sh.allocated))
                     .collect();
-                let nw = savers.iter().map(|sh| sh.name.len()).max().unwrap_or(0);
-                for sh in &savers {
-                    lines.push(Line::from(vec![
-                        sty(
-                            format!("  {:<nw$}  ", sh.name),
-                            Style::default().fg(palette::META),
-                        ),
-                        plain(format!("{:>9}", format_size(sh.apparent as usize))),
-                        dim(" → ".into()),
-                        plain(format!("{:>9}", format_size(sh.allocated as usize))),
-                        dim(format!(
-                            "  ({})",
-                            crate::stats::ratio_phrase(sh.apparent, sh.allocated)
-                        )),
-                    ]));
-                }
-                let hidden = d.shards.len() - savers.len();
-                if hidden > 0 {
-                    lines.push(Line::from(dim(format!(
-                        "  … {hidden} shard{} with no filesystem saving",
-                        if hidden == 1 { "" } else { "s" }
-                    ))));
+                let arrow = if shards_expanded { "▾" } else { "▸" };
+                let hint = if shards_expanded {
+                    "  (f to fold)".to_string()
+                } else {
+                    format!(
+                        "  ({} of {} smaller · f to expand)",
+                        savers.len(),
+                        d.shards.len()
+                    )
+                };
+                fold_line = Some(lines.len());
+                lines.push(Line::from(vec![
+                    sty(format!("  {arrow} "), Style::default().fg(palette::ACCENT)),
+                    plain("per-shard breakdown".into()),
+                    dim(hint),
+                ]));
+                if shards_expanded {
+                    let nw = savers.iter().map(|sh| sh.name.len()).max().unwrap_or(0);
+                    for sh in &savers {
+                        lines.push(Line::from(vec![
+                            sty(
+                                format!("    {:<nw$}  ", sh.name),
+                                Style::default().fg(palette::META),
+                            ),
+                            plain(format!("{:>9}", format_size(sh.apparent as usize))),
+                            dim(" → ".into()),
+                            plain(format!("{:>9}", format_size(sh.allocated as usize))),
+                            dim(format!(
+                                "  ({})",
+                                crate::stats::ratio_phrase(sh.apparent, sh.allocated)
+                            )),
+                        ]));
+                    }
+                    let hidden = d.shards.len() - savers.len();
+                    if hidden > 0 {
+                        lines.push(Line::from(dim(format!(
+                            "    … {hidden} shard{} with no filesystem saving",
+                            if hidden == 1 { "" } else { "s" }
+                        ))));
+                    }
                 }
             }
         }
 
+        // The fold toggle (when present) is the popup's one clickable body row.
+        let clickable: Vec<(usize, KeyEvent)> = fold_line
+            .map(|i| (i, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)))
+            .into_iter()
+            .collect();
         render_scroll_popup(
             frame,
             "Checkpoint stats",
             lines,
             stats_footer_line(copied, bg),
             scroll,
+            &clickable,
         )
     }
 
@@ -2659,7 +2769,8 @@ fn render_scroll_popup(
     body: Vec<Line<'static>>,
     footer: Line<'static>,
     scroll: usize,
-) -> usize {
+    clickable: &[(usize, KeyEvent)],
+) -> (usize, Vec<(Rect, KeyEvent)>) {
     let area = frame.area();
     let panel = Style::default().bg(palette::PANEL_BG);
     let total = body.len();
@@ -2749,7 +2860,21 @@ fn render_scroll_popup(
         },
         frame.buffer_mut(),
     );
-    max_scroll
+    // Map each requested body-line index to its on-screen row (when currently
+    // visible in the scrolled window), so the caller can hit-test clicks on it.
+    let regions: Vec<(Rect, KeyEvent)> = clickable
+        .iter()
+        .filter(|(idx, _)| *idx >= scroll && *idx < scroll + visible)
+        .map(|(idx, key)| {
+            let row = Rect {
+                y: inner.y + (idx - scroll) as u16,
+                height: 1,
+                ..inner
+            };
+            (row, *key)
+        })
+        .collect();
+    (max_scroll, regions)
 }
 
 /// A small hint pop-up for the read-only badge, anchored bottom-right just above
@@ -4942,30 +5067,42 @@ mod tests {
             },
         ]);
         let stats = CheckpointStats::compute(&tensors, None, disk);
-        let text = crate::tui::headless_render(100, 50, |f| {
-            UI::render_stats(f, &stats, None, 0);
+
+        // Expanded: only the real saver is listed; the untouched shard is a count.
+        let expanded = crate::tui::headless_render(100, 50, |f| {
+            UI::render_stats(f, &stats, None, 0, true);
         })
         .unwrap();
-        assert!(text.contains("On disk (filesystem)"), "{text}");
-        assert!(text.contains("Allocated"), "{text}");
-        // Only the real saver is listed; the untouched shard is folded into a count.
-        assert!(text.contains("shard-saver.safetensors"), "{text}");
-        assert!(text.contains("4.00×"), "{text}");
-        assert!(!text.contains("shard-plain"), "{text}");
-        assert!(text.contains("1 shard with no filesystem saving"), "{text}");
+        assert!(expanded.contains("On disk (filesystem)"), "{expanded}");
+        assert!(expanded.contains("Allocated"), "{expanded}");
+        assert!(expanded.contains("shard-saver.safetensors"), "{expanded}");
+        assert!(expanded.contains("4.00×"), "{expanded}");
+        assert!(!expanded.contains("shard-plain"), "{expanded}");
+        assert!(
+            expanded.contains("1 shard with no filesystem saving"),
+            "{expanded}"
+        );
+
+        // Folded (default): the shard list collapses to a single toggle line.
+        let folded = crate::tui::headless_render(100, 50, |f| {
+            UI::render_stats(f, &stats, None, 0, false);
+        })
+        .unwrap();
+        assert!(folded.contains("per-shard breakdown"), "{folded}");
+        assert!(!folded.contains("shard-saver.safetensors"), "{folded}");
     }
 
     #[test]
     fn tree_scrollbar_geometry_and_mapping() {
         // Everything fits the viewport → no bar.
-        assert!(UI::tree_scrollbar(80, 40, false, false, false, 5).is_none());
+        assert!(UI::tree_scrollbar(80, 40, false, false, 5).is_none());
         // Too narrow for a bar plus content → no bar.
-        assert!(UI::tree_scrollbar(1, 40, false, false, false, 999).is_none());
+        assert!(UI::tree_scrollbar(1, 40, false, false, 999).is_none());
 
         // Overflow → a bar in the rightmost column, tracking the visible rows.
-        let visible = UI::tree_visible_rows(80, 20, false, false, false);
-        let sb = UI::tree_scrollbar(80, 20, false, false, false, visible + 50)
-            .expect("overflow shows bar");
+        let visible = UI::tree_visible_rows(80, 20, false, false);
+        let sb =
+            UI::tree_scrollbar(80, 20, false, false, visible + 50).expect("overflow shows bar");
         assert_eq!(sb.col, 79);
         assert_eq!(sb.rows as usize, visible);
         assert_eq!(sb.max_offset, 50);
@@ -5026,6 +5163,7 @@ mod tests {
                 interactive,
                 readonly_hover: false,
                 health_hover: false,
+                metadata_hover: false,
             }
         }
 
@@ -5128,6 +5266,7 @@ mod tests {
             copied_flash: None,
             interactive: true,
             readonly_hover: false,
+            metadata_hover: false,
         };
 
         // Not hovering: the short `⚠ health` badge shows on the bottom line, on the
@@ -5186,6 +5325,30 @@ mod tests {
     }
 
     #[test]
+    fn metadata_badge_sits_left_of_the_others() {
+        use unicode_width::UnicodeWidthStr;
+        let (w, h) = (120u16, 40u16);
+        // With a health badge present, the metadata badge sits left of both it and
+        // the read-only badge; without one, only left of read-only.
+        let with_health = metadata_badge_rect(w, h, true).expect("fits");
+        let without = metadata_badge_rect(w, h, false).expect("fits");
+        assert!(
+            with_health.x + with_health.width < without.x + without.width,
+            "the health badge pushes metadata-only further left"
+        );
+        // Its rect ends a gap to the left of the read-only badge on the last row.
+        let right = READONLY_BADGE.width() as u16 + BADGE_GAP;
+        assert_eq!(without.x + without.width, w - right);
+        assert_eq!(without.y, h - 1);
+        // Hit-test agrees with the drawn rect, and misses the row above.
+        assert!(UI::metadata_badge_hit(w, h, false, without.x, h - 1));
+        assert!(!UI::metadata_badge_hit(w, h, false, without.x, h - 2));
+        // No room on a tiny frame → no badge, no hit.
+        assert!(metadata_badge_rect(10, h, false).is_none());
+        assert!(!UI::metadata_badge_hit(10, h, false, 0, h - 1));
+    }
+
+    #[test]
     fn scroll_popup_reports_overflow() {
         let body: Vec<Line> = (0..50).map(|i| Line::from(format!("row {i}"))).collect();
         let footer = Line::from("footer");
@@ -5193,7 +5356,7 @@ mod tests {
         // Tall frame: the whole body fits → nothing to scroll.
         let mut fits_max = usize::MAX;
         crate::tui::headless_render(40, 60, |f| {
-            fits_max = render_scroll_popup(f, "T", body.clone(), footer.clone(), 0);
+            fits_max = render_scroll_popup(f, "T", body.clone(), footer.clone(), 0, &[]).0;
         })
         .unwrap();
         assert_eq!(fits_max, 0, "a 50-row body in a 60-row frame fits");
@@ -5201,7 +5364,7 @@ mod tests {
         // Short frame: the body overflows → scrollable, and the indicator shows.
         let mut small_max = 0;
         let out = crate::tui::headless_render(40, 12, |f| {
-            small_max = render_scroll_popup(f, "T", body.clone(), footer.clone(), 0);
+            small_max = render_scroll_popup(f, "T", body.clone(), footer.clone(), 0, &[]).0;
         })
         .unwrap();
         assert!(small_max > 0, "a 50-row body in a 12-row frame must scroll");

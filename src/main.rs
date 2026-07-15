@@ -306,6 +306,12 @@ struct ExploreArgs {
 
     #[arg(
         long,
+        help = "Like --stats, but with the on-disk per-shard breakdown expanded (the popup's `f` toggle)"
+    )]
+    stats_shards: bool,
+
+    #[arg(
+        long,
         help = "Render the requested view once and exit, without entering interactive navigation"
     )]
     exit: bool,
@@ -1582,7 +1588,8 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.search.is_some()
         || args.legend
         || args.health
-        || args.stats;
+        || args.stats
+        || args.stats_shards;
     let view = if args.values {
         OpenView::Values
     } else if args.heatmap {
@@ -1628,6 +1635,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.legend
         || args.health
         || args.stats
+        || args.stats_shards
         || args.exit;
     let open = wants_open.then_some(OpenRequest {
         tensor: args.tensor,
@@ -1649,6 +1657,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         legend: args.legend,
         health: args.health,
         stats: args.stats,
+        stats_shards: args.stats_shards,
         exit_after: args.exit,
     });
 

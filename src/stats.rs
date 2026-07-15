@@ -12,6 +12,13 @@ use std::collections::{BTreeSet, HashMap};
 use crate::check::{expert_index, split_layer_index};
 use crate::tree::{Storage, TensorInfo};
 
+/// Section glyphs, matching the tree view's (`▦` tensors, `≡` layers) so the
+/// popup reads like the rest of the UI rather than a flat table.
+pub(crate) const GLYPH_FILES: &str = "▤";
+pub(crate) const GLYPH_TENSORS: &str = "▦";
+pub(crate) const GLYPH_LAYERS: &str = "≡";
+pub(crate) const GLYPH_EXPERTS: &str = "◆";
+
 /// One named tensor with its logical size — for the largest / smallest rows.
 #[derive(Debug, Clone)]
 pub struct NamedSize {
@@ -100,6 +107,20 @@ pub struct DtypeStat {
     pub bytes: usize,
 }
 
+/// Per-file (per-shard) logical-size distribution — the tensor-size stats, but
+/// over whole files. Sizes are logical (Σ of each file's tensor `size_bytes`).
+#[derive(Debug, Clone)]
+pub struct FileStats {
+    /// Number of distinct files the tensors were read from; 1 for a single file.
+    pub count: usize,
+    /// Singular noun for a file — "safetensors file" vs. a plain "file".
+    pub noun: &'static str,
+    pub largest: usize,
+    pub smallest: usize,
+    pub mean: usize,
+    pub median: usize,
+}
+
 /// One shard file's on-disk footprint: its apparent size vs. the blocks the
 /// filesystem actually allocated. `allocated < apparent` means the filesystem
 /// (e.g. ZFS/btrfs transparent compression, or sparse-file holes) is squeezing
@@ -174,10 +195,8 @@ pub fn shard_name(path: &str) -> String {
 /// Everything the `s` popup shows, computed once when the popup opens.
 #[derive(Debug, Clone)]
 pub struct CheckpointStats {
-    /// Distinct files the tensors were read from (shards); 1 for a single file.
-    pub n_files: usize,
-    /// Singular noun for a file — "safetensors file" vs. a plain "file".
-    pub file_noun: &'static str,
+    /// Per-file (shard) count and size distribution.
+    pub files: FileStats,
     pub n_tensors: usize,
     pub params: usize,
     /// Logical (uncompressed) bytes: Σ `size_bytes`.
@@ -215,19 +234,30 @@ impl CheckpointStats {
             .iter()
             .any(|t| matches!(t.storage, Storage::Compressed { .. }));
 
-        // Distinct source files (shards). A single file collapses to 1.
-        let mut files: Vec<&str> = tensors.iter().map(|t| t.source_path.as_str()).collect();
-        files.sort_unstable();
-        files.dedup();
-        let n_files = files.len();
-        let file_noun = if files
-            .first()
+        // Per-file (shard) logical size = Σ of that file's tensor bytes.
+        let mut per_file: HashMap<&str, usize> = HashMap::new();
+        for t in tensors {
+            *per_file.entry(t.source_path.as_str()).or_default() += t.size_bytes;
+        }
+        let noun = if per_file
+            .keys()
+            .next()
             .and_then(|p| p.rsplit('.').next())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
         {
             "safetensors file"
         } else {
             "file"
+        };
+        let mut file_sizes: Vec<usize> = per_file.into_values().collect();
+        file_sizes.sort_unstable();
+        let files = FileStats {
+            count: file_sizes.len(),
+            noun,
+            largest: file_sizes.last().copied().unwrap_or(0),
+            smallest: file_sizes.first().copied().unwrap_or(0),
+            mean: logical_bytes.checked_div(file_sizes.len()).unwrap_or(0),
+            median: file_sizes.get(file_sizes.len() / 2).copied().unwrap_or(0),
         };
 
         let largest = tensors
@@ -269,8 +299,7 @@ impl CheckpointStats {
         dtypes.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.dtype.cmp(&b.dtype)));
 
         CheckpointStats {
-            n_files,
-            file_noun,
+            files,
             n_tensors,
             params,
             logical_bytes,
@@ -290,7 +319,7 @@ impl CheckpointStats {
 
     /// A plain-text rendering of the stats — what the popup's `r` copies. Mirrors
     /// the on-screen sections so the copied text reads the same, minus styling.
-    pub fn render(&self) -> String {
+    pub fn render(&self, shards_expanded: bool) -> String {
         use crate::utils::{format_parameters, format_size};
         const LW: usize = 12;
         // A guaranteed separator space follows the padded label, so a full-width
@@ -306,16 +335,6 @@ impl CheckpointStats {
         if let Some(mt) = &self.model_type {
             out.push(row("Architecture", mt.clone()));
         }
-        out.push(row(
-            "Files",
-            format!(
-                "{} {}{}",
-                self.n_files,
-                self.file_noun,
-                if self.n_files == 1 { "" } else { "s" }
-            ),
-        ));
-        out.push(row("Tensors", self.n_tensors.to_string()));
         out.push(row("Parameters", format_parameters(self.params)));
         out.push(row(
             "Size",
@@ -331,9 +350,20 @@ impl CheckpointStats {
             },
         ));
 
-        // Tensor size.
+        // Files (per-shard logical size distribution).
         out.push(String::new());
-        out.push("Tensor size".into());
+        out.push(format!(
+            "{GLYPH_FILES} Files  ×{} {}",
+            self.files.count, self.files.noun
+        ));
+        out.push(row("Largest", format_size(self.files.largest)));
+        out.push(row("Smallest", format_size(self.files.smallest)));
+        out.push(row("Average", format_size(self.files.mean)));
+        out.push(row("Median", format_size(self.files.median)));
+
+        // Tensors (count + size distribution).
+        out.push(String::new());
+        out.push(format!("{GLYPH_TENSORS} Tensors  ×{}", self.n_tensors));
         if let Some(l) = &self.largest {
             out.push(row(
                 "Largest",
@@ -352,7 +382,7 @@ impl CheckpointStats {
         // Layers.
         if let Some(l) = &self.layers {
             out.push(String::new());
-            out.push(format!("Layers  ×{}", l.count));
+            out.push(format!("{GLYPH_LAYERS} Layers  ×{}", l.count));
             out.push(row(
                 "Params",
                 each_total(
@@ -374,7 +404,7 @@ impl CheckpointStats {
             } else {
                 String::new()
             };
-            out.push(format!("Experts{count}"));
+            out.push(format!("{GLYPH_EXPERTS} Experts{count}"));
             let mut storage = x.storage.label().to_string();
             if x.gate_up_fused {
                 storage.push_str(" · gate+up fused");
@@ -424,29 +454,37 @@ impl CheckpointStats {
                     ratio_phrase(d.total_apparent, d.total_allocated),
                 ),
             ));
-            // Per-shard rows, but only for shards the filesystem actually shrank
-            // — listing every unchanged shard just buries the ones that matter.
+            // Per-shard breakdown, folded away by default (a many-shard model is
+            // otherwise a wall of rows) and only for shards the filesystem shrank.
             if d.shards.len() > 1 {
                 let savers: Vec<&ShardDisk> = d
                     .shards
                     .iter()
                     .filter(|s| has_saving(s.apparent, s.allocated))
                     .collect();
-                let nw = savers.iter().map(|s| s.name.len()).max().unwrap_or(0);
-                for s in &savers {
+                if shards_expanded {
+                    let nw = savers.iter().map(|s| s.name.len()).max().unwrap_or(0);
+                    for s in &savers {
+                        out.push(format!(
+                            "    {:<nw$}  {:>9} → {:>9}  ({})",
+                            s.name,
+                            format_size(s.apparent as usize),
+                            format_size(s.allocated as usize),
+                            ratio_phrase(s.apparent, s.allocated),
+                        ));
+                    }
+                    let hidden = d.shards.len() - savers.len();
+                    if hidden > 0 {
+                        out.push(format!(
+                            "    … {hidden} shard{} with no filesystem saving",
+                            if hidden == 1 { "" } else { "s" }
+                        ));
+                    }
+                } else {
                     out.push(format!(
-                        "  {:<nw$}  {:>9} → {:>9}  ({})",
-                        s.name,
-                        format_size(s.apparent as usize),
-                        format_size(s.allocated as usize),
-                        ratio_phrase(s.apparent, s.allocated),
-                    ));
-                }
-                let hidden = d.shards.len() - savers.len();
-                if hidden > 0 {
-                    out.push(format!(
-                        "  … {hidden} shard{} with no filesystem saving",
-                        if hidden == 1 { "" } else { "s" }
+                        "  ▸ per-shard breakdown ({} of {} smaller)",
+                        savers.len(),
+                        d.shards.len()
                     ));
                 }
             }
@@ -717,7 +755,7 @@ mod tests {
             tie_word_embeddings: None,
             use_qk_norm: None,
         };
-        let report = CheckpointStats::compute(&tensors, Some(&config), None).render();
+        let report = CheckpointStats::compute(&tensors, Some(&config), None).render(false);
 
         // Median is its own labelled row, not folded into Average's parens.
         assert!(report.contains("\n  Median"), "report:\n{report}");
@@ -730,11 +768,11 @@ mod tests {
             report.contains("Architecture qwen3_moe"),
             "label and value should be separated:\n{report}"
         );
-        // Architecture sits under Overview — before the Tensor-size section.
+        // Architecture sits under Overview — before the first glyphed section.
         let arch = report.find("Architecture").expect("architecture row");
-        let sizes = report.find("Tensor size").expect("tensor-size header");
+        let files = report.find("Files").expect("files header");
         assert!(
-            arch < sizes,
+            arch < files,
             "architecture should be in the Overview section"
         );
     }
@@ -783,7 +821,7 @@ mod tests {
                 allocated: 4 * 1024 * 1024 + 4096, // block rounding — larger on disk
             },
         ]);
-        let report = CheckpointStats::compute(&tensors, None, disk).render();
+        let report = CheckpointStats::compute(&tensors, None, disk).render(true);
         assert!(report.contains("On disk (filesystem)"), "report:\n{report}");
         assert!(report.contains("Allocated"), "report:\n{report}");
         // Only the shard with a real saving is listed…
