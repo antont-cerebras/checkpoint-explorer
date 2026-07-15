@@ -8,10 +8,13 @@
 //! `diff`-style exit code ([`DiffReport::has_differences`]) are separate so the
 //! logic is testable without any I/O.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write;
 
+use anyhow::{Context, Result};
 use glob::{MatchOptions, Pattern};
+use regex::Regex;
 use serde_json::Value;
 
 use crate::filter::NameFilter;
@@ -470,6 +473,102 @@ impl CheckpointSummary {
             total_bytes,
             total_params,
         }
+    }
+}
+
+/// An ordered list of regex rewrite rules that rename one checkpoint's tensor
+/// names into the other's naming scheme *before* the structural diff, so a tensor
+/// that is "the same tensor" under a different name lines up (and shows as changed
+/// or unchanged) instead of appearing as a removed/added pair. Rules apply in
+/// order, each a `replace_all` on the running name (sed-style), with `$1` / `$name`
+/// capture references in the replacement — so one rule can rewrite a shared
+/// substring across every layer at once (e.g. `\.mlp\.experts\.` for all layers).
+#[derive(Default)]
+pub struct NameMap {
+    rules: Vec<(Regex, String)>,
+}
+
+impl NameMap {
+    /// No rules — [`NameMap::map`] returns names unchanged and [`remap_summary`]
+    /// is a no-op.
+    ///
+    /// [`remap_summary`]: NameMap::remap_summary
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    /// The number of rewrite rules (for a "applied N rule(s)" note).
+    pub fn len(&self) -> usize {
+        self.rules.len()
+    }
+
+    /// Compile `(pattern, replacement)` pairs into rules — shared by the CLI /
+    /// plain-text form ([`parse_rules`]) and the JSON form. An invalid regex is an
+    /// error naming the offending pattern.
+    ///
+    /// [`parse_rules`]: NameMap::parse_rules
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Result<Self> {
+        let mut rules = Vec::new();
+        for (pat, rep) in pairs {
+            let re = Regex::new(&pat).with_context(|| format!("invalid --map regex {pat:?}"))?;
+            rules.push((re, rep));
+        }
+        Ok(Self { rules })
+    }
+
+    /// Parse `PATTERN=>REPLACEMENT` lines (the CLI `--map` value and the plain-text
+    /// `--map-from` file): split on the first `=>`, trim both sides (tensor names
+    /// carry no whitespace, so rules can be column-aligned), and skip blank lines
+    /// and `#` comments — mirroring the `--names-from` file convention.
+    pub fn parse_rules<'a>(
+        lines: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<(String, String)>> {
+        let mut pairs = Vec::new();
+        for line in lines {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (pat, rep) = line
+                .split_once("=>")
+                .with_context(|| format!("map rule missing `=>` separator: {line:?}"))?;
+            pairs.push((pat.trim().to_string(), rep.trim().to_string()));
+        }
+        Ok(pairs)
+    }
+
+    /// Rewrite `name` through every rule in order. `replace_all` only allocates on
+    /// a match, so a name no rule touches passes through cheaply.
+    pub fn map<'n>(&self, name: &'n str) -> Cow<'n, str> {
+        let mut cur = Cow::Borrowed(name);
+        for (re, rep) in &self.rules {
+            if let Cow::Owned(s) = re.replace_all(&cur, rep.as_str()) {
+                cur = Cow::Owned(s);
+            }
+        }
+        cur
+    }
+
+    /// Rewrite `sum`'s tensor names through the rules in place. Metadata names are
+    /// left untouched (renames are a tensor-naming concern). Returns any target
+    /// names that two distinct source names collided onto — the map keeps the last
+    /// (a `BTreeMap` insert), so the caller can warn that a rule is too broad.
+    pub fn remap_summary(&self, sum: &mut CheckpointSummary) -> Vec<String> {
+        if self.rules.is_empty() {
+            return Vec::new();
+        }
+        let mut mapped: BTreeMap<String, TensorSig> = BTreeMap::new();
+        let mut collisions = Vec::new();
+        for (name, sig) in std::mem::take(&mut sum.tensors) {
+            let to = self.map(&name).into_owned();
+            if mapped.insert(to.clone(), sig).is_some() {
+                collisions.push(to);
+            }
+        }
+        sum.tensors = mapped;
+        collisions.sort_unstable();
+        collisions.dedup();
+        collisions
     }
 }
 
@@ -1497,6 +1596,101 @@ mod tests {
             total_bytes: 0,
             total_params: 0,
         }
+    }
+
+    #[test]
+    fn name_map_parses_rules_skipping_blanks_and_comments() {
+        let text = "\
+            # gpt-oss rename\n\
+            \\.mlp\\.experts\\.  =>  .block_sparse_moe.experts.\n\
+            \n\
+            experts\\.down_proj$ => experts.down_proj.weight\n";
+        let pairs = NameMap::parse_rules(text.lines()).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    r"\.mlp\.experts\.".to_string(),
+                    ".block_sparse_moe.experts.".to_string()
+                ),
+                (
+                    r"experts\.down_proj$".to_string(),
+                    "experts.down_proj.weight".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn name_map_rule_without_separator_is_an_error() {
+        assert!(NameMap::parse_rules(["a.b.c"]).is_err());
+    }
+
+    #[test]
+    fn name_map_applies_rules_in_order_with_captures() {
+        let map = NameMap::from_pairs(
+            NameMap::parse_rules([
+                r"\.mlp\.experts\.=>.block_sparse_moe.experts.",
+                r"experts\.(down|gate_up)_proj$=>experts.${1}_proj.weight",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        // Both rules fire, in order (rename the segment, then append `.weight`).
+        assert_eq!(
+            map.map("model.layers.0.mlp.experts.down_proj"),
+            "model.layers.0.block_sparse_moe.experts.down_proj.weight"
+        );
+        // A name no rule matches passes through unchanged (and stays borrowed).
+        assert!(matches!(map.map("lm_head.weight"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn name_map_remaps_old_summary_so_renamed_tensors_line_up() {
+        let map = NameMap::from_pairs(
+            NameMap::parse_rules([
+                r"\.mlp\.experts\.down_proj$=>.block_sparse_moe.experts.down_proj.weight",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let mut old = summary(
+            &[("model.layers.0.mlp.experts.down_proj", sig("BF16", &[8]))],
+            &[],
+        );
+        let new = summary(
+            &[(
+                "model.layers.0.block_sparse_moe.experts.down_proj.weight",
+                sig("BF16", &[8]),
+            )],
+            &[],
+        );
+        // Before the map: nothing lines up (one removed, one added).
+        assert_eq!(compare(&old, &new).tensors_removed.len(), 1);
+        // After: the rename aligns them, so it's a match (unchanged, same sig).
+        assert!(map.remap_summary(&mut old).is_empty());
+        let report = compare(&old, &new);
+        assert_eq!(report.tensors_removed.len(), 0);
+        assert_eq!(report.tensors_added.len(), 0);
+        assert_eq!(report.tensors_unchanged, 1);
+    }
+
+    #[test]
+    fn name_map_reports_collisions() {
+        // A too-broad rule drops the layer prefix, so two distinct names collide
+        // onto one — reported so the user knows a rename is over-eager.
+        let map =
+            NameMap::from_pairs(vec![(r"^.*\.(q_proj)$".into(), "shared.$1".into())]).unwrap();
+        let mut old = summary(
+            &[
+                ("x.q_proj", sig("BF16", &[8])),
+                ("y.q_proj", sig("BF16", &[8])),
+            ],
+            &[],
+        );
+        let collisions = map.remap_summary(&mut old);
+        assert_eq!(collisions, vec!["shared.q_proj".to_string()]);
+        assert_eq!(old.tensors.len(), 1); // the two folded into one (last wins)
     }
 
     #[test]
