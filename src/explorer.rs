@@ -1045,6 +1045,19 @@ impl Explorer {
         Ok(())
     }
 
+    /// The health badge's alert level: red for a real error (a referenced file or
+    /// tensor is missing on disk), a softer orange when there are only warnings
+    /// (e.g. extra files on disk), `None` when there's nothing to flag.
+    fn health_alert(&self) -> Option<crate::ui::HealthAlert> {
+        if self.health_reports.is_empty() {
+            None
+        } else if self.health_reports.iter().any(|r| r.has_errors()) {
+            Some(crate::ui::HealthAlert::Error)
+        } else {
+            Some(crate::ui::HealthAlert::Warning)
+        }
+    }
+
     /// Files on disk but absent from the index (per the health reports' extra
     /// files), resolved to absolute paths so they match each tensor's
     /// `source_path` — the tree dims their rows.
@@ -2241,7 +2254,7 @@ impl Explorer {
             status_icon,
             status_bar: &status_bar,
             status_secondary: &status_secondary,
-            health_warning: !self.health_reports.is_empty(),
+            health: self.health_alert(),
             can_repack: self.repack_input().is_some(),
             unindexed: &self.unindexed,
             packing_schemas: &self.packing_schemas,

@@ -31,6 +31,14 @@ impl HealthReport {
             || !self.missing_tensors.is_empty()
             || !self.extra_tensors.is_empty()
     }
+
+    /// Whether any issue is a real *error* (something the index references is
+    /// absent) rather than a benign *warning* (something on disk the index doesn't
+    /// mention). Matches the `check` report's severities: missing files/tensors are
+    /// errors; extra files/tensors are warnings. Drives the health badge's colour.
+    pub fn has_errors(&self) -> bool {
+        !self.missing_files.is_empty() || !self.missing_tensors.is_empty()
+    }
 }
 
 /// A checkpoint directory's index parsed once, ready to health-check against the
@@ -183,6 +191,22 @@ fn list_safetensors(dir: &Path) -> BTreeSet<String> {
 mod tests {
     use super::*;
     use crate::tree::{Layout, Storage};
+
+    #[test]
+    fn has_errors_only_for_missing_not_extra() {
+        let report = |missing_f: &[&str], extra_f: &[&str], missing_t: &[&str]| HealthReport {
+            index_path: "idx".into(),
+            missing_files: missing_f.iter().map(|s| s.to_string()).collect(),
+            extra_files: extra_f.iter().map(|s| s.to_string()).collect(),
+            missing_tensors: missing_t.iter().map(|s| s.to_string()).collect(),
+            extra_tensors: Vec::new(),
+        };
+        // Extra files on disk are only a warning (benign — e.g. codebooks/qscales).
+        assert!(!report(&[], &["codebooks.safetensors"], &[]).has_errors());
+        // A referenced file or tensor that's missing on disk is a real error.
+        assert!(report(&["model-00007.safetensors"], &[], &[]).has_errors());
+        assert!(report(&[], &[], &["a.weight  (expected in x)"]).has_errors());
+    }
 
     /// A `TensorInfo` named `name` whose `source_path` is `dir/file` (absolute,
     /// matching what the loader records) — enough for the health check's grouping.

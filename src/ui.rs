@@ -199,8 +199,12 @@ mod palette {
     pub const ERROR: Color = Color::Indexed(9);
     /// Filled-red *background* for an alert badge (white text on it) — high
     /// luminance contrast that reads clearly on the grey status bar, where any
-    /// red *foreground* stays muddy against the mid-grey. The health badge.
+    /// red *foreground* stays muddy against the mid-grey. The health *error* badge.
     pub const ALERT: Color = Color::Indexed(160);
+    /// Filled-orange *background* for the health badge when there are only
+    /// warnings (e.g. extra files on disk) — a softer alert than the red [`ALERT`],
+    /// which is reserved for real errors (missing files/tensors).
+    pub const WARN_BG: Color = Color::Indexed(166);
     /// Something present but unexpected (a softer alert than [`ERROR`]).
     pub const WARN: Color = Color::Indexed(11);
     /// The bottom status bar (foreground on background).
@@ -255,6 +259,16 @@ const COMPRESSED_MARK: &str = "⇩";
 /// e.g. `593 MiB → 588 MiB`. Shared by the tree rows and the legend.
 const SIZE_ARROW: &str = "→";
 
+/// Severity of the checkpoint-health badge on the tree's status line: a real
+/// error (missing files/tensors — the checkpoint may be incomplete) shows a red
+/// badge; warnings only (e.g. extra files on disk not in the index) show a softer
+/// orange one, so the screaming red is reserved for genuine problems.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HealthAlert {
+    Warning,
+    Error,
+}
+
 pub struct DrawConfig<'a> {
     pub tree: &'a [(TreeNode, usize)],
     pub current_file: &'a str,
@@ -277,9 +291,10 @@ pub struct DrawConfig<'a> {
     /// Second status line, below `status_bar`: a tensor's source file (empty for
     /// groups).
     pub status_secondary: &'a str,
-    /// Whether a checkpoint health issue was detected — shows the `⚠ health`
-    /// alert badge beside the read-only badge (press `h` for the report).
-    pub health_warning: bool,
+    /// The checkpoint's health-alert level, if any — shows the `⚠ health` badge
+    /// beside the read-only badge (press `h` for the report), orange for
+    /// warnings-only and red for real errors. `None` hides the badge.
+    pub health: Option<HealthAlert>,
     /// Whether the mouse is hovering the health badge, floating its help bubble.
     pub health_hover: bool,
     /// Whether the loaded checkpoint can be repacked (a single HDF5 file), which
@@ -600,32 +615,39 @@ impl UI {
 
     /// Draw the short `⚠ health` alert badge on the bottom status line, just
     /// left of the read-only badge — a stale index / dropped shard, surfaced
-    /// without opening the report. When `hover` is set, float a help bubble above
-    /// it explaining the alert. Caller gates on the health warning being present.
-    pub fn render_health_badge(frame: &mut Frame, hover: bool) {
+    /// without opening the report. Red for a real `Error` (missing files/tensors),
+    /// a softer orange for warnings only. When `hover` is set, float a help bubble
+    /// above it. Caller gates on the alert being present.
+    pub fn render_health_badge(frame: &mut Frame, alert: HealthAlert, hover: bool) {
         let area = frame.area();
         let Some(rect) = health_badge_rect(area.width, area.height) else {
             return;
         };
+        let (bg, detail) = match alert {
+            HealthAlert::Error => (
+                palette::ALERT,
+                "Index / file mismatch — files or tensors the index references are \
+                 missing on disk, so the checkpoint may be incomplete. Click (or \
+                 press h) for the health report.",
+            ),
+            HealthAlert::Warning => (
+                palette::WARN_BG,
+                "Index / file mismatch (warnings only) — e.g. files on disk the \
+                 index doesn't reference. Click (or press h) for the health report.",
+            ),
+        };
         Paragraph::new(Line::from(Span::styled(
             HEALTH_BADGE,
             Style::default()
-                .bg(palette::ALERT)
+                .bg(bg)
                 .fg(palette::STATUS_FG)
                 .add_modifier(Modifier::BOLD),
         )))
         .render(rect, frame.buffer_mut());
         if hover {
             // Title + border match the badge (as the read-only bubble mirrors its
-            // badge): the alert red and the `⚠ health` label.
-            render_hover_bubble(
-                frame,
-                rect,
-                palette::ALERT,
-                Some(HEALTH_BADGE),
-                "Index / file mismatch — the checkpoint's index.json doesn't match \
-                 the files on disk. Click (or press h) for the health report.",
-            );
+            // badge): the badge's colour and the `⚠ health` label.
+            render_hover_bubble(frame, rect, bg, Some(HEALTH_BADGE), detail);
         }
     }
 
@@ -874,7 +896,7 @@ impl UI {
         // text never runs under either.
         use unicode_width::UnicodeWidthStr;
         let mut reserve = READONLY_BADGE.width();
-        if config.health_warning {
+        if config.health.is_some() {
             reserve += HEALTH_BADGE.width() + BADGE_GAP as usize;
         }
         if config.metadata_only {
@@ -949,11 +971,11 @@ impl UI {
         // `metadata-only` (remote — data views need the file locally). Each with
         // an on-hover bubble; drawn left of one another in that order.
         Self::render_readonly_badge(frame, config.readonly_hover);
-        if config.health_warning {
-            Self::render_health_badge(frame, config.health_hover);
+        if let Some(alert) = config.health {
+            Self::render_health_badge(frame, alert, config.health_hover);
         }
         if config.metadata_only {
-            Self::render_metadata_badge(frame, config.metadata_hover, config.health_warning);
+            Self::render_metadata_badge(frame, config.metadata_hover, config.health.is_some());
         }
 
         // Clickable regions: each footer chip (the hint block starts at row 1,
@@ -5267,7 +5289,7 @@ mod tests {
                 status_icon: "▪",
                 status_bar: "",
                 status_secondary: "",
-                health_warning: false,
+                health: None,
                 can_repack: false,
                 unindexed,
                 packing_schemas: schemas,
@@ -5370,7 +5392,7 @@ mod tests {
             status_icon: "▪",
             status_bar: "model.safetensors",
             status_secondary: "",
-            health_warning: true,
+            health: Some(HealthAlert::Error),
             health_hover,
             can_repack: false,
             unindexed: &unindexed,
