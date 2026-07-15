@@ -18,6 +18,7 @@
 //! checkpoint and prints metadata to stdout. So `--ssh-read` cannot create or
 //! modify anything on the server — and no tensor data crosses the wire.
 
+use std::collections::{BTreeSet, HashMap};
 use std::io::{IsTerminal, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,23 @@ use ssh2::{CheckResult, KnownHostFileKind, Session};
 
 use crate::explorer::Explorer;
 use crate::tree::{MetadataInfo, TensorInfo};
+
+/// What one pass over a remote directory (one `readdir`, one index read) yields:
+/// the shard read order plus the pieces the index health check needs — so the
+/// index and listing are read once, shared between reading the shards and checking
+/// them (mirroring the local single-read path).
+pub struct ShardListing {
+    /// Shard files to read, in index order then any extras (full remote paths).
+    pub files: Vec<String>,
+    /// The `model.safetensors.index.json` path, when the directory has a usable
+    /// one (a `weight_map`); `None` for a single file or a missing/unparsable index.
+    pub index_path: Option<String>,
+    /// The index's `weight_map` (tensor name -> shard file basename); empty without
+    /// a usable index.
+    pub weight_map: HashMap<String, String>,
+    /// The `.safetensors` file basenames actually present in the directory.
+    pub actual: BTreeSet<String>,
+}
 
 /// An authenticated SSH session. Constructed once per host, then reused for every
 /// read (SFTP for safetensors dirs, an exec channel for the cstorch dump), so a
@@ -136,43 +154,12 @@ impl RemoteSession {
         Ok(out)
     }
 
-    /// List the `.safetensors` shards of a directory (or a single file) over SFTP.
-    pub fn list_shards(&self, path: &str) -> Result<Vec<String>> {
+    /// List the `.safetensors` shards of a directory (or a single file) over SFTP,
+    /// together with the index/listing pieces the health check needs — one
+    /// `readdir` and one index read, shared by the shard read and the check.
+    pub fn list_shards(&self, path: &str) -> Result<ShardListing> {
         let sftp = self.session.sftp().context("opening the SFTP subsystem")?;
         list_shards(&sftp, path)
-    }
-
-    /// Compare a remote directory's `model.safetensors.index.json` `weight_map`
-    /// against the `.safetensors` files actually present, both over SFTP — the
-    /// file-level half of the local health check, for a remote checkpoint. Returns
-    /// `(index_path, missing, extra)`: files the index references but that aren't
-    /// on disk, and files on disk the index never mentions. `None` when there's no
-    /// index to check (a single file, or no `index.json`).
-    pub fn index_file_mismatch(&self, path: &str) -> Option<(String, Vec<String>, Vec<String>)> {
-        use std::collections::BTreeSet;
-        if path.ends_with(".safetensors") {
-            return None;
-        }
-        let sftp = self.session.sftp().ok()?;
-        let base = path.trim_end_matches('/');
-        let index_path = format!("{base}/model.safetensors.index.json");
-        let bytes = read_all(&sftp, &index_path).ok()?;
-        let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-        let wm = v.get("weight_map")?.as_object()?;
-        let referenced: BTreeSet<String> = wm
-            .values()
-            .filter_map(|f| f.as_str().map(str::to_string))
-            .collect();
-        let actual: BTreeSet<String> = sftp
-            .readdir(Path::new(base))
-            .ok()?
-            .iter()
-            .filter_map(|(p, _)| p.file_name().and_then(|n| n.to_str()))
-            .filter(|n| n.ends_with(".safetensors"))
-            .map(str::to_string)
-            .collect();
-        let (missing, extra) = index_file_diff(&referenced, &actual);
-        Some((index_path, missing, extra))
     }
 
     /// Read a whole small remote file — a metadata sidecar like `config.json` —
@@ -428,40 +415,60 @@ impl ssh2::KeyboardInteractivePrompt for Prompter<'_> {
 /// try to open files that aren't there. So index entries are kept only when the
 /// listing confirms them; when the directory can't be listed at all, the index is
 /// trusted as the only signal we have.
-fn list_shards(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<String>> {
+fn list_shards(sftp: &ssh2::Sftp, path: &str) -> Result<ShardListing> {
     if path.ends_with(".safetensors") {
-        return Ok(vec![path.to_string()]);
+        return Ok(ShardListing {
+            files: vec![path.to_string()],
+            index_path: None,
+            weight_map: HashMap::new(),
+            actual: BTreeSet::new(),
+        });
     }
     let base = path.trim_end_matches('/');
 
-    // The `.safetensors` files actually present, sorted — the truth.
-    let (on_disk, listed) = match sftp.readdir(Path::new(base)) {
+    // The `.safetensors` files actually present — full paths (for the read order,
+    // sorted) and basenames (for the health check). The listing is the truth.
+    let (on_disk, actual, listed) = match sftp.readdir(Path::new(base)) {
         Ok(entries) => {
-            let mut names: Vec<String> = entries
+            let names: Vec<String> = entries
                 .iter()
                 .filter_map(|(p, _)| p.file_name().and_then(|n| n.to_str()))
                 .filter(|n| n.ends_with(".safetensors"))
-                .map(|n| format!("{base}/{n}"))
+                .map(str::to_string)
                 .collect();
-            names.sort();
-            (names, true)
+            let mut full: Vec<String> = names.iter().map(|n| format!("{base}/{n}")).collect();
+            full.sort();
+            (full, names.into_iter().collect::<BTreeSet<_>>(), true)
         }
-        Err(_) => (Vec::new(), false),
+        Err(_) => (Vec::new(), BTreeSet::new(), false),
     };
 
-    // The index gives the preferred shard order.
+    // The index gives the preferred shard order and the health check's weight_map.
     let mut indexed: Vec<String> = Vec::new();
+    let mut weight_map: HashMap<String, String> = HashMap::new();
+    let mut index_path = None;
     let index = format!("{base}/model.safetensors.index.json");
     if let Ok(bytes) = read_all(sftp, &index)
         && let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes)
         && let Some(wm) = v.get("weight_map").and_then(|w| w.as_object())
     {
+        index_path = Some(index);
+        for (tensor, file) in wm {
+            if let Some(f) = file.as_str() {
+                weight_map.insert(tensor.clone(), f.to_string());
+            }
+        }
         let mut shards: Vec<&str> = wm.values().filter_map(|s| s.as_str()).collect();
         shards.sort_unstable();
         shards.dedup();
         indexed = shards.into_iter().map(|s| format!("{base}/{s}")).collect();
     }
-    Ok(merge_shard_lists(&indexed, &on_disk, listed))
+    Ok(ShardListing {
+        files: merge_shard_lists(&indexed, &on_disk, listed),
+        index_path,
+        weight_map,
+        actual,
+    })
 }
 
 /// Combine the index's shard order with the directory listing: keep index
@@ -482,19 +489,6 @@ fn merge_shard_lists(indexed: &[String], on_disk: &[String], listed: bool) -> Ve
         }
     }
     files
-}
-
-/// The file-level index/disk mismatch: `(missing, extra)` — files the index
-/// `referenced` but that aren't in `actual`, and files in `actual` the index
-/// never mentioned. Pure, so the comparison is unit-tested without a live SFTP.
-fn index_file_diff(
-    referenced: &std::collections::BTreeSet<String>,
-    actual: &std::collections::BTreeSet<String>,
-) -> (Vec<String>, Vec<String>) {
-    (
-        referenced.difference(actual).cloned().collect(),
-        actual.difference(referenced).cloned().collect(),
-    )
 }
 
 /// Wrap a string in single quotes for a POSIX shell, escaping any embedded
@@ -610,28 +604,5 @@ mod tests {
         let indexed = v(&["d/model-00001.safetensors"]);
         let got = merge_shard_lists(&indexed, &[], false);
         assert_eq!(got, indexed);
-    }
-
-    #[test]
-    fn index_file_diff_flags_a_stale_index() {
-        use std::collections::BTreeSet;
-        let set = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
-        // The index names `-of-00014` shards; the directory holds `-of-00073`
-        // ones plus codebooks. Everything referenced is missing; everything on
-        // disk is unreferenced.
-        let referenced = set(&["model-00000-of-00014.safetensors"]);
-        let actual = set(&["codebooks.safetensors", "model-00001-of-00073.safetensors"]);
-        let (missing, extra) = index_file_diff(&referenced, &actual);
-        assert_eq!(missing, vec!["model-00000-of-00014.safetensors"]);
-        assert_eq!(
-            extra,
-            vec![
-                "codebooks.safetensors".to_string(),
-                "model-00001-of-00073.safetensors".to_string(),
-            ]
-        );
-        // A matching index → no findings.
-        let (m, e) = index_file_diff(&referenced, &referenced);
-        assert!(m.is_empty() && e.is_empty());
     }
 }

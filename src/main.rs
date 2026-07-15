@@ -784,20 +784,19 @@ fn run_check(
                 .with_context(|| format!("reading {src}"));
             bars.finish(0, out.is_ok());
             bars.join();
-            // `check` ignores the on-disk footprint (it's a health report).
-            let (tensors, metadata, _disk) = out?;
+            let rc = out?;
             // The checkpoint's config.json, fetched over the same session (no
             // second prompt) so the config check runs remotely too.
             let config = r.read_config(&session, &src);
-            // Index/file consistency over the same session, so `check` flags a
-            // botched/stale remote index just like a local one.
-            let health = r.index_health(&session, &src);
+            // Index/file consistency comes from the same read (computed from the
+            // parsed shards), so `check` flags a botched/stale remote index just
+            // like a local one — with no second index read.
             Ok(check::run(
                 src.clone(),
-                &tensors,
-                &metadata,
+                &rc.tensors,
+                &rc.metadata,
                 &[],
-                &health,
+                &rc.health,
                 config.as_ref(),
                 &filter,
                 false,
@@ -1221,8 +1220,8 @@ fn run_diff(
                         .read(session, src, &password, progress.as_deref())
                         .with_context(|| format!("reading {src}"));
                     bars.finish(i, out.is_ok());
-                    // `diff` compares structure, not the on-disk footprint.
-                    out.map(|(tensors, metadata, _disk)| (tensors, metadata))
+                    // `diff` compares structure, not the on-disk footprint or health.
+                    out.map(|rc| (rc.tensors, rc.metadata))
                 };
             let (ra, rb) = std::thread::scope(|s| {
                 let (oref, nref): (&str, &str) = (&old_str, &new_str);

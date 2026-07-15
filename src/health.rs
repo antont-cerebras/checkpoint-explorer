@@ -61,12 +61,7 @@ pub fn parse_index_spec(dir: &Path, index_path: &Path) -> Result<IndexSpec> {
 /// set; only those whose `source_path` is a file directly in `spec.dir` count, so
 /// this is safe when several checkpoints are loaded together.
 pub fn check_loaded(spec: &IndexSpec, tensors: &[TensorInfo]) -> HealthReport {
-    let referenced: BTreeSet<String> = spec.weight_map.values().cloned().collect();
     let actual = list_safetensors(&spec.dir);
-
-    // File-level diff.
-    let missing_files: Vec<String> = referenced.difference(&actual).cloned().collect();
-    let extra_files: Vec<String> = actual.difference(&referenced).cloned().collect();
 
     // Tensor names present per file, taken from the already-parsed tensors (grouped
     // by the file name of their `source_path`) — keyed to `spec.dir` so a same-named
@@ -90,10 +85,36 @@ pub fn check_loaded(spec: &IndexSpec, tensors: &[TensorInfo]) -> HealthReport {
         }
     }
 
+    reconcile(
+        &spec.index_path.display().to_string(),
+        &spec.weight_map,
+        &actual,
+        &present_by_file,
+    )
+}
+
+/// The pure index-vs-checkpoint comparison shared by the local
+/// ([`check_loaded`]) and remote (`--ssh-read`) health checks: given the index's
+/// `weight_map` (tensor -> file), the `.safetensors` files actually present, and
+/// the tensor names present in each file (from the already-parsed headers), report
+/// the file- and tensor-level mismatches. No I/O — both callers supply the pieces
+/// from data they've already read, so a header is never read twice.
+pub fn reconcile(
+    index_path: &str,
+    weight_map: &HashMap<String, String>,
+    actual: &BTreeSet<String>,
+    present_by_file: &HashMap<String, BTreeSet<String>>,
+) -> HealthReport {
+    let referenced: BTreeSet<String> = weight_map.values().cloned().collect();
+
+    // File-level diff.
+    let missing_files: Vec<String> = referenced.difference(actual).cloned().collect();
+    let extra_files: Vec<String> = actual.difference(&referenced).cloned().collect();
+
     // Tensor-level diff, limited to files that are both referenced and present
     // (wholesale-missing / wholesale-extra files are already covered above).
     let mut claimed_by_file: HashMap<String, BTreeSet<String>> = HashMap::new();
-    for (tensor, file) in &spec.weight_map {
+    for (tensor, file) in weight_map {
         claimed_by_file
             .entry(file.clone())
             .or_default()
@@ -102,7 +123,7 @@ pub fn check_loaded(spec: &IndexSpec, tensors: &[TensorInfo]) -> HealthReport {
 
     let mut missing_tensors = Vec::new();
     let mut extra_tensors = Vec::new();
-    for file in referenced.intersection(&actual) {
+    for file in referenced.intersection(actual) {
         let present = present_by_file.get(file).cloned().unwrap_or_default();
         let claimed = claimed_by_file.get(file).cloned().unwrap_or_default();
         for tensor in claimed.difference(&present) {
@@ -116,7 +137,7 @@ pub fn check_loaded(spec: &IndexSpec, tensors: &[TensorInfo]) -> HealthReport {
     extra_tensors.sort();
 
     HealthReport {
-        index_path: spec.index_path.display().to_string(),
+        index_path: index_path.to_string(),
         missing_files,
         extra_files,
         missing_tensors,
