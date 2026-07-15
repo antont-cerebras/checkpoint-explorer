@@ -4,7 +4,9 @@
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::tree::TensorInfo;
 
 /// The result of comparing an index against the files on disk.
 pub struct HealthReport {
@@ -31,22 +33,67 @@ impl HealthReport {
     }
 }
 
-/// Compare `index_path` (a `model.safetensors.index.json` inside `dir`) against
-/// the `.safetensors` files present in `dir`.
-pub fn check(dir: &Path, index_path: &Path) -> Result<HealthReport> {
-    // tensor name -> file the index claims it lives in
-    let weight_map = parse_weight_map(index_path)?;
-    let referenced: BTreeSet<String> = weight_map.values().cloned().collect();
-    let actual = list_safetensors(dir);
+/// A checkpoint directory's index parsed once, ready to health-check against the
+/// tensors the loader parses — so the shard headers are read a single time (by the
+/// loader) rather than again here. Built by [`parse_index_spec`]; consumed by
+/// [`check_loaded`].
+pub struct IndexSpec {
+    /// The directory the index and its shards live in.
+    pub dir: PathBuf,
+    /// The `model.safetensors.index.json` path (for the report label).
+    pub index_path: PathBuf,
+    /// tensor name -> file the index claims it lives in.
+    pub weight_map: HashMap<String, String>,
+}
+
+/// Read and parse a `model.safetensors.index.json` once into an [`IndexSpec`].
+pub fn parse_index_spec(dir: &Path, index_path: &Path) -> Result<IndexSpec> {
+    Ok(IndexSpec {
+        dir: dir.to_path_buf(),
+        index_path: index_path.to_path_buf(),
+        weight_map: parse_weight_map(index_path)?,
+    })
+}
+
+/// Compare an index against the checkpoint as actually loaded: the `.safetensors`
+/// files on disk (a directory listing — no header reads) and the tensor names the
+/// loader already parsed from each shard's header. `tensors` is the whole loaded
+/// set; only those whose `source_path` is a file directly in `spec.dir` count, so
+/// this is safe when several checkpoints are loaded together.
+pub fn check_loaded(spec: &IndexSpec, tensors: &[TensorInfo]) -> HealthReport {
+    let referenced: BTreeSet<String> = spec.weight_map.values().cloned().collect();
+    let actual = list_safetensors(&spec.dir);
 
     // File-level diff.
     let missing_files: Vec<String> = referenced.difference(&actual).cloned().collect();
     let extra_files: Vec<String> = actual.difference(&referenced).cloned().collect();
 
+    // Tensor names present per file, taken from the already-parsed tensors (grouped
+    // by the file name of their `source_path`) — keyed to `spec.dir` so a same-named
+    // shard in another loaded directory can't leak in.
+    let abs_dir = std::path::absolute(&spec.dir).unwrap_or_else(|_| spec.dir.clone());
+    let mut present_by_file: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for t in tensors {
+        let path = Path::new(&t.source_path);
+        let in_dir = path
+            .parent()
+            .map(|p| p == abs_dir || p == spec.dir)
+            .unwrap_or(false);
+        if !in_dir {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            present_by_file
+                .entry(name.to_string())
+                .or_default()
+                .insert(t.name.clone());
+        }
+    }
+
     // Tensor-level diff, limited to files that are both referenced and present
     // (wholesale-missing / wholesale-extra files are already covered above).
     let mut claimed_by_file: HashMap<String, BTreeSet<String>> = HashMap::new();
-    for (tensor, file) in &weight_map {
+    for (tensor, file) in &spec.weight_map {
         claimed_by_file
             .entry(file.clone())
             .or_default()
@@ -56,12 +103,8 @@ pub fn check(dir: &Path, index_path: &Path) -> Result<HealthReport> {
     let mut missing_tensors = Vec::new();
     let mut extra_tensors = Vec::new();
     for file in referenced.intersection(&actual) {
-        let present: BTreeSet<String> = match read_tensor_names(&dir.join(file)) {
-            Ok(names) => names.into_iter().collect(),
-            Err(_) => continue, // unreadable header; skip tensor-level for this file
-        };
+        let present = present_by_file.get(file).cloned().unwrap_or_default();
         let claimed = claimed_by_file.get(file).cloned().unwrap_or_default();
-
         for tensor in claimed.difference(&present) {
             missing_tensors.push(format!("{tensor}  (expected in {file})"));
         }
@@ -72,13 +115,13 @@ pub fn check(dir: &Path, index_path: &Path) -> Result<HealthReport> {
     missing_tensors.sort();
     extra_tensors.sort();
 
-    Ok(HealthReport {
-        index_path: index_path.display().to_string(),
+    HealthReport {
+        index_path: spec.index_path.display().to_string(),
         missing_files,
         extra_files,
         missing_tensors,
         extra_tensors,
-    })
+    }
 }
 
 /// Parse the `weight_map` of an index into a tensor-name -> file-name map.
@@ -115,59 +158,28 @@ fn list_safetensors(dir: &Path) -> BTreeSet<String> {
     files
 }
 
-/// Read just the tensor names from a safetensors header (excludes the
-/// `__metadata__` entry).
-fn read_tensor_names(path: &Path) -> Result<Vec<String>> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("Failed to open file: {}", path.display()))?;
-    let mut len_buf = [0u8; 8];
-    file.read_exact(&mut len_buf)?;
-    let header_len = u64::from_le_bytes(len_buf) as usize;
-
-    const MAX_HEADER_SIZE: usize = 100_000_000;
-    if header_len > MAX_HEADER_SIZE {
-        anyhow::bail!("SafeTensors header too large: {}", path.display());
-    }
-
-    let mut header_buf = vec![0u8; header_len];
-    file.read_exact(&mut header_buf)?;
-    let header: serde_json::Value = serde_json::from_slice(&header_buf)?;
-
-    let names = header
-        .as_object()
-        .map(|obj| {
-            obj.keys()
-                .filter(|k| *k != "__metadata__")
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(names)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use crate::tree::{Layout, Storage};
 
-    /// Write a minimal safetensors file containing the given tensor names.
-    fn write_safetensors(path: &Path, tensors: &[&str]) {
-        let mut entries = serde_json::Map::new();
-        for (i, name) in tensors.iter().enumerate() {
-            entries.insert(
-                name.to_string(),
-                serde_json::json!({
-                    "dtype": "F32", "shape": [1], "data_offsets": [i * 4, i * 4 + 4]
-                }),
-            );
+    /// A `TensorInfo` named `name` whose `source_path` is `dir/file` (absolute,
+    /// matching what the loader records) — enough for the health check's grouping.
+    fn ti(name: &str, dir: &Path, file: &str) -> TensorInfo {
+        let src = std::path::absolute(dir.join(file))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        TensorInfo {
+            name: name.to_string(),
+            dtype: "F32".into(),
+            shape: vec![1],
+            size_bytes: 4,
+            num_elements: 1,
+            storage: Storage::Unknown,
+            source_path: src,
+            layout: Layout::None,
         }
-        let header = serde_json::to_vec(&serde_json::Value::Object(entries)).unwrap();
-        let mut f = std::fs::File::create(path).unwrap();
-        f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
-        f.write_all(&header).unwrap();
-        f.write_all(&vec![0u8; tensors.len() * 4]).unwrap();
     }
 
     #[test]
@@ -186,15 +198,21 @@ mod tests {
         let index_path = dir.join("model.safetensors.index.json");
         std::fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
 
-        // Present: model-00001 (the claimed a.weight plus an unlisted extra),
-        // and model-00003 which the index never references.
-        write_safetensors(
-            &dir.join("model-00001.safetensors"),
-            &["a.weight", "extra.weight"],
-        );
-        write_safetensors(&dir.join("model-00003.safetensors"), &["c.weight"]);
+        // On disk: model-00001 (present) and model-00003 (never referenced); the
+        // file-level check only lists directory entries, so empty files suffice.
+        std::fs::write(dir.join("model-00001.safetensors"), b"").unwrap();
+        std::fs::write(dir.join("model-00003.safetensors"), b"").unwrap();
 
-        let report = check(&dir, &index_path).unwrap();
+        // The tensors the loader parsed: model-00001 holds the claimed a.weight
+        // plus an unlisted extra; model-00003 holds c.weight.
+        let tensors = vec![
+            ti("a.weight", &dir, "model-00001.safetensors"),
+            ti("extra.weight", &dir, "model-00001.safetensors"),
+            ti("c.weight", &dir, "model-00003.safetensors"),
+        ];
+
+        let spec = parse_index_spec(&dir, &index_path).unwrap();
+        let report = check_loaded(&spec, &tensors);
         assert!(report.has_issues());
         assert_eq!(report.missing_files, vec!["model-00002.safetensors"]);
         assert_eq!(report.extra_files, vec!["model-00003.safetensors"]);

@@ -537,8 +537,14 @@ pub struct Explorer {
     /// synthesizes. Rebuilt every frame by the `render_*` functions; read by the
     /// loops' mouse handlers to turn a click into the equivalent keypress.
     clickable: RefCell<Vec<(ratatui::layout::Rect, KeyEvent)>>,
-    /// Index/file mismatches detected at startup, shown as a warning panel.
+    /// Index/file mismatches, shown as a warning panel. Populated in
+    /// [`Self::finalize_load`] from [`Self::index_specs`] once the tensors are
+    /// read (plus any remote index health folded in by the loader).
     health_reports: Vec<crate::health::HealthReport>,
+    /// Parsed `model.safetensors.index.json`(s) to health-check against the loaded
+    /// tensors — deferred to `finalize_load` so the shard headers are read once (by
+    /// the loader), not again for the check.
+    index_specs: Vec<crate::health::IndexSpec>,
     /// Per-tensor dtype reinterpretation chosen in the data views, keyed by
     /// tensor name. Session-scoped: remembered until the app exits.
     dtype_overrides: RefCell<HashMap<String, ViewDtype>>,
@@ -633,20 +639,12 @@ pub struct Explorer {
 impl Explorer {
     pub fn new(
         files: Vec<PathBuf>,
-        health_reports: Vec<crate::health::HealthReport>,
+        index_specs: Vec<crate::health::IndexSpec>,
         open: Option<OpenRequest>,
         preload: bool,
     ) -> Self {
-        // Files on disk but absent from the index (per the health reports),
-        // resolved to absolute paths so they match each tensor's `source_path`.
-        let mut unindexed = HashSet::new();
-        for report in &health_reports {
-            if let Some(dir) = Path::new(&report.index_path).parent() {
-                for file in &report.extra_files {
-                    unindexed.insert(absolute_path(&dir.join(file)));
-                }
-            }
-        }
+        // `health_reports` / `unindexed` are computed in `finalize_load`, once the
+        // tensors are read, from `index_specs` — so no shard header is read twice.
         Self {
             files,
             tensors: Vec::new(),
@@ -667,7 +665,8 @@ impl Explorer {
             copied_flash: None,
             terminal: None,
             clickable: RefCell::new(Vec::new()),
-            health_reports,
+            health_reports: Vec::new(),
+            index_specs,
             dtype_overrides: RefCell::new(HashMap::new()),
             packing_schemas: HashMap::new(),
             shape_overrides: RefCell::new(HashMap::new()),
@@ -689,7 +688,7 @@ impl Explorer {
             reader_cache: RefCell::new(None),
             sample_cache: RefCell::new(None),
             preload,
-            unindexed,
+            unindexed: HashSet::new(),
             readonly_hover: Cell::new(false),
             hovered_shortcut: Cell::new(None),
             health_hover: Cell::new(false),
@@ -1016,8 +1015,37 @@ impl Explorer {
         Ok(())
     }
 
+    /// Files on disk but absent from the index (per the health reports' extra
+    /// files), resolved to absolute paths so they match each tensor's
+    /// `source_path` — the tree dims their rows.
+    fn unindexed_files(reports: &[crate::health::HealthReport]) -> HashSet<String> {
+        let mut unindexed = HashSet::new();
+        for report in reports {
+            if let Some(dir) = Path::new(&report.index_path).parent() {
+                for file in &report.extra_files {
+                    unindexed.insert(absolute_path(&dir.join(file)));
+                }
+            }
+        }
+        unindexed
+    }
+
     /// Shared post-read setup: dedup, sort, parameter/schema/tree build.
     fn finalize_load(&mut self, tensors: Vec<TensorInfo>, metadata: Vec<MetadataInfo>) {
+        // Local index/file health, computed from the freshly-parsed tensors (before
+        // dedup, so a name in two shards is seen in both) — the loader already read
+        // every header, so this re-reads nothing. Remote index health was folded in
+        // by the caller; append the local reports, then derive the unindexed-file
+        // set (files on disk but absent from the index) for the tree's dimming.
+        let local: Vec<crate::health::HealthReport> = self
+            .index_specs
+            .iter()
+            .map(|spec| crate::health::check_loaded(spec, &tensors))
+            .filter(|r| r.has_issues())
+            .collect();
+        self.health_reports.extend(local);
+        self.unindexed = Self::unindexed_files(&self.health_reports);
+
         self.tensors = tensors;
         self.metadata = metadata;
         // The derived reports (health / stats) are keyed to the tensors — drop any

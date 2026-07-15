@@ -811,12 +811,19 @@ fn run_check(
     } else {
         // Health enabled: its index-vs-disk report is folded into the file check.
         (|| -> Result<check::CheckReport> {
-            let (files, health) = collect_safetensors_files(paths, recursive, false)?;
+            let (files, index_specs) = collect_safetensors_files(paths, recursive, false)?;
             if files.is_empty() {
                 anyhow::bail!("no checkpoint files found");
             }
             let (tensors, metadata, config, _disk, _health) =
                 Explorer::gather_checkpoint(&files, None)?;
+            // Index-vs-disk health from the tensors just loaded (no extra header
+            // reads); folded into the file check below.
+            let health: Vec<health::HealthReport> = index_specs
+                .iter()
+                .map(|spec| health::check_loaded(spec, &tensors))
+                .filter(|r| r.has_issues())
+                .collect();
             let label = paths
                 .iter()
                 .map(|p| p.display().to_string())
@@ -1180,7 +1187,7 @@ fn run_diff(
     remote: Option<&crate::remote::RemoteRead>,
 ) -> i32 {
     let load_local = |path: &Path| -> Result<Loaded> {
-        let (files, _health) =
+        let (files, _index_specs) =
             collect_safetensors_files(std::slice::from_ref(&path.to_path_buf()), recursive, true)?;
         if files.is_empty() {
             anyhow::bail!("no checkpoint files found at {}", path.display());
@@ -1634,7 +1641,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
 
     // `--ssh-read` delegates the read to cstorch on a remote host, so the s3://
     // URIs are kept verbatim (no local listing). Otherwise list local sources.
-    let (files, health_reports) = if args.ssh_read.is_some() {
+    let (files, index_specs) = if args.ssh_read.is_some() {
         (args.paths.clone(), Vec::new())
     } else {
         collect_safetensors_files(&args.paths, args.recursive, args.no_health_check)?
@@ -1753,7 +1760,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         exit_after: args.exit,
     });
 
-    let mut explorer = Explorer::new(files, health_reports, open, !args.no_preload);
+    let mut explorer = Explorer::new(files, index_specs, open, !args.no_preload);
     if let Some(host) = args.ssh_read {
         let venv = args.ssh_venv.unwrap_or_else(|| "~/venv".to_string());
         explorer.set_remote_read(host, venv);
@@ -1875,9 +1882,12 @@ fn collect_safetensors_files(
     paths: &[PathBuf],
     recursive: bool,
     no_health_check: bool,
-) -> Result<(Vec<PathBuf>, Vec<health::HealthReport>)> {
+) -> Result<(Vec<PathBuf>, Vec<health::IndexSpec>)> {
     let mut files = Vec::new();
-    let mut health_reports = Vec::new();
+    // Parsed indexes to health-check later against the loaded tensors (so shard
+    // headers are read once, by the loader, not again here). Empty when health is
+    // off. See `health::check_loaded`.
+    let mut index_specs: Vec<health::IndexSpec> = Vec::new();
 
     for path in paths {
         // Remote checkpoints are read via `--ssh-read` (handled before this
@@ -1919,7 +1929,15 @@ fn collect_safetensors_files(
                 let index_path = expanded_path.join("model.safetensors.index.json");
                 let mut found_from_index = false;
                 if index_path.exists() {
-                    let index_files = parse_safetensors_index(&index_path)?;
+                    // Parse the index once. Its `weight_map` gives the shard list
+                    // here, and (unless health is off) the spec is kept to compare
+                    // against the loaded tensors later — so the shard headers are
+                    // read a single time, by the loader, not again for the health
+                    // check.
+                    let spec = health::parse_index_spec(&expanded_path, &index_path)?;
+                    let mut index_files: Vec<String> = spec.weight_map.values().cloned().collect();
+                    index_files.sort();
+                    index_files.dedup();
                     let mut missing = Vec::new();
                     for file in index_files {
                         let full_path = expanded_path.join(&file);
@@ -1944,14 +1962,8 @@ fn collect_safetensors_files(
                             expanded_path.display()
                         );
                     }
-
-                    // Health check: compare the index against the files on disk
-                    // and record any mismatch to surface in the UI.
-                    if !no_health_check
-                        && let Ok(report) = health::check(&expanded_path, &index_path)
-                        && report.has_issues()
-                    {
-                        health_reports.push(report);
+                    if !no_health_check {
+                        index_specs.push(spec);
                     }
                 }
 
@@ -1969,7 +1981,7 @@ fn collect_safetensors_files(
     // collected both from the index and the directory scan (identical paths).
     files.sort();
     files.dedup();
-    Ok((files, health_reports))
+    Ok((files, index_specs))
 }
 
 fn scan_directory(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -1996,29 +2008,6 @@ fn scan_directory(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>) -> Resu
     }
 
     Ok(())
-}
-
-fn parse_safetensors_index(index_path: &PathBuf) -> Result<Vec<String>> {
-    let content = fs::read_to_string(index_path)
-        .with_context(|| format!("Failed to read index file: {}", index_path.display()))?;
-
-    let index: serde_json::Value = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse index file: {}", index_path.display()))?;
-
-    let mut files = Vec::new();
-
-    if let Some(weight_map) = index.get("weight_map").and_then(|v| v.as_object()) {
-        for file_name in weight_map.values() {
-            if let Some(file_str) = file_name.as_str()
-                && !files.iter().any(|existing| existing == file_str)
-            {
-                files.push(file_str.to_string());
-            }
-        }
-    }
-
-    files.sort();
-    Ok(files)
 }
 
 #[cfg(test)]
