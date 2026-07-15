@@ -133,9 +133,8 @@ pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
         (Tree, Up | Down) => "Move the selection up / down one row.",
         (Tree, Left | Right) => "Collapse to the parent group, or step into the child.",
         (Tree, PageUp | PageDown) => "Scroll the tree by one screenful.",
-        (Tree, KeyCode::Enter | Char(' ')) => {
-            "Open the selected tensor, or expand / collapse a group."
-        }
+        (Tree, KeyCode::Enter) => "Open the selected tensor, or expand / collapse a group.",
+        (Tree, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
         (Tree, Char('E')) => "Expand every group in the tree.",
         (Tree, Char('C')) => "Collapse every group in the tree.",
         (Tree, Char('/')) => "Search: filter tensors by name as you type.",
@@ -2470,6 +2469,92 @@ impl UI {
             .collect()
     }
 
+    /// The command palette: a query line above a fuzzy-filtered list of commands
+    /// (each `key`, `title`, and `help`), the selected row inverted. Returns the
+    /// on-screen rect of every listed row so a click can pick it. Fixed width so
+    /// the box doesn't jump as the query filters the list.
+    pub fn render_command_palette(
+        frame: &mut Frame,
+        query: &str,
+        rows: &[(String, String, String, String)],
+        selected: usize,
+    ) -> Vec<Rect> {
+        let key_w = rows
+            .iter()
+            .map(|(k, ..)| k.chars().count())
+            .max()
+            .unwrap_or(1);
+        // `Group: Title` in one column, aligned so the help lines up.
+        let label = |group: &str, title: &str| format!("{group}: {title}");
+        let label_w = rows
+            .iter()
+            .map(|(_, g, t, _)| label(g, t).chars().count())
+            .max()
+            .unwrap_or(0);
+
+        let mut content: Vec<Line> = Vec::new();
+        let mut query_line = vec![Span::styled(
+            "❯ ",
+            Style::default()
+                .fg(palette::KEY)
+                .add_modifier(Modifier::BOLD),
+        )];
+        // Caret at the end (the palette input only appends / backspaces).
+        query_line.extend(input_box_spans(query, query.chars().count(), 24));
+        content.push(Line::from(query_line));
+        content.push(Line::default());
+
+        if rows.is_empty() {
+            content.push(Line::from(dim_span("  (no matching commands)")));
+        }
+        for (i, (key, group, title, help)) in rows.iter().enumerate() {
+            let pad_k = " ".repeat(key_w.saturating_sub(key.chars().count()));
+            let pad_l = " ".repeat(label_w.saturating_sub(label(group, title).chars().count()));
+            if i == selected {
+                content.push(Line::from(Span::styled(
+                    format!("  {pad_k}{key}  {group}: {title}{pad_l}  {help} "),
+                    Style::default()
+                        .fg(palette::SELECT_FG)
+                        .bg(palette::SELECT_BG)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            } else {
+                content.push(Line::from(vec![
+                    Span::raw(format!("  {pad_k}")),
+                    Span::styled(
+                        key.clone(),
+                        Style::default()
+                            .fg(palette::KEY)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    // Category dimmed, command title normal — the VS Code look.
+                    dim_span(format!("{group}: ")),
+                    Span::raw(format!("{title}{pad_l}  ")),
+                    dim_span(help.clone()),
+                ]));
+            }
+        }
+        content.push(Line::default());
+        content.push(Line::from(dim_span(
+            "↑/↓ move · Enter run · type to filter · Esc close",
+        )));
+
+        let width = (frame.area().width as usize)
+            .saturating_sub(4)
+            .clamp(30, 100);
+        let inner = render_popup_box(frame, "Commands", content, Backdrop::Float, Some(width));
+        // Rows start after the query line (0) and the blank separator (1).
+        (0..rows.len())
+            .map(|i| Rect {
+                x: inner.x,
+                y: inner.y + 2 + i as u16,
+                width: inner.width,
+                height: 1,
+            })
+            .collect()
+    }
+
     /// Draw the copied CLI command as a borderless pop-up *over* the current
     /// screen (the surrounding view stays visible above and below the band; the
     /// caller redraws it on dismiss — the screen is not cleared). The command
@@ -3997,13 +4082,14 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<Chi
             ],
             "page",
         ),
+        (vec![Seg::Key("Enter", KeyEvent::new(Enter, plain))], "open"),
         (
             vec![
-                Seg::Key("Enter", KeyEvent::new(Enter, plain)),
-                Seg::Sep("/"),
                 Seg::Key("Space", hint_key(' ')),
+                Seg::Sep("/"),
+                Seg::Key(":", hint_key(':')),
             ],
-            "expand",
+            "commands",
         ),
         (
             vec![
@@ -5089,6 +5175,35 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn command_palette_lists_commands_as_group_colon_title() {
+        let rows = vec![
+            (
+                "c".to_string(),
+                "Copy".to_string(),
+                "Screen text".to_string(),
+                "Copy the whole screen".to_string(),
+            ),
+            (
+                "s".to_string(),
+                "View".to_string(),
+                "Checkpoint stats".to_string(),
+                "Show stats".to_string(),
+            ),
+        ];
+        let out = crate::tui::headless_render(90, 16, |f| {
+            UI::render_command_palette(f, "cop", &rows, 0);
+        })
+        .unwrap();
+        assert!(out.contains("Commands"), "titled box:\n{out}");
+        // VS Code style: `Group: Title`, with the bound key beside it.
+        assert!(out.contains("Copy: Screen text"), "{out}");
+        assert!(out.contains("View: Checkpoint stats"), "{out}");
+        assert!(out.contains("c  Copy: Screen text"), "key shown:\n{out}");
+        // The query is echoed in the input line.
+        assert!(out.contains("cop"), "query shown:\n{out}");
     }
 
     #[test]
