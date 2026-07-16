@@ -5,6 +5,7 @@ mod config;
 mod convert;
 mod diff;
 mod explorer;
+mod filetree;
 mod filter;
 mod gguf;
 #[cfg(feature = "hdf5")]
@@ -18,6 +19,7 @@ mod npy;
 mod progress;
 mod remote;
 mod s3;
+mod safelayout;
 mod sample;
 mod sftp;
 mod stats;
@@ -315,6 +317,27 @@ struct ExploreArgs {
         help = "Like --stats, but with the on-disk per-shard breakdown expanded (the popup's `f` toggle)"
     )]
     stats_shards: bool,
+
+    #[arg(
+        long,
+        help = "Open straight into the file browser — the checkpoint's directory tree (the `Tab` toggle)"
+    )]
+    files: bool,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Open straight into the safetensors byte-layout map for this file (Enter on a .safetensors in the file browser)"
+    )]
+    layout: Option<String>,
+
+    #[arg(
+        long = "layout-select",
+        value_name = "NAME",
+        requires = "layout",
+        help = "Preselect this tensor in the --layout map (what the layout view's `y` records)"
+    )]
+    layout_select: Option<String>,
 
     #[arg(
         long,
@@ -1685,7 +1708,9 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.health
         || args.health_findings
         || args.stats
-        || args.stats_shards;
+        || args.stats_shards
+        || args.files
+        || args.layout.is_some();
     let view = if args.values {
         OpenView::Values
     } else if args.heatmap {
@@ -1733,6 +1758,8 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.health_findings
         || args.stats
         || args.stats_shards
+        || args.files
+        || args.layout.is_some()
         || args.exit;
     let open = wants_open.then_some(OpenRequest {
         tensor: args.tensor,
@@ -1757,6 +1784,9 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         stats: args.stats,
         stats_shards: args.stats_shards,
         exit_after: args.exit,
+        files_view: args.files,
+        layout_file: args.layout,
+        layout_select: args.layout_select,
     });
 
     let mut explorer = Explorer::new(files, index_specs, open, !args.no_preload);

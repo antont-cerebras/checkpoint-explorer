@@ -14,8 +14,8 @@ expert 0 of 30 — stored word 0, field 0/5 (3-bit) — [ ] step · / index or %
      2  0  1  2  3
 
 m heatmap · ← → first/last cols · ↑ ↓ first/last rows · +Shift one end · [ ] slice · / index or % · d dtype · r reshape
-· e window · z zebra: rows · b base: dec · c copy · y copy cmd · l legend · ⌫ back · \ fwd · any other key to return...
-        ╭ Legend — numeric values ─────────────────────────────────────────────────────────────────────────────╮
+· e window · z zebra: rows · b base: dec · c copy · y copy cmd · l legend · Space commands · ⌫ back · \ fwd · any other
+key to r╭ Legend — numeric values ─────────────────────────────────────────────────────────────────────────────╮
         │   12  34    row / column indices into the full tensor (dimmed), not data values                      │
         │   ⋯         columns were skipped here (the gap between the first and last columns)                   │
         │   ⋮         rows were skipped here                                                                   │
