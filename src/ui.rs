@@ -117,6 +117,8 @@ pub fn region_at(regions: &[(Rect, KeyEvent)], col: u16, row: u16) -> Option<(Re
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum HelpCtx {
     Tree,
+    Files,
+    Layout,
     Detail,
     Data,
 }
@@ -124,10 +126,28 @@ pub enum HelpCtx {
 /// A one-line help description for a footer shortcut `key` on screen `ctx`, shown
 /// as a bubble when the mouse hovers the chip. `None` for keys with no help.
 pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
-    use HelpCtx::{Data, Detail, Tree};
-    use KeyCode::{Backspace, Char, Down, Left, PageDown, PageUp, Right, Up};
+    use HelpCtx::{Data, Detail, Files, Layout, Tree};
+    use KeyCode::{Backspace, Char, Down, Left, PageDown, PageUp, Right, Tab, Up};
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let help = match (ctx, key.code) {
+        // File browser.
+        (Tree, Tab) => "Switch to the file browser — the checkpoint's directory.",
+        (Files, Tab) => "Switch back to the tensor tree.",
+        // safetensors layout map.
+        (Layout, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
+        (Layout, Tab) => "Switch back to the tensor tree.",
+        (Layout, Up | Down) => "Move the selection to the previous / next segment.",
+        (Layout, PageUp | PageDown) => "Move the selection by one screenful.",
+        (Layout, KeyCode::Enter) => "Jump to the selected tensor's place in the tensor tree.",
+        (Detail, Tab) => "Show this tensor in its file's byte-layout map.",
+        (Files, Up | Down) => "Move the selection up / down one row.",
+        (Files, Left | Right) => "Collapse a directory / expand it (or step to its parent).",
+        (Files, PageUp | PageDown) => "Scroll the listing by one screenful.",
+        (Files, KeyCode::Enter) => {
+            "Expand a directory, open a checkpoint file, or preview a text / JSON sidecar."
+        }
+        (Files, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
+        (Files, Char('f')) => "Copy the selected file's path.",
         // Tree navigation.
         (Tree, Up | Down) if shift => "Jump to the previous / next sibling at this depth.",
         (Tree, Up | Down) => "Move the selection up / down one row.",
@@ -148,6 +168,7 @@ pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
         (Tree, Char('R')) => "Repack this HDF5 checkpoint into a new file with another codec.",
         (Tree, Char('q')) => "Quit the explorer.",
         // Detail screen.
+        (Detail, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
         (Detail | Data, Char('m')) => "Show the tensor as a heatmap.",
         (Detail | Data, Char('v')) => "Show the tensor as a grid of numeric values.",
         (Detail, Char('h')) => "Compute and show the value histogram.",
@@ -156,6 +177,7 @@ pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
         (Detail | Data, Char('d')) => "Reinterpret the stored dtype (e.g. u4, i4, bf16, f32).",
         (Detail | Data, Char('r' | 'R')) => "Reshape the tensor's dimensions (row-major).",
         // Data view.
+        (Data, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
         (Data, Char('e' | 'E')) => "Cycle the layout: overview → edges → window.",
         (Data, Char('z' | 'Z')) => "Cycle zebra striping: rows → columns → off.",
         (Data, Char('b' | 'B')) => "Cycle the numeral base: dec → hex → oct → bin.",
@@ -480,6 +502,14 @@ const TREE_HEADER_HEIGHT: usize = 3;
 /// Footer rows below the tree list: the two-line status bar. (The metadata-only
 /// state is now a badge on that bar, not a separate banner row.)
 const TREE_FOOTER_HEIGHT: usize = 2;
+
+/// Footer rows below the file-browser list: a one-line status bar (the selected
+/// entry's path / size, or a copy confirmation).
+const FILES_FOOTER_HEIGHT: usize = 1;
+
+/// Header rows above the layout map's strip: the title, the size / tensor-count
+/// summary, and the separator rule.
+const LAYOUT_HEADER_ROWS: usize = 3;
 
 /// Where the tree's vertical scroll bar sits and how a pointer over it maps to a
 /// scroll offset. Built by [`UI::tree_scrollbar`]; consumed by the renderer (to
@@ -997,6 +1027,472 @@ impl UI {
         regions
     }
 
+    /// The first terminal row of the file browser's body — its header height
+    /// (title + hint line(s) + separator rule). Shared with the mouse handler so a
+    /// click at row `r >= this` maps to file row `scroll + (r - this)`.
+    pub fn files_header_rows(width: u16) -> usize {
+        1 + files_hint_lines(width).0.len() + 1 // title + hint(s) + rule
+    }
+
+    /// Body rows visible in the file browser at the given size (header + the
+    /// one-line status bar footer), so the scroll offset stays consistent with
+    /// [`Self::render_files`]'s layout.
+    pub fn files_visible_rows(width: u16, height: u16) -> usize {
+        (height as usize)
+            .saturating_sub(Self::files_header_rows(width) + FILES_FOOTER_HEIGHT)
+            .max(1)
+    }
+
+    /// How many file rows fit one screenful — used to size a PageUp/PageDown jump.
+    pub fn visible_file_rows(width: u16, height: u16) -> usize {
+        Self::files_visible_rows(width, height)
+    }
+
+    /// The file browser's scroll-bar geometry (reusing [`TreeScrollbar`]) for this
+    /// size and a listing of `total` rows, or `None` when it all fits.
+    pub fn files_scrollbar(width: u16, height: u16, total: usize) -> Option<TreeScrollbar> {
+        let rows = Self::files_visible_rows(width, height);
+        if width < 2 || total <= rows {
+            return None;
+        }
+        Some(TreeScrollbar {
+            col: width - 1,
+            top: Self::files_header_rows(width) as u16,
+            rows: rows as u16,
+            max_offset: total - rows,
+        })
+    }
+
+    /// Render the file browser: header (title, hint line(s), rule), the visible
+    /// file rows from `scroll`, a scroll bar when the listing overflows, and a
+    /// one-line status bar showing the selected entry's path (or a copy
+    /// confirmation). Returns the clickable footer chips + `[×]` close, like
+    /// [`Self::render_tree`].
+    pub fn render_files(
+        frame: &mut Frame,
+        root: &str,
+        rows: &[crate::filetree::FileRow],
+        selected: usize,
+        scroll: usize,
+        copied_flash: Option<&str>,
+        interactive: bool,
+    ) -> Vec<(Rect, KeyEvent)> {
+        let area = frame.area();
+        let (width, height) = (area.width, area.height);
+        if height < (FILES_FOOTER_HEIGHT as u16 + 1) {
+            return Vec::new();
+        }
+
+        // --- header + file rows (above the status line) ---
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(Span::raw(format!("File browser - {root}"))));
+        let (hint_lines, chips) = files_hint_lines(width);
+        lines.extend(hint_lines);
+        lines.push(Line::from(Span::styled(
+            "─".repeat(width as usize),
+            Style::default().fg(palette::DIM),
+        )));
+
+        let header_rows = lines.len();
+        let body_rows = (height as usize).saturating_sub(header_rows + FILES_FOOTER_HEIGHT);
+
+        let scrollbar = if interactive {
+            Self::files_scrollbar(width, height, rows.len())
+        } else {
+            None
+        };
+        let body_width = width.saturating_sub(u16::from(scrollbar.is_some()));
+
+        Paragraph::new(lines).render(
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: header_rows as u16,
+            },
+            frame.buffer_mut(),
+        );
+
+        let mut body: Vec<Line> = Vec::with_capacity(body_rows);
+        for (idx, row) in rows.iter().enumerate().skip(scroll).take(body_rows) {
+            body.push(file_row_line(row, idx == selected));
+        }
+        Paragraph::new(body).render(
+            Rect {
+                x: 0,
+                y: header_rows as u16,
+                width: body_width,
+                height: body_rows as u16,
+            },
+            frame.buffer_mut(),
+        );
+
+        if let Some(sb) = &scrollbar {
+            let mut state = ScrollbarState::new(sb.max_offset + 1)
+                .position(scroll)
+                .viewport_content_length(body_rows);
+            StatefulWidget::render(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .track_symbol(Some("│"))
+                    .thumb_symbol("█")
+                    .track_style(Style::default().fg(palette::DIM))
+                    .thumb_style(Style::default().fg(palette::ACCENT)),
+                Rect {
+                    x: sb.col,
+                    y: sb.top,
+                    width: 1,
+                    height: sb.rows,
+                },
+                frame.buffer_mut(),
+                &mut state,
+            );
+        }
+
+        // --- one-line status bar (selected entry, or a copy confirmation) ---
+        use unicode_width::UnicodeWidthStr;
+        let reserve = READONLY_BADGE.width();
+        let max_text = (width as usize).saturating_sub(6 + reserve);
+        let status = if let Some(flash) = copied_flash {
+            Line::from(Span::styled(
+                flash.to_string(),
+                Style::default()
+                    .fg(palette::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else if let Some(row) = rows.get(selected) {
+            let text = truncate_keep_end(&row.path.to_string_lossy(), max_text);
+            Line::from(Span::styled(
+                format!(" ▪ {text} "),
+                Style::default()
+                    .bg(palette::STATUS_BG)
+                    .fg(palette::STATUS_FG),
+            ))
+        } else {
+            Line::default()
+        };
+        Paragraph::new(status).render(
+            Rect {
+                x: 0,
+                y: height.saturating_sub(1),
+                width,
+                height: 1,
+            },
+            frame.buffer_mut(),
+        );
+        Self::render_readonly_badge(frame, false);
+
+        // Clickable footer chips (hint block starts at row 1, below the title)
+        // plus the top-right `[×]` (→ switch back to the tensor tree).
+        let mut regions: Vec<(Rect, KeyEvent)> = chips
+            .iter()
+            .map(|c| {
+                (
+                    Rect {
+                        x: c.col,
+                        y: 1 + c.line,
+                        width: c.width,
+                        height: 1,
+                    },
+                    c.key,
+                )
+            })
+            .collect();
+        regions.extend(close_button(
+            frame,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        ));
+        regions
+    }
+
+    /// Float a sidecar file preview over the file browser: a scrollable pop-up of
+    /// the file's contents (JSON syntax-highlighted, other text plain) or an info
+    /// line for a binary. Reuses the scroll-pop-up chrome; returns its max scroll
+    /// and clickable regions so the caller can clamp/handle them.
+    pub fn render_file_preview(
+        frame: &mut Frame,
+        title: &str,
+        body: &[Line<'static>],
+        footer: Line<'static>,
+        scroll: usize,
+    ) -> (usize, Vec<(Rect, KeyEvent)>) {
+        render_scroll_popup(frame, title, body, footer, scroll, &[])
+    }
+
+    /// The first terminal row of the layout map's strip (its fixed header height),
+    /// for the mouse click-to-select hit-test.
+    pub fn layout_header_rows() -> usize {
+        LAYOUT_HEADER_ROWS
+    }
+
+    /// Body rows the layout map's vertical strip occupies (total height minus the
+    /// 3-row header and the footer hint line(s)).
+    pub fn layout_visible_rows(width: u16, height: u16) -> usize {
+        (height as usize)
+            .saturating_sub(LAYOUT_HEADER_ROWS + layout_hint_lines(width).0.len())
+            .max(1)
+    }
+
+    /// Render the safetensors **layout map** — a scrollable vertical strip of the
+    /// file: a header (title + size / tensor-count / header-size summary), then one
+    /// band per segment (header, each tensor by offset, any padding) whose height
+    /// is proportional to its share of the file. Each band's first row carries its
+    /// offset and a one-line label (name + dtype/shape + size); the header band's
+    /// remaining rows list its `__metadata__` entries tree-like. The `selected`
+    /// segment's label row is highlighted. Returns the max scroll offset (so the
+    /// caller can clamp) and the clickable footer chips.
+    pub fn render_layout(
+        frame: &mut Frame,
+        map: &crate::safelayout::LayoutMap,
+        selected: usize,
+        scroll: usize,
+        copied: Option<&str>,
+        interactive: bool,
+    ) -> (usize, Vec<(Rect, KeyEvent)>) {
+        use crate::safelayout::SegmentKind;
+        let area = frame.area();
+        let (width, height) = (area.width, area.height);
+        if height < (LAYOUT_HEADER_ROWS as u16 + 2) {
+            return (0, Vec::new());
+        }
+
+        // --- header (title, summary, rule) ---
+        let dim = Style::default().fg(palette::DIM);
+        let mut summary = vec![
+            Span::styled(format_size(map.total_len as usize), Style::default()),
+            Span::styled(" · ", dim),
+            Span::raw(format!("{} tensors", map.tensor_count)),
+            Span::styled(" · ", dim),
+            Span::raw(format!("header {}", format_size(map.header_len as usize))),
+        ];
+        if map.metadata_entries() > 0 {
+            summary.push(Span::styled(
+                format!(" · {} metadata", map.metadata_entries()),
+                dim,
+            ));
+        }
+        let header_lines = vec![
+            Line::from(Span::raw(format!("Layout - {}", map.name))),
+            Line::from(summary),
+            Line::from(Span::styled(
+                "─".repeat(width as usize),
+                Style::default().fg(palette::DIM),
+            )),
+        ];
+        Paragraph::new(header_lines).render(
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: LAYOUT_HEADER_ROWS as u16,
+            },
+            frame.buffer_mut(),
+        );
+
+        // --- footer hints (pinned to the bottom) ---
+        // A copy confirmation temporarily takes over the footer's first line (its
+        // own line, cleared full-width) so it never intermingles with the hints.
+        let (mut hint_lines, chips) = layout_hint_lines(width);
+        let footer_rows = hint_lines.len();
+        let body_rows = (height as usize).saturating_sub(LAYOUT_HEADER_ROWS + footer_rows);
+        if let Some(msg) = copied
+            && let Some(first) = hint_lines.first_mut()
+        {
+            *first = Line::from(Span::styled(
+                msg.to_string(),
+                Style::default()
+                    .fg(palette::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        Paragraph::new(hint_lines).render(
+            Rect {
+                x: 0,
+                y: (height as usize - footer_rows) as u16,
+                width,
+                height: footer_rows as u16,
+            },
+            frame.buffer_mut(),
+        );
+
+        // --- the vertical strip (scrollable) ---
+        let rows = band_rows(map, body_rows);
+        let total_rows: usize = rows.iter().sum();
+        let scrollbar =
+            interactive.then(|| Self::files_scrollbar_like(width, total_rows, body_rows));
+        let scrollbar = scrollbar.flatten();
+        let strip_width = width.saturating_sub(u16::from(scrollbar.is_some()));
+
+        let max_scroll = total_rows.saturating_sub(body_rows);
+        let scroll = scroll.min(max_scroll);
+        // Cumulative start row of each band.
+        let mut starts = Vec::with_capacity(rows.len() + 1);
+        let mut acc = 0usize;
+        for &h in &rows {
+            starts.push(acc);
+            acc += h;
+        }
+
+        let sel = Style::default()
+            .fg(palette::SELECT_FG)
+            .bg(palette::SELECT_BG);
+        let mut seg = 0usize; // segment whose band contains the current row
+        let mut body: Vec<Line> = Vec::with_capacity(body_rows);
+        for r in scroll..(scroll + body_rows).min(total_rows) {
+            // Advance to the band containing global row `r`.
+            while seg + 1 < starts.len() && r >= starts[seg] + rows[seg] {
+                seg += 1;
+            }
+            let s = &map.segments[seg];
+            let row_in = r - starts[seg];
+            let first = row_in == 0;
+            let selected_row = seg == selected && first;
+            let rule = if r == 0 {
+                '┬'
+            } else if r == total_rows - 1 {
+                '┴'
+            } else {
+                '│'
+            };
+            let (glyph, color) = band_style(s, map.total_len);
+            let off = if first {
+                format!("{:#014x}", s.start)
+            } else {
+                " ".repeat(14)
+            };
+            let mut spans = vec![
+                Span::styled(off, dim),
+                Span::raw(" "),
+                Span::styled(rule.to_string(), dim),
+                Span::raw(" "),
+                Span::styled(glyph.to_string(), Style::default().fg(color)),
+                Span::raw("  "),
+            ];
+            let label_w = strip_width.saturating_sub(20) as usize;
+            if first {
+                // One-line label: name (selection-highlighted), then a dim
+                // dtype/shape + size, so nothing looks orphaned on a blank row.
+                let name = truncate_keep_end(&s.name, label_w.saturating_sub(24));
+                let name_style = if selected_row {
+                    sel
+                } else {
+                    Style::default().fg(color)
+                };
+                spans.push(Span::styled(name, name_style));
+                let mut detail = String::new();
+                if let (SegmentKind::Tensor, Some(dt)) = (s.kind, &s.dtype) {
+                    detail.push_str(&format!("  {dt}"));
+                    if !s.shape.is_empty() {
+                        detail.push_str(&format!(" {}", format_shape(&s.shape)));
+                    }
+                }
+                detail.push_str(&format!("  {}", format_size(s.len() as usize)));
+                spans.push(Span::styled(detail, if selected_row { sel } else { dim }));
+            } else if s.kind == SegmentKind::Header {
+                // The header band's rows list its `__metadata__` entries tree-like.
+                if let Some((k, v)) = map.metadata.get(row_in - 1) {
+                    let val = truncate_keep_end(v, label_w.saturating_sub(k.len() + 6));
+                    spans.push(Span::styled(
+                        format!("† {k}  "),
+                        Style::default().fg(palette::META),
+                    ));
+                    spans.push(Span::styled(val, dim));
+                }
+            }
+            body.push(Line::from(spans));
+        }
+        Paragraph::new(body).render(
+            Rect {
+                x: 0,
+                y: LAYOUT_HEADER_ROWS as u16,
+                width: strip_width,
+                height: body_rows as u16,
+            },
+            frame.buffer_mut(),
+        );
+
+        if let Some(sb) = &scrollbar {
+            let mut state = ScrollbarState::new(sb.max_offset + 1)
+                .position(scroll)
+                .viewport_content_length(body_rows);
+            StatefulWidget::render(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .track_symbol(Some("│"))
+                    .thumb_symbol("█")
+                    .track_style(Style::default().fg(palette::DIM))
+                    .thumb_style(Style::default().fg(palette::ACCENT)),
+                Rect {
+                    x: sb.col,
+                    y: LAYOUT_HEADER_ROWS as u16,
+                    width: 1,
+                    height: body_rows as u16,
+                },
+                frame.buffer_mut(),
+                &mut state,
+            );
+        }
+
+        // Clickable footer chips (hints start at the footer's top row) + `[×]`
+        // (→ back to the tensor tree, like the file view's close).
+        let footer_top = (height as usize - footer_rows) as u16;
+        let mut regions: Vec<(Rect, KeyEvent)> = chips
+            .iter()
+            .map(|c| {
+                (
+                    Rect {
+                        x: c.col,
+                        y: footer_top + c.line,
+                        width: c.width,
+                        height: 1,
+                    },
+                    c.key,
+                )
+            })
+            .collect();
+        regions.extend(close_button(
+            frame,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        ));
+        (max_scroll, regions)
+    }
+
+    /// A vertical scrollbar for a plain `total`-row list of `visible` rows sitting
+    /// just below the layout-map header — reusing [`TreeScrollbar`].
+    fn files_scrollbar_like(width: u16, total: usize, visible: usize) -> Option<TreeScrollbar> {
+        if width < 2 || total <= visible {
+            return None;
+        }
+        Some(TreeScrollbar {
+            col: width - 1,
+            top: LAYOUT_HEADER_ROWS as u16,
+            rows: visible as u16,
+            max_offset: total - visible,
+        })
+    }
+
+    /// The cumulative start row of each layout-map band, plus the total row count
+    /// as a trailing entry (so band `i` spans `[starts[i], starts[i+1])`). Lets the
+    /// browsing loop map a click to a segment and snap the scroll to the selection,
+    /// using the same band heights [`Self::render_layout`] draws.
+    pub fn layout_band_starts(
+        map: &crate::safelayout::LayoutMap,
+        width: u16,
+        height: u16,
+    ) -> Vec<usize> {
+        let body_rows = Self::layout_visible_rows(width, height);
+        let mut starts = Vec::with_capacity(map.segments.len() + 1);
+        let mut acc = 0usize;
+        for h in band_rows(map, body_rows) {
+            starts.push(acc);
+            acc += h;
+        }
+        starts.push(acc);
+        starts
+    }
+
     /// Render the tensor detail screen. `view` is the active dtype reinterpretation
     /// (which changes the shown dtype, shape and parameter count); `overridable`
     /// gates the `d`/`r` hints. `histogram` adds the value-histogram section below
@@ -1027,11 +1523,15 @@ impl UI {
 
         let (header, stats_gauge_row) =
             detail_field_lines(tensor, shape, view, unindexed, stats, schema, width);
-        let (footer, chips) = detail_footer_lines(
-            overridable,
-            crate::remote::is_remote_source(&tensor.source_path),
-            width,
-        );
+        let remote = crate::remote::is_remote_source(&tensor.source_path);
+        // The `Tab` → file-layout hint shows only for a local `.safetensors` shard
+        // (the only source with a byte-layout map).
+        let layout = !remote
+            && std::path::Path::new(&tensor.source_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
+        let (footer, chips) = detail_footer_lines(overridable, remote, layout, width);
         let header_len = header.len();
         let footer_len = footer.len();
         // The screen row the footer block begins on (filled in per layout branch
@@ -2084,7 +2584,7 @@ impl UI {
         render_scroll_popup(
             frame,
             "Health check",
-            lines,
+            &lines,
             check_footer_line(&state, fold, bg),
             scroll,
             &clickable,
@@ -2367,7 +2867,7 @@ impl UI {
         render_scroll_popup(
             frame,
             "Checkpoint stats",
-            lines,
+            &lines,
             stats_footer_line(copied, fold, bg),
             scroll,
             &clickable,
@@ -2928,7 +3428,7 @@ fn render_popup_box(
 fn render_scroll_popup(
     frame: &mut Frame,
     title: &str,
-    body: Vec<Line<'static>>,
+    body: &[Line<'static>],
     footer: Line<'static>,
     scroll: usize,
     clickable: &[(usize, KeyEvent)],
@@ -2994,7 +3494,9 @@ fn render_scroll_popup(
     let inner = block.inner(rect);
     block.render(rect, frame.buffer_mut());
 
-    let window: Vec<Line> = body.into_iter().skip(scroll).take(visible).collect();
+    // Clone only the visible window (not the whole body) so scrolling a large
+    // pop-up — e.g. a big safetensors header — stays O(screen), not O(content).
+    let window: Vec<Line> = body.iter().skip(scroll).take(visible).cloned().collect();
     Paragraph::new(window).style(panel).render(
         Rect {
             height: visible as u16,
@@ -3603,6 +4105,7 @@ fn view_footer_items(
     items.push(("c", "copy"));
     items.push(("y", "copy cmd"));
     items.push(("l", "legend"));
+    items.push(("Space", "commands"));
     items.push(("⌫", "back"));
     items.push(("\\", "fwd"));
     items.push(("", "any other key to return..."));
@@ -3766,6 +4269,9 @@ fn hint_spans(items: &[(&str, &str)]) -> Vec<Span<'static>> {
 fn footer_key_event(key: &str) -> Option<KeyEvent> {
     if key == "⌫" {
         return Some(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+    }
+    if key == "Space" {
+        return Some(hint_key(' ')); // opens the command palette
     }
     let mut chars = key.chars();
     match (chars.next(), chars.next()) {
@@ -4042,7 +4548,7 @@ fn tree_span(selected: bool, color: Color, text: impl Into<String>) -> Span<'sta
 /// The tree browser's key-hint line(s), word-wrapped to `width` on the
 /// ` · `-separated `key label` chips (the long hint spills onto a second line).
 fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
-    use KeyCode::{Backspace, Down, Enter, Left, PageDown, PageUp, Right, Up};
+    use KeyCode::{Backspace, Down, Enter, Left, PageDown, PageUp, Right, Tab, Up};
     let plain = KeyModifiers::NONE;
     let shift = KeyModifiers::SHIFT;
     // Each chip's key text is a list of segments; a `Seg::Key` glyph is clickable
@@ -4083,6 +4589,7 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<Chi
             "page",
         ),
         (vec![Seg::Key("Enter", KeyEvent::new(Enter, plain))], "open"),
+        (vec![Seg::Key("Tab", KeyEvent::new(Tab, plain))], "files"),
         (
             vec![
                 Seg::Key("Space", hint_key(' ')),
@@ -4121,7 +4628,14 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<Chi
         items.push((vec![Seg::Key("R", hint_key('R'))], "repack"));
     }
     items.push((vec![Seg::Key("q", hint_key('q'))], "quit"));
+    wrap_hint_items(items, width)
+}
 
+/// Lay a list of key-hint chips (`key label`, ` · `-separated) into styled
+/// [`Line`]s wrapped to `width`, tracking each clickable [`Seg::Key`]'s
+/// [`ChipHit`] position. Shared by the tree ([`tree_hint_lines`]) and file
+/// ([`files_hint_lines`]) footers so their wrapping and hit-testing match.
+fn wrap_hint_items(items: Vec<(Vec<Seg>, &str)>, width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
     let width = width as usize;
     let key_style = Style::default()
         .fg(palette::KEY)
@@ -4184,6 +4698,215 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<Chi
         lines.push(Line::from(spans));
     }
     (lines, chips)
+}
+
+/// The file browser's key-hint line(s), wrapped to `width` like
+/// [`tree_hint_lines`] — the same `key label · …` chips and clickable
+/// [`ChipHit`]s, for the file-view footer.
+fn files_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
+    use KeyCode::{Backspace, Down, Enter, Left, PageDown, PageUp, Right, Tab, Up};
+    let plain = KeyModifiers::NONE;
+    let items: Vec<(Vec<Seg>, &str)> = vec![
+        (
+            vec![
+                Seg::Key("↑", KeyEvent::new(Up, plain)),
+                Seg::Sep("/"),
+                Seg::Key("↓", KeyEvent::new(Down, plain)),
+            ],
+            "navigate",
+        ),
+        (
+            vec![
+                Seg::Key("←", KeyEvent::new(Left, plain)),
+                Seg::Sep("/"),
+                Seg::Key("→", KeyEvent::new(Right, plain)),
+            ],
+            "collapse/expand",
+        ),
+        (
+            vec![
+                Seg::Key("PgUp", KeyEvent::new(PageUp, plain)),
+                Seg::Sep("/"),
+                Seg::Key("PgDn", KeyEvent::new(PageDown, plain)),
+            ],
+            "page",
+        ),
+        (
+            vec![Seg::Key("Enter", KeyEvent::new(Enter, plain))],
+            "open/preview",
+        ),
+        (
+            vec![Seg::Key("Tab", KeyEvent::new(Tab, plain))],
+            "tensor tree",
+        ),
+        (
+            vec![
+                Seg::Key("Space", hint_key(' ')),
+                Seg::Sep("/"),
+                Seg::Key(":", hint_key(':')),
+            ],
+            "commands",
+        ),
+        (vec![Seg::Key("l", hint_key('l'))], "legend"),
+        (vec![Seg::Key("f", hint_key('f'))], "copy path"),
+        (vec![Seg::Key("c", hint_key('c'))], "copy screen"),
+        (vec![Seg::Key("y", hint_key('y'))], "copy command"),
+        (
+            vec![
+                Seg::Key("⌫", KeyEvent::new(Backspace, plain)),
+                Seg::Sep("/"),
+                Seg::Key("\\", hint_key('\\')),
+            ],
+            "back/fwd",
+        ),
+        (vec![Seg::Key("q", hint_key('q'))], "quit"),
+    ];
+    wrap_hint_items(items, width)
+}
+
+/// The layout map's footer hints (`↑↓ select · ↵ in tree · …`), wrapped to
+/// `width` like the tree's, with clickable [`ChipHit`]s.
+fn layout_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
+    use KeyCode::{Backspace, Down, Enter, PageDown, PageUp, Up};
+    let plain = KeyModifiers::NONE;
+    let items: Vec<(Vec<Seg>, &str)> = vec![
+        (
+            vec![
+                Seg::Key("↑", KeyEvent::new(Up, plain)),
+                Seg::Sep("/"),
+                Seg::Key("↓", KeyEvent::new(Down, plain)),
+            ],
+            "select",
+        ),
+        (
+            vec![
+                Seg::Key("PgUp", KeyEvent::new(PageUp, plain)),
+                Seg::Sep("/"),
+                Seg::Key("PgDn", KeyEvent::new(PageDown, plain)),
+            ],
+            "page",
+        ),
+        (vec![Seg::Key("↵", KeyEvent::new(Enter, plain))], "in tree"),
+        (
+            vec![
+                Seg::Key("Space", hint_key(' ')),
+                Seg::Sep("/"),
+                Seg::Key(":", hint_key(':')),
+            ],
+            "commands",
+        ),
+        (vec![Seg::Key("l", hint_key('l'))], "legend"),
+        (vec![Seg::Key("c", hint_key('c'))], "copy screen"),
+        (vec![Seg::Key("y", hint_key('y'))], "copy command"),
+        (
+            vec![
+                Seg::Key("⌫", KeyEvent::new(Backspace, plain)),
+                Seg::Sep("/"),
+                Seg::Key("\\", hint_key('\\')),
+            ],
+            "back/fwd",
+        ),
+        (vec![Seg::Key("q", hint_key('q'))], "quit"),
+    ];
+    wrap_hint_items(items, width)
+}
+
+/// The band glyph (shaded by the segment's share of the file) and colour for the
+/// layout-map strip: the header in the metadata violet, padding dim, tensors in
+/// the dtype amber with a fuller block the larger they are — the shading is the
+/// map's ASCII "graphic", so a big tensor reads as a solid column.
+fn band_style(seg: &crate::safelayout::Segment, total_len: u64) -> (char, Color) {
+    use crate::safelayout::SegmentKind;
+    match seg.kind {
+        SegmentKind::Header => ('█', palette::META),
+        SegmentKind::Gap => ('░', palette::DIM),
+        SegmentKind::Tensor => {
+            let share = seg.len() as f64 / total_len.max(1) as f64;
+            let glyph = if share >= 0.10 {
+                '█'
+            } else if share >= 0.02 {
+                '▓'
+            } else if share >= 0.005 {
+                '▒'
+            } else {
+                '░'
+            };
+            (glyph, palette::DTYPE)
+        }
+    }
+}
+
+/// Per-segment band heights for the layout strip: proportional to each segment's
+/// share of the file, at least one row each (so every tensor is labelled), summing
+/// to a scrollable total. `body_rows` seeds the resolution so a small file fills
+/// the viewport while a large one scrolls.
+fn band_rows(map: &crate::safelayout::LayoutMap, body_rows: usize) -> Vec<usize> {
+    use crate::safelayout::SegmentKind;
+    let total_len = map.total_len.max(1) as f64;
+    let target = map.segments.len().max(body_rows.max(1));
+    map.segments
+        .iter()
+        .map(|s| {
+            let share = s.len() as f64 / total_len;
+            let proportional = (share * target as f64).round() as usize;
+            match s.kind {
+                // The header lists its `__metadata__` tree-like, so give it enough
+                // rows to show them (a label row + one per entry) even when its
+                // byte share is tiny — as it is for a multi-GB file.
+                SegmentKind::Header => proportional.max(1 + map.metadata.len()),
+                _ => proportional.max(1),
+            }
+        })
+        .collect()
+}
+
+/// One file-browser row as a styled [`Line`]: a directory shows a fold arrow, its
+/// name in the accent with a trailing `/`, and a dim size + file count; a file
+/// shows a kind marker (a distinct glyph for openable checkpoints), its name
+/// coloured by kind, and its dim size. `selected` draws the whole row in the
+/// selection colours (via [`tree_span`], shared with the tensor tree).
+fn file_row_line(row: &crate::filetree::FileRow, selected: bool) -> Line<'static> {
+    use crate::filetree::FileKind;
+    let indent = "  ".repeat(row.depth);
+    let mut s: Vec<Span> = vec![tree_span(selected, Color::Reset, indent)];
+    if row.is_dir {
+        let arrow = if row.expanded { "▾" } else { "▸" };
+        s.push(tree_span(selected, palette::ACCENT, arrow));
+        s.push(tree_span(selected, Color::Reset, " "));
+        s.push(tree_span(
+            selected,
+            palette::ACCENT,
+            format!("{}/", row.name),
+        ));
+        let files = row.files;
+        s.push(tree_span(
+            selected,
+            palette::DIM,
+            format!(
+                "  {} · {files} {}",
+                format_size(row.size as usize),
+                if files == 1 { "file" } else { "files" }
+            ),
+        ));
+    } else {
+        // A checkpoint gets the tensor glyph (it opens into the tree) and the amber
+        // dtype accent; JSON/text/other stay quiet, so the openable ones stand out.
+        let (marker, name_color) = match row.kind {
+            FileKind::Checkpoint => ("▦", palette::DTYPE),
+            FileKind::Json => ("{}", palette::META),
+            FileKind::Text => ("·", Color::Reset),
+            FileKind::Other => ("·", palette::DIM),
+        };
+        s.push(tree_span(selected, palette::DIM, marker));
+        s.push(tree_span(selected, Color::Reset, " "));
+        s.push(tree_span(selected, name_color, row.name.clone()));
+        s.push(tree_span(
+            selected,
+            palette::DIM,
+            format!("  {}", format_size(row.size as usize)),
+        ));
+    }
+    Line::from(s)
 }
 
 /// The search bar header line: `Search [query▒]  N matches  Enter view · …`.
@@ -4450,6 +5173,17 @@ fn tree_node_line(
 /// A dimmed span (field labels, chrome) for the detail screen.
 pub fn dim_span(text: impl Into<String>) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(palette::DIM))
+}
+
+/// A bold green span — a "✓ copied" style confirmation, matching the copy
+/// flashes elsewhere. Used by the preview pop-up's copy hint.
+pub fn success_span(text: impl Into<String>) -> Span<'static> {
+    Span::styled(
+        text.into(),
+        Style::default()
+            .fg(palette::SUCCESS)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 /// A bold bright-cyan key span (e.g. `s`, `d`) — the Ratatui equivalent of the
@@ -4837,6 +5571,7 @@ fn detail_field_lines(
 fn detail_footer_lines(
     overridable: bool,
     remote: bool,
+    layout: bool,
     width: u16,
 ) -> (Vec<Line<'static>>, Vec<ChipHit>) {
     // Each chunk is a run of spans that should not be split across lines; the
@@ -4872,9 +5607,17 @@ fn detail_footer_lines(
         chunks.push(key_chunk("d", " to reinterpret the dtype, ", hint_key('d')));
         chunks.push(key_chunk("r", " to reshape, ", hint_key('r')));
     }
+    if layout {
+        chunks.push(key_chunk(
+            "Tab",
+            " for the file layout, ",
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        ));
+    }
     chunks.push(key_chunk("c", " to copy, ", hint_key('c')));
     chunks.push(key_chunk("y", " to copy the command, ", hint_key('y')));
     chunks.push(key_chunk("l", " for the legend, ", hint_key('l')));
+    chunks.push(key_chunk("Space", " / : for commands, ", hint_key(' ')));
     // The dual ⌫ / \ chunk: two independently clickable glyphs. `\` sits at char
     // offset 4 (after "⌫" + " / ").
     chunks.push((
@@ -5050,7 +5793,7 @@ fn render_histogram(
 /// string per line; otherwise `None`, so the caller shows the raw text. Bare
 /// scalars (a lone string/number) aren't worth reformatting, so they fall
 /// through to the raw path too.
-fn highlight_json(raw: &str) -> Option<Vec<String>> {
+fn highlight_json(raw: &str, inline_arrays: bool) -> Option<Vec<String>> {
     let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
     if !value.is_object() && !value.is_array() {
         return None;
@@ -5058,23 +5801,68 @@ fn highlight_json(raw: &str) -> Option<Vec<String>> {
     // `colored_json` paints via yansi, whose default condition drops the ANSI
     // codes when stdout isn't a detected TTY (which would also make the result
     // non-deterministic). We render into our own buffer and own the terminal, so
-    // force coloring on.
+    // force coloring on. `inline_arrays` swaps the layout formatter so a
+    // safetensors header's flat arrays (shape / data_offsets) stay on one line.
     yansi::enable();
+    let styler = json_styler();
+    let on = colored_json::ColorMode::On;
+    let pretty = if inline_arrays {
+        colored_json::ColoredFormatter::with_styler(ObjectPrettyArrayInline::default(), styler)
+            .to_colored_json(&value, on)
+            .ok()?
+    } else {
+        colored_json::ColoredFormatter::with_styler(colored_json::PrettyFormatter::new(), styler)
+            .to_colored_json(&value, on)
+            .ok()?
+    };
+    Some(pretty.split('\n').map(str::to_string).collect())
+}
+
+/// Pretty-print `raw` JSON with flat scalar arrays inline (like
+/// [`highlight_json_lines_inline`]) but **without** colour — as plain Ratatui
+/// lines. Far cheaper than the highlighted path (no `colored_json` ANSI + no
+/// `ansi-to-tui` parse), so a huge safetensors header renders instantly. Returns
+/// `None` for non-JSON.
+pub fn plain_json_lines_inline(raw: &str) -> Option<Vec<Line<'static>>> {
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    if !value.is_object() && !value.is_array() {
+        return None;
+    }
+    // `ColorMode::Off` keeps our layout formatter but emits no ANSI codes.
     let pretty = colored_json::ColoredFormatter::with_styler(
-        colored_json::PrettyFormatter::new(),
+        ObjectPrettyArrayInline::default(),
         json_styler(),
     )
-    .to_colored_json(&value, colored_json::ColorMode::On)
+    .to_colored_json(&value, colored_json::ColorMode::Off)
     .ok()?;
-    Some(pretty.split('\n').map(str::to_string).collect())
+    Some(
+        pretty
+            .split('\n')
+            .map(|l| Line::from(Span::raw(l.to_string())))
+            .collect(),
+    )
 }
 
 /// [`highlight_json`] parsed back into styled Ratatui lines (via `ansi-to-tui`),
 /// or `None` for non-JSON. Shared by the metadata detail view and the copy-menu
 /// preview so both show the same `colored_json` palette.
 pub fn highlight_json_lines(raw: &str) -> Option<Vec<Line<'static>>> {
+    json_to_lines(raw, false)
+}
+
+/// Like [`highlight_json_lines`], but flat scalar arrays stay on one line — for
+/// the safetensors header preview (`shape` / `data_offsets` read as `[a, b]`).
+pub fn highlight_json_lines_inline(raw: &str) -> Option<Vec<Line<'static>>> {
+    json_to_lines(raw, true)
+}
+
+fn json_to_lines(raw: &str, inline_arrays: bool) -> Option<Vec<Line<'static>>> {
     use ansi_to_tui::IntoText;
-    let mut lines = highlight_json(raw)?.join("\n").into_text().ok()?.lines;
+    let mut lines = highlight_json(raw, inline_arrays)?
+        .join("\n")
+        .into_text()
+        .ok()?
+        .lines;
     // `colored_json`'s resets parse to an explicit `bg = Reset`, which would
     // paint the terminal's default background over a panel (e.g. the copy-menu
     // pop-up). Drop it so each span inherits whatever container draws it.
@@ -5082,6 +5870,74 @@ pub fn highlight_json_lines(raw: &str) -> Option<Vec<Line<'static>>> {
         span.style.bg = None;
     }
     Some(lines)
+}
+
+/// A `serde_json` formatter that pretty-prints objects (one key per line) but
+/// keeps arrays inline (`[1, 2, 3]`). safetensors headers only contain flat
+/// scalar arrays (a tensor's `shape` / `data_offsets`), so this reads far better
+/// than the default element-per-line arrays. Fed to `colored_json`, which colours
+/// the values while this controls the layout.
+#[derive(Default)]
+struct ObjectPrettyArrayInline {
+    indent: usize,
+    has_value: bool,
+}
+
+impl serde_json::ser::Formatter for ObjectPrettyArrayInline {
+    fn begin_object<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.indent += 1;
+        self.has_value = false;
+        w.write_all(b"{")
+    }
+    fn end_object<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.indent -= 1;
+        if self.has_value {
+            w.write_all(b"\n")?;
+            json_indent(w, self.indent)?;
+        }
+        w.write_all(b"}")
+    }
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        w.write_all(if first { b"\n" } else { b",\n" })?;
+        json_indent(w, self.indent)
+    }
+    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(b": ")
+    }
+    fn end_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        let _ = w;
+        self.has_value = true;
+        Ok(())
+    }
+    fn begin_array<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(b"[")
+    }
+    fn end_array<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(b"]")
+    }
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first { Ok(()) } else { w.write_all(b", ") }
+    }
+    fn end_array_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        let _ = w;
+        self.has_value = true;
+        Ok(())
+    }
+}
+
+fn json_indent<W: ?Sized + std::io::Write>(w: &mut W, levels: usize) -> std::io::Result<()> {
+    for _ in 0..levels {
+        w.write_all(b"  ")?;
+    }
+    Ok(())
 }
 
 /// Truncate `s` to at most `width` characters, keeping the END (so a path's
@@ -5207,6 +6063,117 @@ mod tests {
     }
 
     #[test]
+    fn file_browser_shows_dirs_files_and_footer() {
+        use crate::filetree::{FileKind, FileRow};
+        let rows = vec![
+            FileRow {
+                depth: 0,
+                name: "ckpt".into(),
+                path: "/ckpt".into(),
+                size: 100,
+                is_dir: true,
+                expanded: true,
+                files: 2,
+                kind: FileKind::Other,
+            },
+            FileRow {
+                depth: 1,
+                name: "model.safetensors".into(),
+                path: "/ckpt/model.safetensors".into(),
+                size: 90,
+                is_dir: false,
+                expanded: false,
+                files: 0,
+                kind: FileKind::Checkpoint,
+            },
+            FileRow {
+                depth: 1,
+                name: "config.json".into(),
+                path: "/ckpt/config.json".into(),
+                size: 10,
+                is_dir: false,
+                expanded: false,
+                files: 0,
+                kind: FileKind::Json,
+            },
+        ];
+        let out = crate::tui::headless_render(90, 16, |f| {
+            UI::render_files(f, "/ckpt", &rows, 1, 0, None, true);
+        })
+        .unwrap();
+        assert!(out.contains("File browser - /ckpt"), "title:\n{out}");
+        assert!(out.contains("ckpt/"), "dir row with trailing slash:\n{out}");
+        assert!(out.contains("model.safetensors"), "checkpoint row:\n{out}");
+        assert!(out.contains("config.json"), "json row:\n{out}");
+        // The selected row's path lands on the status bar.
+        assert!(
+            out.contains("/ckpt/model.safetensors"),
+            "status bar path:\n{out}"
+        );
+        // Footer advertises the Tab toggle back to the tensor tree.
+        assert!(out.contains("tensor tree"), "footer hint:\n{out}");
+    }
+
+    #[test]
+    fn layout_map_renders_summary_and_bands() {
+        use crate::safelayout::{LayoutMap, Segment, SegmentKind};
+        let seg = |name: &str, dtype: Option<&str>, shape: Vec<usize>, start, end, kind| Segment {
+            name: name.to_string(),
+            dtype: dtype.map(str::to_string),
+            shape,
+            start,
+            end,
+            kind,
+        };
+        let map = LayoutMap {
+            name: "model.safetensors".to_string(),
+            total_len: 1_000_000,
+            header_len: 200,
+            tensor_count: 2,
+            metadata: vec![("format".to_string(), "pt".to_string())],
+            segments: vec![
+                seg(
+                    "header (8 B length + JSON metadata)",
+                    None,
+                    vec![],
+                    0,
+                    200,
+                    SegmentKind::Header,
+                ),
+                seg(
+                    "embed.weight",
+                    Some("BF16"),
+                    vec![1000, 256],
+                    200,
+                    800_200,
+                    SegmentKind::Tensor,
+                ),
+                seg(
+                    "norm.weight",
+                    Some("F32"),
+                    vec![256],
+                    800_200,
+                    1_000_000,
+                    SegmentKind::Tensor,
+                ),
+            ],
+        };
+        let out = crate::tui::headless_render(90, 24, |f| {
+            UI::render_layout(f, &map, 1, 0, None, true);
+        })
+        .unwrap();
+        assert!(out.contains("Layout - model.safetensors"), "title:\n{out}");
+        assert!(out.contains("2 tensors"), "summary:\n{out}");
+        assert!(out.contains("1 metadata"), "metadata count:\n{out}");
+        assert!(out.contains("embed.weight"), "tensor band:\n{out}");
+        assert!(out.contains("BF16"), "dtype shown:\n{out}");
+        // The header band lists its __metadata__ entries tree-like.
+        assert!(out.contains("† format"), "metadata entry shown:\n{out}");
+        // Absolute offsets are shown in hex.
+        assert!(out.contains("0x00000000"), "header offset:\n{out}");
+    }
+
+    #[test]
     fn bottom_band_clears_the_rows_it_overlays() {
         // The band (dtype menu / slice / reshape prompts) overlays the live data
         // view, whose footer sits on the same bottom rows. It must clear them, or
@@ -5253,12 +6220,12 @@ mod tests {
     #[test]
     fn highlight_json_colors_objects_and_arrays_only() {
         // Non-JSON text and bare scalars fall through to the raw path.
-        assert!(highlight_json("just some text").is_none());
-        assert!(highlight_json("\"a lone string\"").is_none());
-        assert!(highlight_json("42").is_none());
+        assert!(highlight_json("just some text", false).is_none());
+        assert!(highlight_json("\"a lone string\"", false).is_none());
+        assert!(highlight_json("42", false).is_none());
 
         let raw = r#"{"b":[true,null,"x"],"a":1}"#;
-        let lines = highlight_json(raw).expect("an object is highlighted");
+        let lines = highlight_json(raw, false).expect("an object is highlighted");
         let joined = lines.join("\n");
         // Styled from the app palette: keys in the ACCENT color, numbers in the
         // DTYPE color (256-color SGR `38;5;<n>`), not colored_json's defaults.
@@ -5276,6 +6243,64 @@ mod tests {
         assert_eq!(
             strip_ansi_codes(&joined),
             serde_json::to_string_pretty(&value).unwrap()
+        );
+    }
+
+    #[test]
+    fn inline_arrays_keep_scalar_arrays_on_one_line() {
+        // The safetensors-header variant renders a tensor's shape / data_offsets
+        // inline — as they actually appear in the rendered (colored → Ratatui)
+        // lines, not just in an isolated formatter.
+        let raw = r#"{"w":{"dtype":"BF16","shape":[152064,4096],"data_offsets":[0,16]}}"#;
+        let lines = highlight_json_lines_inline(raw).expect("json highlights");
+        let text = |l: &Line| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        // Some single rendered line carries the whole shape inline.
+        assert!(
+            lines.iter().any(|l| text(l).contains("[152064, 4096]")),
+            "shape inline:\n{}",
+            lines.iter().map(text).collect::<Vec<_>>().join("\n")
+        );
+        assert!(
+            lines.iter().any(|l| text(l).contains("[0, 16]")),
+            "offsets inline"
+        );
+        // The object is still expanded — dtype and shape land on different lines.
+        assert!(lines.len() > 4, "object still multi-line: {}", lines.len());
+    }
+
+    #[test]
+    fn plain_inline_matches_the_highlighted_layout_without_color() {
+        // The fast (uncoloured) path used for large headers keeps arrays inline
+        // and produces the same text as the highlighted path, minus the ANSI.
+        let raw = r#"{"w":{"dtype":"BF16","shape":[152064,4096],"data_offsets":[0,16]}}"#;
+        let text = |ls: &[Line]| {
+            ls.iter()
+                .map(|l| {
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let plain = plain_json_lines_inline(raw).expect("plain json");
+        assert!(
+            text(&plain).contains("[152064, 4096]"),
+            "shape inline (plain)"
+        );
+        // No colour: every span uses the default (Reset) foreground.
+        assert!(
+            plain
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .all(|s| s.style.fg.is_none() || s.style.fg == Some(Color::Reset)),
+            "plain lines carry no colour"
+        );
+        // Same text as the highlighted variant (stripped of styling).
+        assert_eq!(
+            text(&plain),
+            text(&highlight_json_lines_inline(raw).unwrap())
         );
     }
 
@@ -5635,7 +6660,7 @@ mod tests {
         // Tall frame: the whole body fits → nothing to scroll.
         let mut fits_max = usize::MAX;
         crate::tui::headless_render(40, 60, |f| {
-            fits_max = render_scroll_popup(f, "T", body.clone(), footer.clone(), 0, &[]).0;
+            fits_max = render_scroll_popup(f, "T", &body, footer.clone(), 0, &[]).0;
         })
         .unwrap();
         assert_eq!(fits_max, 0, "a 50-row body in a 60-row frame fits");
@@ -5643,7 +6668,7 @@ mod tests {
         // Short frame: the body overflows → scrollable, and the indicator shows.
         let mut small_max = 0;
         let out = crate::tui::headless_render(40, 12, |f| {
-            small_max = render_scroll_popup(f, "T", body.clone(), footer.clone(), 0, &[]).0;
+            small_max = render_scroll_popup(f, "T", &body, footer.clone(), 0, &[]).0;
         })
         .unwrap();
         assert!(small_max > 0, "a 50-row body in a 12-row frame must scroll");

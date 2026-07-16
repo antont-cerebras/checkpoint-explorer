@@ -40,5 +40,5 @@ Histogram: 60 values  (<time>)
 … 18 more bins (enlarge the terminal)
 
 Press m for a heatmap, v for numeric values, h for a histogram, b to set its bin count, d to reinterpret the dtype,
-r to reshape, c to copy, y to copy the command, l for the legend,
+r to reshape, Tab for the file layout, c to copy, y to copy the command, l for the legend, Space / : for commands,
 ⌫ / \ to step back / forward, any other key to return...                                                      read-only

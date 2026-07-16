@@ -269,6 +269,15 @@ pub struct OpenRequest {
     pub stats_shards: bool,
     /// Render the view once and exit without interactive navigation.
     pub exit_after: bool,
+    /// Land in the file browser (`--files`, the `Tab` toggle) once the tree is
+    /// up. Round-trips through `y`: the file view's `y` copies `… --files`.
+    pub files_view: bool,
+    /// Open straight into the safetensors layout map for this file (`--layout
+    /// PATH`). Round-trips through `y` from the layout view.
+    pub layout_file: Option<String>,
+    /// Preselect this tensor in the layout map (`--layout-select NAME`), so the
+    /// layout view's `y` round-trips the selection.
+    pub layout_select: Option<String>,
 }
 
 /// Which representation a tensor data view renders.
@@ -343,6 +352,10 @@ type GroupFilesCache = Option<(usize, usize, bool, std::collections::BTreeSet<St
 const WHEEL_STEP: usize = 3;
 /// Rows a PageUp/PageDown scrolls the health-report popup body.
 const SCROLL_PAGE: usize = 10;
+/// Footer rows below the file-browser list (its one-line status bar) — the
+/// explorer-side mirror of ui's `FILES_FOOTER_HEIGHT`, for the mouse row
+/// hit-test in [`Explorer::run_files`].
+const FILES_FOOTER_ROWS: usize = 1;
 
 /// Max gap between two presses of the same navigation key for the second to count
 /// as auto-repeat (a held key) rather than a fresh tap — comfortably above the OS
@@ -497,6 +510,20 @@ enum ScanOutcome {
 #[derive(Clone)]
 enum Screen {
     Tree,
+    /// The file browser: a tree of the checkpoint's directory (files + sizes),
+    /// toggled with `Tab`. Its state (selection, scroll, fold) lives on the
+    /// [`Explorer`] like the tensor tree's, so the variant carries no fields.
+    Files,
+    /// The safetensors **layout map** for one file: a scrollable strip of its
+    /// byte layout (header + each tensor's span). Opened from the file browser
+    /// (`Enter` on a `.safetensors`) or `--layout PATH`. `selected` / `scroll` are
+    /// recorded back into the history on leaving, so stepping away and back (e.g.
+    /// `Enter` into the tree then Backspace) returns to the same segment.
+    Layout {
+        path: String,
+        selected: usize,
+        scroll: usize,
+    },
     Detail {
         tensor: String,
         slice: usize,
@@ -505,6 +532,17 @@ enum Screen {
         tensor: String,
         repr: Representation,
         slice: usize,
+    },
+}
+
+/// Which live frame stays behind a [`Explorer::float_scroll_popup`] box — the
+/// file browser, or a layout map (with the view state needed to redraw it).
+enum PopupBackdrop<'a> {
+    Files,
+    Layout {
+        map: &'a crate::safelayout::LayoutMap,
+        selected: usize,
+        scroll: usize,
     },
 }
 
@@ -528,6 +566,7 @@ enum Cmd {
     Search,
     ExpandAll,
     CollapseAll,
+    ViewFiles,
     Stats,
     Health,
     Legend,
@@ -540,6 +579,64 @@ enum Cmd {
     Quit,
 }
 
+/// A command the file browser's palette lists and runs — its own small registry,
+/// since the file view acts on files (not tensors), so the tree's [`Cmd`] actions
+/// (copy tensor name, expand groups, …) don't apply. See [`FILE_COMMANDS`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FileCmd {
+    TensorTree,
+    Legend,
+    CopyPath,
+    CopyScreen,
+    CopyCommand,
+    Quit,
+}
+
+/// A command the safetensors layout map's palette lists and runs. See
+/// [`LAYOUT_COMMANDS`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LayoutCmd {
+    TensorTree,
+    Legend,
+    CopyScreen,
+    CopyCommand,
+    Quit,
+}
+
+/// A command the tensor **detail** view's palette lists. Each maps to the key
+/// that already runs it (the palette synthesizes that key), so no separate
+/// dispatch is needed. See [`DETAIL_COMMANDS`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DetailCmd {
+    Heatmap,
+    Values,
+    Histogram,
+    Bins,
+    Stats,
+    Dtype,
+    Reshape,
+    FileLayout,
+    Legend,
+    CopyScreen,
+    CopyCommand,
+}
+
+/// A command the **data view** (heatmap / numeric grid) palette lists. Like
+/// [`DetailCmd`], each maps to the key that already runs it. See [`DATA_COMMANDS`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DataCmd {
+    Heatmap,
+    Values,
+    Layout,
+    Zebra,
+    Base,
+    Dtype,
+    Reshape,
+    Legend,
+    CopyScreen,
+    CopyCommand,
+}
+
 /// The tree screen's command registry, in palette order: `(command, group,
 /// title, the key that also runs it)`. The palette shows each as `Group: Title`
 /// (VS Code style); the one-line help beside it is looked up from
@@ -549,6 +646,7 @@ const TREE_COMMANDS: &[(Cmd, &str, &str, char)] = &[
     (Cmd::Search, "Tree", "Search by name", '/'),
     (Cmd::ExpandAll, "Tree", "Expand all groups", 'E'),
     (Cmd::CollapseAll, "Tree", "Collapse all groups", 'C'),
+    (Cmd::ViewFiles, "View", "File browser", '\t'),
     (Cmd::Stats, "View", "Checkpoint stats", 's'),
     (Cmd::Health, "View", "Health report", 'h'),
     (Cmd::Legend, "View", "Legend", 'l'),
@@ -561,8 +659,106 @@ const TREE_COMMANDS: &[(Cmd, &str, &str, char)] = &[
     (Cmd::Quit, "App", "Quit", 'q'),
 ];
 
-/// A resolved command entry: `(command, group, title, key)`.
-type CmdEntry = (Cmd, &'static str, &'static str, char);
+/// The file browser's command registry, in palette order — the file-view analogue
+/// of [`TREE_COMMANDS`]. `\t` (`Tab`) toggles back to the tensor tree.
+const FILE_COMMANDS: &[(FileCmd, &str, &str, char)] = &[
+    (FileCmd::TensorTree, "View", "Tensor tree", '\t'),
+    (FileCmd::Legend, "View", "Legend", 'l'),
+    (FileCmd::CopyPath, "Copy", "File path", 'f'),
+    (FileCmd::CopyScreen, "Copy", "Screen text", 'c'),
+    (
+        FileCmd::CopyCommand,
+        "Copy",
+        "Command to reopen this view",
+        'y',
+    ),
+    (FileCmd::Quit, "App", "Quit", 'q'),
+];
+
+/// The layout map's command registry, in palette order. `\t` (`Tab`) returns to
+/// the tensor tree.
+const LAYOUT_COMMANDS: &[(LayoutCmd, &str, &str, char)] = &[
+    (LayoutCmd::TensorTree, "View", "Tensor tree", '\t'),
+    (LayoutCmd::Legend, "View", "Legend", 'l'),
+    (LayoutCmd::CopyScreen, "Copy", "Screen text", 'c'),
+    (
+        LayoutCmd::CopyCommand,
+        "Copy",
+        "Command to reopen this view",
+        'y',
+    ),
+    (LayoutCmd::Quit, "App", "Quit", 'q'),
+];
+
+/// The detail view's command registry (palette order). Each `key` is the shortcut
+/// the palette synthesizes when the command is chosen; `\t` is `Tab` (file layout).
+const DETAIL_COMMANDS: &[(DetailCmd, &str, &str, char)] = &[
+    (DetailCmd::Heatmap, "View", "Heatmap", 'm'),
+    (DetailCmd::Values, "View", "Numeric values", 'v'),
+    (DetailCmd::Histogram, "View", "Value histogram", 'h'),
+    (DetailCmd::Bins, "View", "Histogram bin count…", 'b'),
+    (DetailCmd::Stats, "View", "Compute statistics", 's'),
+    (DetailCmd::Dtype, "View", "Reinterpret dtype…", 'd'),
+    (DetailCmd::Reshape, "View", "Reshape…", 'r'),
+    (DetailCmd::FileLayout, "View", "File layout", '\t'),
+    (DetailCmd::Legend, "View", "Legend", 'l'),
+    (DetailCmd::CopyScreen, "Copy", "Screen text", 'c'),
+    (
+        DetailCmd::CopyCommand,
+        "Copy",
+        "Command to reopen this view",
+        'y',
+    ),
+];
+
+/// The data view's command registry (palette order). Each `key` is the shortcut
+/// the palette synthesizes when the command is chosen.
+const DATA_COMMANDS: &[(DataCmd, &str, &str, char)] = &[
+    (DataCmd::Heatmap, "View", "Heatmap", 'm'),
+    (DataCmd::Values, "View", "Numeric values", 'v'),
+    (
+        DataCmd::Layout,
+        "View",
+        "Cycle layout (overview / edges / window)",
+        'e',
+    ),
+    (DataCmd::Zebra, "View", "Cycle zebra striping", 'z'),
+    (
+        DataCmd::Base,
+        "View",
+        "Cycle numeral base (dec / hex / oct / bin)",
+        'b',
+    ),
+    (DataCmd::Dtype, "View", "Reinterpret dtype…", 'd'),
+    (DataCmd::Reshape, "View", "Reshape…", 'r'),
+    (DataCmd::Legend, "View", "Legend", 'l'),
+    (DataCmd::CopyScreen, "Copy", "Screen text", 'c'),
+    (
+        DataCmd::CopyCommand,
+        "Copy",
+        "Command to reopen this view",
+        'y',
+    ),
+];
+
+/// A resolved palette entry for a command of type `T`: `(command, group, title,
+/// key)`. Generic so every view's palette shares the picker
+/// ([`Explorer::run_palette`]).
+type PaletteRow<T> = (T, &'static str, &'static str, char);
+type CmdEntry = PaletteRow<Cmd>;
+type FileCmdEntry = PaletteRow<FileCmd>;
+type LayoutCmdEntry = PaletteRow<LayoutCmd>;
+type DetailCmdEntry = PaletteRow<DetailCmd>;
+type DataCmdEntry = PaletteRow<DataCmd>;
+
+/// The display label for a palette/footer key: `Tab` for the `\t` sentinel
+/// ([`Cmd::ViewFiles`] / [`FileCmd::TensorTree`]), else the character itself.
+fn key_label(c: char) -> String {
+    match c {
+        '\t' => "Tab".to_string(),
+        _ => c.to_string(),
+    }
+}
 
 /// The tree command bound to key `c`, if any — so the key handler and the palette
 /// share one key→command mapping (the registry table).
@@ -571,6 +767,72 @@ fn tree_command_for_key(c: char) -> Option<Cmd> {
         .iter()
         .find(|(_, _, _, key)| *key == c)
         .map(|(cmd, _, _, _)| *cmd)
+}
+
+/// The file-browser command bound to key `c`, if any — the file-view analogue of
+/// [`tree_command_for_key`] (the `\t` sentinel is dispatched from the `Tab` arm,
+/// not the `Char` handler, so it never resolves here).
+fn file_command_for_key(c: char) -> Option<FileCmd> {
+    FILE_COMMANDS
+        .iter()
+        .find(|(_, _, _, key)| *key == c)
+        .map(|(cmd, _, _, _)| *cmd)
+}
+
+/// The layout-map command bound to key `c`, if any.
+fn layout_command_for_key(c: char) -> Option<LayoutCmd> {
+    LAYOUT_COMMANDS
+        .iter()
+        .find(|(_, _, _, key)| *key == c)
+        .map(|(cmd, _, _, _)| *cmd)
+}
+
+/// The detail-view commands available now: dtype / reshape only when the tensor's
+/// dtype is reinterpretable, and the file layout only for a local `.safetensors`.
+fn available_detail_commands(overridable: bool, layout: bool) -> Vec<DetailCmdEntry> {
+    DETAIL_COMMANDS
+        .iter()
+        .copied()
+        .filter(|(cmd, _, _, _)| match cmd {
+            DetailCmd::Dtype | DetailCmd::Reshape => overridable,
+            DetailCmd::FileLayout => layout,
+            _ => true,
+        })
+        .collect()
+}
+
+/// The key a chosen [`DetailCmd`] maps to — the palette synthesizes this so the
+/// detail loop's existing key handlers run it (`\t` → `Tab` = file layout).
+fn detail_cmd_key(cmd: DetailCmd) -> KeyEvent {
+    let entry = DETAIL_COMMANDS.iter().find(|(c, ..)| *c == cmd);
+    match entry.map(|(_, _, _, key)| *key) {
+        Some('\t') => KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        Some(ch) => KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        None => KeyEvent::new(KeyCode::Null, KeyModifiers::NONE),
+    }
+}
+
+/// The data-view commands available now: dtype / reshape only when the tensor's
+/// dtype is reinterpretable.
+fn available_data_commands(overridable: bool) -> Vec<DataCmdEntry> {
+    DATA_COMMANDS
+        .iter()
+        .copied()
+        .filter(|(cmd, _, _, _)| match cmd {
+            DataCmd::Dtype | DataCmd::Reshape => overridable,
+            _ => true,
+        })
+        .collect()
+}
+
+/// The key a chosen [`DataCmd`] maps to — synthesized so the data loop's existing
+/// key handlers run it.
+fn data_cmd_key(cmd: DataCmd) -> KeyEvent {
+    let key = DATA_COMMANDS
+        .iter()
+        .find(|(c, ..)| *c == cmd)
+        .map_or('\0', |(_, _, _, key)| *key);
+    KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
 }
 
 pub struct Explorer {
@@ -717,6 +979,23 @@ pub struct Explorer {
     /// (`collect_source_paths`, O(tensors)) on every status-bar redraw *and* every
     /// `f`/`t` copy — the walk happens once per selection and both reuse it.
     cached_group_files: RefCell<GroupFilesCache>,
+    /// The directory the file browser (`Tab`) lists — the checkpoint's own
+    /// directory (the common parent of its shards). Fixed for the session.
+    browse_root: PathBuf,
+    /// The file browser's directory tree, built lazily the first time the file
+    /// view opens (so a session that never uses it never stats the directory),
+    /// then kept — with its per-directory fold state — across `Tab` toggles.
+    file_tree: Option<crate::filetree::FileNode>,
+    /// The file tree flattened to visible rows — the file-view analogue of
+    /// [`Self::flattened_tree`], cached so the browsing loop and renderer never
+    /// re-walk the tree per frame (which would slow the input drain enough to lag
+    /// the wheel and break held-key acceleration). Rebuilt only when the fold
+    /// state changes (a directory toggles) via [`Self::rebuild_file_rows`].
+    file_flattened: Vec<crate::filetree::FileRow>,
+    /// The file browser's selected row and viewport scroll, mirroring the tensor
+    /// tree's [`Self::selected_idx`] / [`Self::scroll_offset`].
+    file_selected: usize,
+    file_scroll: usize,
 }
 
 impl Explorer {
@@ -728,6 +1007,7 @@ impl Explorer {
     ) -> Self {
         // `health_reports` / `unindexed` are computed in `finalize_load`, once the
         // tensors are read, from `index_specs` — so no shard header is read twice.
+        let browse_root = browse_root_of(&files);
         Self {
             files,
             tensors: Vec::new(),
@@ -780,6 +1060,11 @@ impl Explorer {
             cached_check: RefCell::new(None),
             checkpoint_stats_cache: RefCell::new(None),
             cached_group_files: RefCell::new(None),
+            browse_root,
+            file_tree: None,
+            file_flattened: Vec::new(),
+            file_selected: 0,
+            file_scroll: 0,
         }
     }
 
@@ -823,14 +1108,32 @@ impl Explorer {
         term: &mut crate::tui::LiveTerminal,
         mut draw: impl FnMut(&mut ratatui::Frame),
     ) {
+        // A wrong-keyboard-layout key flashes the same hint as the main views
+        // (rather than dismissing the pop-up), so a mistaken shortcut is explained
+        // even with a pop-up up; cleared on the next input.
+        let mut layout_hint: Option<char> = None;
         loop {
-            if term.draw(|f| draw(f)).is_err() {
+            let hint = layout_hint;
+            if term
+                .draw(|f| {
+                    draw(f);
+                    if let Some(c) = hint {
+                        UI::render_notice(f, &layout_hint_msg(c));
+                    }
+                })
+                .is_err()
+            {
                 return;
             }
+            layout_hint = None;
             match event::read() {
                 Ok(Event::Key(key)) => {
                     if is_ctrl_c(&key) {
                         quit_immediately();
+                    }
+                    if let Some(c) = wrong_layout_char(&key) {
+                        layout_hint = Some(c);
+                        continue; // warn, stay open
                     }
                     return;
                 }
@@ -1933,6 +2236,15 @@ impl Explorer {
     fn reopen_command(&self, screen: &Screen, want_stats: bool, want_hist: bool) -> String {
         match screen {
             Screen::Tree => self.command_for_tree_selection(),
+            Screen::Files => self.command_for_files(),
+            Screen::Layout { path, selected, .. } => {
+                // Resolve the selected segment's tensor name (parse the header) so
+                // the reopen command restores the selection.
+                let select = crate::safelayout::parse(Path::new(path))
+                    .ok()
+                    .and_then(|m| Self::layout_selected_tensor(&m, *selected));
+                self.command_for_layout(path, select.as_deref())
+            }
             Screen::Detail { tensor, .. } => {
                 let Some(t) = self.tensors.iter().find(|t| &t.name == tensor).cloned() else {
                     return String::new();
@@ -2158,6 +2470,13 @@ impl Explorer {
         let want_health = want_health_findings || self.open.as_ref().is_some_and(|r| r.health);
         let want_stats_shards = self.open.as_ref().is_some_and(|r| r.stats_shards);
         let want_stats_popup = want_stats_shards || self.open.as_ref().is_some_and(|r| r.stats);
+        // `--files` lands in the file browser once the tree is up (like a seeded
+        // `--tensor` screen, but pushed after the popups so it wins the landing).
+        let want_files = self.open.as_ref().is_some_and(|r| r.files_view);
+        // `--layout PATH` lands in that file's layout map, optionally preselecting
+        // a tensor (`--layout-select NAME`).
+        let want_layout = self.open.as_ref().and_then(|r| r.layout_file.clone());
+        let want_layout_select = self.open.as_ref().and_then(|r| r.layout_select.clone());
 
         // A `--tensor` request seeds the history with that screen — or, with
         // `--exit`, renders it once and quits without entering the navigator.
@@ -2215,17 +2534,69 @@ impl Explorer {
             self.show_stats(&mut term, want_stats_shards);
             self.terminal = Some(term);
         }
+        // `--files`: open the file browser on top of the tree, so `Tab`/Backspace
+        // drop back to it. Pushed last so it wins even alongside `--tensor`. The
+        // file views are local-only, so skip them for a remote checkpoint.
+        if want_files && self.file_view_available() {
+            history.push(Screen::Files);
+            cursor = history.len() - 1;
+        }
+        // `--layout PATH`: open that file's layout map on top of the tree. A
+        // relative PATH resolves against the checkpoint directory, so the `--layout
+        // <relative>` command that `y` copies round-trips.
+        if let Some(path) = want_layout.filter(|_| self.file_view_available()) {
+            let p = Path::new(&path);
+            let abs = if p.is_absolute() {
+                path
+            } else {
+                self.browse_root.join(p).to_string_lossy().into_owned()
+            };
+            // Resolve `--layout-select NAME` to its segment index (parse the header).
+            let selected = want_layout_select
+                .and_then(|name| {
+                    crate::safelayout::parse(Path::new(&abs))
+                        .ok()
+                        .and_then(|m| {
+                            m.segments.iter().position(|s| {
+                                s.kind == crate::safelayout::SegmentKind::Tensor && s.name == name
+                            })
+                        })
+                })
+                .unwrap_or(0);
+            history.push(Screen::Layout {
+                path: abs,
+                selected,
+                scroll: 0,
+            });
+            cursor = history.len() - 1;
+        }
 
         loop {
             // The tensor the screen we're about to run belongs to (if any), so
             // that on returning to the tree we can land back on it.
             let screen_tensor = match &history[cursor] {
                 Screen::Detail { tensor, .. } | Screen::Data { tensor, .. } => Some(tensor.clone()),
-                Screen::Tree => None,
+                Screen::Tree | Screen::Files | Screen::Layout { .. } => None,
             };
 
             let nav = match history[cursor].clone() {
                 Screen::Tree => self.run_tree()?,
+                Screen::Files => self.run_files()?,
+                Screen::Layout {
+                    path,
+                    selected,
+                    scroll,
+                } => {
+                    // Record where the user left the layout map so back/forward
+                    // returns to the same segment (like the data view's slice/repr).
+                    let (nav, selected, scroll) = self.run_layout(&path, selected, scroll)?;
+                    history[cursor] = Screen::Layout {
+                        path,
+                        selected,
+                        scroll,
+                    };
+                    nav
+                }
                 Screen::Detail { tensor, slice } => self.run_detail(
                     &tensor,
                     slice,
@@ -2499,15 +2870,22 @@ impl Explorer {
         let mut previewed = usize::MAX;
         let mut preview: Vec<Line<'static>> = Vec::new();
         let mut item_rects: Vec<ratatui::layout::Rect> = Vec::new();
+        // A wrong-keyboard-layout key flashes the shared hint rather than being
+        // silently ignored; cleared on the next input.
+        let mut layout_hint: Option<char> = None;
         loop {
             if sel != previewed {
                 preview = self.export_preview(EXPORT_CHOICES[sel]);
                 previewed = sel;
             }
+            let hint = layout_hint;
             if term
                 .draw(|f| {
                     self.render_tree_frame(f, true);
                     item_rects = UI::render_menu_box(f, "Copy as…", &labels, sel, &preview);
+                    if let Some(c) = hint {
+                        UI::render_notice(f, &layout_hint_msg(c));
+                    }
                 })
                 .is_err()
             {
@@ -2524,6 +2902,11 @@ impl Explorer {
                     if is_ctrl_c(&key) {
                         quit_immediately();
                     }
+                    if let Some(c) = wrong_layout_char(&key) {
+                        layout_hint = Some(c);
+                        continue;
+                    }
+                    layout_hint = None;
                     match key.code {
                         KeyCode::Up => sel = if sel == 0 { last } else { sel - 1 },
                         KeyCode::Down => sel = if sel == last { 0 } else { sel + 1 },
@@ -2964,6 +3347,13 @@ impl Explorer {
         out
     }
 
+    /// Whether the file browser / layout map are usable: they read the checkpoint
+    /// directory and files locally, so they're unavailable for a remote
+    /// (`--ssh-read`) source, which has no local bytes.
+    fn file_view_available(&self) -> bool {
+        self.remote_read.is_none()
+    }
+
     /// Perform a tree command, from its key or the palette. Returns `Some(Nav)` for
     /// a command that leaves the tree (only `Quit` so far), else `None`. Pop-up
     /// commands borrow the terminal via [`Self::with_terminal`].
@@ -2972,6 +3362,22 @@ impl Explorer {
             Cmd::Search => self.enter_search_mode(),
             Cmd::ExpandAll => self.set_all_expanded(true),
             Cmd::CollapseAll => self.set_all_expanded(false),
+            Cmd::ViewFiles => {
+                if self.file_view_available() {
+                    return Some(Nav::Open(Screen::Files));
+                }
+                // Remote checkpoint: no local directory to browse — say so rather
+                // than opening an empty view.
+                self.with_terminal(|s, t| {
+                    s.float_until_dismissed(t, |f| {
+                        s.render_tree_frame(f, true);
+                        UI::render_notice(
+                            f,
+                            "The file browser is available for local checkpoints only.",
+                        );
+                    });
+                });
+            }
             Cmd::CopyScreen => self.copy_tree_screen(),
             Cmd::CopyPath => self.copy_selected_path(),
             Cmd::CopyName => self.copy_selected_name(),
@@ -2998,6 +3404,7 @@ impl Explorer {
             .copied()
             .filter(|(cmd, _, _, _)| match cmd {
                 Cmd::Repack => self.repack_input().is_some(),
+                Cmd::ViewFiles => self.file_view_available(),
                 _ => true,
             })
             .collect()
@@ -3008,13 +3415,55 @@ impl Explorer {
     /// runs it after the terminal is handed back, so a pop-up command can reclaim
     /// it — or `None` if dismissed.
     fn command_palette(&mut self, term: &mut crate::tui::LiveTerminal) -> Option<Cmd> {
-        let all = self.available_commands();
-        let help = |key: char| {
-            crate::ui::shortcut_help(
-                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
-                HelpCtx::Tree,
-            )
-            .unwrap_or("")
+        let entries = self.available_commands();
+        self.run_palette(term, entries, HelpCtx::Tree, |s, f| {
+            s.render_tree_frame(f, true)
+        })
+    }
+
+    /// The file browser's command palette (Space or `:`) — the file-view analogue
+    /// of [`Self::command_palette`], over [`FILE_COMMANDS`].
+    fn file_command_palette(&mut self, term: &mut crate::tui::LiveTerminal) -> Option<FileCmd> {
+        let entries = self.available_file_commands();
+        self.run_palette(term, entries, HelpCtx::Files, |s, f| {
+            s.render_files_frame(f, true)
+        })
+    }
+
+    /// The layout map's command palette (Space or `:`), drawn over the strip.
+    fn layout_command_palette(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        map: &crate::safelayout::LayoutMap,
+        selected: usize,
+        scroll: usize,
+    ) -> Option<LayoutCmd> {
+        let entries: Vec<LayoutCmdEntry> = LAYOUT_COMMANDS.to_vec();
+        self.run_palette(term, entries, HelpCtx::Layout, move |_s, f| {
+            UI::render_layout(f, map, selected, scroll, None, true);
+        })
+    }
+
+    /// The shared fuzzy command-palette picker, generic over the command type so
+    /// every view reuses one loop. `ctx` looks up each command's one-line help;
+    /// `backdrop` draws the live frame behind the palette (passed `&self` so it can
+    /// call the view's `render_*`). Returns the chosen command, or `None`.
+    fn run_palette<T: Copy>(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        all: Vec<PaletteRow<T>>,
+        ctx: HelpCtx,
+        backdrop: impl Fn(&Self, &mut ratatui::Frame),
+    ) -> Option<T> {
+        // The `\t` sentinel (Tab) has no `Char` help entry — look it up by its real
+        // key code, so `Tab`'s hint shows in the palette.
+        let help = move |key: char| {
+            let code = if key == '\t' {
+                KeyCode::Tab
+            } else {
+                KeyCode::Char(key)
+            };
+            crate::ui::shortcut_help(KeyEvent::new(code, KeyModifiers::NONE), ctx).unwrap_or("")
         };
         let matcher = SkimMatcherV2::default();
         let mut query = String::new();
@@ -3022,10 +3471,10 @@ impl Explorer {
         let mut row_rects: Vec<ratatui::layout::Rect> = Vec::new();
         loop {
             // Filter + rank by fuzzy score over "Group Title help".
-            let filtered: Vec<CmdEntry> = if query.is_empty() {
+            let filtered: Vec<PaletteRow<T>> = if query.is_empty() {
                 all.clone()
             } else {
-                let mut scored: Vec<(CmdEntry, i64)> = all
+                let mut scored: Vec<(PaletteRow<T>, i64)> = all
                     .iter()
                     .filter_map(|&(cmd, group, title, key)| {
                         let hay = format!("{group} {title} {}", help(key));
@@ -3045,7 +3494,7 @@ impl Explorer {
                 .iter()
                 .map(|&(_, group, title, key)| {
                     (
-                        key.to_string(),
+                        key_label(key),
                         group.to_string(),
                         title.to_string(),
                         help(key).to_string(),
@@ -3054,7 +3503,7 @@ impl Explorer {
                 .collect();
             if term
                 .draw(|f| {
-                    self.render_tree_frame(f, true);
+                    backdrop(self, f);
                     row_rects = UI::render_command_palette(f, &query, &rows, sel);
                 })
                 .is_err()
@@ -3095,16 +3544,1196 @@ impl Explorer {
                             sel = i;
                         }
                     }
-                    MouseEventKind::Down(_) => match hit(m.column, m.row) {
-                        Some(i) => return filtered.get(i).map(|&(c, _, _, _)| c),
-                        None => return None,
-                    },
+                    MouseEventKind::Down(_) => {
+                        // A click off any row dismisses (returns None).
+                        let i = hit(m.column, m.row)?;
+                        return filtered.get(i).map(|&(c, _, _, _)| c);
+                    }
                     _ => {}
                 },
                 Ok(_) => {}
                 Err(_) => return None,
             }
         }
+    }
+
+    /// Recompute the cached flattened file rows from the tree (after a build or a
+    /// directory fold), clamping the selection into the new row count — the
+    /// file-view analogue of the tensor tree's flatten-on-change.
+    fn rebuild_file_rows(&mut self) {
+        self.file_flattened = self
+            .file_tree
+            .as_ref()
+            .map(crate::filetree::flatten)
+            .unwrap_or_default();
+        let n = self.file_flattened.len();
+        self.file_selected = self.file_selected.min(n.saturating_sub(1));
+    }
+
+    /// Draw the file browser: delegates to [`UI::render_files`] with the current
+    /// (cached) rows and records the frame's clickable regions (footer chips +
+    /// `[×]`).
+    fn render_files_frame(&self, frame: &mut ratatui::Frame, interactive: bool) {
+        let root = self.browse_root.to_string_lossy().into_owned();
+        let flash = self.copied_flash.as_ref().map(|(what, _)| what.as_str());
+        let regions = UI::render_files(
+            frame,
+            &root,
+            &self.file_flattened,
+            self.file_selected,
+            self.file_scroll,
+            flash,
+            interactive,
+        );
+        *self.clickable.borrow_mut() = regions;
+    }
+
+    /// One screenful of file rows, to size a PageUp/PageDown jump.
+    fn file_page_rows(&self) -> usize {
+        let (w, h) = terminal::size().unwrap_or((80, 40));
+        UI::visible_file_rows(w, h)
+    }
+
+    fn move_file_selection(&mut self, delta: i32) {
+        let len = self.file_flattened.len();
+        if len == 0 {
+            return;
+        }
+        self.file_selected = if delta < 0 {
+            self.file_selected.saturating_sub((-delta) as usize)
+        } else {
+            (self.file_selected + delta as usize).min(len - 1)
+        };
+    }
+
+    /// Keep the selected file row in view (snap the scroll offset), mirroring
+    /// [`Self::update_tree_scroll`].
+    fn update_files_scroll(&mut self, width: u16, height: u16) {
+        let body = UI::files_visible_rows(width, height);
+        let sel = self.file_selected;
+        self.file_scroll = if sel >= self.file_scroll + body {
+            sel.saturating_sub(body - 1)
+        } else if sel < self.file_scroll {
+            sel
+        } else {
+            self.file_scroll
+        };
+    }
+
+    /// `←`: collapse the selected directory if it's open, else jump to its parent.
+    fn file_collapse_or_parent(&mut self) {
+        let Some((is_dir, expanded, depth)) = self
+            .file_flattened
+            .get(self.file_selected)
+            .map(|r| (r.is_dir, r.expanded, r.depth))
+        else {
+            return;
+        };
+        if is_dir && expanded {
+            self.toggle_file_dir(self.file_selected);
+            return;
+        }
+        if depth == 0 {
+            return;
+        }
+        if let Some(parent) = (0..self.file_selected)
+            .rev()
+            .find(|&i| self.file_flattened[i].depth < depth)
+        {
+            self.file_selected = parent;
+        }
+    }
+
+    /// `→`: expand the selected directory if it's collapsed (a no-op otherwise).
+    fn file_expand_or_child(&mut self) {
+        let Some((is_dir, expanded)) = self
+            .file_flattened
+            .get(self.file_selected)
+            .map(|r| (r.is_dir, r.expanded))
+        else {
+            return;
+        };
+        if is_dir && !expanded {
+            self.toggle_file_dir(self.file_selected);
+        }
+    }
+
+    /// Toggle the fold of the directory at flattened index `idx` and refresh the
+    /// cached rows so the collapsed / expanded subtree shows immediately.
+    fn toggle_file_dir(&mut self, idx: usize) {
+        if let Some(tree) = self.file_tree.as_mut() {
+            crate::filetree::toggle_by_index(tree, idx);
+        }
+        self.rebuild_file_rows();
+    }
+
+    /// Whether `path` is one of the checkpoint files currently loaded (so opening
+    /// it means switching back to the tensor tree, not loading a new checkpoint).
+    fn is_loaded_checkpoint(&self, path: &Path) -> bool {
+        let target = std::fs::canonicalize(path).ok();
+        self.files
+            .iter()
+            .any(|f| f == path || (target.is_some() && std::fs::canonicalize(f).ok() == target))
+    }
+
+    /// Act on the highlighted file row (`Enter` / double-click): toggle a
+    /// directory, open a checkpoint's file view (the layout map for safetensors,
+    /// else the tensor tree / an info pop-up), or preview a text / JSON sidecar.
+    /// Returns `Some(Nav)` only when it leaves the file view.
+    fn activate_file_selection(&mut self) -> Option<Nav> {
+        use crate::filetree::FileKind;
+        let row = self.file_flattened.get(self.file_selected)?.clone();
+        if row.is_dir {
+            self.toggle_file_dir(self.file_selected);
+            return None;
+        }
+        // A safetensors file opens its byte-layout map (the "proper" file view) —
+        // for any such file, loaded or not (the map reads only its header).
+        let is_safetensors = row
+            .path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
+        if row.kind == FileKind::Checkpoint && is_safetensors {
+            return Some(Nav::Open(Screen::Layout {
+                path: row.path.to_string_lossy().into_owned(),
+                selected: 0,
+                scroll: 0,
+            }));
+        }
+        match row.kind {
+            // A non-safetensors checkpoint that's the one we're exploring drops
+            // back to its tensor tree (no per-file layout map for those formats).
+            FileKind::Checkpoint if self.is_loaded_checkpoint(&row.path) => {
+                return Some(Nav::Back);
+            }
+            FileKind::Checkpoint => {
+                let cmd = format!("{PROGRAM} {}", shell_quote(&row.path.to_string_lossy()));
+                let body = vec![
+                    Line::from(Span::raw(
+                        "This is a different checkpoint from the one open here.".to_string(),
+                    )),
+                    Line::default(),
+                    Line::from(crate::ui::dim_span("Open it in its own view with:")),
+                    Line::from(Span::raw(format!("  {cmd}"))),
+                ];
+                self.with_terminal(|s, t| {
+                    s.float_scroll_popup(t, row.name.as_str(), body, PopupBackdrop::Files, None);
+                });
+            }
+            FileKind::Json | FileKind::Text => {
+                self.with_terminal(|s, t| s.preview_sidecar(t, &row.path, &row.name, row.kind));
+            }
+            FileKind::Other => {
+                let body = vec![
+                    Line::from(crate::ui::dim_span(format!(
+                        "{}  ·  binary / unknown file",
+                        crate::utils::format_size(row.size as usize)
+                    ))),
+                    Line::default(),
+                    Line::from(Span::raw("No preview available.".to_string())),
+                ];
+                self.with_terminal(|s, t| {
+                    s.float_scroll_popup(t, row.name.as_str(), body, PopupBackdrop::Files, None);
+                });
+            }
+        }
+        None
+    }
+
+    /// Read a text / JSON sidecar (capped) and float a scrollable preview over the
+    /// file browser — JSON syntax-highlighted, other text plain. A non-UTF-8 file
+    /// shows an info line instead.
+    fn preview_sidecar(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        path: &Path,
+        name: &str,
+        kind: crate::filetree::FileKind,
+    ) {
+        const CAP: u64 = 4 << 20; // 4 MiB — plenty for config/tokenizer sidecars
+        // `copy` holds the raw text so `c` copies the file's contents verbatim.
+        let (body, copy) = match read_text_capped(path, CAP) {
+            Ok((text, truncated)) => {
+                let mut lines = preview_lines(&text, kind);
+                if lines.is_empty() {
+                    lines.push(Line::from(crate::ui::dim_span("(empty file)")));
+                }
+                if truncated {
+                    lines.push(Line::default());
+                    lines.push(Line::from(crate::ui::dim_span(format!(
+                        "… truncated at {}",
+                        crate::utils::format_size(CAP as usize)
+                    ))));
+                }
+                (lines, Some(text))
+            }
+            Err(msg) => (vec![Line::from(crate::ui::dim_span(msg))], None),
+        };
+        self.float_scroll_popup(term, name, body, PopupBackdrop::Files, copy);
+    }
+
+    /// The file browser's legend (glyphs + what `Enter` does), floated like a
+    /// preview.
+    fn show_files_legend(&self, term: &mut crate::tui::LiveTerminal) {
+        let body = vec![
+            Line::from(crate::ui::dim_span("Directories sort first, then files.")),
+            Line::default(),
+            Line::from(Span::raw(
+                "▸ / ▾   collapsed / expanded directory".to_string(),
+            )),
+            Line::from(Span::raw(
+                "▦        checkpoint — Enter opens its layout map (safetensors) or tensor tree"
+                    .to_string(),
+            )),
+            Line::from(Span::raw(
+                "{}       JSON — Enter previews it, highlighted".to_string(),
+            )),
+            Line::from(Span::raw(
+                "·        text / other — Enter previews plain text".to_string(),
+            )),
+        ];
+        self.float_scroll_popup(
+            term,
+            "File browser legend",
+            body,
+            PopupBackdrop::Files,
+            None,
+        );
+    }
+
+    /// A scrollable pop-up floated over the file browser (or the layout map):
+    /// `↑↓`/`PgUp`/`PgDn`/`Home`/`End` scroll (held-key accelerated), any other
+    /// key or a click dismisses, Ctrl-C quits. Shared by the sidecar preview, the
+    /// legends, the copy-command panel, and the info pop-ups. `backdrop` chooses
+    /// which frame stays live behind the box. When `copy` is `Some`, `c` copies
+    /// that text to the clipboard (the footer advertises it) without dismissing.
+    fn float_scroll_popup(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        title: &str,
+        body: Vec<Line<'static>>,
+        backdrop: PopupBackdrop,
+        copy: Option<String>,
+    ) {
+        let mut scroll = 0usize;
+        let mut scroll_max = 0usize;
+        // When the last `c` copy happened — the "✓ copied" footer shows for
+        // `COPY_FLASH`, then reverts on its own (like the copy flash elsewhere).
+        let mut copied_at: Option<std::time::Instant> = None;
+        // A wrong-keyboard-layout key flashes the shared hint (as in the main
+        // views) instead of being silently ignored; cleared on the next input.
+        let mut layout_hint: Option<char> = None;
+        loop {
+            let footer = if copied_at.is_some() {
+                Line::from(crate::ui::success_span(
+                    "✓ copied to the clipboard · Esc / click to close",
+                ))
+            } else if copy.is_some() {
+                Line::from(crate::ui::dim_span(
+                    "↑↓ PgUp/PgDn scroll · c copy · Esc / click to close",
+                ))
+            } else {
+                files_dismiss_footer()
+            };
+            let hint = layout_hint;
+            if term
+                .draw(|f| {
+                    match backdrop {
+                        PopupBackdrop::Files => self.render_files_frame(f, true),
+                        PopupBackdrop::Layout {
+                            map,
+                            selected,
+                            scroll,
+                        } => {
+                            UI::render_layout(f, map, selected, scroll, None, true);
+                        }
+                    }
+                    // Borrow the body (no per-frame clone) — only the visible window
+                    // is copied inside, so a large header scrolls smoothly.
+                    let (max, _) = UI::render_file_preview(f, title, &body, footer, scroll);
+                    scroll_max = max;
+                    if let Some(c) = hint {
+                        UI::render_notice(f, &layout_hint_msg(c));
+                    }
+                })
+                .is_err()
+            {
+                return;
+            }
+            // While the copy confirmation is up, wake when it expires so it clears
+            // itself (not only on the next key press).
+            if let Some(at) = copied_at {
+                let remaining = COPY_FLASH.saturating_sub(at.elapsed());
+                if remaining.is_zero() || !event::poll(remaining).unwrap_or(false) {
+                    copied_at = None;
+                    continue; // redraw with the confirmation gone
+                }
+            }
+            match event::read() {
+                Ok(Event::Key(key)) => {
+                    if is_ctrl_c(&key) {
+                        quit_immediately();
+                    }
+                    // A wrong-layout key flashes the hint and keeps the pop-up up.
+                    if let Some(c) = wrong_layout_char(&key) {
+                        layout_hint = Some(c);
+                        continue;
+                    }
+                    layout_hint = None;
+                    // Held-key acceleration, matching the tree / layout views.
+                    match key.code {
+                        KeyCode::Up => {
+                            scroll =
+                                scroll.saturating_sub(self.held_step(KeyCode::Up, accel_step_row));
+                        }
+                        KeyCode::Down => {
+                            scroll = (scroll + self.held_step(KeyCode::Down, accel_step_row))
+                                .min(scroll_max);
+                        }
+                        KeyCode::PageUp => {
+                            let step =
+                                SCROLL_PAGE * self.held_step(KeyCode::PageUp, accel_step_page);
+                            scroll = scroll.saturating_sub(step);
+                        }
+                        KeyCode::PageDown => {
+                            let step =
+                                SCROLL_PAGE * self.held_step(KeyCode::PageDown, accel_step_page);
+                            scroll = (scroll + step).min(scroll_max);
+                        }
+                        KeyCode::Home => scroll = 0,
+                        KeyCode::End => scroll = scroll_max,
+                        // `c` copies (when there's something to copy) and stays open;
+                        // the confirmation clears itself after `COPY_FLASH`.
+                        KeyCode::Char('c') if copy.is_some() => {
+                            copy_to_clipboard(copy.as_deref().unwrap_or_default());
+                            copied_at = Some(std::time::Instant::now());
+                        }
+                        // Only Esc closes (as the footer says); other keys —
+                        // including a wrong keyboard layout's — are ignored rather
+                        // than dismissing the pop-up unexpectedly.
+                        KeyCode::Esc => return,
+                        _ => {}
+                    }
+                }
+                Ok(Event::Mouse(m)) => match m.kind {
+                    MouseEventKind::ScrollUp => scroll = scroll.saturating_sub(WHEEL_STEP),
+                    MouseEventKind::ScrollDown => scroll = (scroll + WHEEL_STEP).min(scroll_max),
+                    MouseEventKind::Down(_) => return,
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// The file browser's commands available now (no preconditions — the whole
+    /// registry), for its palette.
+    fn available_file_commands(&self) -> Vec<FileCmdEntry> {
+        FILE_COMMANDS.to_vec()
+    }
+
+    /// Run a file-browser command, from its key or the palette. Returns `Some(Nav)`
+    /// for a command that leaves the file view (`Tab` → tensor tree, `q` → quit).
+    fn run_file_command(&mut self, cmd: FileCmd) -> Option<Nav> {
+        match cmd {
+            FileCmd::TensorTree => return Some(Nav::Back),
+            FileCmd::Legend => self.with_terminal(|s, t| s.show_files_legend(t)),
+            FileCmd::CopyPath => self.copy_file_path(),
+            FileCmd::CopyScreen => self.copy_files_screen(),
+            FileCmd::CopyCommand => {
+                let c = self.command_for_files();
+                self.with_terminal(|s, t| s.copy_command(t, &c, None));
+            }
+            FileCmd::Quit => return Some(Nav::Quit),
+        }
+        None
+    }
+
+    /// Run a layout-map command, from its key or the palette. Returns `Some(Nav)`
+    /// for a command that leaves the view (`Tab` → tensor tree, `q` → quit). The
+    /// pop-ups float over the strip, so they need `map`/`selected`/`scroll`.
+    fn run_layout_command(
+        &mut self,
+        cmd: LayoutCmd,
+        path: &str,
+        map: &crate::safelayout::LayoutMap,
+        selected: usize,
+        scroll: usize,
+    ) -> Option<Nav> {
+        match cmd {
+            LayoutCmd::TensorTree => return Some(Nav::Back),
+            LayoutCmd::Quit => return Some(Nav::Quit),
+            LayoutCmd::Legend => {
+                let body = layout_legend_lines();
+                self.with_terminal(|s, t| {
+                    s.float_scroll_popup(
+                        t,
+                        "Layout legend",
+                        body,
+                        PopupBackdrop::Layout {
+                            map,
+                            selected,
+                            scroll,
+                        },
+                        None,
+                    )
+                });
+            }
+            LayoutCmd::CopyScreen => {
+                copy_to_clipboard(&layout_to_text(map));
+                self.flash_copied("screen contents");
+            }
+            LayoutCmd::CopyCommand => {
+                let select = Self::layout_selected_tensor(map, selected);
+                let command = self.command_for_layout(path, select.as_deref());
+                copy_to_clipboard(&command);
+                self.with_terminal(|s, t| {
+                    s.float_until_dismissed(t, |f| {
+                        UI::render_layout(f, map, selected, scroll, None, true);
+                        UI::render_command_band(f, &command);
+                    });
+                });
+            }
+        }
+        None
+    }
+
+    /// Copy the selected file row's path (`f`).
+    fn copy_file_path(&mut self) {
+        let path = self
+            .file_flattened
+            .get(self.file_selected)
+            .map(|r| r.path.to_string_lossy().into_owned());
+        if let Some(path) = path {
+            copy_to_clipboard(&path);
+            self.flash_copied("the file path");
+        }
+    }
+
+    /// Copy the file browser's visible listing as plain text (`c`).
+    fn copy_files_screen(&mut self) {
+        let text = self
+            .file_flattened
+            .iter()
+            .map(|r| {
+                let indent = "  ".repeat(r.depth);
+                let name = if r.is_dir {
+                    format!("{}/", r.name)
+                } else {
+                    r.name.clone()
+                };
+                format!(
+                    "{indent}{name}\t{}",
+                    crate::utils::format_size(r.size as usize)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        copy_to_clipboard(&text);
+        self.flash_copied("screen contents");
+    }
+
+    /// The file browser. Lists the checkpoint's directory (directories fold with
+    /// `←`/`→`, `Enter` opens a checkpoint / previews a sidecar), `Tab` /
+    /// Backspace return to the tensor tree, `\` steps forward. Returns the chosen
+    /// [`Nav`].
+    fn run_files(&mut self) -> Result<Nav> {
+        // Build the directory tree lazily on first entry (a session that never
+        // opens the file view never stats the directory), then keep it — its fold
+        // state persists across `Tab` toggles.
+        if self.file_tree.is_none() {
+            self.file_tree = Some(crate::filetree::build(&self.browse_root, 8));
+            self.rebuild_file_rows();
+        }
+        let mut first = true;
+        let mut last_click: Option<(std::time::Instant, u16)> = None;
+        let mut last_sel = usize::MAX;
+        let mut scrollbar_drag = false;
+        // A wrong-keyboard-layout key flashes a hint rather than being silently
+        // ignored (as on the tree / detail views); cleared on the next input.
+        let mut layout_hint: Option<char> = None;
+        loop {
+            let input_pending = event::poll(std::time::Duration::ZERO).unwrap_or(false);
+            let mut term = self
+                .terminal
+                .take()
+                .expect("interactive loop owns the terminal");
+            if first {
+                term.clear()?;
+                first = false;
+            }
+            let size = term.size().ok();
+            let total = self.file_flattened.len();
+            if !input_pending {
+                if let Some(sz) = size {
+                    if self.file_selected != last_sel {
+                        self.update_files_scroll(sz.width, sz.height);
+                        last_sel = self.file_selected;
+                    }
+                    let body = UI::files_visible_rows(sz.width, sz.height);
+                    self.file_scroll = self.file_scroll.min(total.saturating_sub(body));
+                }
+                let hint = layout_hint;
+                term.draw(|f| {
+                    self.render_files_frame(f, true);
+                    if let Some(c) = hint {
+                        UI::render_notice(f, &layout_hint_msg(c));
+                    }
+                })?;
+            }
+            self.terminal = Some(term);
+
+            let ev = if let Some((_, at)) = &self.copied_flash {
+                let remaining = COPY_FLASH.saturating_sub(at.elapsed());
+                if remaining.is_zero() || !event::poll(remaining).unwrap_or(false) {
+                    self.copied_flash = None;
+                    continue;
+                }
+                event::read()?
+            } else {
+                event::read()?
+            };
+            self.hovered_shortcut.set(None);
+            layout_hint = None;
+
+            // Mouse: scrollbar scrub/drag, row select / double-click activate, the
+            // wheel scrolls the viewport, and a footer chip / `[×]` acts like its key.
+            let mut synth: Option<KeyEvent> = None;
+            if let Event::Mouse(m) = &ev {
+                let (kind, row, col) = (m.kind, m.row, m.column);
+                match kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.copied_flash = None;
+                        scrollbar_drag = false;
+                        if let Some(sz) = size
+                            && let Some(sb) = UI::files_scrollbar(sz.width, sz.height, total)
+                            && sb.hit(col, row)
+                        {
+                            self.file_scroll = sb.offset_at(row);
+                            scrollbar_drag = true;
+                            continue;
+                        }
+                        if let Some(k) = crate::ui::region_hit(&self.clickable.borrow(), col, row) {
+                            synth = Some(k); // a footer chip / [×]
+                        } else if let Some(sz) = size {
+                            let body_top = UI::files_header_rows(sz.width) as u16;
+                            let body_bottom = sz.height.saturating_sub(FILES_FOOTER_ROWS as u16);
+                            if row >= body_top && row < body_bottom {
+                                let idx = self.file_scroll + (row - body_top) as usize;
+                                let fr = self.file_flattened.get(idx).cloned();
+                                if let Some(fr) = fr {
+                                    // A click on a directory's ▸/▾ twisty (column
+                                    // `2 * depth`) toggles it on a single click.
+                                    let on_arrow = fr.is_dir && col == 2 * fr.depth as u16;
+                                    self.file_selected = idx;
+                                    if on_arrow {
+                                        last_click = None;
+                                        self.activate_file_selection();
+                                    } else {
+                                        let double = matches!(
+                                            last_click,
+                                            Some((t, r)) if r == row && t.elapsed() < DOUBLE_CLICK
+                                        );
+                                        if double {
+                                            last_click = None;
+                                            if let Some(nav) = self.activate_file_selection() {
+                                                return Ok(nav);
+                                            }
+                                        } else {
+                                            last_click = Some((std::time::Instant::now(), row));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) if scrollbar_drag => {
+                        if let Some(sz) = size
+                            && let Some(sb) = UI::files_scrollbar(sz.width, sz.height, total)
+                        {
+                            self.file_scroll = sb.offset_at(row);
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => scrollbar_drag = false,
+                    MouseEventKind::ScrollDown => {
+                        self.copied_flash = None;
+                        self.file_scroll = self.file_scroll.saturating_add(WHEEL_STEP);
+                    }
+                    MouseEventKind::ScrollUp => {
+                        self.copied_flash = None;
+                        self.file_scroll = self.file_scroll.saturating_sub(WHEEL_STEP);
+                    }
+                    MouseEventKind::Moved => {
+                        if let Some(sz) = size {
+                            self.update_hovers(HelpCtx::Files, sz.width, sz.height, col, row);
+                        }
+                    }
+                    _ => {}
+                }
+                if synth.is_none() {
+                    continue;
+                }
+            }
+
+            let key_event = match synth {
+                Some(k) => k,
+                None => match ev {
+                    Event::Key(k) => k,
+                    _ => continue,
+                },
+            };
+            self.copied_flash = None;
+            // A non-Latin key (wrong keyboard layout) matches no shortcut — flash a
+            // hint rather than silently ignoring it.
+            if let Some(c) = wrong_layout_char(&key_event) {
+                layout_hint = Some(c);
+                continue;
+            }
+            match key_event {
+                KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => return Ok(Nav::Quit),
+                // Space or `:` opens the file browser's command palette.
+                KeyEvent {
+                    code: KeyCode::Char(' ') | KeyCode::Char(':'),
+                    ..
+                } => {
+                    if let Some(cmd) = self.with_terminal(|s, t| s.file_command_palette(t))
+                        && let Some(nav) = self.run_file_command(cmd)
+                    {
+                        return Ok(nav);
+                    }
+                }
+                // Every lettered file command dispatches through the registry,
+                // like the tree — so key and palette entry can't drift.
+                KeyEvent {
+                    code: KeyCode::Char(c),
+                    modifiers,
+                    ..
+                } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && file_command_for_key(c).is_some() =>
+                {
+                    let cmd = file_command_for_key(c).expect("guarded by is_some");
+                    if let Some(nav) = self.run_file_command(cmd) {
+                        return Ok(nav);
+                    }
+                }
+                // Tab / Backspace return to the tensor tree; `\` steps forward.
+                KeyEvent {
+                    code: KeyCode::Tab, ..
+                }
+                | KeyEvent {
+                    code: KeyCode::Backspace,
+                    ..
+                } => return Ok(Nav::Back),
+                KeyEvent {
+                    code: KeyCode::Char('\\'),
+                    ..
+                } => return Ok(Nav::Forward),
+                KeyEvent {
+                    code: KeyCode::Up, ..
+                } => {
+                    let step = self.held_step(KeyCode::Up, accel_step_row) as i32;
+                    self.move_file_selection(-step);
+                }
+                KeyEvent {
+                    code: KeyCode::Down,
+                    ..
+                } => {
+                    let step = self.held_step(KeyCode::Down, accel_step_row) as i32;
+                    self.move_file_selection(step);
+                }
+                KeyEvent {
+                    code: KeyCode::PageUp,
+                    ..
+                } => {
+                    let step = (self.file_page_rows()
+                        * self.held_step(KeyCode::PageUp, accel_step_page))
+                        as i32;
+                    self.move_file_selection(-step);
+                }
+                KeyEvent {
+                    code: KeyCode::PageDown,
+                    ..
+                } => {
+                    let step = (self.file_page_rows()
+                        * self.held_step(KeyCode::PageDown, accel_step_page))
+                        as i32;
+                    self.move_file_selection(step);
+                }
+                KeyEvent {
+                    code: KeyCode::Home,
+                    ..
+                } => self.file_selected = 0,
+                KeyEvent {
+                    code: KeyCode::End, ..
+                } => self.file_selected = total.saturating_sub(1),
+                KeyEvent {
+                    code: KeyCode::Left,
+                    ..
+                } => self.file_collapse_or_parent(),
+                KeyEvent {
+                    code: KeyCode::Right,
+                    ..
+                } => self.file_expand_or_child(),
+                KeyEvent {
+                    code: KeyCode::Enter,
+                    ..
+                } => {
+                    if let Some(nav) = self.activate_file_selection() {
+                        return Ok(nav);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The command that reopens the layout map for `path` (`--layout`): the launch
+    /// path(s) plus the flag. The file is emitted **relative to the checkpoint
+    /// directory** (which the launch path already names), so the path isn't
+    /// duplicated — `… <ckpt-dir> --layout model-00016.safetensors`. When a tensor
+    /// is selected, `--layout-select <name>` restores the selection too.
+    fn command_for_layout(&self, path: &str, select: Option<&str>) -> String {
+        let mut parts = self.command_prefix();
+        parts.extend(self.checkpoint_path_parts());
+        parts.push("--layout".to_string());
+        let rel = Path::new(path)
+            .strip_prefix(&self.browse_root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string());
+        parts.push(shell_quote(&rel));
+        if let Some(name) = select {
+            parts.push("--layout-select".to_string());
+            parts.push(shell_quote(name));
+        }
+        parts.join(" ")
+    }
+
+    /// The selected segment's tensor name in `map`, if the selection is a tensor
+    /// (the header / a gap / out of range → `None`) — for `--layout-select`.
+    fn layout_selected_tensor(
+        map: &crate::safelayout::LayoutMap,
+        selected: usize,
+    ) -> Option<String> {
+        map.segments
+            .get(selected)
+            .filter(|s| s.kind == crate::safelayout::SegmentKind::Tensor)
+            .map(|s| s.name.clone())
+    }
+
+    /// The safetensors layout map for one file: a scrollable vertical strip of its
+    /// byte layout. A drill-down like the detail / data views — Backspace / `Tab`
+    /// / `[×]` return to where it was opened from (the file browser, or the tree
+    /// for `--layout`), `\` steps forward, `l` / `c` / `y` and `q` as elsewhere.
+    fn run_layout(
+        &mut self,
+        path: &str,
+        initial_selected: usize,
+        initial_scroll: usize,
+    ) -> Result<(Nav, usize, usize)> {
+        let map = match crate::safelayout::parse(Path::new(path)) {
+            Ok(m) => m,
+            Err(e) => {
+                let body = vec![
+                    Line::from(Span::raw(format!("Can't read the layout of {path}:"))),
+                    Line::default(),
+                    Line::from(crate::ui::dim_span(e)),
+                ];
+                self.with_terminal(|s, t| {
+                    s.float_scroll_popup(t, "Layout", body, PopupBackdrop::Files, None)
+                });
+                return Ok((Nav::Back, initial_selected, initial_scroll));
+            }
+        };
+        let n = map.segments.len();
+        let mut first = true;
+        // Restore where the user left this map (clamped to the current segments).
+        let mut selected = initial_selected.min(n.saturating_sub(1));
+        let mut last_sel = usize::MAX;
+        let mut scroll = initial_scroll;
+        let mut scroll_max = 0usize;
+        // A wrong-keyboard-layout key flashes a hint instead of being silently
+        // ignored (as on the tree / detail views); cleared on the next input.
+        let mut layout_hint: Option<char> = None;
+        let nav = loop {
+            let input_pending = event::poll(std::time::Duration::ZERO).unwrap_or(false);
+            let mut term = self
+                .terminal
+                .take()
+                .expect("interactive loop owns the terminal");
+            if first {
+                term.clear()?;
+                first = false;
+            }
+            let size = term.size().ok();
+            // Compute the scroll bounds from the band layout up front (not from the
+            // last frame's draw, which is 0 on entry — that would clamp away the
+            // snap below and leave the view stuck at the top). Then snap so the
+            // selected band's label row is visible when the selection moved (the
+            // wheel can otherwise scroll freely past it).
+            if let Some(sz) = size {
+                let starts = UI::layout_band_starts(&map, sz.width, sz.height);
+                let body = UI::layout_visible_rows(sz.width, sz.height);
+                let total_rows = starts.last().copied().unwrap_or(0);
+                scroll_max = total_rows.saturating_sub(body);
+                if selected != last_sel {
+                    let band_start = starts.get(selected).copied().unwrap_or(0);
+                    if band_start < scroll {
+                        scroll = band_start;
+                    } else if band_start >= scroll + body {
+                        scroll = band_start + 1 - body;
+                    }
+                    last_sel = selected;
+                }
+                scroll = scroll.min(scroll_max);
+            }
+            if !input_pending {
+                let flash = self.copied_flash.as_ref().map(|(w, _)| w.clone());
+                let hint = layout_hint;
+                term.draw(|f| {
+                    let (max, regions) =
+                        UI::render_layout(f, &map, selected, scroll, flash.as_deref(), true);
+                    scroll_max = max;
+                    *self.clickable.borrow_mut() = regions;
+                    if let Some(c) = hint {
+                        UI::render_notice(f, &layout_hint_msg(c));
+                    }
+                })?;
+            }
+            self.terminal = Some(term);
+
+            let ev = if let Some((_, at)) = &self.copied_flash {
+                let remaining = COPY_FLASH.saturating_sub(at.elapsed());
+                if remaining.is_zero() || !event::poll(remaining).unwrap_or(false) {
+                    self.copied_flash = None;
+                    continue;
+                }
+                event::read()?
+            } else {
+                event::read()?
+            };
+            self.hovered_shortcut.set(None);
+            layout_hint = None;
+
+            // Mouse: a click on a band selects it, the wheel scrolls the strip, a
+            // footer chip / `[×]` acts like its key.
+            let mut synth: Option<KeyEvent> = None;
+            if let Event::Mouse(m) = &ev {
+                let (kind, row, col) = (m.kind, m.row, m.column);
+                match kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.copied_flash = None;
+                        if let Some(k) = crate::ui::region_hit(&self.clickable.borrow(), col, row) {
+                            synth = Some(k); // a footer chip / [×]
+                        } else if let Some(sz) = size {
+                            let top = UI::layout_header_rows() as u16;
+                            let body = UI::layout_visible_rows(sz.width, sz.height);
+                            if row >= top && (row as usize) < top as usize + body {
+                                let content_row = scroll + (row - top) as usize;
+                                let starts = UI::layout_band_starts(&map, sz.width, sz.height);
+                                // The band whose [start, next) contains this row.
+                                if let Some(seg) = starts
+                                    .windows(2)
+                                    .position(|w| content_row >= w[0] && content_row < w[1])
+                                {
+                                    selected = seg.min(n.saturating_sub(1));
+                                }
+                            }
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.copied_flash = None;
+                        scroll = (scroll + WHEEL_STEP).min(scroll_max);
+                    }
+                    MouseEventKind::ScrollUp => {
+                        self.copied_flash = None;
+                        scroll = scroll.saturating_sub(WHEEL_STEP);
+                    }
+                    MouseEventKind::Moved => {
+                        if let Some(sz) = size {
+                            self.update_hovers(HelpCtx::Layout, sz.width, sz.height, col, row);
+                        }
+                    }
+                    _ => {}
+                }
+                if synth.is_none() {
+                    continue;
+                }
+            }
+
+            let key_event = match synth {
+                Some(k) => k,
+                None => match ev {
+                    Event::Key(k) => k,
+                    _ => continue,
+                },
+            };
+            self.copied_flash = None;
+            // A non-Latin key (wrong keyboard layout) matches no shortcut — flash a
+            // hint rather than silently ignoring it.
+            if let Some(c) = wrong_layout_char(&key_event) {
+                layout_hint = Some(c);
+                continue;
+            }
+            let move_sel = |sel: usize, delta: i32| -> usize {
+                if delta < 0 {
+                    sel.saturating_sub((-delta) as usize)
+                } else {
+                    (sel + delta as usize).min(n.saturating_sub(1))
+                }
+            };
+            match key_event {
+                KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } => break Nav::Quit,
+                // Space or `:` opens the layout map's command palette.
+                KeyEvent {
+                    code: KeyCode::Char(' ') | KeyCode::Char(':'),
+                    ..
+                } => {
+                    if let Some(cmd) = self
+                        .with_terminal(|s, t| s.layout_command_palette(t, &map, selected, scroll))
+                        && let Some(nav) =
+                            self.run_layout_command(cmd, path, &map, selected, scroll)
+                    {
+                        break nav;
+                    }
+                }
+                // Every lettered layout command dispatches through the registry
+                // (`q` / `l` / `c` / `y`) — so the key and the palette can't drift.
+                KeyEvent {
+                    code: KeyCode::Char(ch),
+                    modifiers,
+                    ..
+                } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && layout_command_for_key(ch).is_some() =>
+                {
+                    let cmd = layout_command_for_key(ch).expect("guarded by is_some");
+                    if let Some(nav) = self.run_layout_command(cmd, path, &map, selected, scroll) {
+                        break nav;
+                    }
+                }
+                // Backspace / Tab / Esc return to where the map was opened from.
+                KeyEvent {
+                    code: KeyCode::Backspace | KeyCode::Tab | KeyCode::Esc,
+                    ..
+                } => break Nav::Back,
+                KeyEvent {
+                    code: KeyCode::Char('\\'),
+                    ..
+                } => break Nav::Forward,
+                KeyEvent {
+                    code: KeyCode::Up, ..
+                } => {
+                    let step = self.held_step(KeyCode::Up, accel_step_row) as i32;
+                    selected = move_sel(selected, -step);
+                }
+                KeyEvent {
+                    code: KeyCode::Down,
+                    ..
+                } => {
+                    let step = self.held_step(KeyCode::Down, accel_step_row) as i32;
+                    selected = move_sel(selected, step);
+                }
+                KeyEvent {
+                    code: KeyCode::PageUp,
+                    ..
+                } => {
+                    let page = self.layout_page_segments(&map, size);
+                    let step = (page * self.held_step(KeyCode::PageUp, accel_step_page)) as i32;
+                    selected = move_sel(selected, -step);
+                }
+                KeyEvent {
+                    code: KeyCode::PageDown,
+                    ..
+                } => {
+                    let page = self.layout_page_segments(&map, size);
+                    let step = (page * self.held_step(KeyCode::PageDown, accel_step_page)) as i32;
+                    selected = move_sel(selected, step);
+                }
+                KeyEvent {
+                    code: KeyCode::Home,
+                    ..
+                } => selected = 0,
+                KeyEvent {
+                    code: KeyCode::End, ..
+                } => selected = n.saturating_sub(1),
+                // Enter on the header previews the raw JSON header; on a tensor it
+                // jumps to that tensor's place in the checkpoint tree.
+                KeyEvent {
+                    code: KeyCode::Enter,
+                    ..
+                } => match map.segments.get(selected).map(|s| s.kind) {
+                    Some(crate::safelayout::SegmentKind::Header) => {
+                        self.with_terminal(|s, t| {
+                            s.preview_header_json(t, path, &map, selected, scroll)
+                        });
+                    }
+                    Some(crate::safelayout::SegmentKind::Tensor) => {
+                        if let Some(nav) = self.reveal_layout_selection(&map, selected)? {
+                            break nav;
+                        }
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        };
+        Ok((nav, selected, scroll))
+    }
+
+    /// How many segments to move the layout selection for one PageUp/PageDown —
+    /// the number of bands currently on screen (at least one).
+    fn layout_page_segments(
+        &self,
+        map: &crate::safelayout::LayoutMap,
+        size: Option<ratatui::layout::Size>,
+    ) -> usize {
+        let Some(sz) = size else { return 1 };
+        let starts = UI::layout_band_starts(map, sz.width, sz.height);
+        let body = UI::layout_visible_rows(sz.width, sz.height);
+        // Segments whose start row falls within one screenful — a rough page.
+        let visible = starts
+            .iter()
+            .take(map.segments.len())
+            .filter(|&&s| s < body)
+            .count();
+        visible.max(1)
+    }
+
+    /// `Enter` in the layout map: if the selected segment is a tensor that belongs
+    /// to the loaded checkpoint, reveal it in the tensor tree (opening that screen);
+    /// otherwise flash a note. Returns `Some(Nav)` when it navigates.
+    fn reveal_layout_selection(
+        &mut self,
+        map: &crate::safelayout::LayoutMap,
+        selected: usize,
+    ) -> Result<Option<Nav>> {
+        use crate::safelayout::SegmentKind;
+        let Some(seg) = map.segments.get(selected) else {
+            return Ok(None);
+        };
+        if seg.kind != SegmentKind::Tensor {
+            return Ok(None);
+        }
+        let name = seg.name.clone();
+        if self.tensors.iter().any(|t| t.name == name) {
+            self.ensure_full_load()?;
+            self.reveal_tensor(&name);
+            Ok(Some(Nav::Open(Screen::Tree)))
+        } else {
+            // A different checkpoint's file — its tensors aren't in this tree. Flash
+            // a note (set directly, since it isn't a "copied" confirmation).
+            self.copied_flash = Some((
+                format!("{name} is not in the open checkpoint"),
+                std::time::Instant::now(),
+            ));
+            Ok(None)
+        }
+    }
+
+    /// `Enter` on the layout map's header band: float a scrollable, syntax-
+    /// highlighted preview of the file's raw JSON header (the metadata that
+    /// describes every tensor), pretty-printed for readability.
+    fn preview_header_json(
+        &self,
+        term: &mut crate::tui::LiveTerminal,
+        path: &str,
+        map: &crate::safelayout::LayoutMap,
+        selected: usize,
+        scroll: usize,
+    ) {
+        const CAP: u64 = 2 << 20; // 2 MiB — a shard's header is far smaller
+        // The JSON length `N` (the file's first 8 bytes hold this as a u64 LE).
+        let n = map.header_len.saturating_sub(8);
+        // `copy` holds the raw JSON so `c` copies the header verbatim.
+        let (body, copy) = match crate::safelayout::read_header_json(Path::new(path), CAP) {
+            Ok((json, truncated)) => {
+                // Show the 8-byte length prefix first — the header is that u64
+                // (little-endian) followed by `N` bytes of JSON.
+                let mut lines = vec![
+                    Line::from(crate::ui::dim_span(format!(
+                        "8-byte length prefix (u64 LE) = {n}  ({})",
+                        crate::utils::format_size(n as usize)
+                    ))),
+                    Line::from(crate::ui::dim_span(format!(
+                        "followed by {n} bytes of JSON:"
+                    ))),
+                    Line::default(),
+                ];
+                // Keep a tensor's flat arrays (shape / data_offsets) on one line.
+                // Syntax-highlighting a big header (colored_json + ANSI parse) is
+                // slow, so only colour modest headers; a large one renders plain
+                // (pretty-printed, uncoloured) — instant. `c` still copies the raw.
+                const HIGHLIGHT_CAP: usize = 256 << 10; // 256 KiB of header JSON
+                let json_lines = if json.len() <= HIGHLIGHT_CAP {
+                    crate::ui::highlight_json_lines_inline(&json)
+                } else {
+                    crate::ui::plain_json_lines_inline(&json)
+                };
+                match json_lines {
+                    Some(json_lines) => lines.extend(json_lines),
+                    None => {
+                        lines.extend(json.lines().map(|l| Line::from(Span::raw(l.to_string()))))
+                    }
+                }
+                if truncated {
+                    lines.push(Line::default());
+                    lines.push(Line::from(crate::ui::dim_span(
+                        "… header truncated for preview",
+                    )));
+                }
+                (lines, Some(json))
+            }
+            Err(e) => (vec![Line::from(crate::ui::dim_span(e))], None),
+        };
+        let title = format!("{} — header", map.name);
+        self.float_scroll_popup(
+            term,
+            &title,
+            body,
+            PopupBackdrop::Layout {
+                map,
+                selected,
+                scroll,
+            },
+            copy,
+        );
+    }
+
+    /// The layout-map screen for `tensor`'s shard, with that tensor preselected —
+    /// `Some` only for a local `.safetensors` source (the layout map reads the
+    /// file's header locally). Backs the detail view's `Tab` → file layout.
+    fn tensor_layout_screen(&self, tensor: &TensorInfo) -> Option<Screen> {
+        if self.remote_read.is_some() {
+            return None;
+        }
+        let path = &tensor.source_path;
+        let is_safetensors = Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
+        if !is_safetensors {
+            return None;
+        }
+        let map = crate::safelayout::parse(Path::new(path)).ok()?;
+        let selected = map
+            .segments
+            .iter()
+            .position(|s| s.kind == crate::safelayout::SegmentKind::Tensor && s.name == tensor.name)
+            .unwrap_or(0);
+        Some(Screen::Layout {
+            path: path.clone(),
+            selected,
+            scroll: 0,
+        })
     }
 
     /// The tree browser. Handles in-place keys (navigation, search, expand) and
@@ -3497,6 +5126,16 @@ impl Explorer {
                     KeyEvent {
                         code: KeyCode::Tab, ..
                     } if self.search_mode => self.reveal_search_result(),
+                    // Otherwise Tab toggles to the file browser (the checkpoint's
+                    // directory) — routed through the registry so the key and the
+                    // `View: File browser` palette entry share one action.
+                    KeyEvent {
+                        code: KeyCode::Tab, ..
+                    } => {
+                        if let Some(nav) = self.run_command(Cmd::ViewFiles) {
+                            return Ok(nav);
+                        }
+                    }
                     // Enter acts on the highlighted row in both modes: expand a
                     // group, or open a tensor detail (returned to the navigator).
                     // (Space no longer does this — it opens the command palette,
@@ -4197,7 +5836,9 @@ impl Explorer {
                 } => {
                     self.run_data(tensor, *repr, *slice, Interaction::OneShot);
                 }
-                Screen::Tree => {}
+                // The tree renders itself; the file browser and layout map are
+                // interactive-only (a `--files`/`--layout --exit` falls back).
+                Screen::Tree | Screen::Files | Screen::Layout { .. } => {}
             }
             return Ok(None);
         }
@@ -4533,7 +6174,7 @@ impl Explorer {
             // A click on a footer chip / `[×]` acts like its key, routed through the
             // match below; other mouse events (wheel, release, drag, motion) do
             // nothing on the detail screen.
-            let ev = match ev {
+            let mut ev = match ev {
                 Ok(Event::Mouse(m)) => {
                     if let MouseEventKind::Down(MouseButton::Left) = m.kind {
                         match crate::ui::region_hit(&self.clickable.borrow(), m.column, m.row) {
@@ -4569,6 +6210,39 @@ impl Explorer {
             {
                 layout_hint = Some(c);
                 continue;
+            }
+            // Space or `:` opens the command palette; the chosen command is
+            // dispatched as its shortcut key (fed into the match below), so it runs
+            // through the same handlers.
+            if let Ok(Event::Key(KeyEvent {
+                code: KeyCode::Char(' ') | KeyCode::Char(':'),
+                ..
+            })) = &ev
+            {
+                let layout_ok = !remote
+                    && std::path::Path::new(&tensor.source_path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
+                let entries = available_detail_commands(overridable, layout_ok);
+                let chosen = self.run_palette(term, entries, HelpCtx::Detail, |s, f| {
+                    s.render_detail_frame(
+                        f,
+                        tensor,
+                        &shape,
+                        view,
+                        overridable,
+                        unindexed,
+                        stats_view,
+                        hist.as_ref(),
+                        None,
+                        None,
+                    );
+                });
+                match chosen {
+                    Some(cmd) => ev = Ok(Event::Key(detail_cmd_key(cmd))),
+                    None => continue,
+                }
             }
             // Metadata-only (remote): the data keys can't run without local bytes, so
             // float a notice over the detail explaining why instead of attempting a
@@ -4608,6 +6282,15 @@ impl Explorer {
                         repr: Representation::Values,
                         slice: start_slice,
                     });
+                }
+                // Tab jumps to this tensor's place in its shard's byte-layout map
+                // (local safetensors only; a no-op otherwise).
+                Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Tab, ..
+                })) => {
+                    if let Some(screen) = self.tensor_layout_screen(tensor) {
+                        return Nav::Open(screen);
+                    }
                 }
                 // Compute the whole-tensor value histogram, animating the bars
                 // filling in below the statistics.
@@ -5322,6 +7005,23 @@ impl Explorer {
                             // History navigation: Backspace back, `\` forward.
                             KeyCode::Backspace => return (Nav::Back, repr, slice),
                             KeyCode::Char('\\') => return (Nav::Forward, repr, slice),
+                            // Space or `:` opens the command palette; the chosen
+                            // command is dispatched as its shortcut key (re-fed
+                            // through this match).
+                            KeyCode::Char(' ') | KeyCode::Char(':') => {
+                                let entries = available_data_commands(overridable);
+                                let chosen =
+                                    self.run_palette(term, entries, HelpCtx::Data, |s, f| {
+                                        let _ = s.render_data_frame(
+                                            f, tensor, repr, slice, view, mode, stats_view, stripe,
+                                            base, None,
+                                        );
+                                    });
+                                if let Some(cmd) = chosen {
+                                    pending = Ok(Event::Key(data_cmd_key(cmd)));
+                                    continue;
+                                }
+                            }
                             // Any other key goes back to the detail screen.
                             _ => {
                                 return (
@@ -6845,6 +8545,15 @@ impl Explorer {
         parts.join(" ")
     }
 
+    /// The command that reopens the file browser (`--files`): the launch path(s)
+    /// plus the flag — so the file view's `y` round-trips like every other view.
+    fn command_for_files(&self) -> String {
+        let mut parts = self.command_prefix();
+        parts.extend(self.checkpoint_path_parts());
+        parts.push("--files".to_string());
+        parts.join(" ")
+    }
+
     /// `--tree-state` args reproducing the current bulk expansion (`expanded` /
     /// `collapsed`), or nothing for the default / a mixed (per-group) state. The
     /// shared tail for the tree's reopen commands so `E` / `C` round-trip.
@@ -7028,6 +8737,119 @@ enum DtypePreview {
 }
 
 /// The directory shared by all `paths`, or `None` if they don't all share one.
+/// The directory the file browser lists for a checkpoint launched as `files`:
+/// the common parent of its shards (a directory checkpoint / sharded model), or
+/// a single file's parent. Falls back to `.` when there's nothing to anchor to
+/// (e.g. an empty list or a bare relative filename with no parent).
+fn browse_root_of(files: &[PathBuf]) -> PathBuf {
+    match files {
+        [] => PathBuf::from("."),
+        [one] => one
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+        many => {
+            let set: BTreeSet<String> = many
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            common_dir(&set)
+                .map(PathBuf::from)
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| PathBuf::from("."))
+        }
+    }
+}
+
+/// The `↑↓ … scroll · Esc / click to close` footer shared by the file view's
+/// pop-ups (sidecar preview, legend, info).
+fn files_dismiss_footer() -> Line<'static> {
+    Line::from(crate::ui::dim_span(
+        "↑↓ PgUp/PgDn scroll · Esc / click to close",
+    ))
+}
+
+/// Read up to `cap` bytes of `path` as UTF-8, returning `(text, truncated)`.
+/// A non-UTF-8 file yields an error message the caller shows in an info pop-up.
+fn read_text_capped(path: &Path, cap: u64) -> Result<(String, bool), String> {
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let f = File::open(path).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    f.take(cap)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    let text =
+        String::from_utf8(buf).map_err(|_| "Binary (non-UTF-8) file — no preview.".to_string())?;
+    Ok((text, len > cap))
+}
+
+/// The layout map's legend (glyphs + a one-paragraph explainer of the safetensors
+/// on-disk format), floated over the strip by `l`.
+fn layout_legend_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(crate::ui::dim_span(
+            "How a .safetensors file is laid out on disk:",
+        )),
+        Line::default(),
+        Line::from(Span::raw(
+            "█ header    8-byte length + JSON metadata (dtype, shape, offsets)".to_string(),
+        )),
+        Line::from(Span::raw(
+            "█ ▓ ▒ ░     one band per tensor, in file-offset order".to_string(),
+        )),
+        Line::from(crate::ui::dim_span(
+            "            the fuller the block, the larger the tensor",
+        )),
+        Line::from(Span::raw(
+            "░ padding   an unaccounted gap (alignment)".to_string(),
+        )),
+        Line::default(),
+        Line::from(crate::ui::dim_span(
+            "Each band's height ∝ its share of the file; offsets are absolute bytes.",
+        )),
+    ]
+}
+
+/// The layout map as plain text (offset, size, dtype/shape, name per segment) —
+/// what `c` copies from the layout view.
+fn layout_to_text(map: &crate::safelayout::LayoutMap) -> String {
+    use crate::utils::{format_shape, format_size};
+    let mut out = format!(
+        "{}\n{} · {} tensors · header {}\n\n",
+        map.name,
+        format_size(map.total_len as usize),
+        map.tensor_count,
+        format_size(map.header_len as usize),
+    );
+    for s in &map.segments {
+        let detail = match &s.dtype {
+            Some(dt) => format!("  {dt} {}", format_shape(&s.shape)),
+            None => String::new(),
+        };
+        out.push_str(&format!(
+            "{:#014x}  {:>10}  {}{}\n",
+            s.start,
+            format_size(s.len() as usize),
+            s.name,
+            detail
+        ));
+    }
+    out
+}
+
+/// Build a sidecar preview's lines: JSON syntax-highlighted (falling back to
+/// plain text when it doesn't parse), any other text plain.
+fn preview_lines(text: &str, kind: crate::filetree::FileKind) -> Vec<Line<'static>> {
+    if kind == crate::filetree::FileKind::Json
+        && let Some(lines) = crate::ui::highlight_json_lines(text)
+    {
+        return lines;
+    }
+    text.lines()
+        .map(|l| Line::from(Span::raw(l.to_string())))
+        .collect()
+}
+
 fn common_dir(paths: &BTreeSet<String>) -> Option<String> {
     let mut dirs = paths.iter().map(|p| {
         Path::new(p)
@@ -7342,6 +9164,112 @@ fn copy_to_clipboard(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browse_root_is_the_checkpoints_directory() {
+        // A single file browses its parent directory.
+        assert_eq!(
+            browse_root_of(&[PathBuf::from("/models/m/model.safetensors")]),
+            PathBuf::from("/models/m")
+        );
+        // Sharded files in one directory browse that common directory.
+        assert_eq!(
+            browse_root_of(&[
+                PathBuf::from("/models/m/model-00001.safetensors"),
+                PathBuf::from("/models/m/model-00002.safetensors"),
+            ]),
+            PathBuf::from("/models/m")
+        );
+        // A bare filename with no parent falls back to the current directory.
+        assert_eq!(
+            browse_root_of(&[PathBuf::from("model.safetensors")]),
+            PathBuf::from(".")
+        );
+        assert_eq!(browse_root_of(&[]), PathBuf::from("."));
+    }
+
+    #[test]
+    fn layout_command_encodes_relative_path_and_selection() {
+        // Launched with a shard file: the layout path is emitted relative to the
+        // checkpoint directory (no duplication), and the selected tensor is
+        // recorded so the precise view round-trips.
+        let e = Explorer::new(
+            vec![PathBuf::from("/ckpt/model-00016.safetensors")],
+            Vec::new(),
+            None,
+            false,
+        );
+        let plain = e.command_for_layout("/ckpt/model-00016.safetensors", None);
+        assert!(
+            plain.contains("--layout model-00016.safetensors"),
+            "relative path:\n{plain}"
+        );
+        assert!(!plain.contains("--layout-select"), "no selection:\n{plain}");
+
+        let with_sel = e.command_for_layout(
+            "/ckpt/model-00016.safetensors",
+            Some("model.embed_tokens.weight"),
+        );
+        assert!(
+            with_sel.contains("--layout-select model.embed_tokens.weight"),
+            "selection encoded:\n{with_sel}"
+        );
+    }
+
+    #[test]
+    fn file_command_registry_maps_keys() {
+        // The file view's Tab (`\t`) toggles back to the tensor tree; other keys
+        // map through the file registry, and the tree registry now offers Files.
+        assert_eq!(file_command_for_key('l'), Some(FileCmd::Legend));
+        assert_eq!(file_command_for_key('f'), Some(FileCmd::CopyPath));
+        assert_eq!(file_command_for_key('q'), Some(FileCmd::Quit));
+        assert_eq!(file_command_for_key('z'), None); // unbound
+        assert_eq!(tree_command_for_key('\t'), Some(Cmd::ViewFiles));
+        assert_eq!(key_label('\t'), "Tab");
+        assert_eq!(key_label('q'), "q");
+    }
+
+    #[test]
+    fn layout_and_detail_palettes_map_keys() {
+        // Layout palette.
+        assert_eq!(layout_command_for_key('l'), Some(LayoutCmd::Legend));
+        assert_eq!(layout_command_for_key('y'), Some(LayoutCmd::CopyCommand));
+        assert_eq!(layout_command_for_key('q'), Some(LayoutCmd::Quit));
+        assert_eq!(layout_command_for_key('\t'), Some(LayoutCmd::TensorTree));
+        assert_eq!(layout_command_for_key('z'), None);
+
+        // Detail palette: each command's synthesized key round-trips, and the file
+        // layout maps to Tab.
+        assert_eq!(detail_cmd_key(DetailCmd::Heatmap).code, KeyCode::Char('m'));
+        assert_eq!(detail_cmd_key(DetailCmd::FileLayout).code, KeyCode::Tab);
+
+        // dtype/reshape only when overridable; file layout only when local .st.
+        let full = available_detail_commands(true, true);
+        assert!(full.iter().any(|(c, ..)| *c == DetailCmd::Dtype));
+        assert!(full.iter().any(|(c, ..)| *c == DetailCmd::FileLayout));
+        let bare = available_detail_commands(false, false);
+        assert!(!bare.iter().any(|(c, ..)| *c == DetailCmd::Dtype));
+        assert!(!bare.iter().any(|(c, ..)| *c == DetailCmd::Reshape));
+        assert!(!bare.iter().any(|(c, ..)| *c == DetailCmd::FileLayout));
+        // The data views / copies are always offered.
+        assert!(bare.iter().any(|(c, ..)| *c == DetailCmd::Heatmap));
+        assert!(bare.iter().any(|(c, ..)| *c == DetailCmd::CopyCommand));
+
+        // Data view palette: keys synthesize back to their shortcut, and
+        // dtype/reshape gate on overridable.
+        assert_eq!(data_cmd_key(DataCmd::Values).code, KeyCode::Char('v'));
+        assert_eq!(data_cmd_key(DataCmd::Base).code, KeyCode::Char('b'));
+        assert!(
+            available_data_commands(true)
+                .iter()
+                .any(|(c, ..)| *c == DataCmd::Reshape)
+        );
+        assert!(
+            !available_data_commands(false)
+                .iter()
+                .any(|(c, ..)| *c == DataCmd::Dtype)
+        );
+    }
 
     #[test]
     fn command_registry_maps_keys_and_filters_unavailable() {

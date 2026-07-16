@@ -15,8 +15,8 @@ slice 0 of 3 (fixed leading index) — [ ] step · / index or %
      3  7966  8480  8994  9508 10022
 
 m heatmap · ← → first/last cols · ↑ ↓ first/last rows · +Shift one end · [ ] slice · / index or % · d dtype · r reshape
-· e window · z zebra: rows · b base: dec · c copy · y copy cmd · l legend · ⌫ back · \ fwd · any other key to return...
-
+· e window · z zebra: rows · b base: dec · c copy · y copy cmd · l legend · Space commands · ⌫ back · \ fwd · any other
+key to return...
 
 
 

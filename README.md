@@ -238,6 +238,8 @@ without `--tensor` is reported as ambiguous.
 | `--health-findings` | Like `--health`, but with the per-finding detail expanded (the popup's `f` toggle) |
 | `--stats` | Open straight into the checkpoint-stats popup on the tree (the `s` key) |
 | `--stats-shards` | Like `--stats`, but with the on-disk per-shard breakdown expanded (the popup's `f` toggle) |
+| `--files` | Open straight into the [file browser](#file-browser-tab) — the checkpoint's directory tree (the `Tab` toggle) |
+| `--layout <PATH>` | Open straight into the [safetensors layout map](#safetensors-layout-map) for `PATH` (`Enter` on a `.safetensors` in the file browser) |
 | `--dtype <DTYPE>` | Reinterpret the dtype: `u4`, `i4`, `unpacked` (fused-codebook unmerge; needs a packing schema), or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
 | `--shape <DIMS>` | Reinterpret the shape (same element count): `10,100` / `10x100`; one dim may be `-1`/`*`/`_` to infer |
 | `--edge[=RFRAC,CFRAC]` (alias `--edges`) / `--overview` / `--window[=ROW,COL]` | Force the edges submode (optional head/tail split fractions `0..1`) / the overview / the contiguous window (optional top-left `ROW,COL`) |
@@ -302,7 +304,8 @@ what it does (handy while you're still learning the keys).
 | `→` | Enter the group (expand if needed) and select its first child |
 | `Shift`+`↑` / `Shift`+`↓` | Jump to the previous / next sibling |
 | `Enter` | Expand/collapse the group, or open the tensor's details |
-| `Space` / `:` | Open the **command palette** — fuzzy-search and run any command (VS Code style, grouped `Copy: File path`, `View: Stats`, …) |
+| `Tab` | Toggle the **[file browser](#file-browser-tab)** — the checkpoint's directory tree; `Tab` again (or `Backspace`) returns to the tensor tree |
+| `Space` / `:` | Open the **command palette** — fuzzy-search and run any command (VS Code style, grouped `Copy: File path`, `View: File browser`, …) |
 | `E` / `C` | Expand all / collapse all groups |
 | `/` | Enter search mode to filter tensors |
 | `l` | Show a legend explaining the symbols on the current screen (works on every screen) |
@@ -359,6 +362,64 @@ Press `/` to enter search mode and start typing to filter tensors by name. The s
 - Sorts by **relevance** - best matches appear first
 
 Press `Enter` to open the highlighted result's details (you stay in search), and `Esc` or `q` to exit search mode and return to the full tree view.
+
+### File browser (`Tab`)
+
+Press `Tab` to swap the tensor tree for a **file browser** of the checkpoint's
+directory — the shards alongside their sidecars (`config.json`, tokenizer files,
+`README`, …), each with its size, directories folding with `←` / `→`. `Tab`
+again (or `Backspace`) returns to the tensor tree; launch straight into it with
+`--files`, or run `View: File browser` from the command palette.
+
+`Enter` acts on the selected entry:
+
+- a **`.safetensors`** file opens its **[layout map](#safetensors-layout-map)** —
+  a picture of how its tensors are stored inside the file (see below).
+- another **checkpoint file** (`.gguf`, `.npy`, `.npz`, `.h5`) opens its tensor
+  tree — the one you're exploring drops straight back to it; a *different*
+  checkpoint shows the command to open it in its own view.
+- a **JSON** sidecar opens a scrollable, syntax-highlighted preview; other
+  **text** files (`.txt`, `.md`, `.py`, `README`, …) preview as plain scrollable
+  text.
+- anything else shows a short info pop-up (no preview).
+
+The file view has the same command palette (`Space` / `:`), `l` legend, `c` /
+`f` / `y` copies, and `y` round-trips through `--files`, like the tree.
+
+The file browser and layout map read the checkpoint's directory and files
+locally, so they're unavailable for a remote (`--ssh-read`) checkpoint.
+
+### safetensors layout map
+
+Pressing `Enter` on a `.safetensors` file (or launching with `--layout PATH`, or
+`Tab` from a tensor's detail screen) opens a **layout map** — a scrollable,
+top-to-bottom picture of the file's byte layout, so you can *see* how a
+safetensors file is built:
+
+```
+Layout - model-00001.safetensors
+2.3 GiB · 291 tensors · header 42.0 KiB · 3 metadata
+────────────────────────────────────────────────────────────
+0x00000000000a ┬ █  header (8 B length + JSON metadata)  42.0 KiB
+               │ █  † format  pt
+               │ ▓  model.embed_tokens.weight  BF16 (152064, 4096)  512.0 MiB
+               │ ▒  model.layers.0.self_attn.q_proj.weight  BF16 (4096, 4096)  36.0 MiB
+0x00002000a00a │ ░  model.layers.0.self_attn.k_proj.weight  BF16 (1024, 4096)  9.0 MiB
+               ...
+```
+
+The file is `8` bytes of little-endian header length, then that many bytes of
+JSON metadata (each tensor's dtype, shape and byte offsets), then the tensor
+data laid out back-to-back. The map shows one band per region in file order —
+the header first, then every tensor by offset — each band's **height
+proportional to its share of the file** and its block shaded by size, with the
+absolute byte offset on the left. The header band lists the file's
+`__metadata__` entries tree-like. Move the selection with `↑↓` / `PgUp`/`PgDn`
+(or click a band); `Enter` on the header previews the raw JSON (with its 8-byte
+length; `c` copies it), or on a tensor jumps to its place in the tree; `l`
+explains the glyphs; `y` copies the reopen command including the selected tensor
+(`--layout … --layout-select <name>`); `Backspace` (or `Tab`) returns to the
+browser (and back again lands on the same segment).
 
 ### Tensor data preview
 
