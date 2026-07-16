@@ -183,11 +183,15 @@ fn settings() -> insta::Settings {
     s.add_filter(r#"[^\s"]*tiny\.(?:safetensors|hdf5)"#, "[FIXTURE]");
     // The statistics / histogram scan duration (e.g. `(2ms)`, `(1.0s)`) is timing.
     s.add_filter(r"\(\d+(?:\.\d+)?m?s\)", "(<time>)");
-    // The read-only badge is right-aligned, so when the status line to its left
-    // carries the (now `[FIXTURE]`-normalized) checkpoint path, the run of spaces
-    // between them reflects that path's *real* length — which varies with the
-    // checkout location (local vs CI). Collapse it so the snapshot is stable.
-    s.add_filter(r"(?m)\[FIXTURE\] {2,}read-only$", "[FIXTURE]  read-only");
+    // The access badge (`read-only` / `editable`) is right-aligned, so when the
+    // status line to its left carries the (now `[FIXTURE]`-normalized) checkpoint
+    // path, the run of spaces between them reflects that path's *real* length —
+    // which varies with the checkout location (local vs CI). Collapse it so the
+    // snapshot is stable.
+    s.add_filter(
+        r"(?m)\[FIXTURE\] {2,}(read-only|editable)$",
+        "[FIXTURE]  $1",
+    );
     s
 }
 

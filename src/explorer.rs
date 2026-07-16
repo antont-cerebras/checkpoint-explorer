@@ -278,6 +278,12 @@ pub struct OpenRequest {
     /// Preselect this tensor in the layout map (`--layout-select NAME`), so the
     /// layout view's `y` round-trips the selection.
     pub layout_select: Option<String>,
+    /// Open straight into the in-place rename editor (`--rename`, the `R` key).
+    /// Round-trips through `y`; only honoured for a local safetensors checkpoint.
+    pub rename: bool,
+    /// Seed the rename editor's rule pairs (`--rename-rule 'SRC=>TGT'`, repeatable),
+    /// each a schema `source => new-name`. What the editor's `y` records.
+    pub rename_rules: Vec<String>,
 }
 
 /// Which representation a tensor data view renders.
@@ -533,6 +539,14 @@ enum Screen {
         repr: Representation,
         slice: usize,
     },
+    /// The in-place **rename** editor: a full-screen mode (opened with `R`) with a
+    /// dynamic list of source→new-name rule pairs, live autocomplete, and a
+    /// before→after diff preview. Carries its `(source, new-name)` pairs so that
+    /// stepping away (e.g. clicking a shard to inspect its layout) and back restores
+    /// what was typed.
+    Rename {
+        pairs: Vec<(String, String)>,
+    },
 }
 
 /// Which live frame stays behind a [`Explorer::float_scroll_popup`] box — the
@@ -576,6 +590,7 @@ enum Cmd {
     CopyName,
     CopyCommand,
     Repack,
+    Rename,
     Quit,
 }
 
@@ -621,6 +636,25 @@ enum DetailCmd {
     CopyCommand,
 }
 
+/// A command the in-place **rename editor**'s palette lists and runs. The editor
+/// has mutable state (the rule pairs) and can leave the view, so it dispatches like
+/// the tree/files/layout palettes (Style 1), not by synthesizing a key. Bare
+/// letters can't be accelerators here — they're typed into the name fields — so the
+/// palette is the primary way to reach copy / legend; the edit / apply commands
+/// keep their Ctrl / Enter accelerators. See [`RENAME_COMMANDS`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RenameCmd {
+    Apply,
+    AddRule,
+    RemoveRule,
+    CopyScreen,
+    CopyReopenCmd,
+    CopyApplyCmd,
+    Legend,
+    Back,
+    Quit,
+}
+
 /// A command the **data view** (heatmap / numeric grid) palette lists. Like
 /// [`DetailCmd`], each maps to the key that already runs it. See [`DATA_COMMANDS`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -655,7 +689,8 @@ const TREE_COMMANDS: &[(Cmd, &str, &str, char)] = &[
     (Cmd::CopyPath, "Copy", "File path", 'f'),
     (Cmd::CopyName, "Copy", "Tensor name", 'n'),
     (Cmd::CopyCommand, "Copy", "Command to reopen this view", 'y'),
-    (Cmd::Repack, "File", "Repack HDF5 into a new codec…", 'R'),
+    (Cmd::Repack, "File", "Repack HDF5 into a new codec…", 'r'),
+    (Cmd::Rename, "File", "Rename tensors in place…", 'R'),
     (Cmd::Quit, "App", "Quit", 'q'),
 ];
 
@@ -741,6 +776,38 @@ const DATA_COMMANDS: &[(DataCmd, &str, &str, char)] = &[
     ),
 ];
 
+/// The rename editor's command registry (palette order). The `char` is a *sentinel*
+/// (not a bare accelerator): control chars name the real trigger (`\r` = Enter,
+/// `^N`/`^D`/`^Y`, Esc, `^C`) and `\u{1}`/`\u{2}`/`\u{5}` are the palette-only copy /
+/// legend commands (no key label). [`key_label`] renders them; [`crate::ui::shortcut_help`]
+/// (the `Rename` arms) supplies each one's one-line help, keyed by the same char.
+const RENAME_COMMANDS: &[(RenameCmd, &str, &str, char)] = &[
+    (RenameCmd::Apply, "Rename", "Apply the rename", '\r'),
+    (RenameCmd::AddRule, "Rename", "Add a rule", '\u{e}'),
+    (
+        RenameCmd::RemoveRule,
+        "Rename",
+        "Remove the focused rule",
+        '\u{4}',
+    ),
+    (RenameCmd::CopyScreen, "Copy", "Screen text", '\u{1}'),
+    (
+        RenameCmd::CopyReopenCmd,
+        "Copy",
+        "Command to reopen this view",
+        '\u{2}',
+    ),
+    (
+        RenameCmd::CopyApplyCmd,
+        "Copy",
+        "Command to apply this rename",
+        '\u{19}',
+    ),
+    (RenameCmd::Legend, "View", "Legend", '\u{5}'),
+    (RenameCmd::Back, "App", "Back", '\u{1b}'),
+    (RenameCmd::Quit, "App", "Quit", '\u{3}'),
+];
+
 /// A resolved palette entry for a command of type `T`: `(command, group, title,
 /// key)`. Generic so every view's palette shares the picker
 /// ([`Explorer::run_palette`]).
@@ -750,12 +817,25 @@ type FileCmdEntry = PaletteRow<FileCmd>;
 type LayoutCmdEntry = PaletteRow<LayoutCmd>;
 type DetailCmdEntry = PaletteRow<DetailCmd>;
 type DataCmdEntry = PaletteRow<DataCmd>;
+type RenameCmdEntry = PaletteRow<RenameCmd>;
 
 /// The display label for a palette/footer key: `Tab` for the `\t` sentinel
 /// ([`Cmd::ViewFiles`] / [`FileCmd::TensorTree`]), else the character itself.
+/// The rename palette ([`RENAME_COMMANDS`]) uses control-char sentinels for the
+/// commands whose real trigger is a Ctrl combo / Enter / Esc (bare letters can't
+/// be accelerators there — they're typed into the name fields), and blank-label
+/// sentinels for its palette-only commands.
 fn key_label(c: char) -> String {
     match c {
         '\t' => "Tab".to_string(),
+        '\r' => "Enter".to_string(),
+        '\u{e}' => "^N".to_string(),
+        '\u{4}' => "^D".to_string(),
+        '\u{19}' => "^Y".to_string(),
+        '\u{1b}' => "Esc".to_string(),
+        '\u{3}' => "^C".to_string(),
+        // Palette-only rename commands: no bare-key accelerator, so no key label.
+        '\u{1}' | '\u{2}' | '\u{5}' => String::new(),
         _ => c.to_string(),
     }
 }
@@ -785,6 +865,79 @@ fn layout_command_for_key(c: char) -> Option<LayoutCmd> {
         .iter()
         .find(|(_, _, _, key)| *key == c)
         .map(|(cmd, _, _, _)| *cmd)
+}
+
+/// The rename-editor commands available now: Apply only when the staged rename is
+/// clean, the copy-apply command only when there's a complete rule (a `convert
+/// --map` command exists), and Remove only when there's more than one rule.
+fn available_rename_commands(
+    applicable: bool,
+    has_apply_cmd: bool,
+    npairs: usize,
+) -> Vec<RenameCmdEntry> {
+    RENAME_COMMANDS
+        .iter()
+        .copied()
+        .filter(|(cmd, _, _, _)| match cmd {
+            RenameCmd::Apply => applicable,
+            RenameCmd::CopyApplyCmd => has_apply_cmd,
+            RenameCmd::RemoveRule => npairs > 1,
+            _ => true,
+        })
+        .collect()
+}
+
+/// Build the rename editor's [`crate::ui::RenameView`] from the current staged
+/// state and render it, returning the preview's max scroll, the footer chip regions
+/// (clickable), and the link regions (shard → layout, concrete source → tree).
+/// Shared by the live draw, the palette / legend backdrops, and the `c` copy-screen
+/// (headless) so they can't drift.
+#[allow(clippy::too_many_arguments)]
+fn draw_rename_frame(
+    f: &mut ratatui::Frame,
+    root: &str,
+    mode: &RenameMode,
+    schemas: &[String],
+    rules_view: &[crate::ui::RenameRuleView],
+    total: usize,
+    warnings: &[String],
+    has_index: bool,
+    applicable: bool,
+    synth_err: &Option<String>,
+    cli: Option<&str>,
+    copied: Option<&str>,
+) -> (usize, crate::ui::ChipRegions, crate::ui::LinkRegions) {
+    let sugg = if mode.show_sugg {
+        mode.suggestions(schemas)
+    } else {
+        Vec::new()
+    };
+    let display_error = synth_err.clone().or_else(|| mode.error.clone());
+    let pairs_disp: Vec<(String, String)> = mode
+        .pairs
+        .iter()
+        .map(|p| (p.source.clone(), p.target.clone()))
+        .collect();
+    let view = crate::ui::RenameView {
+        root,
+        pairs: &pairs_disp,
+        focus_pair: mode.focus_pair,
+        on_target: mode.on_target,
+        cursor: mode.cursor,
+        show_suggestions: mode.show_sugg,
+        suggestions: &sugg,
+        rules: rules_view,
+        total,
+        warnings,
+        has_index,
+        applicable,
+        scroll: mode.scroll,
+        error: display_error.as_deref(),
+        confirming: mode.confirming,
+        cli,
+        copied,
+    };
+    UI::render_rename(f, &view)
 }
 
 /// The detail-view commands available now: dtype / reshape only when the tensor's
@@ -877,6 +1030,11 @@ pub struct Explorer {
     /// synthesizes. Rebuilt every frame by the `render_*` functions; read by the
     /// loops' mouse handlers to turn a click into the equivalent keypress.
     clickable: RefCell<Vec<(ratatui::layout::Rect, KeyEvent)>>,
+    /// Clickable **links** for the frame on screen: a safetensors filename or a
+    /// concrete tensor name paired with where it jumps (a layout view / the tree).
+    /// The app-wide counterpart to `clickable` — rebuilt each frame by the screens
+    /// that show such names; a click routes through [`Self::open_link`].
+    links: RefCell<Vec<(ratatui::layout::Rect, crate::ui::Link)>>,
     /// Index/file mismatches, shown as a warning panel. Populated in
     /// [`Self::finalize_load`] from [`Self::index_specs`] once the tensors are
     /// read (plus any remote index health folded in by the loader).
@@ -955,19 +1113,14 @@ pub struct Explorer {
     /// `model.safetensors.index.json` (derived from the health reports); their
     /// tensors are flagged in the tree and detail screens.
     unindexed: HashSet<String>,
-    /// Whether the mouse is currently hovering the read-only badge, which floats
-    /// its hint pop-up. Toggled by the browsing loops on mouse-move.
-    readonly_hover: Cell<bool>,
+    /// Which bottom-right status badge the mouse is over (index into the current
+    /// screen's [`Self::screen_badges`]), which floats that badge's hover bubble.
+    /// Set on mouse-move, `None` when over none. One field for all badges.
+    hovered_badge: Cell<Option<usize>>,
     /// The footer shortcut chip the mouse is hovering (its on-screen rect + help
     /// text), which floats a help bubble beside it. Set on mouse-move, cleared on
     /// any other event so it never lingers onto the next screen.
     hovered_shortcut: Cell<Option<(ratatui::layout::Rect, &'static str)>>,
-    /// Whether the mouse is hovering the `⚠ index` health badge, floating its
-    /// help bubble. Toggled by the tree loop on mouse-move.
-    health_hover: Cell<bool>,
-    /// Whether the mouse is hovering the `metadata-only` badge (remote only),
-    /// floating its help bubble. Toggled by the tree loop on mouse-move.
-    metadata_hover: Cell<bool>,
     /// Derived reports cached for the session — the loaded checkpoint is
     /// immutable, so the health-check report (`h`) and the stats (`s`) are each
     /// an O(tensors) pass computed once and reused, rather than recomputed every
@@ -1028,6 +1181,7 @@ impl Explorer {
             copied_flash: None,
             terminal: None,
             clickable: RefCell::new(Vec::new()),
+            links: RefCell::new(Vec::new()),
             health_reports: Vec::new(),
             index_specs,
             dtype_overrides: RefCell::new(HashMap::new()),
@@ -1053,10 +1207,8 @@ impl Explorer {
             sample_cache: RefCell::new(None),
             preload,
             unindexed: HashSet::new(),
-            readonly_hover: Cell::new(false),
+            hovered_badge: Cell::new(None),
             hovered_shortcut: Cell::new(None),
-            health_hover: Cell::new(false),
-            metadata_hover: Cell::new(false),
             cached_check: RefCell::new(None),
             checkpoint_stats_cache: RefCell::new(None),
             cached_group_files: RefCell::new(None),
@@ -1077,24 +1229,32 @@ impl Explorer {
         self.hovered_shortcut.set(hovered);
     }
 
+    /// The bottom-right status badges for screen `ctx`, in right-to-left order — the
+    /// single source of truth both the renderer and the hover / click hit-test use.
+    /// The access badge shows on every browsing screen; the health and
+    /// metadata-only badges only on the tree.
+    fn screen_badges(&self, ctx: HelpCtx) -> Vec<crate::ui::Badge> {
+        let (health, metadata_only) = if ctx == HelpCtx::Tree {
+            (self.health_alert(), self.remote_read.is_some())
+        } else {
+            (None, false)
+        };
+        match ctx {
+            // The layout map draws no status bar.
+            HelpCtx::Layout => Vec::new(),
+            _ => crate::ui::status_badges(self.access_badge(), health, metadata_only),
+        }
+    }
+
     /// Refresh every hover-bubble state from the mouse position `(col, row)` on a
-    /// frame of `width`×`height`: the read-only badge, the health badge (tree
-    /// only), and the footer shortcut chip under the cursor. Called on every
-    /// mouse-move — by the browsing loops *and* the pop-up loops, so the bubbles
-    /// stay live (rather than freezing) while a pop-up floats over the tree.
+    /// frame of `width`×`height`: the status badge under the cursor and the footer
+    /// shortcut chip. Called on every mouse-move — by the browsing loops *and* the
+    /// pop-up loops, so the bubbles stay live (rather than freezing) while a pop-up
+    /// floats over the tree.
     fn update_hovers(&self, ctx: HelpCtx, width: u16, height: u16, col: u16, row: u16) {
-        self.readonly_hover
-            .set(UI::readonly_badge_hit(width, height, col, row));
-        self.health_hover.set(
-            ctx == HelpCtx::Tree
-                && !self.health_reports.is_empty()
-                && UI::health_badge_hit(width, height, col, row),
-        );
-        self.metadata_hover.set(
-            ctx == HelpCtx::Tree
-                && self.remote_read.is_some()
-                && UI::metadata_badge_hit(width, height, !self.health_reports.is_empty(), col, row),
-        );
+        let badges = self.screen_badges(ctx);
+        self.hovered_badge
+            .set(UI::badge_bar_hit(width, height, col, row, &badges));
         self.update_shortcut_hover(ctx, col, row);
     }
 
@@ -1982,6 +2142,59 @@ impl Explorer {
         self.flatten_tree();
     }
 
+    /// Dispatch a [`Link`](crate::ui::Link): open a safetensors file's layout view,
+    /// or reveal a concrete tensor in the tree. `None` when a `Tree` link names a
+    /// tensor that isn't in this checkpoint (a stray click).
+    fn open_link(&mut self, link: &crate::ui::Link) -> Option<Nav> {
+        match link {
+            crate::ui::Link::Layout(path) => Some(Nav::Open(Screen::Layout {
+                path: path.clone(),
+                selected: 0,
+                scroll: 0,
+            })),
+            crate::ui::Link::Tree(name) => {
+                if self.tensors.iter().any(|t| &t.name == name) {
+                    self.reveal_tensor(name);
+                    Some(Nav::Open(Screen::Tree))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Hit-test the current frame's [`Self::links`] at `(col, row)` and, on a hit,
+    /// follow that link. The shared click path for every screen's clickable names.
+    fn link_click(&mut self, col: u16, row: u16) -> Option<Nav> {
+        let link = self.link_at(col, row)?;
+        self.open_link(&link)
+    }
+
+    /// The link (if any) whose region covers `(col, row)` in the current frame.
+    fn link_at(&self, col: u16, row: u16) -> Option<crate::ui::Link> {
+        self.links
+            .borrow()
+            .iter()
+            .find(|(r, _)| row == r.y && col >= r.x && col < r.x + r.width)
+            .map(|(_, l)| l.clone())
+    }
+
+    /// Resolve a link click that needs no mutation — a [`Link::Layout`](crate::ui::Link)
+    /// → open that file's layout map. For the detail view, whose loop borrows `self`
+    /// immutably (so it can't call [`Self::link_click`]) and whose only link is the
+    /// `File:` path. A `Link::Tree` (which reveals a tensor, needing `&mut self`)
+    /// can't originate there, so it's ignored.
+    fn layout_link_at(&self, col: u16, row: u16) -> Option<Nav> {
+        match self.link_at(col, row)? {
+            crate::ui::Link::Layout(path) => Some(Nav::Open(Screen::Layout {
+                path,
+                selected: 0,
+                scroll: 0,
+            })),
+            crate::ui::Link::Tree(_) => None,
+        }
+    }
+
     /// Move the tree cursor onto the leaf named `name` — a tensor or a metadata
     /// entry — expanding any collapsed groups so it's visible. Used when
     /// returning to the tree from a detail/data view, and when the app was
@@ -2268,7 +2481,26 @@ impl Explorer {
                 };
                 self.command_for_data(&t, *repr, *slice)
             }
+            Screen::Rename { pairs } => self.command_for_rename(pairs),
         }
+    }
+
+    /// The `--rename [--rename-rule 'SRC=>TGT']…` command that reopens the in-place
+    /// rename editor with the current rule pairs pre-seeded (what `y` copies). Each
+    /// complete pair round-trips as a schema `source => new-name`, so restoring is
+    /// lossless (no regex reversal). Mirrors [`Self::command_for_files`].
+    fn command_for_rename(&self, pairs: &[(String, String)]) -> String {
+        let mut parts = self.command_prefix();
+        parts.extend(self.checkpoint_path_parts());
+        parts.push("--rename".to_string());
+        for (src, tgt) in pairs {
+            if src.is_empty() || tgt.is_empty() {
+                continue;
+            }
+            parts.push("--rename-rule".to_string());
+            parts.push(shell_quote(&format!("{src}=>{tgt}")));
+        }
+        parts.join(" ")
     }
 
     /// Render a tensor's detail screen to plain text for [`Self::render_plain`],
@@ -2477,6 +2709,14 @@ impl Explorer {
         // a tensor (`--layout-select NAME`).
         let want_layout = self.open.as_ref().and_then(|r| r.layout_file.clone());
         let want_layout_select = self.open.as_ref().and_then(|r| r.layout_select.clone());
+        // `--rename` lands in the in-place rename editor, seeded with any
+        // `--rename-rule 'SRC=>TGT'` pairs. Local safetensors only.
+        let want_rename = self.open.as_ref().is_some_and(|r| r.rename);
+        let want_rename_rules = self
+            .open
+            .as_ref()
+            .map(|r| r.rename_rules.clone())
+            .unwrap_or_default();
 
         // A `--tensor` request seeds the history with that screen — or, with
         // `--exit`, renders it once and quits without entering the navigator.
@@ -2570,18 +2810,41 @@ impl Explorer {
             });
             cursor = history.len() - 1;
         }
+        // `--rename` (+ `--rename-rule 'SRC=>TGT'`): open the in-place rename editor
+        // seeded with those schema pairs. Skip silently for a checkpoint that can't
+        // be renamed in place (remote / non-safetensors) — same guard as the `R` key.
+        if want_rename && self.rename_target().is_some() {
+            let pairs: Vec<(String, String)> = want_rename_rules
+                .iter()
+                .filter_map(|rule| {
+                    rule.split_once("=>")
+                        .map(|(src, tgt)| (src.trim().to_string(), tgt.trim().to_string()))
+                })
+                .collect();
+            history.push(Screen::Rename { pairs });
+            cursor = history.len() - 1;
+        }
 
         loop {
             // The tensor the screen we're about to run belongs to (if any), so
             // that on returning to the tree we can land back on it.
             let screen_tensor = match &history[cursor] {
                 Screen::Detail { tensor, .. } | Screen::Data { tensor, .. } => Some(tensor.clone()),
-                Screen::Tree | Screen::Files | Screen::Layout { .. } => None,
+                Screen::Tree | Screen::Files | Screen::Layout { .. } | Screen::Rename { .. } => {
+                    None
+                }
             };
 
             let nav = match history[cursor].clone() {
                 Screen::Tree => self.run_tree()?,
                 Screen::Files => self.run_files()?,
+                Screen::Rename { pairs } => {
+                    // Persist the typed rules so a round-trip (e.g. clicking a shard
+                    // to view its layout) returns to the same editor state.
+                    let (nav, pairs) = self.run_rename(pairs)?;
+                    history[cursor] = Screen::Rename { pairs };
+                    nav
+                }
                 Screen::Layout {
                     path,
                     selected,
@@ -2665,12 +2928,12 @@ impl Explorer {
             &self.flattened_tree
         };
         let (status_icon, status_bar, status_secondary) = self.status_bar();
+        let badges = self.screen_badges(HelpCtx::Tree);
         let config = DrawConfig {
             tree: tree_to_display,
             current_file: &title,
             file_idx: 0,
             total_files: 1,
-            metadata_only: self.remote_read.is_some(),
             selected_idx: self.selected_idx,
             scroll_offset: self.scroll_offset,
             search_mode: self.search_mode,
@@ -2679,17 +2942,16 @@ impl Explorer {
             status_icon,
             status_bar: &status_bar,
             status_secondary: &status_secondary,
-            health: self.health_alert(),
             can_repack: self.repack_input().is_some(),
             unindexed: &self.unindexed,
             packing_schemas: &self.packing_schemas,
             copied_flash: self.copied_flash.as_ref().map(|(what, _)| what.as_str()),
             interactive,
-            readonly_hover: self.readonly_hover.get(),
-            health_hover: self.health_hover.get(),
-            metadata_hover: self.metadata_hover.get(),
+            badges: &badges,
+            hovered_badge: self.hovered_badge.get(),
         };
         *self.clickable.borrow_mut() = UI::render_tree(frame, &config);
+        self.links.borrow_mut().clear(); // tree rows navigate on their own
         self.render_shortcut_hover(frame);
     }
 
@@ -3134,7 +3396,7 @@ impl Explorer {
         hist_scanning: Option<crate::ui::ScanProgress>,
         overlay: Option<&Overlay>,
     ) {
-        *self.clickable.borrow_mut() = UI::render_detail(
+        let (chips, links) = UI::render_detail(
             frame,
             tensor,
             shape,
@@ -3147,7 +3409,10 @@ impl Explorer {
             self.schema_for(&tensor.name),
             overlay,
         );
-        UI::render_readonly_badge(frame, self.readonly_hover.get());
+        *self.clickable.borrow_mut() = chips;
+        *self.links.borrow_mut() = links; // `File:` path → layout map
+        let badges = self.screen_badges(HelpCtx::Detail);
+        UI::render_badge_bar(frame, &badges, self.hovered_badge.get());
         self.render_shortcut_hover(frame);
     }
 
@@ -3227,7 +3492,9 @@ impl Explorer {
             Some(Overlay::Notice(m)) => UI::render_notice_box(frame, m),
             None => {}
         }
-        UI::render_readonly_badge(frame, self.readonly_hover.get());
+        let badges = self.screen_badges(HelpCtx::Data);
+        UI::render_badge_bar(frame, &badges, self.hovered_badge.get());
+        self.links.borrow_mut().clear(); // data view shows no linkable names
         self.render_shortcut_hover(frame);
         Ok(info)
     }
@@ -3354,6 +3621,17 @@ impl Explorer {
         self.remote_read.is_none()
     }
 
+    /// Which access badge the bottom-right status line shows: `Editable` when the
+    /// open checkpoint is one the in-place rename can rewrite (a local safetensors
+    /// checkpoint — see [`Self::rename_target`]), else `ReadOnly`.
+    fn access_badge(&self) -> crate::ui::AccessBadge {
+        if self.rename_target().is_some() {
+            crate::ui::AccessBadge::Editable
+        } else {
+            crate::ui::AccessBadge::ReadOnly
+        }
+    }
+
     /// Perform a tree command, from its key or the palette. Returns `Some(Nav)` for
     /// a command that leaves the tree (only `Quit` so far), else `None`. Pop-up
     /// commands borrow the terminal via [`Self::with_terminal`].
@@ -3390,6 +3668,23 @@ impl Explorer {
                 self.with_terminal(|s, t| s.copy_command(t, &c, None));
             }
             Cmd::Repack => self.with_terminal(|s, t| s.repack_checkpoint(t)),
+            Cmd::Rename => {
+                if self.rename_target().is_some() {
+                    return Some(Nav::Open(Screen::Rename { pairs: Vec::new() }));
+                }
+                // Not a local safetensors checkpoint — say so rather than opening an
+                // empty editor (the palette already hides it; a bare `r` can still
+                // reach here).
+                self.with_terminal(|s, t| {
+                    s.float_until_dismissed(t, |f| {
+                        s.render_tree_frame(f, true);
+                        UI::render_notice(
+                            f,
+                            "In-place rename is available for a local safetensors checkpoint only.",
+                        );
+                    });
+                });
+            }
             Cmd::Quit => return Some(Nav::Quit),
         }
         None
@@ -3404,6 +3699,7 @@ impl Explorer {
             .copied()
             .filter(|(cmd, _, _, _)| match cmd {
                 Cmd::Repack => self.repack_input().is_some(),
+                Cmd::Rename => self.rename_target().is_some(),
                 Cmd::ViewFiles => self.file_view_available(),
                 _ => true,
             })
@@ -3576,6 +3872,7 @@ impl Explorer {
     fn render_files_frame(&self, frame: &mut ratatui::Frame, interactive: bool) {
         let root = self.browse_root.to_string_lossy().into_owned();
         let flash = self.copied_flash.as_ref().map(|(what, _)| what.as_str());
+        let badges = self.screen_badges(HelpCtx::Files);
         let regions = UI::render_files(
             frame,
             &root,
@@ -3584,8 +3881,11 @@ impl Explorer {
             self.file_scroll,
             flash,
             interactive,
+            &badges,
+            self.hovered_badge.get(),
         );
         *self.clickable.borrow_mut() = regions;
+        self.links.borrow_mut().clear(); // file rows activate on their own
     }
 
     /// One screenful of file rows, to size a PageUp/PageDown jump.
@@ -4396,10 +4696,11 @@ impl Explorer {
                 let flash = self.copied_flash.as_ref().map(|(w, _)| w.clone());
                 let hint = layout_hint;
                 term.draw(|f| {
-                    let (max, regions) =
+                    let (max, regions, links) =
                         UI::render_layout(f, &map, selected, scroll, flash.as_deref(), true);
                     scroll_max = max;
                     *self.clickable.borrow_mut() = regions;
+                    *self.links.borrow_mut() = links; // tensor band name → tree
                     if let Some(c) = hint {
                         UI::render_notice(f, &layout_hint_msg(c));
                     }
@@ -4428,6 +4729,11 @@ impl Explorer {
                 match kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         self.copied_flash = None;
+                        // A click on a tensor band's (underlined) name jumps to it in
+                        // the tree — the shared link path (before the chip hit-test).
+                        if let Some(nav) = self.link_click(col, row) {
+                            break nav;
+                        }
                         if let Some(k) = crate::ui::region_hit(&self.clickable.borrow(), col, row) {
                             synth = Some(k); // a footer chip / [×]
                         } else if let Some(sz) = size {
@@ -4853,21 +5159,25 @@ impl Explorer {
                             scrollbar_drag = true;
                             continue;
                         }
-                        // A click on the health badge opens the report (its hover
-                        // bubble invites it) — same as pressing `h`; otherwise a
-                        // hit on a footer chip / `[×]` acts like its key.
-                        let health_click = !self.health_reports.is_empty()
-                            && !self.search_mode
-                            && size.is_some_and(|sz| {
-                                UI::health_badge_hit(sz.width, sz.height, col, row)
-                            });
-                        let hit = if health_click {
-                            Some(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+                        // A click on a status badge acts as its key (the health
+                        // badge → `h`, opening the report); otherwise a hit on a
+                        // footer chip / `[×]` acts like its key.
+                        let badge_action =
+                            (!self.search_mode)
+                                .then_some(size)
+                                .flatten()
+                                .and_then(|sz| {
+                                    let badges = self.screen_badges(HelpCtx::Tree);
+                                    UI::badge_bar_hit(sz.width, sz.height, col, row, &badges)
+                                        .and_then(|i| badges.get(i).and_then(|b| b.action()))
+                                });
+                        let hit = if let Some(k) = badge_action {
+                            Some(KeyEvent::new(KeyCode::Char(k), KeyModifiers::NONE))
                         } else {
                             crate::ui::region_hit(&self.clickable.borrow(), col, row)
                         };
                         if let Some(k) = hit {
-                            synth = Some(k); // clicked the health badge / a hint chip / [×]
+                            synth = Some(k); // clicked a badge / a hint chip / [×]
                         } else if let Some(sz) = size {
                             let body_top =
                                 UI::tree_header_rows(sz.width, self.search_mode, self.can_repack())
@@ -5836,9 +6146,9 @@ impl Explorer {
                 } => {
                     self.run_data(tensor, *repr, *slice, Interaction::OneShot);
                 }
-                // The tree renders itself; the file browser and layout map are
-                // interactive-only (a `--files`/`--layout --exit` falls back).
-                Screen::Tree | Screen::Files | Screen::Layout { .. } => {}
+                // The tree renders itself; the file browser, layout map and rename
+                // editor are interactive-only (a `--files`/`--layout --exit` falls back).
+                Screen::Tree | Screen::Files | Screen::Layout { .. } | Screen::Rename { .. } => {}
             }
             return Ok(None);
         }
@@ -6177,6 +6487,11 @@ impl Explorer {
             let mut ev = match ev {
                 Ok(Event::Mouse(m)) => {
                     if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                        // A click on the (underlined) `File:` path opens its layout
+                        // map — the shared link path, before the footer-chip hit-test.
+                        if let Some(nav) = self.layout_link_at(m.column, m.row) {
+                            return nav;
+                        }
                         match crate::ui::region_hit(&self.clickable.borrow(), m.column, m.row) {
                             Some(k) => Ok(Event::Key(k)),
                             None => continue,
@@ -7640,6 +7955,533 @@ impl Explorer {
         }
     }
 
+    /// The path an in-place rename would operate on: a *local* safetensors
+    /// checkpoint — a single `.safetensors` file, or the directory holding its
+    /// shards (so every shard *and* the index are renamed consistently). `None`
+    /// (command hidden) for a remote source or any non-safetensors format.
+    fn rename_target(&self) -> Option<PathBuf> {
+        if self.remote_read.is_some() || self.files.is_empty() {
+            return None;
+        }
+        if !self.files.iter().all(|f| {
+            f.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"))
+        }) {
+            return None;
+        }
+        match self.files.as_slice() {
+            [one] => Some(one.clone()),
+            many => Some(browse_root_of(many)),
+        }
+    }
+
+    /// The in-place **rename** mode ([`Screen::Rename`], opened with `R`): a
+    /// full-screen editor with a dynamic list of source→new-name rule pairs, `Tab`
+    /// autocomplete (numbers → `{layer}`/`{expert}` placeholders), and a before→after
+    /// diff preview marking each affected tensor OK / collides / won't-fit. `Enter`
+    /// stages the rename; a second `Enter` (the confirm gate) applies it in place and
+    /// reloads the tree. `^Y` copies the equivalent `convert --map` command.
+    ///
+    /// Keys: `Tab` autocomplete · `↑`/`↓` move between fields (`↓` past the end adds
+    /// a rule) · `←`/`→`/Home/End move the caret · `^N`/`^D` add / remove a rule ·
+    /// `PgUp`/`PgDn` scroll the preview · `Esc` back · `^C` quit.
+    fn run_rename(
+        &mut self,
+        saved_pairs: Vec<(String, String)>,
+    ) -> Result<(Nav, Vec<(String, String)>)> {
+        let Some(target) = self.rename_target() else {
+            return Ok((Nav::Back, saved_pairs)); // gated; bail safely if it slips
+        };
+        // Read every shard header once, so the preview is instant as the user types.
+        let loaded = match crate::rename::load(&target) {
+            Ok(l) => l,
+            Err(e) => {
+                let msg = format!("Cannot open the rename editor: {e:#}");
+                self.with_terminal(|s, t| {
+                    s.float_until_dismissed(t, |f| {
+                        s.render_tree_frame(f, true);
+                        UI::render_notice(f, &msg);
+                    });
+                });
+                return Ok((Nav::Back, saved_pairs));
+            }
+        };
+        // Autocomplete over the deduped *generalized* schemas (one per tensor family)
+        // rather than every concrete name — so a 48-layer model lists one entry.
+        let mut seen = HashSet::new();
+        let schemas: Vec<String> = loaded
+            .names()
+            .iter()
+            .map(|n| crate::rename::generalize(n).0)
+            .filter(|s| seen.insert(s.clone()))
+            .collect();
+        let root = loaded.root().display().to_string();
+        let mut mode = RenameMode::default();
+        // Restore the pairs from a prior visit (e.g. after inspecting a shard's
+        // layout), else start with one blank pair.
+        if !saved_pairs.is_empty() {
+            mode.pairs = saved_pairs
+                .into_iter()
+                .map(|(source, target)| RenamePair { source, target })
+                .collect();
+        }
+        // What was last copied to the clipboard (the `✓ copied …` flash label), or
+        // `None`. Cleared on the next key so the flash is transient.
+        let mut copied: Option<&'static str> = None;
+        let mut first = true;
+
+        // Derived state cached across frames — recomputed (`dirty`) only when the
+        // rule pairs change, so pure caret / focus / scroll moves don't re-preview
+        // the whole checkpoint (which was the source of the arrow-key lag).
+        let mut rules_view: Vec<crate::ui::RenameRuleView> = Vec::new();
+        let mut total = 0usize;
+        let mut warnings: Vec<String> = Vec::new();
+        let mut has_index = false;
+        let mut applicable = false;
+        let mut synth_err: Option<String> = None;
+        let mut cli: Option<String> = None;
+        let mut dirty = true;
+        let mut scroll_max = 0usize;
+
+        // The current rules to persist / restore (dropping fully-blank pairs).
+        let pairs_of = |m: &RenameMode| -> Vec<(String, String)> {
+            m.pairs
+                .iter()
+                .filter(|p| !(p.source.trim().is_empty() && p.target.trim().is_empty()))
+                .map(|p| (p.source.clone(), p.target.clone()))
+                .collect()
+        };
+
+        loop {
+            // Drain a burst of queued input (held arrows) before painting — redraw
+            // once it settles, so movement stays snappy.
+            let input_pending = event::poll(std::time::Duration::ZERO).unwrap_or(false);
+            if !input_pending {
+                if dirty {
+                    let (preview, notes, err) = match mode.build_map() {
+                        Ok((map, notes)) => (loaded.preview(&map), notes, None),
+                        Err(e) => (crate::rename::RenamePreview::default(), Vec::new(), Some(e)),
+                    };
+                    warnings = preview.warnings.clone();
+                    warnings.extend(notes);
+                    has_index = preview.has_index;
+                    applicable = err.is_none() && preview.applicable();
+                    synth_err = err;
+                    cli = self.rename_cli_command(&target, &mode);
+                    // Per-rule summaries (schema before→after, status counts, and the
+                    // per-shard header-fit detail behind a "won't fit" verdict).
+                    rules_view.clear();
+                    total = 0;
+                    for p in &mode.pairs {
+                        if p.source.trim().is_empty() || p.target.trim().is_empty() {
+                            continue;
+                        }
+                        let Ok((pat, rep)) = crate::rename::rule_from_fields(&p.source, &p.target)
+                        else {
+                            continue;
+                        };
+                        let Ok(single) = crate::diff::NameMap::from_pairs([(pat, rep)]) else {
+                            continue;
+                        };
+                        let pv = loaded.preview(&single);
+                        let mut v = crate::ui::RenameRuleView {
+                            from: p.source.clone(),
+                            to: p.target.clone(),
+                            total: pv.rows.len(),
+                            // Tensors the pattern matches (changed or not) — so a
+                            // just-autocompleted no-op rule reads as "matches N",
+                            // not "matches no tensors".
+                            matched: single.match_count(loaded.names().iter().map(String::as_str)),
+                            ok: 0,
+                            collide: 0,
+                            wont_fit: 0,
+                            invalid: 0,
+                            shards: loaded.shard_fits(&single),
+                        };
+                        for r in &pv.rows {
+                            match r.status {
+                                crate::rename::RenameStatus::Ok => v.ok += 1,
+                                crate::rename::RenameStatus::Collision => v.collide += 1,
+                                crate::rename::RenameStatus::WontFit => v.wont_fit += 1,
+                                crate::rename::RenameStatus::Invalid => v.invalid += 1,
+                            }
+                        }
+                        total += v.total;
+                        rules_view.push(v);
+                    }
+                    dirty = false;
+                }
+
+                let mut term = self
+                    .terminal
+                    .take()
+                    .expect("interactive loop owns the terminal");
+                if first {
+                    term.clear()?;
+                    first = false;
+                }
+                let mut sm = 0usize;
+                let mut chips = Vec::new();
+                let mut clicks = Vec::new();
+                term.draw(|f| {
+                    let (m, ch, c) = draw_rename_frame(
+                        f,
+                        &root,
+                        &mode,
+                        &schemas,
+                        &rules_view,
+                        total,
+                        &warnings,
+                        has_index,
+                        applicable,
+                        &synth_err,
+                        cli.as_deref(),
+                        copied,
+                    );
+                    sm = m;
+                    chips = ch;
+                    clicks = c;
+                    // Float the hovered footer chip's help bubble, like every view.
+                    self.render_shortcut_hover(f);
+                })?;
+                scroll_max = sm;
+                *self.clickable.borrow_mut() = chips; // footer chips (replay a key)
+                *self.links.borrow_mut() = clicks; // shard → layout, tensor → tree
+                self.terminal = Some(term);
+                mode.scroll = mode.scroll.min(scroll_max);
+            }
+
+            // Resolve the event to a key: a real keypress, a footer-chip click
+            // (which replays the chip's key, like the other views), or a mouse
+            // action handled inline (scroll / link / hover).
+            let key = match event::read()? {
+                Event::Key(k) => k,
+                Event::Mouse(m) => match m.kind {
+                    MouseEventKind::ScrollDown => {
+                        mode.scroll = (mode.scroll + 3).min(scroll_max);
+                        continue;
+                    }
+                    MouseEventKind::ScrollUp => {
+                        mode.scroll = mode.scroll.saturating_sub(3);
+                        continue;
+                    }
+                    MouseEventKind::Moved => {
+                        if let Some(sz) = self.terminal.as_ref().and_then(|t| t.size().ok()) {
+                            self.update_hovers(
+                                HelpCtx::Rename,
+                                sz.width,
+                                sz.height,
+                                m.column,
+                                m.row,
+                            );
+                        }
+                        continue;
+                    }
+                    // A preview link (shard → layout, concrete source → tree), else a
+                    // footer chip (replays its key). Typed rules are saved so
+                    // Backspace returns here.
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(nav) = self.link_click(m.column, m.row) {
+                            return Ok((nav, pairs_of(&mode)));
+                        }
+                        match crate::ui::region_hit(&self.clickable.borrow(), m.column, m.row) {
+                            Some(k) => k,
+                            None => continue,
+                        }
+                    }
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            if is_ctrl_c(&key) {
+                quit_immediately();
+            }
+            let KeyEvent {
+                code, modifiers, ..
+            } = key;
+            // `^Y` copies the `convert --map` command that applies the rename
+            // non-interactively (works while editing).
+            if code == KeyCode::Char('y') && modifiers.contains(KeyModifiers::CONTROL) {
+                copied = (cli.is_some() && copy_to_clipboard(cli.as_deref().unwrap_or_default()))
+                    .then_some("the apply command");
+                continue;
+            }
+            copied = None;
+            // Confirm gate: a clean rename staged by Enter needs a second Enter to
+            // actually rewrite the files; any other key cancels it.
+            if mode.confirming {
+                match code {
+                    KeyCode::Enter => match self.apply_rename_mode(&loaded, &mode) {
+                        // Applied — the rules are spent; return to the tree with no
+                        // saved pairs.
+                        Ok(nav) => return Ok((nav, Vec::new())),
+                        Err(e) => {
+                            mode.error = Some(e);
+                            mode.confirming = false;
+                        }
+                    },
+                    _ => mode.confirming = false,
+                }
+                continue;
+            }
+            match code {
+                KeyCode::Esc => return Ok((Nav::Back, pairs_of(&mode))),
+                // Space / `:` opens the command palette — the primary way to
+                // reach copy / legend / back (bare letters are typed into the
+                // fields). Safe: a tensor-name schema never has a space/colon.
+                KeyCode::Char(' ') | KeyCode::Char(':') => {
+                    let entries =
+                        available_rename_commands(applicable, cli.is_some(), mode.pairs.len());
+                    let chosen = self.with_terminal(|s, t| {
+                        s.run_palette(t, entries, HelpCtx::Rename, |_s, f| {
+                            let _ = draw_rename_frame(
+                                f,
+                                &root,
+                                &mode,
+                                &schemas,
+                                &rules_view,
+                                total,
+                                &warnings,
+                                has_index,
+                                applicable,
+                                &synth_err,
+                                cli.as_deref(),
+                                copied,
+                            );
+                        })
+                    });
+                    match chosen {
+                        Some(RenameCmd::Back) => {
+                            return Ok((Nav::Back, pairs_of(&mode)));
+                        }
+                        Some(RenameCmd::Quit) => {
+                            return Ok((Nav::Quit, pairs_of(&mode)));
+                        }
+                        Some(RenameCmd::AddRule) => {
+                            mode.add_pair();
+                            mode.error = None;
+                            dirty = true;
+                        }
+                        Some(RenameCmd::RemoveRule) => {
+                            mode.remove_pair();
+                            mode.error = None;
+                            dirty = true;
+                        }
+                        Some(RenameCmd::Apply) => {
+                            if applicable {
+                                mode.confirming = true;
+                                mode.error = None;
+                            } else {
+                                mode.error = Some(
+                                    "can't apply yet — fix the blocked rows / warnings above"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        Some(RenameCmd::CopyApplyCmd) => {
+                            copied = (cli.is_some()
+                                && copy_to_clipboard(cli.as_deref().unwrap_or_default()))
+                            .then_some("the apply command");
+                        }
+                        Some(RenameCmd::CopyReopenCmd) => {
+                            let cmd = self.command_for_rename(&pairs_of(&mode));
+                            copied = copy_to_clipboard(&cmd).then_some("the reopen command");
+                        }
+                        Some(RenameCmd::CopyScreen) => {
+                            let text = crate::tui::headless_render(120, 40, |f| {
+                                let _ = draw_rename_frame(
+                                    f,
+                                    &root,
+                                    &mode,
+                                    &schemas,
+                                    &rules_view,
+                                    total,
+                                    &warnings,
+                                    has_index,
+                                    applicable,
+                                    &synth_err,
+                                    cli.as_deref(),
+                                    None,
+                                );
+                            });
+                            if let Ok(text) = text {
+                                copied = copy_to_clipboard(&text).then_some("the screen text");
+                            }
+                        }
+                        Some(RenameCmd::Legend) => {
+                            self.with_terminal(|s, t| {
+                                s.float_until_dismissed(t, |f| {
+                                    let _ = draw_rename_frame(
+                                        f,
+                                        &root,
+                                        &mode,
+                                        &schemas,
+                                        &rules_view,
+                                        total,
+                                        &warnings,
+                                        has_index,
+                                        applicable,
+                                        &synth_err,
+                                        cli.as_deref(),
+                                        copied,
+                                    );
+                                    UI::render_legend_band(f, Legend::Rename);
+                                });
+                            });
+                        }
+                        None => {}
+                    }
+                }
+                KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    mode.add_pair();
+                    mode.error = None;
+                    dirty = true;
+                }
+                KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    mode.remove_pair();
+                    mode.error = None;
+                    dirty = true;
+                }
+                // The copy-screen chip / palette sentinel (`\u{1}`): copy the whole
+                // rendered screen as text (the universal `c` command; a bare `c`
+                // types into a field here).
+                KeyCode::Char('\u{1}') => {
+                    let text = crate::tui::headless_render(120, 40, |f| {
+                        let _ = draw_rename_frame(
+                            f,
+                            &root,
+                            &mode,
+                            &schemas,
+                            &rules_view,
+                            total,
+                            &warnings,
+                            has_index,
+                            applicable,
+                            &synth_err,
+                            cli.as_deref(),
+                            None,
+                        );
+                    });
+                    if let Ok(text) = text {
+                        copied = copy_to_clipboard(&text).then_some("the screen text");
+                    }
+                }
+                // Tab autocompletes the focused source (does NOT switch field).
+                KeyCode::Tab => {
+                    mode.autocomplete(&schemas);
+                    mode.error = None;
+                    dirty = true;
+                }
+                KeyCode::Enter => {
+                    if applicable {
+                        mode.confirming = true; // stage → confirm gate
+                        mode.error = None;
+                    } else {
+                        mode.error = Some(
+                            "can't apply yet — fix the blocked rows / warnings above".to_string(),
+                        );
+                    }
+                }
+                // Arrows move between fields; the caret moves with ←/→.
+                KeyCode::Up => mode.focus_up(),
+                KeyCode::Down => mode.focus_down(),
+                KeyCode::Left => mode.left(),
+                KeyCode::Right => mode.right(),
+                KeyCode::Home => mode.cursor = 0,
+                KeyCode::End => mode.caret_to_end(),
+                KeyCode::PageUp => mode.scroll = mode.scroll.saturating_sub(SCROLL_PAGE),
+                KeyCode::PageDown => mode.scroll = (mode.scroll + SCROLL_PAGE).min(scroll_max),
+                KeyCode::Backspace => {
+                    mode.backspace();
+                    mode.error = None;
+                    dirty = true;
+                }
+                KeyCode::Delete => {
+                    mode.delete();
+                    mode.error = None;
+                    dirty = true;
+                }
+                KeyCode::Char(c)
+                    if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    mode.insert_char(c);
+                    mode.error = None;
+                    dirty = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The `convert --map …` CLI command equivalent to the renames staged in `mode`
+    /// (one `--map 'PATTERN=>REPLACEMENT'` per complete pair), or `None` until a pair
+    /// is complete. Shown in the editor and copyable with `^Y`.
+    fn rename_cli_command(&self, target: &Path, mode: &RenameMode) -> Option<String> {
+        let mut rules = Vec::new();
+        for p in &mode.pairs {
+            if p.source.trim().is_empty() || p.target.trim().is_empty() {
+                continue;
+            }
+            if let Ok((pat, rep)) = crate::rename::rule_from_fields(&p.source, &p.target) {
+                rules.push((pat, rep));
+            }
+        }
+        if rules.is_empty() {
+            return None;
+        }
+        let mut parts = self.command_prefix(); // PROGRAM (rename is local → just it)
+        parts.push("convert".to_string());
+        parts.push(shell_quote(&target.to_string_lossy()));
+        for (pat, rep) in rules {
+            parts.push("--map".to_string());
+            parts.push(shell_quote(&format!("{pat}=>{rep}")));
+        }
+        Some(parts.join(" "))
+    }
+
+    /// Apply the rename staged in `mode`: build the plan, write it, reload the tree
+    /// so it shows the new names, and flash a confirmation. Returns the `Nav` back to
+    /// the tree, or an error string to surface in the editor.
+    fn apply_rename_mode(
+        &mut self,
+        loaded: &crate::rename::Loaded,
+        mode: &RenameMode,
+    ) -> std::result::Result<Nav, String> {
+        let (map, _) = mode.build_map()?;
+        let plan = loaded.plan(&map).map_err(|e| format!("{e:#}"))?;
+        let count = plan.rename_count();
+        crate::rename::apply(&plan).map_err(|e| format!("apply failed: {e:#}"))?;
+        let msg = match self.reload_after_rename() {
+            Ok(()) => format!("Renamed {count} tensor(s) in place"),
+            Err(e) => format!("Renamed {count} tensor(s); reopen to refresh ({e:#})"),
+        };
+        self.copied_flash = Some((msg, std::time::Instant::now()));
+        Ok(Nav::Back)
+    }
+
+    /// Re-read the checkpoint after an in-place rename so the tree reflects the new
+    /// names. The index files were just rewritten, so the cached index specs are
+    /// rebuilt from disk too — otherwise the health check would compare the new
+    /// tensor names against the old index keys and flag spurious mismatches.
+    fn reload_after_rename(&mut self) -> Result<()> {
+        let mut specs = Vec::with_capacity(self.index_specs.len());
+        for spec in &self.index_specs {
+            specs.push(crate::health::parse_index_spec(
+                &spec.dir,
+                &spec.index_path,
+            )?);
+        }
+        self.index_specs = specs;
+        self.health_reports.clear();
+        let (tensors, metadata, config, disk, health) =
+            Self::gather_checkpoint(&self.files, self.remote_read.as_ref())?;
+        self.config = config;
+        self.remote_disk = disk;
+        self.health_reports.extend(health);
+        self.finalize_load(tensors, metadata);
+        Ok(())
+    }
+
     /// Repack the current HDF5 checkpoint into a new file: prompt for the output
     /// name, then run the conversion with a progress screen.
     fn repack_checkpoint(&self, term: &mut crate::tui::LiveTerminal) {
@@ -8736,6 +9578,274 @@ enum DtypePreview {
     },
 }
 
+/// One source→new-name rule in the rename editor. The source is a concrete tensor
+/// name (picked via autocomplete); the new name is its `{layer}`/`{expert}`/`{n0}`
+/// *schema*, edited so the whole family renames at once.
+#[derive(Default)]
+struct RenamePair {
+    source: String,
+    target: String,
+}
+
+/// The in-place rename editor's live state ([`Screen::Rename`]): a dynamic list of
+/// [`RenamePair`]s (grown with `↓`/`^N`), which field has focus, the caret position
+/// in it, the preview scroll, and the confirm gate. See [`Explorer::run_rename`].
+struct RenameMode {
+    pairs: Vec<RenamePair>,
+    /// Index of the pair whose field has focus.
+    focus_pair: usize,
+    /// Which field of `focus_pair` has focus: `false` = source, `true` = new-name.
+    on_target: bool,
+    /// Caret position (char index) within the focused field.
+    cursor: usize,
+    /// Scroll offset of the preview pane.
+    scroll: usize,
+    /// A staged rename awaiting a confirming second `Enter`.
+    confirming: bool,
+    /// Whether to show the source field's autocomplete list — on while typing a
+    /// source, off after an autocomplete / focus change (so it's not in the way).
+    show_sugg: bool,
+    /// A transient error (a failed apply / rule synthesis) shown in the editor.
+    error: Option<String>,
+}
+
+impl Default for RenameMode {
+    fn default() -> Self {
+        Self {
+            pairs: vec![RenamePair::default()],
+            focus_pair: 0,
+            on_target: false,
+            cursor: 0,
+            scroll: 0,
+            confirming: false,
+            show_sugg: true,
+            error: None,
+        }
+    }
+}
+
+impl RenameMode {
+    /// The focused field, mutably.
+    fn field(&mut self) -> &mut String {
+        let pair = &mut self.pairs[self.focus_pair];
+        if self.on_target {
+            &mut pair.target
+        } else {
+            &mut pair.source
+        }
+    }
+
+    /// The focused field's text.
+    fn field_ref(&self) -> &str {
+        let pair = &self.pairs[self.focus_pair];
+        if self.on_target {
+            &pair.target
+        } else {
+            &pair.source
+        }
+    }
+
+    /// Snap the caret to the end of the focused field (after a focus change).
+    fn caret_to_end(&mut self) {
+        self.cursor = self.field_ref().chars().count();
+    }
+
+    /// Insert a character at the caret and advance past it.
+    fn insert_char(&mut self, c: char) {
+        let cur = self.cursor;
+        {
+            let f = self.field();
+            let byte = f.char_indices().nth(cur).map(|(b, _)| b).unwrap_or(f.len());
+            f.insert(byte, c);
+        }
+        self.cursor += 1;
+        self.show_sugg = !self.on_target; // typing a source re-opens its list
+    }
+
+    /// Delete the character before the caret (Backspace).
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let cur = self.cursor;
+        {
+            let f = self.field();
+            if let Some((byte, _)) = f.char_indices().nth(cur - 1) {
+                f.remove(byte);
+            }
+        }
+        self.cursor -= 1;
+        self.show_sugg = !self.on_target;
+    }
+
+    /// Delete the character at the caret (Delete).
+    fn delete(&mut self) {
+        let cur = self.cursor;
+        {
+            let f = self.field();
+            if let Some((byte, _)) = f.char_indices().nth(cur) {
+                f.remove(byte);
+            }
+        }
+        self.show_sugg = !self.on_target;
+    }
+
+    fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+    fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.field_ref().chars().count());
+    }
+
+    /// Autocomplete suggestions for the focused source (empty on a new-name field):
+    /// the deduped generalized schemas (numbers → `{layer}`/`{expert}`/`{n0}`) that
+    /// match the query number-agnostically. An empty query lists the first few.
+    fn suggestions<'a>(&self, schemas: &'a [String]) -> Vec<&'a str> {
+        const MAX: usize = 8;
+        if self.on_target {
+            return Vec::new();
+        }
+        let q = normalize_for_match(self.pairs[self.focus_pair].source.trim());
+        schemas
+            .iter()
+            .filter(|s| q.is_empty() || normalize_for_match(s).contains(&q))
+            .map(String::as_str)
+            .take(MAX)
+            .collect()
+    }
+
+    /// `Tab`: replace the focused source with the top matching schema (its numbers
+    /// generalized to `{layer}`/`{expert}` placeholders) and prefill the new name
+    /// from it, so one rule covers the whole family. A no-op on a new-name field.
+    fn autocomplete(&mut self, schemas: &[String]) {
+        if self.on_target {
+            return;
+        }
+        let Some(top) = self.suggestions(schemas).first().map(|s| s.to_string()) else {
+            return;
+        };
+        let pair = &mut self.pairs[self.focus_pair];
+        pair.source = top.clone();
+        if pair.target.trim().is_empty() {
+            pair.target = top;
+        }
+        self.caret_to_end();
+        self.show_sugg = false; // hide the list once a completion is accepted
+    }
+
+    /// Build the combined rename map from every complete pair (via
+    /// [`rule_from_fields`](crate::rename::rule_from_fields)), plus notes about
+    /// half-filled pairs. `Err` only on a rule-synthesis error (e.g. a bad
+    /// placeholder), which the caller shows inline.
+    fn build_map(&self) -> std::result::Result<(crate::diff::NameMap, Vec<String>), String> {
+        let mut rules = Vec::new();
+        let mut notes = Vec::new();
+        for (i, p) in self.pairs.iter().enumerate() {
+            match (p.source.trim().is_empty(), p.target.trim().is_empty()) {
+                (true, true) => {} // blank pair — ignored
+                (false, false) => {
+                    rules.push(crate::rename::rule_from_fields(&p.source, &p.target)?)
+                }
+                _ => notes.push(format!(
+                    "rule {}: fill both the source and the new name",
+                    i + 1
+                )),
+            }
+        }
+        let map = crate::diff::NameMap::from_pairs(rules).map_err(|e| format!("{e:#}"))?;
+        Ok((map, notes))
+    }
+
+    /// Append a fresh empty pair and focus its source.
+    fn add_pair(&mut self) {
+        self.pairs.push(RenamePair::default());
+        self.focus_pair = self.pairs.len() - 1;
+        self.on_target = false;
+        self.caret_to_end();
+        self.show_sugg = false;
+    }
+
+    /// Remove the focused pair (keeping at least one), clamping focus.
+    fn remove_pair(&mut self) {
+        if self.pairs.len() > 1 {
+            self.pairs.remove(self.focus_pair);
+            self.focus_pair = self.focus_pair.min(self.pairs.len() - 1);
+            self.on_target = false;
+            self.caret_to_end();
+            self.show_sugg = false;
+        }
+    }
+
+    /// The focused field's flat index (source = even, new-name = odd) — the order
+    /// `↑`/`↓` step through.
+    fn field_index(&self) -> usize {
+        self.focus_pair * 2 + usize::from(self.on_target)
+    }
+
+    fn set_field_index(&mut self, idx: usize) {
+        self.focus_pair = idx / 2;
+        self.on_target = idx % 2 == 1;
+        self.ensure_target_prefill();
+        self.caret_to_end();
+        self.show_sugg = false; // don't pop the list just by moving focus
+    }
+
+    /// `↑`: focus the previous field.
+    fn focus_up(&mut self) {
+        let i = self.field_index();
+        if i > 0 {
+            self.set_field_index(i - 1);
+        }
+    }
+
+    /// `↓`: focus the next field, growing a new pair when stepping past the last.
+    fn focus_down(&mut self) {
+        let i = self.field_index();
+        if i + 1 < self.pairs.len() * 2 {
+            self.set_field_index(i + 1);
+        } else {
+            self.add_pair();
+        }
+    }
+
+    /// When focus lands on an empty new-name field, prefill it with a copy of the
+    /// source, so the user edits a copy (placeholders and concrete numbers kept).
+    fn ensure_target_prefill(&mut self) {
+        if self.on_target {
+            let pair = &mut self.pairs[self.focus_pair];
+            if pair.target.trim().is_empty() && !pair.source.trim().is_empty() {
+                pair.target = pair.source.clone();
+            }
+        }
+    }
+}
+
+/// Normalize a name / query for the rename autocomplete's number-agnostic match:
+/// each `{token}` placeholder and each run of digits collapses to `#`, lowercased —
+/// so typing `layers.5.q` matches the `layers.{layer}.…q…` family.
+fn normalize_for_match(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '{'
+            && let Some(rel) = chars[i + 1..].iter().position(|&c| c == '}')
+        {
+            out.push('#');
+            i += 1 + rel + 1;
+        } else if chars[i].is_ascii_digit() {
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            out.push('#');
+        } else {
+            out.push(chars[i].to_ascii_lowercase());
+            i += 1;
+        }
+    }
+    out
+}
+
 /// The directory shared by all `paths`, or `None` if they don't all share one.
 /// The directory the file browser lists for a checkpoint launched as `files`:
 /// the common parent of its shards (a directory checkpoint / sharded model), or
@@ -9279,8 +10389,9 @@ mod tests {
         assert_eq!(tree_command_for_key('q'), Some(Cmd::Quit));
         assert_eq!(tree_command_for_key('z'), None); // unbound
 
-        // A non-HDF5 checkpoint can't repack, so the palette omits that command
-        // but still offers the rest.
+        // With no files there's nothing to repack (needs an HDF5 source) or rename
+        // (needs a local safetensors checkpoint), so the palette omits both but
+        // still offers the rest.
         let e = Explorer::new(Vec::new(), Vec::new(), None, false);
         let available: Vec<Cmd> = e.available_commands().iter().map(|&(c, ..)| c).collect();
         assert!(available.contains(&Cmd::Stats));
@@ -9289,7 +10400,213 @@ mod tests {
             !available.contains(&Cmd::Repack),
             "repack needs an HDF5 source: {available:?}"
         );
-        assert_eq!(available.len(), TREE_COMMANDS.len() - 1);
+        assert!(
+            !available.contains(&Cmd::Rename),
+            "rename needs a local safetensors checkpoint: {available:?}"
+        );
+        assert_eq!(available.len(), TREE_COMMANDS.len() - 2);
+
+        // A local safetensors checkpoint (even one shard) does offer Rename.
+        let st = Explorer::new(
+            vec![PathBuf::from("model.safetensors")],
+            Vec::new(),
+            None,
+            false,
+        );
+        assert!(st.rename_target().is_some());
+        assert!(
+            st.available_commands()
+                .iter()
+                .any(|&(c, ..)| c == Cmd::Rename)
+        );
+    }
+
+    #[test]
+    fn command_for_rename_round_trips_the_rule_pairs() {
+        // The `y` command for the rename editor: `--rename` plus one
+        // `--rename-rule 'src=>tgt'` per complete pair, so it reopens the editor
+        // with the same schema pairs (lossless — no regex reversal).
+        let e = Explorer::new(
+            vec![PathBuf::from("/ckpt/model.safetensors")],
+            Vec::new(),
+            None,
+            false,
+        );
+        let pairs = vec![
+            (
+                "model.layers.{layer}.attn.q_proj.weight".to_string(),
+                "model.layers.{layer}.self_attn.q_proj.weight".to_string(),
+            ),
+            // A blank pair is dropped (never emitted).
+            (String::new(), String::new()),
+            ("a.0.w".to_string(), "b.0.w".to_string()),
+        ];
+        let cmd = e.command_for_rename(&pairs);
+        assert!(cmd.contains("--rename "), "opens the editor:\n{cmd}");
+        assert_eq!(cmd.matches("--rename-rule").count(), 2, "two rules:\n{cmd}");
+        assert!(
+            cmd.contains("--rename-rule 'a.0.w=>b.0.w'"),
+            "literal:\n{cmd}"
+        );
+
+        // Re-parse the emitted `--rename-rule` values the way `interactive_loop`
+        // seeds them (split on the first `=>`) and confirm the pairs round-trip.
+        let parsed: Vec<(String, String)> = cmd
+            .split("--rename-rule ")
+            .skip(1)
+            .map(|rest| {
+                let raw = rest.split(" --").next().unwrap_or(rest).trim();
+                let unquoted = raw.trim_matches('\'');
+                let (s, t) = unquoted.split_once("=>").unwrap();
+                (s.to_string(), t.to_string())
+            })
+            .collect();
+        assert_eq!(
+            parsed,
+            vec![
+                (
+                    "model.layers.{layer}.attn.q_proj.weight".to_string(),
+                    "model.layers.{layer}.self_attn.q_proj.weight".to_string()
+                ),
+                ("a.0.w".to_string(), "b.0.w".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn open_link_opens_layout_and_reveals_tensor() {
+        use crate::tree::{Layout, Storage, TensorInfo};
+        let ti = |name: &str| TensorInfo {
+            name: name.to_string(),
+            dtype: "F32".into(),
+            shape: vec![2, 2],
+            size_bytes: 16,
+            num_elements: 4,
+            storage: Storage::Unknown,
+            source_path: "/tmp/x.safetensors".into(),
+            layout: Layout::None,
+        };
+        let mut e = Explorer::new(Vec::new(), Vec::new(), None, false);
+        e.finalize_load(vec![ti("blk.0.a"), ti("blk.1.b")], Vec::new());
+
+        // A `Layout` link opens that file's byte-layout view.
+        assert!(matches!(
+            e.open_link(&crate::ui::Link::Layout("/tmp/x.safetensors".into())),
+            Some(Nav::Open(Screen::Layout { .. }))
+        ));
+
+        // A `Tree` link to a real tensor reveals it and lands on the tree.
+        e.set_all_expanded(true);
+        assert!(matches!(
+            e.open_link(&crate::ui::Link::Tree("blk.1.b".into())),
+            Some(Nav::Open(Screen::Tree))
+        ));
+        assert_eq!(e.flattened_tree[e.selected_idx].0.name(), "blk.1.b");
+
+        // A `Tree` link to an absent tensor is a no-op (a stray click).
+        assert!(e.open_link(&crate::ui::Link::Tree("nope".into())).is_none());
+    }
+
+    #[test]
+    fn rename_palette_registry_labels_and_gating() {
+        // The control-char sentinels render as their real accelerators; the
+        // palette-only copy/legend commands have no key label.
+        assert_eq!(key_label('\r'), "Enter");
+        assert_eq!(key_label('\u{e}'), "^N");
+        assert_eq!(key_label('\u{19}'), "^Y");
+        assert_eq!(key_label('\u{1b}'), "Esc");
+        assert_eq!(key_label('\u{1}'), "");
+
+        // Every rename command has one-line help, looked up by its sentinel char.
+        for &(_, _, _, key) in RENAME_COMMANDS {
+            assert!(
+                crate::ui::shortcut_help(
+                    KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                    HelpCtx::Rename,
+                )
+                .is_some(),
+                "no help for rename key {key:?}"
+            );
+        }
+
+        // Apply needs a clean staged rename; the apply-command copy needs a rule;
+        // Remove needs more than one pair.
+        let full = available_rename_commands(true, true, 2);
+        assert!(full.iter().any(|(c, ..)| *c == RenameCmd::Apply));
+        assert!(full.iter().any(|(c, ..)| *c == RenameCmd::CopyApplyCmd));
+        assert!(full.iter().any(|(c, ..)| *c == RenameCmd::RemoveRule));
+        let bare = available_rename_commands(false, false, 1);
+        assert!(!bare.iter().any(|(c, ..)| *c == RenameCmd::Apply));
+        assert!(!bare.iter().any(|(c, ..)| *c == RenameCmd::CopyApplyCmd));
+        assert!(!bare.iter().any(|(c, ..)| *c == RenameCmd::RemoveRule));
+        // Copy-screen / reopen-command / legend / back / quit are always offered.
+        assert!(bare.iter().any(|(c, ..)| *c == RenameCmd::CopyScreen));
+        assert!(bare.iter().any(|(c, ..)| *c == RenameCmd::CopyReopenCmd));
+        assert!(bare.iter().any(|(c, ..)| *c == RenameCmd::Back));
+    }
+
+    #[test]
+    fn rename_mode_suggests_by_substring_and_grows_pairs() {
+        let names: Vec<String> = [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "model.embed_tokens.weight",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // Autocomplete matches the deduped, *generalized* schemas — number-agnostic,
+        // so a concrete "Q_PROJ" query finds the {layer} family.
+        let schemas: Vec<String> = {
+            let mut seen = HashSet::new();
+            names
+                .iter()
+                .map(|n| crate::rename::generalize(n).0)
+                .filter(|s| seen.insert(s.clone()))
+                .collect()
+        };
+        let mut mode = RenameMode::default();
+        mode.pairs[0].source = "Q_PROJ".to_string();
+        assert_eq!(
+            mode.suggestions(&schemas),
+            vec!["model.layers.{layer}.self_attn.q_proj.weight"]
+        );
+        // Empty query lists all families for discovery.
+        mode.pairs[0].source.clear();
+        assert_eq!(mode.suggestions(&schemas).len(), 3);
+        // No autocomplete on a new-name field.
+        mode.on_target = true;
+        assert!(mode.suggestions(&schemas).is_empty());
+
+        // ↓ past the last field grows a new pair and focuses its source.
+        let before = mode.pairs.len();
+        mode.focus_down();
+        assert_eq!(mode.pairs.len(), before + 1);
+        assert_eq!(mode.focus_pair, before);
+        assert!(!mode.on_target);
+    }
+
+    #[test]
+    fn rename_mode_build_map_combines_complete_pairs_and_notes_partial() {
+        let mut mode = RenameMode::default();
+        mode.pairs[0] = RenamePair {
+            source: "model.layers.{layer}.self_attn.q_proj.weight".to_string(),
+            target: "model.layers.{layer}.attn.q_proj.weight".to_string(),
+        };
+        // A half-filled pair becomes a note, not a rule.
+        mode.pairs.push(RenamePair {
+            source: "dangling".to_string(),
+            target: String::new(),
+        });
+        let (map, notes) = mode.build_map().unwrap();
+        assert_eq!(map.len(), 1, "only the complete pair becomes a rule");
+        assert_eq!(notes.len(), 1, "the half-filled pair is noted");
+        assert_eq!(
+            map.map("model.layers.5.self_attn.q_proj.weight")
+                .into_owned(),
+            "model.layers.5.attn.q_proj.weight"
+        );
     }
 
     #[test]

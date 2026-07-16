@@ -18,6 +18,7 @@ mod health;
 mod npy;
 mod progress;
 mod remote;
+mod rename;
 mod s3;
 mod safelayout;
 mod sample;
@@ -341,6 +342,20 @@ struct ExploreArgs {
 
     #[arg(
         long,
+        help = "Open straight into the in-place rename editor (local safetensors only; the `R` shortcut)"
+    )]
+    rename: bool,
+
+    #[arg(
+        long = "rename-rule",
+        value_name = "SRC=>TGT",
+        requires = "rename",
+        help = "Seed a rename rule in the --rename editor: SOURCE=>NEW-NAME (schema form, {layer}/{expert} placeholders kept). Repeatable; what the editor's `y` records"
+    )]
+    rename_rule: Vec<String>,
+
+    #[arg(
+        long,
         help = "Render the requested view once and exit, without entering interactive navigation"
     )]
     exit: bool,
@@ -414,27 +429,50 @@ struct ExploreArgs {
 // variant doesn't matter here.
 #[allow(clippy::large_enum_variant)]
 enum Command {
-    /// Repack an HDF5 checkpoint into a new file, re-compressing every dataset
-    /// with the chosen codec (e.g. gzip/zstd are ~2× smaller than the LZ4 these
-    /// checkpoints ship with).
+    /// Repack an HDF5 checkpoint, or rename tensors in place in a safetensors one.
+    ///
+    /// Without `--map`: repack the HDF5 INPUT into a new OUTPUT file, re-compressing
+    /// every dataset with the chosen codec (gzip/zstd are ~2× smaller than the LZ4
+    /// these checkpoints ship with).
+    ///
+    /// With `--map`: rename tensors **in place** in a local safetensors checkpoint
+    /// (a directory or a single `.safetensors` file) — no OUTPUT is given. Only each
+    /// shard's header region is rewritten (padded back to its original length, so
+    /// tensor DATA IS NOT MOVED) and `model.safetensors.index.json` is updated to
+    /// match. A rename whose new names don't fit in the existing header is refused
+    /// (honouring it would mean rewriting the whole file). It confirms before
+    /// touching anything unless `--force` is given.
     Convert {
-        /// Source `.h5`/`.hdf5` checkpoint.
+        /// Source: an `.h5`/`.hdf5` checkpoint to repack, or (with `--map`) a local
+        /// safetensors directory / `.safetensors` file to rename in place.
         input: PathBuf,
-        /// Destination file to create.
-        output: PathBuf,
-        /// Compression codec for the output.
+        /// Destination file to create (repack mode only; omit when using `--map`).
+        output: Option<PathBuf>,
+        /// Compression codec for the output (repack mode).
         #[arg(short, long, value_enum, default_value_t = codec::Codec::default())]
         codec: codec::Codec,
         /// Compression level (gzip 0–9, zstd 1–22; ignored for lz4/none).
-        /// Defaults to a sensible level for the codec.
+        /// Defaults to a sensible level for the codec (repack mode).
         #[arg(short, long)]
         level: Option<u8>,
-        /// Streaming buffer per dataset block, e.g. `256M`, `1G` (default 256M).
+        /// Streaming buffer per dataset block, e.g. `256M`, `1G` (repack mode).
         #[arg(short, long, default_value = "256M")]
         buffer: String,
-        /// Overwrite the output file if it already exists.
+        /// Repack mode: overwrite the output file if it exists. Rename mode: skip
+        /// the confirmation prompt (apply without asking).
         #[arg(short, long)]
         force: bool,
+        /// Rename tensors **in place** using this rule — regex
+        /// `PATTERN=>REPLACEMENT` (with `$1`/`$name` captures); repeatable, applied
+        /// in order. Switches `convert` to the in-place safetensors rename mode.
+        /// E.g. drop a prefix: `--map 'model\.layers\.=>layers.'`
+        #[arg(long = "map", value_name = "REGEX=>REPL")]
+        map: Vec<String>,
+        /// Load rename rules from a file (see `--map`; same format as `diff
+        /// --map-from`): a `.json` array of `[pattern, replacement]` pairs, or one
+        /// `REGEX=>REPLACEMENT` per line (`#` comments and blank lines ignored).
+        #[arg(long = "map-from", value_name = "FILE")]
+        map_from: Option<PathBuf>,
     },
 
     /// Compare two checkpoints and summarize their structural differences:
@@ -623,7 +661,28 @@ fn main() -> Result<()> {
             level,
             buffer,
             force,
-        }) => run_convert(&input, &output, codec, level, &buffer, force),
+            map,
+            map_from,
+        }) => {
+            if map.is_empty() && map_from.is_none() {
+                // Repack mode: an OUTPUT file is required.
+                let output = output.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "convert needs an OUTPUT file to repack into (or --map to rename tensors in place)"
+                    )
+                })?;
+                run_convert(&input, &output, codec, level, &buffer, force)
+            } else {
+                // In-place rename mode: no OUTPUT (the files are edited in place).
+                if let Some(out) = output {
+                    anyhow::bail!(
+                        "convert --map renames tensors in place, so it takes no OUTPUT (got {})",
+                        out.display()
+                    );
+                }
+                run_rename(&input, &map, map_from.as_deref(), force)
+            }
+        }
         Some(Command::Diff {
             old,
             new,
@@ -1710,7 +1769,8 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.stats
         || args.stats_shards
         || args.files
-        || args.layout.is_some();
+        || args.layout.is_some()
+        || args.rename;
     let view = if args.values {
         OpenView::Values
     } else if args.heatmap {
@@ -1760,6 +1820,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.stats_shards
         || args.files
         || args.layout.is_some()
+        || args.rename
         || args.exit;
     let open = wants_open.then_some(OpenRequest {
         tensor: args.tensor,
@@ -1787,6 +1848,8 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         files_view: args.files,
         layout_file: args.layout,
         layout_select: args.layout_select,
+        rename: args.rename,
+        rename_rules: args.rename_rule,
     });
 
     let mut explorer = Explorer::new(files, index_specs, open, !args.no_preload);
@@ -1813,6 +1876,63 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
     } else {
         explorer.run()
     }
+}
+
+/// `convert --map`: rename tensors **in place** in a local safetensors checkpoint.
+/// Builds and validates the full remapping (all sources exist, no collisions, every
+/// rewritten header fits without moving data), prints the plan, asks for
+/// confirmation (unless `force`), then rewrites the shard headers and index.json.
+/// Feature-independent — the rename never touches HDF5.
+fn run_rename(input: &Path, map: &[String], map_from: Option<&Path>, force: bool) -> Result<()> {
+    use anyhow::bail;
+    use std::io::{IsTerminal, Write};
+
+    // Local-only: reject an obvious remote URL up front (rename edits files in
+    // place, which only makes sense on the local filesystem).
+    if input.to_string_lossy().contains("://") {
+        bail!(
+            "rename is local-only, but {} looks like a remote URL",
+            input.display()
+        );
+    }
+
+    let name_map = build_name_map(map, map_from)?;
+    let plan = rename::plan(input, &name_map)?;
+
+    // Show the plan (renames, index note, warnings, the in-place caveat).
+    for line in plan.summary_lines(40) {
+        eprintln!("{line}");
+    }
+
+    if !force {
+        if !std::io::stdin().is_terminal() {
+            bail!(
+                "refusing to rename without confirmation on a non-interactive terminal — \
+                 pass --force to apply"
+            );
+        }
+        eprint!("Proceed with the in-place rename? [y/N] ");
+        std::io::stderr().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes") {
+            eprintln!("Aborted; nothing was changed.");
+            return Ok(());
+        }
+    }
+
+    rename::apply(&plan)?;
+    eprintln!(
+        "Renamed {} tensor(s) across {} shard file(s){}.",
+        plan.rename_count(),
+        plan.shard_count(),
+        if plan.index.is_some() {
+            " (+ model.safetensors.index.json)"
+        } else {
+            ""
+        },
+    );
+    Ok(())
 }
 
 #[cfg(feature = "hdf5")]
