@@ -61,6 +61,10 @@ subcommands for comparing and health-checking checkpoints.
   command to reopen any view — shareable and scriptable.
 - 🗜️ **HDF5 repacking.** Losslessly [re-compress](#repacking-hdf5-checkpoints---features-hdf5)
   LZ4 checkpoints with **zstd**/gzip for a smaller on-disk footprint.
+- ✏️ **In-place tensor renaming.** [Rename tensors](#renaming-tensors-in-place-convert---map)
+  in a safetensors checkpoint with regex rules (`convert --map`, or `r` in the
+  TUI) — rewrites only the headers and the index, so the weight **data never
+  moves**; the whole remapping is validated first.
 
 Plus the essentials: 🔎 fuzzy search (`/`), 🔢 natural sort for layer numbers
 (`layer.2` before `layer.10`), 📏 human-readable sizes (KiB/MiB/GiB), and full
@@ -240,6 +244,8 @@ without `--tensor` is reported as ambiguous.
 | `--stats-shards` | Like `--stats`, but with the on-disk per-shard breakdown expanded (the popup's `f` toggle) |
 | `--files` | Open straight into the [file browser](#file-browser-tab) — the checkpoint's directory tree (the `Tab` toggle) |
 | `--layout <PATH>` | Open straight into the [safetensors layout map](#safetensors-layout-map) for `PATH` (`Enter` on a `.safetensors` in the file browser) |
+| `--rename` | Open straight into the [rename editor](#renaming-tensors-in-place-convert---map) (local safetensors only; the `R` key) |
+| `--rename-rule <SRC=>TGT>` | Seed a rule pair in the `--rename` editor (schema form, `{layer}`/`{expert}` placeholders kept); repeatable — what the editor's `y` records |
 | `--dtype <DTYPE>` | Reinterpret the dtype: `u4`, `i4`, `unpacked` (fused-codebook unmerge; needs a packing schema), or `f16`/`bf16`/`i16`/`u16`/`f32`/`i32`/`u32`/`f64`/`i64`/`u64`/`i8`/`u8`/`stored` |
 | `--shape <DIMS>` | Reinterpret the shape (same element count): `10,100` / `10x100`; one dim may be `-1`/`*`/`_` to infer |
 | `--edge[=RFRAC,CFRAC]` (alias `--edges`) / `--overview` / `--window[=ROW,COL]` | Force the edges submode (optional head/tail split fractions `0..1`) / the overview / the contiguous window (optional top-left `ROW,COL`) |
@@ -316,7 +322,8 @@ what it does (handy while you're still learning the keys).
 | `y` | Show and copy the CLI command that reopens this exact screen — file, tensor (or metadata entry), dtype/shape overrides, view, layout, zebra, base, slice (works on every screen) |
 | `s` | **Detail screen:** compute the tensor's statistics on demand · **Tree:** float the [checkpoint-stats popup](#checkpoint-statistics-s) — per-file / per-tensor sizes, params, the dtype mix, and the per-layer / per-expert breakdown; `f` folds/unfolds the on-disk per-shard list, `r` copies the report, `c` the screen, `y` the reopen command (`--stats`) |
 | `h` | **Detail screen:** show the value histogram · **Tree:** run the health checks and float the report in a popup — `f` folds/unfolds the per-finding detail (folded by default), `v` runs the value-tier data scan (progress bar; `Esc` cancels), `r` copies the report, `c` the screen, `y` the reopen command (`--health`); same checks as the [`check`](#checking-checkpoints-check) subcommand (auto-suggested when an index/file mismatch is detected) |
-| `R` | Repack the current HDF5 checkpoint into a new file (HDF5 only) |
+| `r` | Repack the current HDF5 checkpoint into a new file (HDF5 only) |
+| `R` | Open the [rename editor](#renaming-tensors-in-place-convert---map) (local safetensors only): a full-screen mode to rename tensors in place with autocomplete + a live before→after diff preview. Capital `R` — deliberately harder to hit than a plain letter, since it edits files in place |
 | `Backspace` / `\` | Step **back** / **forward** through the screens you've visited (browser-style history) — e.g. reopen a view you just left |
 | `Esc` | Exit search mode |
 | `q` | Quit the application (or exit search mode if active) |
@@ -420,6 +427,12 @@ length; `c` copies it), or on a tensor jumps to its place in the tree; `l`
 explains the glyphs; `y` copies the reopen command including the selected tensor
 (`--layout … --layout-select <name>`); `Backspace` (or `Tab`) returns to the
 browser (and back again lands on the same segment).
+
+**Clickable names, everywhere.** Names are links across the app: a concrete
+**tensor name** (underlined) jumps to it in the tree — the tensor bands here, and
+the source tensor in the rename preview — and a **safetensors filename** opens its
+layout map (a tensor detail screen's `File:` path, and each shard in the rename
+preview). One click, straight to the right view.
 
 ### Tensor data preview
 
@@ -663,6 +676,99 @@ On completion it reports how the on-disk size changed — e.g.
 `39 datasets · on disk 8.2 GiB (lz4) → 5.3 GiB (zstd): 35% smaller (1.56×)`. It
 refuses to write over its own input, and warns if the chosen codec is the one
 the source already uses (a re-encode, where a plain copy would do).
+
+### Renaming tensors in place (`convert --map`)
+
+Sometimes a safetensors checkpoint just needs its tensors *renamed* — to match
+another naming scheme, drop a `model.` prefix, and so on — without touching the
+weights. `convert --map` does exactly that, **truly in place**: it rewrites only
+each shard's JSON header (padding it back to its original length, so the tensor
+**data never moves**) and updates `model.safetensors.index.json` to match. No new
+file is written, and nothing is copied.
+
+Rules use the **same `PATTERN=>REPLACEMENT` regex syntax as [`diff --map`](#comparing-checkpoints-diff)**
+(repeatable, applied in order; `--map-from FILE` loads a plain-text or JSON rule
+list). The scope is **local checkpoints only** — a directory of shards, or a
+single `.safetensors` file.
+
+```bash
+# Drop the "model.layers." prefix across every shard, in place
+checkpoint-explorer convert ./my-checkpoint --map 'model\.layers\.=>layers.'
+
+# Two rules, apply without the confirmation prompt
+checkpoint-explorer convert model.safetensors \
+  --map 'self_attn=>attn' --map 'mlp=>feed_forward' --force
+```
+
+Because it never moves data, the whole remapping is **validated up front** and
+refused (with nothing changed) if it isn't safe:
+
+- **every rename target must fit in the existing header** — the new names are
+  padded, not grown, so a rename to *longer* names that would overflow the header
+  is rejected, naming the offending shard and by how many bytes it's over;
+- **no collisions** — two tensors may not be renamed onto one name;
+- **no invalid targets** — empty, or the reserved `__metadata__`;
+- a rule that **matches nothing** is warned about; a rule set that renames
+  nothing is refused.
+
+It's a destructive, one-way edit, so it **asks for confirmation** first (showing
+the full list of renames and the in-place caveat); `--force` skips the prompt,
+and on a non-interactive terminal it refuses unless `--force` is given. The same
+validity checks back [`diff --map`](#comparing-checkpoints-diff) too (there they
+only *warn*, since `diff` never writes).
+
+From the main tree screen, press **`R`** (capital — it edits files in place, so
+it's deliberately harder to hit) or use the command palette → *File: Rename tensors
+in place…* to open the **rename editor** — a full-screen mode (like the tensor
+detail view), no regex required:
+
+- **Rule pairs.** Each rule is a **source** field and a **new-name** field. Type a
+  substring in the source (matching is number-agnostic) and press **`Tab`** to
+  autocomplete it to a tensor's **schema**, where each layer / expert index becomes
+  a `{layer}` / `{expert}` / `{n0}` **placeholder**; the new name is prefilled from
+  it. Keep the placeholders and one rule renames the tensor across **every** layer
+  and expert at once; type a **concrete** number instead (e.g. `…layers.0.…`) and
+  it renames only that one.
+- **Editing.** `↑`/`↓` move between fields (`↓` past the last field adds a new rule
+  pair); `←`/`→`/Home/End move the caret; `^N` adds a rule, `^D` removes the
+  focused one — so you can build up several renames at once.
+- **Live before→after preview.** A pane updates as you type with a **per-rule**
+  summary: the schema `from → to`, how many tensors it touches, and whether they
+  can be applied in place — `⚠ N won't fit in place` (the new names are longer than
+  the header's fixed region) or `⚠ N collide` (two tensors onto one). A won't-fit
+  rule lists **each shard's header sizing** (`header <current> B → <needed> B`, and
+  the bytes over / to spare) so you can see exactly which file overflows — and each
+  shard name is **clickable** (opens that file's [layout view](#safetensors-layout-map)).
+  Compact — one block per rule — so it stays readable even when a rule matches every
+  layer. Apply stays disabled until every rule is clean.
+- **Apply command.** The equivalent `convert --map …` command that would apply the
+  rename non-interactively is shown at the bottom (labelled `apply:`) and copied to
+  the clipboard with **`^Y`**.
+- **Command palette + copies.** Like every other view, the editor has a command
+  palette — press **`Space`** or **`:`** (a tensor-name schema never contains
+  either, so they're free to use). From it you can *Apply*, *Add / Remove a rule*,
+  copy the **screen text**, copy the **command to reopen this view** (the `y`
+  equivalent — see below), copy the **apply command**, show the **legend**, or go
+  *Back* / *Quit*. The palette is the primary way to reach copy / legend here, since
+  bare letters are typed into the name fields; the edit/apply accelerators
+  (`^N`/`^D`/`^Y`/`Enter`) still work directly.
+
+`Enter` stages the rename (once the preview is all-clear); a second `Enter`
+confirms and applies it in place, then the tree reloads with the new names. `Esc`
+backs out; `^C` quits. (The editor builds regex `--map` rules under the hood — the
+CLI is still there for scripted / multi-rule remappings.)
+
+Like the other views, the editor is **reproducible from the CLI**: `--rename` opens
+it straight away, and each repeatable `--rename-rule 'SOURCE=>NEW-NAME'` seeds a rule
+pair (schema form, `{layer}`/`{expert}` placeholders kept literally). That's exactly
+what the palette's *Copy: Command to reopen this view* records, so an editor session
+round-trips through `y`:
+
+```bash
+# Open the rename editor with one rule pre-filled (renames every layer's q_proj)
+checkpoint-explorer ./my-checkpoint --rename \
+  --rename-rule 'model.layers.{layer}.attn.q_proj.weight=>model.layers.{layer}.self_attn.q_proj.weight'
+```
 
 ### Comparing checkpoints (`diff`)
 

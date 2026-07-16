@@ -214,6 +214,29 @@ pub fn read_header_json(path: &Path, cap: u64) -> Result<(String, bool), String>
     Ok((json, n > cap))
 }
 
+/// Read the *full* JSON header of the safetensors file at `path`: the header
+/// length `N` and the exact `N` bytes of JSON that follow the 8-byte prefix.
+/// Unlike [`read_header_json`] this never truncates — the in-place rename
+/// (`convert --map`) has to rewrite the whole header — so a header beyond
+/// [`MAX_HEADER`] is refused rather than partially read. Returns `(N, json_bytes)`.
+pub fn read_header_full(path: &Path) -> Result<(u64, Vec<u8>), String> {
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut len_buf = [0u8; 8];
+    file.read_exact(&mut len_buf)
+        .map_err(|_| "not a safetensors file (too short for a header length)".to_string())?;
+    let n = u64::from_le_bytes(len_buf);
+    if n == 0 {
+        return Err("empty safetensors header".to_string());
+    }
+    if n > MAX_HEADER {
+        return Err("header length is out of range (not a safetensors file?)".to_string());
+    }
+    let mut json = vec![0u8; n as usize];
+    file.read_exact(&mut json)
+        .map_err(|_| "truncated safetensors header".to_string())?;
+    Ok((n, json))
+}
+
 fn gap(start: u64, end: u64) -> Segment {
     Segment {
         name: "(padding)".to_string(),

@@ -4,52 +4,52 @@ expression: out
 ---
 {
   "checkpoint": "[FIXTURE]",
-  "checks": [
-    {
-      "findings": [],
-      "id": "byte_ranges",
-      "status": "pass",
-      "title": "Byte-range integrity"
-    },
-    {
-      "findings": [],
-      "id": "hdf5",
-      "status": "na",
-      "title": "HDF5 integrity"
-    },
-    {
-      "findings": [],
-      "id": "layers",
-      "status": "na",
-      "title": "Layer completeness"
-    },
-    {
-      "findings": [],
-      "id": "shapes_dtypes",
-      "status": "pass",
-      "title": "Shape / dtype sanity"
-    },
-    {
-      "findings": [],
-      "id": "config",
-      "status": "na",
-      "title": "Config consistency"
-    },
-    {
-      "findings": [],
-      "id": "files",
-      "status": "na",
-      "title": "Files & sharding"
-    }
-  ],
-  "exit_code": 0,
-  "healthy": true,
   "summary": {
-    "errors": 0,
     "files": 1,
-    "params": 124,
     "tensors": 7,
+    "params": 124,
+    "errors": 0,
     "warnings": 0
   },
-  "values": false
+  "values": false,
+  "checks": [
+    {
+      "id": "byte_ranges",
+      "title": "Byte-range integrity",
+      "status": "pass",
+      "findings": []
+    },
+    {
+      "id": "hdf5",
+      "title": "HDF5 integrity",
+      "status": "na",
+      "findings": []
+    },
+    {
+      "id": "layers",
+      "title": "Layer completeness",
+      "status": "na",
+      "findings": []
+    },
+    {
+      "id": "shapes_dtypes",
+      "title": "Shape / dtype sanity",
+      "status": "pass",
+      "findings": []
+    },
+    {
+      "id": "config",
+      "title": "Config consistency",
+      "status": "na",
+      "findings": []
+    },
+    {
+      "id": "files",
+      "title": "Files & sharding",
+      "status": "na",
+      "findings": []
+    }
+  ],
+  "healthy": true,
+  "exit_code": 0
 }

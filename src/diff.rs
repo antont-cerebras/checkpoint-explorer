@@ -9,7 +9,7 @@
 //! logic is testable without any I/O.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 
 use anyhow::{Context, Result};
@@ -578,19 +578,103 @@ impl NameMap {
         if self.rules.is_empty() {
             return Vec::new();
         }
+        // Classify from the original names *before* they collapse into `mapped`,
+        // reusing the same collision detection the in-place rename relies on.
+        let collisions = self
+            .plan_renames(sum.tensors.keys().map(String::as_str))
+            .collisions;
         let mut mapped: BTreeMap<String, TensorSig> = BTreeMap::new();
-        let mut collisions = Vec::new();
         for (name, sig) in std::mem::take(&mut sum.tensors) {
-            let to = self.map(&name).into_owned();
-            if mapped.insert(to.clone(), sig).is_some() {
-                collisions.push(to);
-            }
+            mapped.insert(self.map(&name).into_owned(), sig); // keeps the last
         }
         sum.tensors = mapped;
-        collisions.sort_unstable();
-        collisions.dedup();
         collisions
     }
+
+    /// Classify how the rules rewrite `names` (see [`RenamePlan`]). This is the
+    /// shared basis for both the `diff` collision *warning* and the `convert --map`
+    /// in-place rename's (fatal) validity checks — one engine, two severities.
+    ///
+    /// The collision set counts *every* resulting name, including names no rule
+    /// changed, so a rule that renames one tensor onto another, untouched one is
+    /// caught too (not just two sources colliding onto a fresh name).
+    pub fn plan_renames<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> RenamePlan {
+        let mut renames = Vec::new();
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        for name in names {
+            let to = self.map(name).into_owned();
+            *counts.entry(to.clone()).or_insert(0) += 1;
+            if to != name {
+                renames.push((name.to_string(), to));
+            }
+        }
+        let mut collisions: Vec<String> = counts
+            .into_iter()
+            .filter_map(|(name, c)| (c > 1).then_some(name))
+            .collect();
+        collisions.sort_unstable();
+        RenamePlan {
+            renames,
+            collisions,
+        }
+    }
+
+    /// The indices of rules that never change *any* of `names`. Rules are applied
+    /// cumulatively (a later rule sees earlier rules' output, exactly as [`map`]
+    /// does), so this reports a genuinely dead rule — a typo'd pattern the caller
+    /// can warn about without failing the whole operation.
+    ///
+    /// [`map`]: NameMap::map
+    pub fn unmatched_rules<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Vec<usize> {
+        if self.rules.is_empty() {
+            return Vec::new();
+        }
+        let mut matched = vec![false; self.rules.len()];
+        for name in names {
+            let mut cur = Cow::Borrowed(name);
+            for (i, (re, rep)) in self.rules.iter().enumerate() {
+                // `replace_all` returns `Owned` iff it matched at least once.
+                if let Cow::Owned(s) = re.replace_all(&cur, rep.as_str()) {
+                    matched[i] = true;
+                    cur = Cow::Owned(s);
+                }
+            }
+        }
+        (0..self.rules.len()).filter(|&i| !matched[i]).collect()
+    }
+
+    /// How many of `names` at least one rule matches — counting a name even when
+    /// the rewrite leaves it unchanged (the replacement re-inserts the same
+    /// capture). Lets a caller tell "the pattern matches N tensors but the new
+    /// name is identical" apart from "the pattern matches nothing", which
+    /// [`plan_renames`](Self::plan_renames) (changed-only) can't.
+    pub fn match_count<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> usize {
+        names
+            .into_iter()
+            .filter(|name| {
+                let mut cur = Cow::Borrowed(*name);
+                let mut matched = false;
+                for (re, rep) in &self.rules {
+                    if let Cow::Owned(s) = re.replace_all(&cur, rep.as_str()) {
+                        matched = true;
+                        cur = Cow::Owned(s);
+                    }
+                }
+                matched
+            })
+            .count()
+    }
+}
+
+/// How a [`NameMap`]'s rules rewrite a set of tensor names — the shared basis for
+/// the `diff` collision warning and the in-place `rename` validity checks.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RenamePlan {
+    /// `(old, new)` for every name a rule changes, in the input order.
+    pub renames: Vec<(String, String)>,
+    /// Target names that two or more distinct sources map onto (rules too broad).
+    /// Sorted. A rename is unsafe while any collision remains.
+    pub collisions: Vec<String>,
 }
 
 /// A tensor's shape as a glob-matchable path, `dim/dim/…` (empty for a scalar) —
@@ -1565,6 +1649,31 @@ fn write_meta_line_diff(s: &mut String, old: &str, new: &str, color: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn match_count_counts_matches_even_when_the_name_is_unchanged() {
+        let names = [
+            "model.layers.0.mlp.experts.down_proj.codebook",
+            "model.layers.1.mlp.experts.down_proj.codebook",
+            "model.embed_tokens.weight",
+        ];
+        // A no-op rule (the replacement re-inserts the same capture) still *matches*
+        // its tensors, though `plan_renames` reports no *changes*.
+        let noop = NameMap::from_pairs([(
+            r"^model\.layers\.(\d+)\.mlp\.experts\.down_proj\.codebook$".to_string(),
+            "model.layers.$1.mlp.experts.down_proj.codebook".to_string(),
+        )])
+        .unwrap();
+        assert_eq!(noop.match_count(names), 2, "the pattern matches two layers");
+        assert!(
+            noop.plan_renames(names).renames.is_empty(),
+            "but nothing is renamed (new name == old)"
+        );
+
+        // A pattern that matches nothing counts zero.
+        let miss = NameMap::from_pairs([("^nope$".to_string(), "x".to_string())]).unwrap();
+        assert_eq!(miss.match_count(names), 0);
+    }
 
     fn sig(dtype: &str, shape: &[usize]) -> TensorSig {
         TensorSig {

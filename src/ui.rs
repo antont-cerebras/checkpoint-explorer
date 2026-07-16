@@ -76,20 +76,7 @@ fn data_view_regions(
     chips: &[ChipHit],
     footer_top: u16,
 ) -> Vec<(Rect, KeyEvent)> {
-    let mut regions: Vec<(Rect, KeyEvent)> = chips
-        .iter()
-        .map(|c| {
-            (
-                Rect {
-                    x: c.col,
-                    y: footer_top + c.line,
-                    width: c.width,
-                    height: 1,
-                },
-                c.key,
-            )
-        })
-        .collect();
+    let mut regions = chip_regions(chips, footer_top);
     regions.extend(close_button(
         frame,
         KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
@@ -112,6 +99,28 @@ pub fn region_at(regions: &[(Rect, KeyEvent)], col: u16, row: u16) -> Option<(Re
         .copied()
 }
 
+/// Map a footer's [`ChipHit`]s (line/col relative to their hint block) to absolute
+/// screen [`Rect`]s paired with each chip's key. `base_row` is the block's first
+/// screen row: `1` for the tree/files header hints, or `footer_top` for the modes
+/// whose hints sit in the bottom footer. Replaces the per-mode remap that was
+/// copy-pasted across every screen renderer.
+pub fn chip_regions(chips: &[ChipHit], base_row: u16) -> ChipRegions {
+    chips
+        .iter()
+        .map(|c| {
+            (
+                Rect {
+                    x: c.col,
+                    y: base_row + c.line,
+                    width: c.width,
+                    height: 1,
+                },
+                c.key,
+            )
+        })
+        .collect()
+}
+
 /// Which screen a footer shortcut sits on, so [`shortcut_help`] can disambiguate
 /// keys that mean different things per screen (`h`, `b`, `r`, the arrows).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -121,12 +130,13 @@ pub enum HelpCtx {
     Layout,
     Detail,
     Data,
+    Rename,
 }
 
 /// A one-line help description for a footer shortcut `key` on screen `ctx`, shown
 /// as a bubble when the mouse hovers the chip. `None` for keys with no help.
 pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
-    use HelpCtx::{Data, Detail, Files, Layout, Tree};
+    use HelpCtx::{Data, Detail, Files, Layout, Rename, Tree};
     use KeyCode::{Backspace, Char, Down, Left, PageDown, PageUp, Right, Tab, Up};
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let help = match (ctx, key.code) {
@@ -165,7 +175,10 @@ pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
         (Tree, Char('t')) => "Copy the tree or a flat tensor list — text or JSON (opens a menu).",
         (Tree, Char('f')) => "Copy the selected row's file path.",
         (Tree, Char('n')) => "Copy the selected tensor's name.",
-        (Tree, Char('R')) => "Repack this HDF5 checkpoint into a new file with another codec.",
+        (Tree, Char('r')) => "Repack this HDF5 checkpoint into a new file with another codec.",
+        (Tree, Char('R')) => {
+            "Rename tensors in place (safetensors): rewrites shard headers and the index."
+        }
         (Tree, Char('q')) => "Quit the explorer.",
         // Detail screen.
         (Detail, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
@@ -185,6 +198,20 @@ pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
         (Data, Up | Down | Left | Right) => {
             "Pan the view (Shift = one screenful, Ctrl = to the edge)."
         }
+        // Rename editor — palette commands, keyed by their registry sentinel char
+        // (the palette maps each to `KeyCode::Char(sentinel)`; see `RENAME_COMMANDS`).
+        (Rename, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
+        (Rename, Char('\r')) => "Apply the rename in place (a second Enter confirms).",
+        (Rename, Char('\u{e}')) => "Add another source → new-name rule.",
+        (Rename, Char('\u{4}')) => "Remove the focused rule.",
+        (Rename, Char('\u{19}')) => {
+            "Copy the `convert --map` command that applies this rename non-interactively."
+        }
+        (Rename, Char('\u{1}')) => "Copy the whole screen's text to the clipboard.",
+        (Rename, Char('\u{2}')) => "Copy the CLI command that reopens this rename editor.",
+        (Rename, Char('\u{5}')) => "Show the legend for the rename editor's symbols.",
+        (Rename, Char('\u{1b}')) => "Go back to the previous view.",
+        (Rename, Char('\u{3}')) => "Quit the explorer.",
         // Common to every screen.
         (_, Char('l')) => "Show the legend for this screen's symbols and keys.",
         (_, Char('c')) => "Copy the whole screen's text to the clipboard.",
@@ -295,9 +322,6 @@ pub struct DrawConfig<'a> {
     pub current_file: &'a str,
     pub file_idx: usize,
     pub total_files: usize,
-    /// Read remotely (`--ssh-read`): the checkpoint is metadata-only here, so the
-    /// title carries a metadata-only badge and the data views are unavailable.
-    pub metadata_only: bool,
     pub selected_idx: usize,
     pub scroll_offset: usize,
     pub search_mode: bool,
@@ -312,12 +336,6 @@ pub struct DrawConfig<'a> {
     /// Second status line, below `status_bar`: a tensor's source file (empty for
     /// groups).
     pub status_secondary: &'a str,
-    /// The checkpoint's health-alert level, if any — shows the `⚠ health` badge
-    /// beside the read-only badge (press `h` for the report), orange for
-    /// warnings-only and red for real errors. `None` hides the badge.
-    pub health: Option<HealthAlert>,
-    /// Whether the mouse is hovering the health badge, floating its help bubble.
-    pub health_hover: bool,
     /// Whether the loaded checkpoint can be repacked (a single HDF5 file), which
     /// gates the `R` hint.
     pub can_repack: bool,
@@ -334,10 +352,89 @@ pub struct DrawConfig<'a> {
     /// scroll bar: a headless `--plain` / screen-copy render is a static text
     /// dump with no viewport, so it shows no bar (see [`UI::tree_scrollbar`]).
     pub interactive: bool,
-    /// Whether the mouse is hovering the read-only badge, floating its hint.
-    pub readonly_hover: bool,
-    /// Whether the mouse is hovering the metadata-only badge (remote only).
-    pub metadata_hover: bool,
+    /// The bottom-right status badges (access / health / metadata-only), from
+    /// [`UI::status_badges`], right-to-left; and which one the mouse is over (for
+    /// its hover bubble). One uniform bar — see [`UI::render_badge_bar`].
+    pub badges: &'a [Badge],
+    pub hovered_badge: Option<usize>,
+}
+
+/// A clickable link in the UI — the app-wide primitive for "click a name to jump".
+/// A safetensors filename links to its byte-layout view; a *concrete* tensor name
+/// links to its place in the tree (a schema with `{layer}`/`{expert}` placeholders
+/// matches many tensors, so it is never a link). Recorded per screen and dispatched
+/// by [`Explorer::open_link`](crate::explorer). See the `links` field on `Explorer`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Link {
+    /// Open the byte-layout view of this safetensors file (its full path).
+    Layout(String),
+    /// Reveal this concrete tensor in the tree.
+    Tree(String),
+}
+
+/// A frame's footer-chip click regions — each replays a [`KeyEvent`].
+pub type ChipRegions = Vec<(Rect, KeyEvent)>;
+/// A frame's navigation-link regions — each opens another view via a [`Link`].
+pub type LinkRegions = Vec<(Rect, Link)>;
+
+/// One rule's line in the rename preview: the before→after *schema* plus how many
+/// tensors it touches and how they break down by [`RenameStatus`]. Summarising per
+/// rule keeps the preview a few lines even when a rule matches every layer.
+pub struct RenameRuleView {
+    pub from: String,
+    pub to: String,
+    /// Tensors whose name the rule *changes* (the rows the preview lists).
+    pub total: usize,
+    /// Tensors the pattern *matches*, changed or not — so a no-op rule (a
+    /// just-autocompleted source whose new name is still identical) reads as
+    /// "matches N · unchanged", not the misleading "matches no tensors".
+    pub matched: usize,
+    pub ok: usize,
+    pub collide: usize,
+    pub wont_fit: usize,
+    pub invalid: usize,
+    /// Per changed shard: how the rewritten header sizes up (the detail behind a
+    /// `won't fit` verdict — which file, and by how many bytes).
+    pub shards: Vec<crate::rename::ShardFit>,
+}
+
+/// Everything [`UI::render_rename`] draws: the dynamic list of source→new-name rule
+/// pairs (with the focused field + its autocomplete) and a compact, per-rule
+/// before→after preview marking each rule's in-place feasibility.
+pub struct RenameView<'a> {
+    pub root: &'a str,
+    /// `(source, new-name)` for each rule pair, in order.
+    pub pairs: &'a [(String, String)],
+    pub focus_pair: usize,
+    /// Which field of `focus_pair` has focus: `false` = source, `true` = new-name.
+    pub on_target: bool,
+    /// Caret position (char index) within the focused field.
+    pub cursor: usize,
+    /// Whether to show the source's autocomplete list (hidden after a completion).
+    pub show_suggestions: bool,
+    /// Autocomplete suggestions for the focused source (empty on a new-name field);
+    /// the first is what `Tab` accepts.
+    pub suggestions: &'a [&'a str],
+    /// One summary per complete rule (the before→after preview).
+    pub rules: &'a [RenameRuleView],
+    /// Total tensors renamed across all rules (for the header).
+    pub total: usize,
+    pub warnings: &'a [String],
+    /// Whether `model.safetensors.index.json` will be updated too.
+    pub has_index: bool,
+    /// Whether the rename can be applied (every affected tensor clean).
+    pub applicable: bool,
+    /// Preview-pane scroll offset.
+    pub scroll: usize,
+    pub error: Option<&'a str>,
+    /// Whether a clean rename is staged, awaiting the confirming second `Enter`.
+    pub confirming: bool,
+    /// The `convert --map …` CLI command equivalent to the entered renames (shown
+    /// above the footer, copyable with `^Y`), or `None` until a rule is complete.
+    pub cli: Option<&'a str>,
+    /// What was just copied to the clipboard (e.g. `"the apply command"`), shown as
+    /// a `✓ copied …` flash on the command row; `None` when nothing was just copied.
+    pub copied: Option<&'a str>,
 }
 
 /// How a screen should render the statistics area: not computed yet, a scan in
@@ -479,6 +576,7 @@ pub enum Legend {
     Detail,
     Heatmap,
     Values,
+    Rename,
 }
 
 /// A floating pop-up the detail screen can show *over* its live frame — drawn as
@@ -546,186 +644,217 @@ impl TreeScrollbar {
 
 pub struct UI;
 
-/// The read-only badge text, drawn bottom-right on every view. This tool never
-/// modifies a checkpoint (local or remote), so the badge is unconditional.
-const READONLY_BADGE: &str = " read-only ";
+/// What the bottom-right access badge advertises about the currently open
+/// checkpoint: whether the tool can rewrite it in place. Only a **local
+/// safetensors** checkpoint is [`Editable`](AccessBadge::Editable) — the in-place
+/// rename (`convert --map` / the `R` action) is the one path that modifies it;
+/// everything else (a remote `--ssh-read` read, an HDF5 file, plain exports) is
+/// [`ReadOnly`](AccessBadge::ReadOnly), and browsing never modifies it either way.
+/// It is the rightmost [`Badge`] in the [`status bar`](UI::render_badge_bar).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AccessBadge {
+    ReadOnly,
+    Editable,
+}
 
-/// The short health-alert badge, drawn just left of the read-only badge on the
-/// tree's bottom line when the index/file health check found a problem.
+impl AccessBadge {
+    /// The chip text, symmetrically padded with one space on each side.
+    const fn label(self) -> &'static str {
+        match self {
+            AccessBadge::ReadOnly => " read-only ",
+            AccessBadge::Editable => " editable ",
+        }
+    }
+
+    /// The chip foreground: reassuring green when read-only, attention-drawing
+    /// amber when the checkpoint can be rewritten in place.
+    fn color(self) -> Color {
+        match self {
+            AccessBadge::ReadOnly => palette::SUCCESS,
+            AccessBadge::Editable => palette::WARN,
+        }
+    }
+
+    /// The hover-bubble text explaining what the badge means.
+    fn hover(self) -> &'static str {
+        match self {
+            AccessBadge::ReadOnly => {
+                "The checkpoint you open is never modified — browsing and exports only \
+                 ever read it. (Repack / convert write a new file, leaving the original \
+                 untouched.)"
+            }
+            AccessBadge::Editable => {
+                "Browsing and exports never modify this checkpoint. The one exception is \
+                 the in-place rename (R / convert --map), which rewrites the headers \
+                 after you confirm."
+            }
+        }
+    }
+}
+
 const HEALTH_BADGE: &str = " ⚠ health ";
-
-/// The metadata-only badge, drawn on the tree's bottom line (left of the health /
-/// read-only badges) when browsing a remote (`--ssh-read`) checkpoint: only header
-/// metadata is loaded, so the data views (heatmap / grid / …) can't open.
 const METADATA_BADGE: &str = " metadata-only ";
 
-/// Default-background columns left between adjacent badges, so the `STATUS_BG`
-/// chips read as separate badges rather than one bar.
+/// Default-background columns left between adjacent badges (and between the
+/// leftmost badge and the status text), so the `STATUS_BG` chips read as separate
+/// badges rather than one bar.
 const BADGE_GAP: u16 = 2;
 
-/// A badge's rect on the bottom row, right-aligned after `right_w` columns already
-/// spoken for by the badges to its right (each followed by a [`BADGE_GAP`]).
-/// `None` if the frame is too narrow/short. Shared by the renderer and the hover
-/// hit-test so they can't drift.
-fn badge_rect(width: u16, height: u16, right_w: u16, badge_w: u16) -> Option<Rect> {
-    if height == 0 || width <= right_w + badge_w {
-        return None;
-    }
-    Some(Rect {
-        x: width - right_w - badge_w,
-        y: height - 1,
-        width: badge_w,
-        height: 1,
-    })
+/// One chip in the bottom-right **status bar** — the uniform model behind the
+/// access / health / metadata-only badges. Built by [`UI::status_badges`] and laid
+/// out / drawn / hit-tested by the `badge_bar_*` functions, so every badge shares
+/// one path for width, gap, colour, hover bubble and click action (they used to be
+/// three hand-threaded implementations that kept drifting).
+#[derive(Clone, Copy)]
+pub struct Badge {
+    /// Chip text, already padded (`" read-only "`, `" ⚠ health "`, …); also the
+    /// hover bubble's title.
+    label: &'static str,
+    fg: Color,
+    bg: Color,
+    /// The hover bubble's border / title colour.
+    accent: Color,
+    /// The hover bubble body (word-wrapped by [`render_hover_bubble`]).
+    help: &'static str,
+    /// The key a click on this badge synthesizes (e.g. `h` opens the health
+    /// report), or `None` if the badge isn't actionable.
+    action: Option<char>,
 }
 
-/// Where the health badge sits — left of the read-only badge, using each badge's
-/// *display* width (the ⚠ glyph is wide).
-fn health_badge_rect(width: u16, height: u16) -> Option<Rect> {
-    use unicode_width::UnicodeWidthStr;
-    let readonly_w = READONLY_BADGE.width() as u16;
-    badge_rect(
-        width,
-        height,
-        readonly_w + BADGE_GAP,
-        HEALTH_BADGE.width() as u16,
-    )
+impl Badge {
+    /// The chip's display width (the `⚠` glyph is wide).
+    fn width(self) -> u16 {
+        use unicode_width::UnicodeWidthStr;
+        self.label.width() as u16
+    }
+
+    /// The key a click on this badge acts as, if any.
+    pub fn action(self) -> Option<char> {
+        self.action
+    }
 }
 
-/// Where the metadata-only badge sits — left of the read-only badge, and left of
-/// the health badge too when it's present (`health_present`).
-fn metadata_badge_rect(width: u16, height: u16, health_present: bool) -> Option<Rect> {
-    use unicode_width::UnicodeWidthStr;
-    let mut right_w = READONLY_BADGE.width() as u16 + BADGE_GAP;
-    if health_present {
-        right_w += HEALTH_BADGE.width() as u16 + BADGE_GAP;
-    }
-    badge_rect(width, height, right_w, METADATA_BADGE.width() as u16)
-}
-
-impl UI {
-    /// Draw the persistent `read-only` badge on the very bottom status line,
-    /// right-aligned. Rendered last on every view (tree / detail / data) so it
-    /// sits above whatever occupies that row. When `hover` is set (the mouse is
-    /// over the badge) a small hint pop-up floats just above it.
-    pub fn render_readonly_badge(frame: &mut Frame, hover: bool) {
-        let area = frame.area();
-        let badge_w = READONLY_BADGE.chars().count() as u16;
-        if area.width <= badge_w || area.height == 0 {
-            return;
-        }
-        Paragraph::new(Line::from(Span::styled(
-            READONLY_BADGE,
-            Style::default()
-                .bg(palette::STATUS_BG)
-                .fg(palette::SUCCESS)
-                .add_modifier(Modifier::BOLD),
-        )))
-        .render(
-            Rect {
-                x: area.width - badge_w,
-                y: area.height - 1,
-                width: badge_w,
-                height: 1,
-            },
-            frame.buffer_mut(),
-        );
-        if hover {
-            render_readonly_hint(frame);
-        }
-    }
-
-    /// Is the point `(col, row)` over the read-only badge, given the frame size?
-    /// Lets a loop toggle the hover hint without duplicating the badge geometry.
-    pub fn readonly_badge_hit(width: u16, height: u16, col: u16, row: u16) -> bool {
-        let badge_w = READONLY_BADGE.chars().count() as u16;
-        width > badge_w && height > 0 && row == height - 1 && col >= width - badge_w
-    }
-
-    /// Draw the short `⚠ health` alert badge on the bottom status line, just
-    /// left of the read-only badge — a stale index / dropped shard, surfaced
-    /// without opening the report. Red for a real `Error` (missing files/tensors),
-    /// a softer orange for warnings only. When `hover` is set, float a help bubble
-    /// above it. Caller gates on the alert being present.
-    pub fn render_health_badge(frame: &mut Frame, alert: HealthAlert, hover: bool) {
-        let area = frame.area();
-        let Some(rect) = health_badge_rect(area.width, area.height) else {
-            return;
-        };
-        let (bg, detail) = match alert {
+/// Build the bottom-right status badges in **right-to-left** order (index 0 is the
+/// rightmost, hugging the edge): the access badge always, then the health badge
+/// when the index/file check flagged something, then the metadata-only badge for a
+/// remote source. This is the single source of truth both the renderer and the
+/// hover / click hit-test build from, so they can't disagree.
+pub fn status_badges(
+    access: AccessBadge,
+    health: Option<HealthAlert>,
+    metadata_only: bool,
+) -> Vec<Badge> {
+    let mut badges = vec![Badge {
+        label: access.label(),
+        fg: access.color(),
+        bg: palette::STATUS_BG,
+        accent: access.color(),
+        help: access.hover(),
+        action: None,
+    }];
+    if let Some(alert) = health {
+        let (bg, help) = match alert {
             HealthAlert::Error => (
                 palette::ALERT,
                 "Index / file mismatch — files or tensors the index references are \
-                 missing on disk, so the checkpoint may be incomplete. Click (or \
-                 press h) for the health report.",
+                 missing on disk, so the checkpoint may be incomplete. Click (or press \
+                 h) for the health report.",
             ),
             HealthAlert::Warning => (
                 palette::WARN_BG,
-                "Index / file mismatch (warnings only) — e.g. files on disk the \
-                 index doesn't reference. Click (or press h) for the health report.",
+                "Index / file mismatch (warnings only) — e.g. files on disk the index \
+                 doesn't reference. Click (or press h) for the health report.",
             ),
         };
-        Paragraph::new(Line::from(Span::styled(
-            HEALTH_BADGE,
-            Style::default()
-                .bg(bg)
-                .fg(palette::STATUS_FG)
-                .add_modifier(Modifier::BOLD),
-        )))
-        .render(rect, frame.buffer_mut());
-        if hover {
-            // Title + border match the badge (as the read-only bubble mirrors its
-            // badge): the badge's colour and the `⚠ health` label.
-            render_hover_bubble(frame, rect, bg, Some(HEALTH_BADGE), detail);
-        }
+        badges.push(Badge {
+            label: HEALTH_BADGE,
+            fg: palette::STATUS_FG,
+            bg,
+            accent: bg,
+            help,
+            action: Some('h'),
+        });
     }
-
-    /// Is the point `(col, row)` over the health badge? Mirrors
-    /// [`Self::readonly_badge_hit`] for the health alert's hover bubble.
-    pub fn health_badge_hit(width: u16, height: u16, col: u16, row: u16) -> bool {
-        health_badge_rect(width, height)
-            .is_some_and(|r| row == r.y && col >= r.x && col < r.x + r.width)
+    if metadata_only {
+        badges.push(Badge {
+            label: METADATA_BADGE,
+            fg: palette::WARN,
+            bg: palette::STATUS_BG,
+            accent: palette::WARN,
+            help: "A remote source: only header metadata is loaded, so the data views \
+                   (heatmap / grid / histogram / statistics) need the file locally.",
+            action: None,
+        });
     }
+    badges
+}
 
-    /// Draw the `metadata-only` badge on the tree's bottom line, left of the
-    /// health / read-only badges — a remote (`--ssh-read`) checkpoint whose data
-    /// views can't open. `health_present` shifts it left past the health badge.
-    /// When `hover` is set, float a bubble explaining the limitation.
-    pub fn render_metadata_badge(frame: &mut Frame, hover: bool, health_present: bool) {
+/// The on-screen rect of each badge on the bottom row — right-aligned, index 0 at
+/// the edge, each `BADGE_GAP` apart. `None` for a badge that doesn't fit the frame.
+/// The one geometry the renderer, hit-test and reserve all share.
+fn badge_rects(width: u16, height: u16, badges: &[Badge]) -> Vec<Option<Rect>> {
+    let mut rects = Vec::with_capacity(badges.len());
+    let mut right = 0u16; // columns already spoken for to the right (incl. gaps)
+    for b in badges {
+        let w = b.width();
+        let rect = (height > 0 && width > right + w).then(|| Rect {
+            x: width - right - w,
+            y: height - 1,
+            width: w,
+            height: 1,
+        });
+        rects.push(rect);
+        right += w + BADGE_GAP;
+    }
+    rects
+}
+
+impl UI {
+    /// Draw the bottom-right **status bar** — every badge in `badges` (from
+    /// [`status_badges`]) right-aligned on the last row, and, when `hovered` is
+    /// `Some(i)`, that badge's hover bubble floated above it. Rendered last on a
+    /// view so the chips sit over whatever occupies that row.
+    pub fn render_badge_bar(frame: &mut Frame, badges: &[Badge], hovered: Option<usize>) {
         let area = frame.area();
-        let Some(rect) = metadata_badge_rect(area.width, area.height, health_present) else {
-            return;
-        };
-        Paragraph::new(Line::from(Span::styled(
-            METADATA_BADGE,
-            Style::default()
-                .bg(palette::STATUS_BG)
-                .fg(palette::WARN)
-                .add_modifier(Modifier::BOLD),
-        )))
-        .render(rect, frame.buffer_mut());
-        if hover {
-            render_hover_bubble(
-                frame,
-                rect,
-                palette::WARN,
-                Some(METADATA_BADGE),
-                "A remote source: only header metadata is loaded, so the data views \
-                 (heatmap / grid / histogram / statistics) need the file locally.",
-            );
+        let rects = badge_rects(area.width, area.height, badges);
+        for (b, rect) in badges.iter().zip(&rects) {
+            if let Some(r) = rect {
+                Paragraph::new(Line::from(Span::styled(
+                    b.label,
+                    Style::default()
+                        .bg(b.bg)
+                        .fg(b.fg)
+                        .add_modifier(Modifier::BOLD),
+                )))
+                .render(*r, frame.buffer_mut());
+            }
+        }
+        // The hover bubble goes last so it floats over the neighbouring chips.
+        if let Some(i) = hovered
+            && let (Some(b), Some(Some(r))) = (badges.get(i), rects.get(i))
+        {
+            render_hover_bubble(frame, *r, b.accent, Some(b.label), b.help);
         }
     }
 
-    /// Is the point `(col, row)` over the metadata-only badge?
-    pub fn metadata_badge_hit(
+    /// The index of the badge under `(col, row)`, if any — for the hover bubble and
+    /// click actions. Shares [`badge_rects`] with the renderer, so they can't drift.
+    pub fn badge_bar_hit(
         width: u16,
         height: u16,
-        health_present: bool,
         col: u16,
         row: u16,
-    ) -> bool {
-        metadata_badge_rect(width, height, health_present)
-            .is_some_and(|r| row == r.y && col >= r.x && col < r.x + r.width)
+        badges: &[Badge],
+    ) -> Option<usize> {
+        badge_rects(width, height, badges)
+            .into_iter()
+            .position(|r| r.is_some_and(|r| row == r.y && col >= r.x && col < r.x + r.width))
+    }
+
+    /// Columns the badge bar reserves on the right of the status line, so the
+    /// status text never runs under it (a [`BADGE_GAP`] before each badge).
+    pub fn badge_bar_width(badges: &[Badge]) -> u16 {
+        badges.iter().map(|b| b.width() + BADGE_GAP).sum()
     }
 
     /// How many tree rows are visible at once (one screenful), used to size a
@@ -920,17 +1049,9 @@ impl UI {
 
         // --- bottom two-line status bar ---
         // Reserve room on the right of the bottom status line for the persistent
-        // badges drawn there — the read-only badge, plus (when the health check
-        // flagged a problem) the short `⚠ health` badge to its left — so the status
-        // text never runs under either.
-        use unicode_width::UnicodeWidthStr;
-        let mut reserve = READONLY_BADGE.width();
-        if config.health.is_some() {
-            reserve += HEALTH_BADGE.width() + BADGE_GAP as usize;
-        }
-        if config.metadata_only {
-            reserve += METADATA_BADGE.width() + BADGE_GAP as usize;
-        }
+        // badges drawn there (access, and any health / metadata-only badge), so the
+        // status text never runs under them.
+        let reserve = Self::badge_bar_width(config.badges) as usize;
         let max_text = (width as usize).saturating_sub(6 + reserve);
         let row0 = if config.search_mode && config.tree.is_empty() {
             Line::from(vec![
@@ -995,34 +1116,13 @@ impl UI {
             frame.buffer_mut(),
         );
 
-        // Right-aligned badges on the bottom status line: read-only (always), the
-        // `⚠ health` alert (local; a stale index / dropped shard), and
-        // `metadata-only` (remote — data views need the file locally). Each with
-        // an on-hover bubble; drawn left of one another in that order.
-        Self::render_readonly_badge(frame, config.readonly_hover);
-        if let Some(alert) = config.health {
-            Self::render_health_badge(frame, alert, config.health_hover);
-        }
-        if config.metadata_only {
-            Self::render_metadata_badge(frame, config.metadata_hover, config.health.is_some());
-        }
+        // Right-aligned status badges (access, and any health / metadata-only), with
+        // the hovered one's bubble — all through the one uniform bar.
+        Self::render_badge_bar(frame, config.badges, config.hovered_badge);
 
         // Clickable regions: each footer chip (the hint block starts at row 1,
         // below the title) plus the top-right `[×]` (→ quit the tree).
-        let mut regions: Vec<(Rect, KeyEvent)> = chips
-            .iter()
-            .map(|c| {
-                (
-                    Rect {
-                        x: c.col,
-                        y: 1 + c.line,
-                        width: c.width,
-                        height: 1,
-                    },
-                    c.key,
-                )
-            })
-            .collect();
+        let mut regions = chip_regions(&chips, 1);
         regions.extend(close_button(frame, hint_key('q')));
         regions
     }
@@ -1068,6 +1168,9 @@ impl UI {
     /// one-line status bar showing the selected entry's path (or a copy
     /// confirmation). Returns the clickable footer chips + `[×]` close, like
     /// [`Self::render_tree`].
+    // A flat render signature (frame + view state) — a config struct would just
+    // move the same fields behind one more indirection for no clarity.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_files(
         frame: &mut Frame,
         root: &str,
@@ -1076,6 +1179,8 @@ impl UI {
         scroll: usize,
         copied_flash: Option<&str>,
         interactive: bool,
+        badges: &[Badge],
+        hovered_badge: Option<usize>,
     ) -> Vec<(Rect, KeyEvent)> {
         let area = frame.area();
         let (width, height) = (area.width, area.height);
@@ -1151,8 +1256,7 @@ impl UI {
         }
 
         // --- one-line status bar (selected entry, or a copy confirmation) ---
-        use unicode_width::UnicodeWidthStr;
-        let reserve = READONLY_BADGE.width();
+        let reserve = Self::badge_bar_width(badges) as usize;
         let max_text = (width as usize).saturating_sub(6 + reserve);
         let status = if let Some(flash) = copied_flash {
             Line::from(Span::styled(
@@ -1181,29 +1285,393 @@ impl UI {
             },
             frame.buffer_mut(),
         );
-        Self::render_readonly_badge(frame, false);
+        Self::render_badge_bar(frame, badges, hovered_badge);
 
         // Clickable footer chips (hint block starts at row 1, below the title)
         // plus the top-right `[×]` (→ switch back to the tensor tree).
-        let mut regions: Vec<(Rect, KeyEvent)> = chips
-            .iter()
-            .map(|c| {
-                (
-                    Rect {
-                        x: c.col,
-                        y: 1 + c.line,
-                        width: c.width,
-                        height: 1,
-                    },
-                    c.key,
-                )
-            })
-            .collect();
+        let mut regions = chip_regions(&chips, 1);
         regions.extend(close_button(
             frame,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
         ));
         regions
+    }
+
+    /// Draw the in-place rename editor ([`Screen::Rename`](crate::explorer)): a
+    /// title + rule header (the same borderless chrome as the tree / detail /
+    /// layout views — it's a first-class view, not a pop-up dialog), the dynamic
+    /// list of source→new-name rule pairs (with the focused field's autocomplete),
+    /// a live before→after diff preview marking each tensor OK / collides /
+    /// won't-fit, and the common footer / confirm bar. Returns the preview pane's
+    /// max scroll offset, the footer chip regions (clickable, like the other
+    /// views), and the preview's nav-link regions.
+    pub fn render_rename(
+        frame: &mut Frame,
+        view: &RenameView,
+    ) -> (usize, ChipRegions, LinkRegions) {
+        let area = frame.area();
+        let (width, height) = (area.width, area.height);
+        if height < 7 || width < 12 {
+            return (0, Vec::new(), Vec::new());
+        }
+
+        // Header: a title line then a full-width rule, matching the other views'
+        // chrome (no surrounding border, no panel fill).
+        let header = vec![
+            Line::from(Span::styled(
+                format!("Rename tensors in place — {}", view.root),
+                Style::default()
+                    .fg(palette::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "─".repeat(width as usize),
+                Style::default().fg(palette::DIM),
+            )),
+        ];
+        let header_h = header.len() as u16;
+        Paragraph::new(header).render(
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: header_h,
+            },
+            frame.buffer_mut(),
+        );
+
+        // One field row: `label  value` — the focused field shows the caret via an
+        // input box; others show their value plainly (not dimmed).
+        let field_row = |label: &str, value: &str, focused: bool| -> Line<'static> {
+            let mut spans = vec![Span::styled(
+                format!("  {label:<4} "),
+                Style::default().fg(palette::KEY),
+            )];
+            if focused {
+                spans.extend(input_box_spans(value, view.cursor, 0));
+            } else {
+                spans.push(Span::raw(value.to_string()));
+            }
+            Line::from(spans)
+        };
+
+        // --- rule-pair editor lines ---
+        let mut editor: Vec<Line<'static>> = Vec::new();
+        for (i, (src, tgt)) in view.pairs.iter().enumerate() {
+            if view.pairs.len() > 1 {
+                editor.push(Line::from(Span::styled(
+                    format!("rule {}", i + 1),
+                    Style::default()
+                        .fg(palette::DTYPE)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+            let focused_src = i == view.focus_pair && !view.on_target;
+            let focused_tgt = i == view.focus_pair && view.on_target;
+            editor.push(field_row("from", src, focused_src));
+            if focused_src && view.show_suggestions {
+                if view.suggestions.is_empty() {
+                    editor.push(Line::from(dim_span(
+                        "       (no tensor matches — type part of a name)",
+                    )));
+                } else {
+                    // The first suggestion is what Tab accepts — highlight just its
+                    // marker + name (not the leading indent).
+                    for (j, name) in view.suggestions.iter().enumerate() {
+                        let top = j == 0;
+                        let style = if top {
+                            Style::default()
+                                .fg(palette::SELECT_FG)
+                                .bg(palette::SELECT_BG)
+                        } else {
+                            Style::default()
+                        };
+                        editor.push(Line::from(vec![
+                            Span::raw("       "),
+                            Span::styled(format!("{} {name}", if top { "▶" } else { " " }), style),
+                        ]));
+                    }
+                }
+            }
+            editor.push(field_row("to", tgt, focused_tgt));
+            editor.push(Line::from(Span::raw("")));
+        }
+
+        // --- compact, per-rule before → after preview ---
+        let mut preview: Vec<Line<'static>> = Vec::new();
+        let mut summary = format!(
+            "Preview — {} tensor(s) across {} rule(s)",
+            view.total,
+            view.rules.len()
+        );
+        // Only claim the index will change when a rule actually matches something.
+        if view.has_index && view.total > 0 {
+            summary.push_str(" · updates index.json");
+        }
+        preview.push(Line::from(Span::styled(
+            summary,
+            Style::default()
+                .fg(palette::KEY)
+                .add_modifier(Modifier::BOLD),
+        )));
+        if view.rules.is_empty() {
+            preview.push(Line::from(dim_span(
+                "  autocomplete a source and edit its new name to preview the changes",
+            )));
+        }
+        // Clickable links in the preview: (preview line index, x within inner,
+        // width, target) — resolved to screen Rects once scroll is known. Shard
+        // names open the layout view; a *concrete* source tensor opens the tree.
+        let mut hits: Vec<(usize, u16, u16, Link)> = Vec::new();
+        for (i, rule) in view.rules.iter().enumerate() {
+            // A one-line status per rule (coloured by the worst outcome), then the
+            // before → after schema on their own lines so nothing is truncated. The
+            // count reflects tensors *changed*, except a matched-but-unchanged rule
+            // (a just-autocompleted source whose new name is still identical), which
+            // reports how many it *matches* so it doesn't read as "matches nothing".
+            let (count, label, color) = if rule.collide > 0 || rule.invalid > 0 {
+                let mut parts = Vec::new();
+                if rule.collide > 0 {
+                    parts.push(format!("{} collide", rule.collide));
+                }
+                if rule.invalid > 0 {
+                    parts.push(format!("{} invalid target", rule.invalid));
+                }
+                (
+                    rule.total,
+                    format!("⚠ {}", parts.join(", ")),
+                    palette::ERROR,
+                )
+            } else if rule.wont_fit > 0 {
+                (
+                    rule.total,
+                    format!("⚠ {} won't fit in place", rule.wont_fit),
+                    palette::WARN,
+                )
+            } else if rule.total == 0 {
+                if rule.matched > 0 {
+                    (
+                        rule.matched,
+                        "new name unchanged — edit the “to” field".to_string(),
+                        palette::WARN,
+                    )
+                } else {
+                    (0, "matches no tensors".to_string(), palette::DIM)
+                }
+            } else {
+                (
+                    rule.total,
+                    "✓ applies cleanly".to_string(),
+                    palette::SUCCESS,
+                )
+            };
+            preview.push(Line::default());
+            preview.push(Line::from(vec![
+                Span::styled(
+                    format!("rule {} · {} tensor(s) · ", i + 1, count),
+                    Style::default().fg(palette::DTYPE),
+                ),
+                Span::styled(label, Style::default().fg(color)),
+            ]));
+            // A concrete source (no `{…}` placeholder) is one real tensor, so it's a
+            // link to the tree; a schema source matches many, so it stays plain.
+            if rule.from.contains('{') {
+                preview.push(Line::from(Span::raw(format!("    {}", rule.from))));
+            } else {
+                hits.push((
+                    preview.len(),
+                    4, // "    " indent
+                    rule.from.chars().count() as u16,
+                    Link::Tree(rule.from.clone()),
+                ));
+                preview.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(
+                        rule.from.clone(),
+                        Style::default()
+                            .fg(palette::ACCENT)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ),
+                ]));
+            }
+            preview.push(Line::from(vec![
+                Span::styled("  → ", Style::default().fg(palette::DIM)),
+                Span::styled(rule.to.clone(), Style::default().fg(color)),
+            ]));
+            // Per-shard header sizing — which file fits in place and by how much.
+            for sf in &rule.shards {
+                let (mark, note, c) = if sf.fits() {
+                    ("✓", format!("{} B to spare", sf.spare()), palette::SUCCESS)
+                } else {
+                    ("✗", format!("{} B over", sf.over()), palette::WARN)
+                };
+                // The filename is a link to that shard's layout view; record its
+                // region. `"      {mark} "` = 6 spaces + mark + space = 8 columns.
+                hits.push((
+                    preview.len(),
+                    8,
+                    sf.file.chars().count() as u16,
+                    Link::Layout(sf.path.clone()),
+                ));
+                preview.push(Line::from(vec![
+                    Span::styled(format!("      {mark} "), Style::default().fg(palette::DIM)),
+                    Span::styled(
+                        sf.file.clone(),
+                        Style::default()
+                            .fg(palette::ACCENT)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ),
+                    Span::styled(
+                        format!(
+                            "  header {} B → {} B  ({note}, {} tensor(s))",
+                            sf.current, sf.needed, sf.tensors
+                        ),
+                        Style::default().fg(c),
+                    ),
+                ]));
+            }
+        }
+        if !view.warnings.is_empty() {
+            preview.push(Line::default());
+        }
+        for w in view.warnings {
+            preview.push(Line::from(Span::styled(
+                format!("note: {w}"),
+                Style::default().fg(palette::WARN),
+            )));
+        }
+
+        // --- footer: the common clickable chip hint, or the confirm / error bar ---
+        // Build it first so its (possibly wrapped) height reserves the bottom rows,
+        // like the layout/file views size their footers.
+        let (footer_lines, chip_hits): (Vec<Line<'static>>, Vec<ChipHit>) = if view.confirming {
+            (
+                vec![Line::from(Span::styled(
+                    " Apply in place?  Enter = confirm · Esc = back — rewrites files, cannot be undone ",
+                    Style::default()
+                        .bg(palette::WARN_BG)
+                        .fg(palette::STATUS_FG)
+                        .add_modifier(Modifier::BOLD),
+                ))],
+                Vec::new(),
+            )
+        } else if let Some(err) = view.error {
+            (
+                vec![Line::from(Span::styled(
+                    format!("⚠ {err}"),
+                    Style::default().fg(palette::ERROR),
+                ))],
+                Vec::new(),
+            )
+        } else {
+            rename_hint_lines(width, view.applicable)
+        };
+        let footer_h = (footer_lines.len() as u16).max(1);
+        let footer_top = height.saturating_sub(footer_h);
+
+        // --- lay out: header, editor, preview (scroll), command row, footer ---
+        // The apply-command row sits just above the footer when there's room.
+        let cmd_y = footer_top.checked_sub(1).filter(|y| *y > header_h + 1);
+        let editor_h = (editor.len() as u16).min(height.saturating_sub(header_h + footer_h + 2));
+        Paragraph::new(editor).render(
+            Rect {
+                x: 0,
+                y: header_h,
+                width,
+                height: editor_h,
+            },
+            frame.buffer_mut(),
+        );
+
+        let sep_y = header_h + editor_h;
+        let preview_bottom = cmd_y.unwrap_or(footer_top);
+        if sep_y < preview_bottom {
+            Paragraph::new(Line::from(dim_span("─".repeat(width as usize)))).render(
+                Rect {
+                    x: 0,
+                    y: sep_y,
+                    width,
+                    height: 1,
+                },
+                frame.buffer_mut(),
+            );
+        }
+        let preview_y = sep_y + 1;
+        let preview_h = preview_bottom.saturating_sub(preview_y);
+        let visible = preview_h as usize;
+        let max_scroll = preview.len().saturating_sub(visible);
+        let scroll = view.scroll.min(max_scroll);
+        let window: Vec<Line> = preview.iter().skip(scroll).take(visible).cloned().collect();
+        Paragraph::new(window).render(
+            Rect {
+                x: 0,
+                y: preview_y,
+                width,
+                height: preview_h,
+            },
+            frame.buffer_mut(),
+        );
+        // Map the visible link hits to on-screen Rects (target per region).
+        let clicks: Vec<(Rect, Link)> = hits
+            .into_iter()
+            .filter(|(idx, ..)| *idx >= scroll && *idx < scroll + visible)
+            .map(|(idx, x, w, target)| {
+                (
+                    Rect {
+                        x,
+                        y: preview_y + (idx - scroll) as u16,
+                        width: w,
+                        height: 1,
+                    },
+                    target,
+                )
+            })
+            .collect();
+
+        // The equivalent apply command (copyable with ^Y), just above the footer.
+        if let Some(y) = cmd_y {
+            let cmd_line = if let Some(what) = view.copied {
+                Line::from(Span::styled(
+                    format!("✓ copied {what} to the clipboard"),
+                    Style::default()
+                        .fg(palette::SUCCESS)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else if let Some(cmd) = view.cli {
+                Line::from(vec![
+                    Span::styled("apply: ", Style::default().fg(palette::DIM)),
+                    Span::styled(cmd.to_string(), Style::default().fg(palette::META)),
+                    Span::styled("   (^Y copy)", Style::default().fg(palette::DIM)),
+                ])
+            } else {
+                Line::from(dim_span(
+                    "enter a rename above to get the `convert --map` command that applies it",
+                ))
+            };
+            Paragraph::new(cmd_line).render(
+                Rect {
+                    x: 0,
+                    y,
+                    width,
+                    height: 1,
+                },
+                frame.buffer_mut(),
+            );
+        }
+
+        Paragraph::new(footer_lines).render(
+            Rect {
+                x: 0,
+                y: footer_top,
+                width,
+                height: footer_h,
+            },
+            frame.buffer_mut(),
+        );
+        // Footer chips → absolute clickable regions (each replays its key).
+        let chips = chip_regions(&chip_hits, footer_top);
+
+        (max_scroll, chips, clicks)
     }
 
     /// Float a sidecar file preview over the file browser: a scrollable pop-up of
@@ -1249,13 +1717,16 @@ impl UI {
         scroll: usize,
         copied: Option<&str>,
         interactive: bool,
-    ) -> (usize, Vec<(Rect, KeyEvent)>) {
+    ) -> (usize, ChipRegions, LinkRegions) {
         use crate::safelayout::SegmentKind;
         let area = frame.area();
         let (width, height) = (area.width, area.height);
         if height < (LAYOUT_HEADER_ROWS as u16 + 2) {
-            return (0, Vec::new());
+            return (0, Vec::new(), Vec::new());
         }
+        // A concrete tensor band's name links to that tensor in the tree; filled in
+        // as the strip is drawn below.
+        let mut links: Vec<(Rect, Link)> = Vec::new();
 
         // --- header (title, summary, rule) ---
         let dim = Style::default().fg(palette::DIM);
@@ -1374,11 +1845,30 @@ impl UI {
                 // One-line label: name (selection-highlighted), then a dim
                 // dtype/shape + size, so nothing looks orphaned on a blank row.
                 let name = truncate_keep_end(&s.name, label_w.saturating_sub(24));
+                // A concrete tensor's name is a link to the tree (underlined, like
+                // the other in-app links); the spans above are a fixed 20 columns
+                // wide, so the name always starts at column 20.
+                let is_tensor = s.kind == SegmentKind::Tensor;
                 let name_style = if selected_row {
                     sel
+                } else if is_tensor {
+                    Style::default()
+                        .fg(color)
+                        .add_modifier(Modifier::UNDERLINED)
                 } else {
                     Style::default().fg(color)
                 };
+                if is_tensor {
+                    links.push((
+                        Rect {
+                            x: 20,
+                            y: LAYOUT_HEADER_ROWS as u16 + (r - scroll) as u16,
+                            width: name.chars().count() as u16,
+                            height: 1,
+                        },
+                        Link::Tree(s.name.clone()),
+                    ));
+                }
                 spans.push(Span::styled(name, name_style));
                 let mut detail = String::new();
                 if let (SegmentKind::Tensor, Some(dt)) = (s.kind, &s.dtype) {
@@ -1438,25 +1928,12 @@ impl UI {
         // Clickable footer chips (hints start at the footer's top row) + `[×]`
         // (→ back to the tensor tree, like the file view's close).
         let footer_top = (height as usize - footer_rows) as u16;
-        let mut regions: Vec<(Rect, KeyEvent)> = chips
-            .iter()
-            .map(|c| {
-                (
-                    Rect {
-                        x: c.col,
-                        y: footer_top + c.line,
-                        width: c.width,
-                        height: 1,
-                    },
-                    c.key,
-                )
-            })
-            .collect();
+        let mut regions = chip_regions(&chips, footer_top);
         regions.extend(close_button(
             frame,
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
         ));
-        (max_scroll, regions)
+        (max_scroll, regions, links)
     }
 
     /// A vertical scrollbar for a plain `total`-row list of `visible` rows sitting
@@ -1517,11 +1994,11 @@ impl UI {
         hist_scanning: Option<ScanProgress>,
         schema: Option<&PackingSchema>,
         overlay: Option<&Overlay>,
-    ) -> Vec<(Rect, KeyEvent)> {
+    ) -> (ChipRegions, LinkRegions) {
         let area = frame.area();
         let (width, height) = (area.width, area.height);
 
-        let (header, stats_gauge_row) =
+        let (header, stats_gauge_row, links) =
             detail_field_lines(tensor, shape, view, unindexed, stats, schema, width);
         let remote = crate::remote::is_remote_source(&tensor.source_path);
         // The `Tab` → file-layout hint shows only for a local `.safetensors` shard
@@ -1628,20 +2105,7 @@ impl UI {
 
         // Clickable regions: each footer chip (made absolute via the footer's
         // start row) plus the top-right `[×]` (→ step back, like `⌫`).
-        let mut regions: Vec<(Rect, KeyEvent)> = chips
-            .iter()
-            .map(|c| {
-                (
-                    Rect {
-                        x: c.col,
-                        y: footer_top + c.line,
-                        width: c.width,
-                        height: 1,
-                    },
-                    c.key,
-                )
-            })
-            .collect();
+        let mut regions = chip_regions(&chips, footer_top);
         regions.extend(close_button(
             frame,
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
@@ -1655,7 +2119,7 @@ impl UI {
             Some(Overlay::Notice(m)) => Self::render_notice_box(frame, m),
             None => {}
         }
-        regions
+        (regions, links)
     }
 
     /// Composite the context-sensitive glyph legend over the live frame as a
@@ -3541,47 +4005,6 @@ fn render_scroll_popup(
     (max_scroll, regions)
 }
 
-/// A small hint pop-up for the read-only badge, anchored bottom-right just above
-/// the badge row so it points at it. Floats over the live frame; the caller only
-/// draws it while the mouse hovers the badge (see [`UI::render_readonly_badge`]).
-fn render_readonly_hint(frame: &mut Frame) {
-    let area = frame.area();
-    let body = [
-        "The checkpoint you open is never modified —",
-        "browsing only ever reads it. (Repack / convert",
-        "write a new file, leaving the original untouched.)",
-    ];
-    let inner_w = body.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-    let box_w = ((inner_w + 4) as u16).min(area.width); // 2 borders + 2 padding
-    let box_h = ((body.len() + 2) as u16).min(area.height); // 2 borders
-    // Bottom-right, flush with the right edge and sitting on the row just above
-    // the badge (which occupies the last row); clamp so it stays on-screen.
-    let rect = Rect {
-        x: area.width.saturating_sub(box_w),
-        y: area.height.saturating_sub(1 + box_h),
-        width: box_w,
-        height: box_h,
-    };
-    Clear.render(rect, frame.buffer_mut());
-    let panel = Style::default().bg(palette::PANEL_BG);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(palette::SUCCESS))
-        .title(Span::styled(
-            " read-only ",
-            Style::default()
-                .fg(palette::SUCCESS)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .padding(Padding::horizontal(1))
-        .style(panel);
-    let inner = block.inner(rect);
-    block.render(rect, frame.buffer_mut());
-    Paragraph::new(body.iter().map(|l| Line::from(*l)).collect::<Vec<_>>())
-        .style(panel)
-        .render(inner, frame.buffer_mut());
-}
-
 /// Greedy word-wrap of a short help string into lines no wider than `width`.
 fn wrap_help(text: &str, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
@@ -3781,6 +4204,7 @@ fn legend_title(legend: Legend) -> &'static str {
         Legend::Detail => "Legend — tensor details",
         Legend::Heatmap => "Legend — heatmap",
         Legend::Values => "Legend — numeric values",
+        Legend::Rename => "Legend — rename tensors in place",
     }
 }
 
@@ -3965,9 +4389,55 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
             ));
             lines.push(Line::from(swatch));
         }
+        Legend::Rename => {
+            let rows = [
+                (
+                    Some(palette::ACCENT),
+                    "{layer}",
+                    "a numbered wildcard — matches any number and copies it into the new name (Tab inserts one)",
+                ),
+                (
+                    None,
+                    "12",
+                    "a literal number matches only itself — so `…layers.0.…` renames just layer 0",
+                ),
+                (
+                    Some(palette::SUCCESS),
+                    "✓",
+                    "the rule applies cleanly in place (the header fits the reserved space)",
+                ),
+                (
+                    Some(palette::WARN),
+                    "✗ won't fit",
+                    "the rewritten header is larger than the shard's reserved space — shorten the new name",
+                ),
+                (
+                    Some(palette::ERROR),
+                    "⚠ collide",
+                    "two tensors would end up with the same name — the rename is blocked",
+                ),
+                (
+                    Some(palette::ACCENT),
+                    "name",
+                    "an underlined name is a link: a tensor opens the tree, a shard opens its byte-layout map",
+                ),
+            ];
+            let col = legend_desc_col(&rows, 0);
+            for (color, sym, desc) in rows {
+                lines.push(legend_row_line(color, sym, desc, col));
+            }
+            lines.push(legend_row_line(None, "", "", col));
+            lines.push(Line::from(dim_span(
+                "  Space / : palette · Tab autocomplete · ↑↓ fields · ←→ caret · ^N add · ^D remove · Enter apply · ^Y copy",
+            )));
+        }
     }
 
-    // Common to every screen: the persistent bottom status-line badges.
+    // Common to every screen: the persistent bottom status-line badges. The rename
+    // editor draws its own footer (not the status bar), so skip them there.
+    if matches!(legend, Legend::Rename) {
+        return lines;
+    }
     lines.push(Line::default());
     lines.push(Line::from(vec![
         Span::raw("  "),
@@ -4628,6 +5098,86 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<Chi
         items.push((vec![Seg::Key("R", hint_key('R'))], "repack"));
     }
     items.push((vec![Seg::Key("q", hint_key('q'))], "quit"));
+    wrap_hint_items(items, width)
+}
+
+/// The in-place rename editor's footer hint chips — the same borderless,
+/// clickable, hover-aware footer every other view has, opening with the common
+/// `Space / :` command-palette chip. The `^N`/`^D`/`^Y` chips synthesize their
+/// Ctrl combos; the rest are plain keys the editor loop already handles.
+fn rename_hint_lines(width: u16, applicable: bool) -> (Vec<Line<'static>>, Vec<ChipHit>) {
+    use KeyCode::{Char, Down, Enter, Esc, Left, PageDown, PageUp, Right, Tab, Up};
+    let plain = KeyModifiers::NONE;
+    let ctrl = KeyModifiers::CONTROL;
+    // The apply chip's label reflects readiness (Enter is blocked until clean).
+    let apply_label = if applicable {
+        "apply"
+    } else {
+        "apply (fix issues)"
+    };
+    let items: Vec<(Vec<Seg>, &str)> = vec![
+        (
+            vec![
+                Seg::Key("Space", hint_key(' ')),
+                Seg::Sep("/"),
+                Seg::Key(":", hint_key(':')),
+            ],
+            "commands",
+        ),
+        (vec![Seg::Key("Tab", KeyEvent::new(Tab, plain))], "complete"),
+        (
+            vec![
+                Seg::Key("↑", KeyEvent::new(Up, plain)),
+                Seg::Sep("/"),
+                Seg::Key("↓", KeyEvent::new(Down, plain)),
+            ],
+            "fields",
+        ),
+        (
+            vec![
+                Seg::Key("←", KeyEvent::new(Left, plain)),
+                Seg::Sep("/"),
+                Seg::Key("→", KeyEvent::new(Right, plain)),
+            ],
+            "caret",
+        ),
+        (
+            vec![Seg::Key("^N", KeyEvent::new(Char('n'), ctrl))],
+            "add rule",
+        ),
+        (
+            vec![Seg::Key("^D", KeyEvent::new(Char('d'), ctrl))],
+            "remove",
+        ),
+        (
+            vec![
+                Seg::Key("PgUp", KeyEvent::new(PageUp, plain)),
+                Seg::Sep("/"),
+                Seg::Key("PgDn", KeyEvent::new(PageDown, plain)),
+            ],
+            "scroll",
+        ),
+        (
+            vec![Seg::Key("↵", KeyEvent::new(Enter, plain))],
+            apply_label,
+        ),
+        // Copy-screen: the universal `c` command, but a bare `c` types into a field
+        // here — so it's a clickable button (`[]`-bracketed, like the `[×]` close
+        // control) plus a palette entry, not a keystroke. The chip replays the
+        // CopyScreen palette sentinel; run_rename copies the screen text.
+        (
+            vec![Seg::Key(
+                "[copy screen]",
+                KeyEvent::new(Char('\u{1}'), plain),
+            )],
+            "",
+        ),
+        (
+            vec![Seg::Key("^Y", KeyEvent::new(Char('y'), ctrl))],
+            "copy apply cmd",
+        ),
+        (vec![Seg::Key("Esc", KeyEvent::new(Esc, plain))], "back"),
+    ];
     wrap_hint_items(items, width)
 }
 
@@ -5356,8 +5906,11 @@ fn detail_field_lines(
     stats: StatsView,
     schema: Option<&PackingSchema>,
     width: u16,
-) -> (Vec<Line<'static>>, Option<usize>) {
+) -> (Vec<Line<'static>>, Option<usize>, LinkRegions) {
     let mut lines: Vec<Line> = Vec::new();
+    // Link regions in the header (currently just the `File:` path → layout map).
+    // The header is rendered at `y = 0`, so a line's index is its screen row.
+    let mut links: Vec<(Rect, Link)> = Vec::new();
 
     lines.push(Line::from(Span::styled(
         "Tensor Details",
@@ -5488,15 +6041,51 @@ fn detail_field_lines(
     let indent = " ".repeat(prefix.len());
     let avail = (width as usize).saturating_sub(prefix.len()).max(1);
     let path_chars: Vec<char> = tensor.source_path.chars().collect();
+    // A local `.safetensors` shard's path is a link to its byte-layout map (accent
+    // + underline, like the other in-app links); a remote / non-safetensors source
+    // has no map, so it stays plain.
+    let linkable = !crate::remote::is_remote_source(&tensor.source_path)
+        && std::path::Path::new(&tensor.source_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
+    let path_style = if linkable {
+        Style::default()
+            .fg(palette::ACCENT)
+            .add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default()
+    };
     if path_chars.is_empty() {
         lines.push(Line::from(dim_span(prefix)));
     } else {
+        // `prefix` and `indent` are the same width, so the path always starts at the
+        // same column on every (wrapped) line.
+        let x = prefix.len() as u16;
         for (i, chunk) in path_chars.chunks(avail).enumerate() {
             let seg: String = chunk.iter().collect();
+            let seg_w = seg.chars().count() as u16;
+            if linkable {
+                links.push((
+                    Rect {
+                        x,
+                        y: lines.len() as u16,
+                        width: seg_w,
+                        height: 1,
+                    },
+                    Link::Layout(tensor.source_path.clone()),
+                ));
+            }
             if i == 0 {
-                lines.push(Line::from(vec![dim_span(prefix), Span::raw(seg)]));
+                lines.push(Line::from(vec![
+                    dim_span(prefix),
+                    Span::styled(seg, path_style),
+                ]));
             } else {
-                lines.push(Line::from(vec![Span::raw(indent.clone()), Span::raw(seg)]));
+                lines.push(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled(seg, path_style),
+                ]));
             }
         }
     }
@@ -5562,7 +6151,7 @@ fn detail_field_lines(
     };
     lines.push(Line::default());
 
-    (lines, stats_gauge_row)
+    (lines, stats_gauge_row, links)
 }
 
 /// The detail screen's footer hint as wrapped [`Line`]s, split into `key label,`
@@ -6097,8 +6686,9 @@ mod tests {
                 kind: FileKind::Json,
             },
         ];
+        let badges = status_badges(AccessBadge::ReadOnly, None, false);
         let out = crate::tui::headless_render(90, 16, |f| {
-            UI::render_files(f, "/ckpt", &rows, 1, 0, None, true);
+            UI::render_files(f, "/ckpt", &rows, 1, 0, None, true, &badges, None);
         })
         .unwrap();
         assert!(out.contains("File browser - /ckpt"), "title:\n{out}");
@@ -6171,6 +6761,113 @@ mod tests {
         assert!(out.contains("† format"), "metadata entry shown:\n{out}");
         // Absolute offsets are shown in hex.
         assert!(out.contains("0x00000000"), "header offset:\n{out}");
+    }
+
+    #[test]
+    fn layout_tensor_band_names_are_tree_links() {
+        use crate::safelayout::{LayoutMap, Segment, SegmentKind};
+        let seg = |name: &str, dtype: Option<&str>, shape: Vec<usize>, start, end, kind| Segment {
+            name: name.to_string(),
+            dtype: dtype.map(str::to_string),
+            shape,
+            start,
+            end,
+            kind,
+        };
+        let map = LayoutMap {
+            name: "model.safetensors".to_string(),
+            total_len: 1_000_000,
+            header_len: 200,
+            tensor_count: 2,
+            metadata: vec![],
+            segments: vec![
+                seg("header", None, vec![], 0, 200, SegmentKind::Header),
+                seg(
+                    "embed.weight",
+                    Some("BF16"),
+                    vec![1000, 256],
+                    200,
+                    800_200,
+                    SegmentKind::Tensor,
+                ),
+                seg(
+                    "norm.weight",
+                    Some("F32"),
+                    vec![256],
+                    800_200,
+                    1_000_000,
+                    SegmentKind::Tensor,
+                ),
+            ],
+        };
+        let mut links = Vec::new();
+        crate::tui::headless_render(90, 24, |f| {
+            let (_, _, l) = UI::render_layout(f, &map, 1, 0, None, true);
+            links = l;
+        })
+        .unwrap();
+        // Each *tensor* band's name is a `Tree` link; the header band is not.
+        let targets: Vec<&Link> = links.iter().map(|(_, l)| l).collect();
+        assert!(
+            targets
+                .iter()
+                .any(|l| matches!(l, Link::Tree(n) if n == "embed.weight")),
+            "embed.weight should link to the tree: {targets:?}"
+        );
+        assert!(
+            targets
+                .iter()
+                .any(|l| matches!(l, Link::Tree(n) if n == "norm.weight")),
+            "norm.weight should link to the tree: {targets:?}"
+        );
+        assert!(
+            !targets
+                .iter()
+                .any(|l| matches!(l, Link::Tree(n) if n == "header")),
+            "the header band is not a tensor link: {targets:?}"
+        );
+        // The link starts at the name column (after the fixed 20-column prefix).
+        assert!(
+            links.iter().all(|(r, _)| r.x == 20),
+            "name column: {links:?}"
+        );
+    }
+
+    #[test]
+    fn detail_file_path_links_to_the_layout_only_for_local_safetensors() {
+        let ti = |source: &str| TensorInfo {
+            name: "blk.0.weight".into(),
+            dtype: "F32".into(),
+            shape: vec![4],
+            size_bytes: 16,
+            num_elements: 4,
+            storage: Storage::Unknown,
+            source_path: source.into(),
+            layout: Layout::None,
+        };
+        let links_for = |source: &str| -> LinkRegions {
+            let t = ti(source);
+            let (_, _, links) = detail_field_lines(
+                &t,
+                &t.shape,
+                ViewDtype::Stored,
+                false,
+                StatsView::Pending,
+                None,
+                80,
+            );
+            links
+        };
+
+        // A local `.safetensors` shard's `File:` path links to its layout map.
+        let local = links_for("/ckpt/model-00001.safetensors");
+        assert_eq!(local.len(), 1, "one File link: {local:?}");
+        assert!(
+            matches!(&local[0].1, Link::Layout(p) if p == "/ckpt/model-00001.safetensors"),
+            "links to the layout: {local:?}"
+        );
+        // A non-safetensors (or remote) source has no layout map — so no link.
+        assert!(links_for("/ckpt/model.gguf").is_empty(), "gguf has no map");
     }
 
     #[test]
@@ -6443,6 +7140,7 @@ mod tests {
             nodes: &'a [(TreeNode, usize)],
             unindexed: &'a HashSet<String>,
             schemas: &'a HashMap<String, PackingSchema>,
+            badges: &'a [Badge],
             interactive: bool,
         ) -> DrawConfig<'a> {
             DrawConfig {
@@ -6450,7 +7148,6 @@ mod tests {
                 current_file: "f",
                 file_idx: 0,
                 total_files: 1,
-                metadata_only: false,
                 selected_idx: 0,
                 scroll_offset: 0,
                 search_mode: false,
@@ -6459,15 +7156,13 @@ mod tests {
                 status_icon: "▪",
                 status_bar: "",
                 status_secondary: "",
-                health: None,
                 can_repack: false,
                 unindexed,
                 packing_schemas: schemas,
                 copied_flash: None,
                 interactive,
-                readonly_hover: false,
-                health_hover: false,
-                metadata_hover: false,
+                badges,
+                hovered_badge: None,
             }
         }
 
@@ -6488,10 +7183,11 @@ mod tests {
             .collect();
         let unindexed = HashSet::new();
         let schemas = HashMap::new();
+        let badges = status_badges(AccessBadge::ReadOnly, None, false);
 
         // Interactive: the bar (thumb █ over a │ track) rides the right edge.
         let live = crate::tui::headless_render(80, 20, |f| {
-            UI::render_tree(f, &cfg(&nodes, &unindexed, &schemas, true));
+            UI::render_tree(f, &cfg(&nodes, &unindexed, &schemas, &badges, true));
         })
         .unwrap();
         assert!(live.contains('█'), "expected a thumb:\n{live}");
@@ -6499,7 +7195,7 @@ mod tests {
 
         // Non-interactive (headless dump): no bar anywhere.
         let plain = crate::tui::headless_render(80, 20, |f| {
-            UI::render_tree(f, &cfg(&nodes, &unindexed, &schemas, false));
+            UI::render_tree(f, &cfg(&nodes, &unindexed, &schemas, &badges, false));
         })
         .unwrap();
         assert!(
@@ -6548,12 +7244,13 @@ mod tests {
         let nodes: Vec<(TreeNode, usize)> = Vec::new();
         let unindexed = HashSet::new();
         let schemas = HashMap::new();
-        let mk = |health_hover: bool| DrawConfig {
+        // access (idx 0) + health (idx 1); hovering the health badge = Some(1).
+        let badges = status_badges(AccessBadge::ReadOnly, Some(HealthAlert::Error), false);
+        let mk = |hovered_badge: Option<usize>| DrawConfig {
             tree: &nodes,
             current_file: "model",
             file_idx: 0,
             total_files: 1,
-            metadata_only: false,
             selected_idx: 0,
             scroll_offset: 0,
             search_mode: false,
@@ -6562,21 +7259,19 @@ mod tests {
             status_icon: "▪",
             status_bar: "model.safetensors",
             status_secondary: "",
-            health: Some(HealthAlert::Error),
-            health_hover,
             can_repack: false,
             unindexed: &unindexed,
             packing_schemas: &schemas,
             copied_flash: None,
             interactive: true,
-            readonly_hover: false,
-            metadata_hover: false,
+            badges: &badges,
+            hovered_badge,
         };
 
         // Not hovering: the short `⚠ health` badge shows on the bottom line, on the
         // same row as `read-only` and to its left — never in the title.
         let out = crate::tui::headless_render(120, 40, |f| {
-            UI::render_tree(f, &mk(false));
+            UI::render_tree(f, &mk(None));
         })
         .unwrap();
         let plain = strip_ansi_codes(&out);
@@ -6604,9 +7299,9 @@ mod tests {
             "bubble only on hover:\n{plain}"
         );
 
-        // Hovering the badge floats its help bubble.
+        // Hovering the badge (index 1) floats its help bubble.
         let hovered = crate::tui::headless_render(120, 40, |f| {
-            UI::render_tree(f, &mk(true));
+            UI::render_tree(f, &mk(Some(1)));
         })
         .unwrap();
         assert!(
@@ -6616,40 +7311,168 @@ mod tests {
     }
 
     #[test]
-    fn health_badge_hit_matches_its_drawn_rect() {
-        // On a 120×40 frame the badge sits on the bottom row, just left of the
-        // read-only badge — the same rect the click handler tests.
-        assert!(UI::health_badge_hit(120, 40, 100, 39), "over the badge");
-        assert!(!UI::health_badge_hit(120, 40, 100, 38), "wrong row");
-        assert!(
-            !UI::health_badge_hit(120, 40, 114, 39),
-            "that's the read-only badge"
+    fn access_badge_reflects_editability_with_symmetric_padding() {
+        for mode in [AccessBadge::ReadOnly, AccessBadge::Editable] {
+            // One space of padding on each side (the user flagged an asymmetric chip).
+            let label = mode.label();
+            assert!(
+                label.starts_with(' ')
+                    && label.ends_with(' ')
+                    && !label.starts_with("  ")
+                    && !label.ends_with("  "),
+                "{mode:?} label should be symmetrically padded: {label:?}"
+            );
+        }
+        for (mode, word) in [
+            (AccessBadge::ReadOnly, "read-only"),
+            (AccessBadge::Editable, "editable"),
+        ] {
+            let badges = status_badges(mode, None, false);
+            let out =
+                crate::tui::headless_render(120, 6, |f| UI::render_badge_bar(f, &badges, None))
+                    .unwrap();
+            let plain = strip_ansi_codes(&out);
+            let last = plain.lines().last().unwrap_or_default();
+            assert!(
+                last.trim_end().ends_with(word),
+                "{mode:?} should show {word:?}: {last:?}"
+            );
+        }
+        // Hovering the editable badge (index 0) floats its in-place hint.
+        let badges = status_badges(AccessBadge::Editable, None, false);
+        let hint = strip_ansi_codes(
+            &crate::tui::headless_render(120, 12, |f| UI::render_badge_bar(f, &badges, Some(0)))
+                .unwrap(),
         );
-        assert!(!UI::health_badge_hit(8, 40, 4, 39), "too narrow → no badge");
+        assert!(
+            hint.contains("in-place") || hint.contains("convert --map"),
+            "editable hint should mention the in-place exception:\n{hint}"
+        );
     }
 
     #[test]
-    fn metadata_badge_sits_left_of_the_others() {
-        use unicode_width::UnicodeWidthStr;
-        let (w, h) = (120u16, 40u16);
-        // With a health badge present, the metadata badge sits left of both it and
-        // the read-only badge; without one, only left of read-only.
-        let with_health = metadata_badge_rect(w, h, true).expect("fits");
-        let without = metadata_badge_rect(w, h, false).expect("fits");
+    fn render_rename_shows_fields_and_marks_the_diff() {
+        let pairs = vec![(
+            "model.layers.{layer}.self_attn.q_proj.weight".to_string(),
+            "model.layers.{layer}.attn.q_proj.weight".to_string(),
+        )];
+        let rules = vec![RenameRuleView {
+            from: "model.layers.{layer}.self_attn.q_proj.weight".to_string(),
+            to: "model.layers.{layer}.attn.q_proj.weight".to_string(),
+            total: 48,
+            matched: 48,
+            ok: 0,
+            collide: 0,
+            wont_fit: 48,
+            invalid: 0,
+            shards: vec![crate::rename::ShardFit {
+                file: "model.safetensors".to_string(),
+                path: "/ckpt/model.safetensors".to_string(),
+                current: 512,
+                needed: 560,
+                tensors: 48,
+            }],
+        }];
+        let view = RenameView {
+            root: "/ckpt",
+            pairs: &pairs,
+            focus_pair: 0,
+            on_target: true,
+            cursor: 0,
+            show_suggestions: false,
+            suggestions: &[],
+            rules: &rules,
+            total: 48,
+            warnings: &[],
+            has_index: true,
+            applicable: false,
+            scroll: 0,
+            error: None,
+            confirming: false,
+            cli: Some("checkpoint-explorer convert /ckpt --map 'a=>b'"),
+            copied: None,
+        };
+        let mut clicks = Vec::new();
+        let out = crate::tui::headless_render(120, 30, |f| {
+            let (_, _chips, c) = UI::render_rename(f, &view);
+            clicks = c;
+        })
+        .unwrap();
+        let plain = strip_ansi_codes(&out);
+        assert!(plain.contains("Rename tensors in place"), "{plain}");
+        assert!(plain.contains("from") && plain.contains("to"), "{plain}");
+        // The per-rule schema before→after and its "won't fit" marker.
         assert!(
-            with_health.x + with_health.width < without.x + without.width,
-            "the health badge pushes metadata-only further left"
+            plain.contains("model.layers.{layer}.attn.q_proj.weight"),
+            "{plain}"
         );
-        // Its rect ends a gap to the left of the read-only badge on the last row.
-        let right = READONLY_BADGE.width() as u16 + BADGE_GAP;
-        assert_eq!(without.x + without.width, w - right);
-        assert_eq!(without.y, h - 1);
-        // Hit-test agrees with the drawn rect, and misses the row above.
-        assert!(UI::metadata_badge_hit(w, h, false, without.x, h - 1));
-        assert!(!UI::metadata_badge_hit(w, h, false, without.x, h - 2));
-        // No room on a tiny frame → no badge, no hit.
-        assert!(metadata_badge_rect(10, h, false).is_none());
-        assert!(!UI::metadata_badge_hit(10, h, false, 0, h - 1));
+        assert!(plain.contains("won't fit in place"), "{plain}");
+        assert!(plain.contains("updates index.json"), "{plain}");
+        // The shard name is a clickable region linking to that file's layout.
+        assert!(
+            clicks.iter().any(|(_, t)| matches!(
+                t,
+                crate::ui::Link::Layout(p) if p == "/ckpt/model.safetensors"
+            )),
+            "expected a clickable shard region"
+        );
+    }
+
+    #[test]
+    fn badge_bar_hit_finds_the_badge_under_the_cursor() {
+        // access (idx 0, rightmost) + health (idx 1) on a 120×40 frame.
+        let badges = status_badges(AccessBadge::ReadOnly, Some(HealthAlert::Error), false);
+        let rects = badge_rects(120, 40, &badges);
+        let r0 = rects[0].expect("access fits");
+        let r1 = rects[1].expect("health fits");
+        assert_eq!(r0.y, 39, "on the bottom row");
+        assert_eq!(r0.x + r0.width, 120, "access badge is flush right");
+        assert!(
+            r1.x + r1.width < r0.x,
+            "health sits left of access: {r1:?} {r0:?}"
+        );
+        // A click maps to whichever badge is under it (and misses the row above).
+        assert_eq!(UI::badge_bar_hit(120, 40, r0.x, 39, &badges), Some(0));
+        assert_eq!(UI::badge_bar_hit(120, 40, r1.x, 39, &badges), Some(1));
+        assert_eq!(UI::badge_bar_hit(120, 40, r1.x, 38, &badges), None);
+        // Too narrow → nothing fits, nothing hits.
+        assert!(badge_rects(8, 40, &badges).iter().all(Option::is_none));
+        assert_eq!(UI::badge_bar_hit(8, 40, 4, 39, &badges), None);
+    }
+
+    #[test]
+    fn badge_bar_lays_out_right_to_left_with_gaps() {
+        let (w, h) = (120u16, 40u16);
+        // access(0) + health(1) + metadata(2), each a BADGE_GAP left of the previous.
+        let badges = status_badges(AccessBadge::ReadOnly, Some(HealthAlert::Error), true);
+        let rects: Vec<Rect> = badge_rects(w, h, &badges)
+            .into_iter()
+            .map(|r| r.expect("fits"))
+            .collect();
+        assert_eq!(
+            rects[0].x + rects[0].width,
+            w,
+            "rightmost badge is flush right"
+        );
+        for i in 1..rects.len() {
+            assert_eq!(
+                rects[i].x + rects[i].width + BADGE_GAP,
+                rects[i - 1].x,
+                "badge {i} sits a gap left of badge {}",
+                i - 1
+            );
+            assert_eq!(rects[i].y, h - 1);
+        }
+        // Dropping the metadata badge leaves just the two.
+        assert_eq!(
+            badge_rects(
+                w,
+                h,
+                &status_badges(AccessBadge::ReadOnly, Some(HealthAlert::Error), false)
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]
