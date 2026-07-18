@@ -610,8 +610,10 @@ enum PaletteResult {
     Handled,
     /// Leave the mode.
     Nav(Nav),
+    /// Copy the reopen command — the engine does it (identical for every mode), so
+    /// the palette's *Copy: Command to reopen this view* matches the `y` key exactly.
+    CopyCommand,
     /// Re-feed this key through `handle_key` (the detail / data "synthesize a key" style).
-    #[allow(dead_code)] // constructed once detail/data migrate (Step 4)
     SynthKey(KeyEvent),
 }
 
@@ -769,9 +771,13 @@ impl Mode for FilesMode {
         ex: &mut Explorer,
         term: &mut crate::tui::LiveTerminal,
     ) -> PaletteResult {
-        if let Some(cmd) = ex.file_command_palette(term)
-            && let Some(nav) = ex.run_file_command(cmd, term)
-        {
+        let Some(cmd) = ex.file_command_palette(term) else {
+            return PaletteResult::Handled;
+        };
+        if cmd == FileCmd::CopyCommand {
+            return PaletteResult::CopyCommand; // engine-owned, like the `y` key
+        }
+        if let Some(nav) = ex.run_file_command(cmd, term) {
             return PaletteResult::Nav(nav);
         }
         PaletteResult::Handled
@@ -1021,9 +1027,14 @@ impl Mode for LayoutMode {
             Ok(m) => m,
             Err(_) => return PaletteResult::Handled,
         };
-        if let Some(cmd) = ex.layout_command_palette(term, map, self.selected, self.scroll)
-            && let Some(nav) =
-                ex.run_layout_command(cmd, &self.path, map, self.selected, self.scroll, term)
+        let Some(cmd) = ex.layout_command_palette(term, map, self.selected, self.scroll) else {
+            return PaletteResult::Handled;
+        };
+        if cmd == LayoutCmd::CopyCommand {
+            return PaletteResult::CopyCommand; // engine-owned, like the `y` key
+        }
+        if let Some(nav) =
+            ex.run_layout_command(cmd, &self.path, map, self.selected, self.scroll, term)
         {
             return PaletteResult::Nav(nav);
         }
@@ -1236,9 +1247,13 @@ impl Mode for TreeMode {
         ex: &mut Explorer,
         term: &mut crate::tui::LiveTerminal,
     ) -> PaletteResult {
-        if let Some(cmd) = ex.command_palette(term)
-            && let Some(nav) = ex.run_command(cmd, term)
-        {
+        let Some(cmd) = ex.command_palette(term) else {
+            return PaletteResult::Handled;
+        };
+        if cmd == Cmd::CopyCommand {
+            return PaletteResult::CopyCommand; // engine-owned, like the `y` key
+        }
+        if let Some(nav) = ex.run_command(cmd, term) {
             return PaletteResult::Nav(nav);
         }
         PaletteResult::Handled
@@ -1897,11 +1912,7 @@ impl Mode for RenameMode2 {
                 self.do_copy_apply();
                 PaletteResult::Handled
             }
-            Some(RenameCmd::CopyReopenCmd) => {
-                let cmd = ex.command_for_rename(&self.pairs());
-                self.copied = copy_to_clipboard(&cmd).then_some("the reopen command");
-                PaletteResult::Handled
-            }
+            Some(RenameCmd::CopyReopenCmd) => PaletteResult::CopyCommand,
             Some(RenameCmd::CopyScreen) => {
                 self.do_copy_screen();
                 PaletteResult::Handled
@@ -1939,14 +1950,9 @@ impl Mode for RenameMode2 {
         let KeyEvent {
             code, modifiers, ..
         } = key;
-        // `^Y` copies the command that reopens this editor (the universal
-        // copy-command, the `y` of the non-editing modes); `^A` copies the
-        // `convert --map` command that *applies* the rename.
-        if code == KeyCode::Char('y') && modifiers.contains(KeyModifiers::CONTROL) {
-            let cmd = ex.command_for_rename(&self.pairs());
-            self.copied = copy_to_clipboard(&cmd).then_some("the reopen command");
-            return Ok(Outcome::Stay);
-        }
+        // `^Y` (copy the command to reopen this editor — the `y` of the non-editing
+        // modes) is handled by the engine (`do_copy_command`), so it's identical
+        // everywhere. `^A` copies the `convert --map` command that *applies* the rename.
         if code == KeyCode::Char('a') && modifiers.contains(KeyModifiers::CONTROL) {
             self.do_copy_apply();
             return Ok(Outcome::Stay);
@@ -2358,6 +2364,7 @@ impl Mode for DetailMode {
             );
         });
         match chosen {
+            Some(DetailCmd::CopyCommand) => PaletteResult::CopyCommand,
             Some(cmd) => PaletteResult::SynthKey(detail_cmd_key(cmd)),
             None => PaletteResult::Handled,
         }
@@ -2561,11 +2568,8 @@ impl Mode for DetailMode {
                     std::time::Instant::now(),
                 ));
             }
-            KeyCode::Char('y') => {
-                let cmd = ex.command_for_detail(&tensor);
-                copy_to_clipboard(&cmd);
-                self.overlay = Some(Overlay::Command(cmd));
-            }
+            // `y` (copy the reopen command) is handled by the engine — see
+            // `Explorer::do_copy_command` — so every mode does it identically.
             KeyCode::Char('l') => self.overlay = Some(Overlay::Legend(Legend::Detail)),
             KeyCode::Backspace => return Ok(Outcome::Leave(Nav::Back)),
             KeyCode::Char('\\') => return Ok(Outcome::Leave(Nav::Forward)),
@@ -2776,6 +2780,7 @@ impl Mode for DataMode {
             );
         });
         match chosen {
+            Some(DataCmd::CopyCommand) => PaletteResult::CopyCommand,
             Some(cmd) => PaletteResult::SynthKey(data_cmd_key(cmd)),
             None => PaletteResult::Handled,
         }
@@ -2959,11 +2964,7 @@ impl Mode for DataMode {
                     std::time::Instant::now(),
                 ));
             }
-            KeyCode::Char('y') => {
-                let cmd = ex.command_for_data(&tensor, self.repr, self.slice.get());
-                copy_to_clipboard(&cmd);
-                self.overlay = Some(Overlay::Command(cmd));
-            }
+            // `y` (copy the reopen command) is engine-owned — see `do_copy_command`.
             KeyCode::Char('l') => {
                 self.overlay = Some(Overlay::Legend(match self.repr {
                     Representation::Heatmap => Legend::Heatmap,
@@ -6154,6 +6155,20 @@ impl Explorer {
     /// / badge clicks, hover, Ctrl-C, the wrong-layout hint, and the command palette
     /// — so a mode only supplies its content (`render_frame` / `handle_key` /
     /// `handle_mouse` / `open_palette`). Replaces the six hand-rolled `run_*` loops.
+    /// Copy the command that reopens the current view (the `y` action) and float a
+    /// borderless [`render_command_band`](UI::render_command_band) with it — the same
+    /// for every mode (the command is `reopen_command(mode.residual())`), so the
+    /// command is on the clipboard AND selectable by hand when OSC-52 can't reach the
+    /// terminal. Engine-owned so no mode can diverge.
+    fn do_copy_command(&self, mode: &dyn Mode, term: &mut crate::tui::LiveTerminal) {
+        let cmd = self.reopen_command(&mode.residual(), false, false);
+        copy_to_clipboard(&cmd);
+        self.float_until_dismissed(term, |f| {
+            mode.render_frame(self, f);
+            UI::render_command_band(f, &cmd);
+        });
+    }
+
     fn run_mode(&mut self, mode: &mut dyn Mode) -> Result<Nav> {
         let spec = mode.spec();
         let mut term = self
@@ -6282,6 +6297,23 @@ impl Explorer {
             // A fresh key clears the copied-flash confirmation.
             self.copied_flash = None;
 
+            // Copy the command that reopens this view (`y`, or `^Y` where letters are
+            // field input). Owned by the engine so every mode behaves identically —
+            // copy to the clipboard AND float a borderless band with the command so it
+            // can still be selected by hand when OSC-52 can't reach the terminal.
+            let copy_cmd = KeyEvent::new(
+                KeyCode::Char('y'),
+                if mode.accepts_text(self) {
+                    KeyModifiers::CONTROL
+                } else {
+                    KeyModifiers::NONE
+                },
+            );
+            if key == copy_cmd {
+                self.do_copy_command(mode, &mut term);
+                continue;
+            }
+
             // Space / `:` opens the command palette (unless the mode takes it as
             // input — the tree while searching).
             if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char(':'))
@@ -6289,6 +6321,7 @@ impl Explorer {
             {
                 match mode.open_palette(self, &mut term) {
                     PaletteResult::Nav(n) => break n,
+                    PaletteResult::CopyCommand => self.do_copy_command(mode, &mut term),
                     PaletteResult::SynthKey(k) => {
                         if let Outcome::Leave(n) = mode.handle_key(self, &mut term, k)? {
                             break n;
@@ -6437,10 +6470,9 @@ impl Explorer {
             Cmd::Health => self.show_check_report(term, false),
             Cmd::Legend => self.show_legend(term, Legend::Tree, None),
             Cmd::CopyTree => self.copy_menu(term),
-            Cmd::CopyCommand => {
-                let c = self.command_for_tree_selection();
-                self.copy_command(term, &c, None);
-            }
+            // Copy-command is engine-owned (`do_copy_command` / the `y` key), reached
+            // via `PaletteResult::CopyCommand`, so it never comes through here.
+            Cmd::CopyCommand => {}
             Cmd::Repack => self.repack_checkpoint(term),
             Cmd::Rename => {
                 if self.can_rename() {
@@ -7022,10 +7054,8 @@ impl Explorer {
             FileCmd::Legend => self.show_files_legend(term),
             FileCmd::CopyPath => self.copy_file_path(),
             FileCmd::CopyScreen => self.copy_files_screen(),
-            FileCmd::CopyCommand => {
-                let c = self.command_for_files();
-                self.copy_command(term, &c, None);
-            }
+            // Copy-command is engine-owned (`PaletteResult::CopyCommand` / `y`).
+            FileCmd::CopyCommand => {}
             FileCmd::Quit => return Some(Nav::Quit),
         }
         None
@@ -7037,7 +7067,7 @@ impl Explorer {
     fn run_layout_command(
         &mut self,
         cmd: LayoutCmd,
-        path: &str,
+        _path: &str,
         map: &crate::safelayout::LayoutMap,
         selected: usize,
         scroll: usize,
@@ -7064,15 +7094,8 @@ impl Explorer {
                 copy_to_clipboard(&layout_to_text(map));
                 self.flash_copied("screen contents");
             }
-            LayoutCmd::CopyCommand => {
-                let select = Self::layout_selected_tensor(map, selected);
-                let command = self.command_for_layout(path, select.as_deref());
-                copy_to_clipboard(&command);
-                self.float_until_dismissed(term, |f| {
-                    UI::render_layout(f, map, selected, scroll, None, true);
-                    UI::render_command_band(f, &command);
-                });
-            }
+            // Copy-command is engine-owned (`PaletteResult::CopyCommand` / `y`).
+            LayoutCmd::CopyCommand => {}
         }
         None
     }
@@ -9486,31 +9509,6 @@ impl Explorer {
             report.results.push(res);
             report.values = true;
         }
-    }
-
-    /// Copy `command` to the clipboard and show it in a dismissible box, so the
-    /// user can both see and paste the exact invocation that reopens this screen
-    /// (the `y` shortcut). Any key returns; Ctrl-C still quits. `resume` keeps a
-    /// caller-paused background scan running while the box is up (see
-    /// [`Self::show_legend`]).
-    fn copy_command(
-        &self,
-        term: &mut crate::tui::LiveTerminal,
-        command: &str,
-        resume: Option<&AtomicBool>,
-    ) {
-        copy_to_clipboard(command);
-        if let Some(pause) = resume {
-            pause.store(false, Ordering::Relaxed);
-        }
-        // Float the CLI-command band over a fresh tree frame (composited last so
-        // the tree stays visible behind it), keeping the hover bubbles live. A
-        // key or click dismisses; wheel/drag are ignored so the command text can
-        // still be selected with the mouse without the pop-up closing.
-        self.float_until_dismissed(term, |f| {
-            self.render_tree_frame(f, true);
-            UI::render_command_band(f, command);
-        });
     }
 
     /// The host to fold into an scp-style positional (`host:/path`) so the reopen
