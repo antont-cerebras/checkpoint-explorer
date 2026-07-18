@@ -201,7 +201,8 @@ pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
         // Rename editor — palette commands, keyed by their registry sentinel char
         // (the palette maps each to `KeyCode::Char(sentinel)`; see `RENAME_COMMANDS`).
         (Rename, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
-        (Rename, Char('\r')) => "Apply the rename in place (a second Enter confirms).",
+        (Rename, Char('R')) => "Apply the rename in place (asks for confirmation first).",
+        (Rename, Char('\r')) => "Move to the next field (past the last field, add a new rule).",
         (Rename, Char('\u{e}')) => "Add another source → new-name rule.",
         (Rename, Char('\u{4}')) => "Remove the focused rule.",
         (Rename, Char('\u{19}')) => {
@@ -440,8 +441,6 @@ pub struct RenameView<'a> {
     /// Preview-pane scroll offset.
     pub scroll: usize,
     pub error: Option<&'a str>,
-    /// Whether a clean rename is staged, awaiting the confirming second `Enter`.
-    pub confirming: bool,
     /// The `convert --map …` CLI command equivalent to the entered renames (shown
     /// above the footer, copyable with `^Y`), or `None` until a rule is complete.
     pub cli: Option<&'a str>,
@@ -1540,31 +1539,22 @@ impl UI {
             )));
         }
 
-        // --- footer: the common clickable chip hint, or the confirm / error bar ---
+        // --- footer: the common clickable chip hint, or the error bar ---
         // Build it first so its (possibly wrapped) height reserves the bottom rows,
-        // like the layout/file views size their footers.
-        let (footer_lines, chip_hits): (Vec<Line<'static>>, Vec<ChipHit>) = if view.confirming {
-            (
-                vec![Line::from(Span::styled(
-                    " Apply in place?  Enter = confirm · Esc = back — rewrites files, cannot be undone ",
-                    Style::default()
-                        .bg(palette::WARN_BG)
-                        .fg(palette::STATUS_FG)
-                        .add_modifier(Modifier::BOLD),
-                ))],
-                Vec::new(),
-            )
-        } else if let Some(err) = view.error {
-            (
-                vec![Line::from(Span::styled(
-                    format!("⚠ {err}"),
-                    Style::default().fg(palette::ERROR),
-                ))],
-                Vec::new(),
-            )
-        } else {
-            rename_hint_lines(width, view.applicable)
-        };
+        // like the layout/file views size their footers. (Apply confirmation is a
+        // floating modal now, not an inline footer bar.)
+        let (footer_lines, chip_hits): (Vec<Line<'static>>, Vec<ChipHit>) =
+            if let Some(err) = view.error {
+                (
+                    vec![Line::from(Span::styled(
+                        format!("⚠ {err}"),
+                        Style::default().fg(palette::ERROR),
+                    ))],
+                    Vec::new(),
+                )
+            } else {
+                rename_hint_lines(width, view.applicable)
+            };
         let footer_h = (footer_lines.len() as u16).max(1);
         let footer_top = height.saturating_sub(footer_h);
 
@@ -2789,6 +2779,49 @@ impl UI {
             ])),
         ];
         Paragraph::new(lines).render(frame.area(), frame.buffer_mut());
+    }
+
+    /// A yes/no confirmation **floated over the live frame** (the screen behind stays
+    /// visible): a title, the `body` summary lines, then an `[Apply] [Cancel]`-style
+    /// choice strip (the `selected` option inverted) and a key hint. Drives the
+    /// in-place rename apply confirmation.
+    pub fn render_confirm_popup(
+        frame: &mut Frame,
+        title: &str,
+        body: &[String],
+        options: &[&str],
+        selected: usize,
+    ) {
+        let mut content: Vec<Line> = body
+            .iter()
+            .map(|l| Line::from(Span::raw(l.clone())))
+            .collect();
+        content.push(Line::default());
+        let mut strip: Vec<Span> = Vec::new();
+        for (i, opt) in options.iter().enumerate() {
+            let label = format!(" {opt} ");
+            if i == selected {
+                strip.push(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(palette::SELECT_FG)
+                        .bg(palette::SELECT_BG)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                strip.push(dim_span(label));
+            }
+            strip.push(Span::raw("  "));
+        }
+        content.push(Line::from(strip));
+        content.push(Line::default());
+        content.push(Line::from(hint_spans(&[
+            ("← →", "move"),
+            ("Enter", "select"),
+            ("Y", "apply"),
+            ("Esc", "cancel"),
+        ])));
+        render_popup_box(frame, title, content, Backdrop::Float, None);
     }
 
     /// The Ratatui port of [`Self::draw_progress`]: a full-screen progress view
@@ -5255,7 +5288,8 @@ fn rename_hint_lines(width: u16, applicable: bool) -> (Vec<Line<'static>>, Vec<C
     use KeyCode::{Char, Down, Enter, Esc, Left, PageDown, PageUp, Right, Tab, Up};
     let plain = KeyModifiers::NONE;
     let ctrl = KeyModifiers::CONTROL;
-    // The apply chip's label reflects readiness (Enter is blocked until clean).
+    let shift = KeyModifiers::SHIFT;
+    // The apply chip's label reflects readiness (`R` is blocked until clean).
     let apply_label = if applicable {
         "apply"
     } else {
@@ -5278,6 +5312,10 @@ fn rename_hint_lines(width: u16, applicable: bool) -> (Vec<Line<'static>>, Vec<C
                 Seg::Key("↓", KeyEvent::new(Down, plain)),
             ],
             "fields",
+        ),
+        (
+            vec![Seg::Key("↵", KeyEvent::new(Enter, plain))],
+            "next field",
         ),
         (
             vec![
@@ -5304,7 +5342,7 @@ fn rename_hint_lines(width: u16, applicable: bool) -> (Vec<Line<'static>>, Vec<C
             "scroll",
         ),
         (
-            vec![Seg::Key("↵", KeyEvent::new(Enter, plain))],
+            vec![Seg::Key("R", KeyEvent::new(Char('R'), shift))],
             apply_label,
         ),
         // Copy-screen: the universal `c` command, but a bare `c` types into a field
@@ -7535,7 +7573,6 @@ mod tests {
             applicable: false,
             scroll: 0,
             error: None,
-            confirming: false,
             cli: Some("checkpoint-explorer convert /ckpt --map 'a=>b'"),
             copied: None,
         };
@@ -7596,7 +7633,6 @@ mod tests {
             applicable: false,
             scroll: 0,
             error: None,
-            confirming: false,
             cli: None,
             copied: None,
         };
@@ -7614,6 +7650,25 @@ mod tests {
         assert!(plain.contains("Tab complete"), "key caption: {plain}");
         // One click target per candidate row (the caption row is not clickable).
         assert_eq!(menu.len(), 2, "a click rect per candidate");
+    }
+
+    #[test]
+    fn render_confirm_popup_shows_summary_and_choices() {
+        let body = vec![
+            "Rename 3 tensor(s) across 1 shard file(s):".to_string(),
+            "Headers are rewritten in place — this cannot be undone.".to_string(),
+        ];
+        let out = crate::tui::headless_render(90, 20, |f| {
+            UI::render_confirm_popup(f, "Apply rename in place?", &body, &["Apply", "Cancel"], 1);
+        })
+        .unwrap();
+        let plain = strip_ansi_codes(&out);
+        assert!(plain.contains("Apply rename in place?"), "{plain}");
+        assert!(plain.contains("cannot be undone"), "{plain}");
+        assert!(
+            plain.contains("Apply") && plain.contains("Cancel"),
+            "{plain}"
+        );
     }
 
     #[test]

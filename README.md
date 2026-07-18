@@ -734,9 +734,12 @@ detail view), no regex required:
   from the source). Keep the placeholders and one rule renames the tensor across
   **every** layer and expert at once; type a **concrete** number instead (e.g.
   `…layers.0.…`) and it renames only that one.
-- **Editing.** With the dropdown **closed**, `↑`/`↓` move between fields (`↓` past
-  the last field adds a new rule pair); `←`/`→`/Home/End move the caret; `^N` adds a
-  rule, `^D` removes the focused one — so you can build up several renames at once.
+- **Editing.** With the dropdown **closed**, `↑`/`↓` (and **`Enter`**) move between
+  fields — `Enter` / `↓` past the last field adds a new rule pair; `←`/`→`/Home/End
+  move the caret; `^N` adds a rule, `^D` removes the focused one. Backspacing a rule
+  until **both** its fields are empty **removes it automatically** (focus jumps to the
+  previous rule, or the next when it was the first) — so you can build up and prune
+  several renames without reaching for `^D`. `Enter` never applies.
 - **Live before→after preview.** A pane updates as you type with a **per-rule**
   summary: the schema `from → to`, how many tensors it touches, and whether they
   can be applied in place — `⚠ N won't fit in place` (the new names are longer than
@@ -756,12 +759,16 @@ detail view), no regex required:
   equivalent — see below), copy the **apply command**, show the **legend**, or go
   *Back* / *Quit*. The palette is the primary way to reach copy / legend here, since
   bare letters are typed into the name fields; the edit/apply accelerators
-  (`^N`/`^D`/`^Y`/`Enter`) still work directly.
+  (`^N`/`^D`/`^Y`/`R`) still work directly.
 
-`Enter` stages the rename (once the preview is all-clear); a second `Enter`
-confirms and applies it in place, then the tree reloads with the new names. `Esc`
-backs out; `^C` quits. (The editor builds regex `--map` rules under the hood — the
-CLI is still there for scripted / multi-rule remappings.)
+Press **`R`** (capital — like the key that opens the editor, deliberately hard to
+hit since it rewrites files, and never typed into a field) to apply. A **confirmation
+pop-up** floats over the editor with a summary of what will change (and the in-place
+caveat); `Enter` on *Apply* — or `Y` — confirms and rewrites the headers, then the
+tree reloads with the new names; `Esc` / `N` cancels. `R` is disabled (with a hint)
+until the preview is all-clear. `Esc` backs out of the editor; `^C` quits. (The editor
+builds regex `--map` rules under the hood — the CLI is still there for scripted /
+multi-rule remappings.)
 
 Like the other views, the editor is **reproducible from the CLI**: `--rename` opens
 it straight away, and each repeatable `--rename-rule 'SOURCE=>NEW-NAME'` seeds a rule
