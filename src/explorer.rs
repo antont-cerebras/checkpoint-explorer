@@ -1951,8 +1951,11 @@ impl Mode for RenameMode2 {
                 self.editor.error = None;
                 self.dirty = true;
             }
-            // The copy-screen chip / palette sentinel (`\u{1}`).
-            KeyCode::Char('\u{1}') => self.do_copy_screen(),
+            // `^S` copies the whole screen's text (a bare `c` types into a field, so
+            // copy-screen is a Ctrl key here — and a footer button + palette entry).
+            KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.do_copy_screen()
+            }
             // Tab opens the dropdown and extends the field to the candidates' longest
             // common prefix (shell-style). Enter / a click accept the highlight — so
             // the two keys stay distinct.
@@ -1964,18 +1967,16 @@ impl Mode for RenameMode2 {
             }
             // Enter accepts a highlighted candidate; with the dropdown closed it
             // moves to the next field (adding a rule past the last) — it never
-            // applies. Apply is `R` (below).
+            // applies. Apply is `^R` (below).
             KeyCode::Enter if menu_open => {
                 self.editor.accept(&self.schemas);
                 self.editor.error = None;
                 self.dirty = true;
             }
             KeyCode::Enter => self.editor.focus_down(),
-            // `R` (capital — deliberately hard to hit, since it rewrites files)
-            // applies the rename, after a confirmation pop-up.
-            KeyCode::Char('R')
-                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
+            // `^R` applies the rename (a Ctrl key, so every character stays typeable),
+            // after a confirmation pop-up.
+            KeyCode::Char('r') if modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(nav) = self.try_apply(ex, term) {
                     return Ok(Outcome::Leave(nav));
                 }
@@ -3164,13 +3165,14 @@ const DATA_COMMANDS: &[(DataCmd, &str, &str, char)] = &[
 ];
 
 /// The rename editor's command registry (palette order). The `char` is a *sentinel*
-/// (not a bare accelerator): `R` applies (a capital letter, so it never types into a
-/// field), control chars name the real trigger (`^N`/`^D`/`^Y`, Esc, `^C`) and
-/// `\u{1}`/`\u{2}`/`\u{5}` are the palette-only copy / legend commands (no key label).
-/// [`key_label`] renders them; [`crate::ui::shortcut_help`] (the `Rename` arms)
-/// supplies each one's one-line help, keyed by the same char.
+/// (not a bare accelerator): control chars name the real Ctrl trigger (`^R` apply,
+/// `^S` copy screen, `^N`/`^D`/`^Y`, Esc, `^C`) — Ctrl keys so every character stays
+/// typeable in the name fields — and `\u{2}`/`\u{5}` are the palette-only copy /
+/// legend commands (no key label). [`key_label`] renders them;
+/// [`crate::ui::shortcut_help`] (the `Rename` arms) supplies each one's one-line help,
+/// keyed by the same char.
 const RENAME_COMMANDS: &[(RenameCmd, &str, &str, char)] = &[
-    (RenameCmd::Apply, "Rename", "Apply the rename", 'R'),
+    (RenameCmd::Apply, "Rename", "Apply the rename", '\u{12}'),
     (RenameCmd::AddRule, "Rename", "Add a rule", '\u{e}'),
     (
         RenameCmd::RemoveRule,
@@ -3178,7 +3180,7 @@ const RENAME_COMMANDS: &[(RenameCmd, &str, &str, char)] = &[
         "Remove the focused rule",
         '\u{4}',
     ),
-    (RenameCmd::CopyScreen, "Copy", "Screen text", '\u{1}'),
+    (RenameCmd::CopyScreen, "Copy", "Screen text", '\u{13}'),
     (
         RenameCmd::CopyReopenCmd,
         "Copy",
@@ -3217,6 +3219,8 @@ fn key_label(c: char) -> String {
     match c {
         '\t' => "Tab".to_string(),
         '\r' => "Enter".to_string(),
+        '\u{12}' => "^R".to_string(),
+        '\u{13}' => "^S".to_string(),
         '\u{e}' => "^N".to_string(),
         '\u{4}' => "^D".to_string(),
         '\u{19}' => "^Y".to_string(),

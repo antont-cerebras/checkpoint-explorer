@@ -757,17 +757,17 @@ detail view), no regex required:
   either, so they're free to use). From it you can *Apply*, *Add / Remove a rule*,
   copy the **screen text**, copy the **command to reopen this view** (the `y`
   equivalent — see below), copy the **apply command**, show the **legend**, or go
-  *Back* / *Quit*. The palette is the primary way to reach copy / legend here, since
-  bare letters are typed into the name fields; the edit/apply accelerators
-  (`^N`/`^D`/`^Y`/`R`) still work directly.
+  *Back* / *Quit*. Because bare letters type into the name fields, the editor's
+  commands are **Ctrl keys** (real, clickable footer buttons): `^R` apply, `^S` copy
+  screen, `^N`/`^D` add / remove a rule, `^Y` copy the apply command — so every
+  character stays typeable. Copy-reopen-command and the legend are palette-only.
 
-Press **`R`** (capital — like the key that opens the editor, deliberately hard to
-hit since it rewrites files, and never typed into a field) to apply. A **confirmation
-pop-up** floats over the editor with a summary of what will change (and the in-place
-caveat); `Enter` on *Apply* — or `Y` — confirms and rewrites the headers, then the
-tree reloads with the new names; `Esc` / `N` cancels. `R` is disabled (with a hint)
-until the preview is all-clear. `Esc` backs out of the editor; `^C` quits. (The editor
-builds regex `--map` rules under the hood — the CLI is still there for scripted /
+Press **`^R`** to apply (a Ctrl key, so every character stays typeable). A
+**confirmation pop-up** floats over the editor with a summary of what will change (and
+the in-place caveat); `Enter` on *Apply* — or `Y` — confirms and rewrites the headers,
+then the tree reloads with the new names; `Esc` / `N` cancels. `^R` is disabled (with a
+hint) until the preview is all-clear. `Esc` backs out of the editor; `^C` quits. (The
+editor builds regex `--map` rules under the hood — the CLI is still there for scripted /
 multi-rule remappings.)
 
 Like the other views, the editor is **reproducible from the CLI**: `--rename` opens
