@@ -10816,6 +10816,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             crate::ui::rename_hint_lines(200, true).1,
         );
+        // Detail's footer is now the same chip format; render it with everything
+        // available (overridable dtype, local file layout, non-remote so `s` shows).
+        check(
+            "detail",
+            &DETAIL_COMMANDS
+                .iter()
+                .map(|&(_, g, _, c)| (g, c))
+                .collect::<Vec<_>>(),
+            crate::ui::detail_footer_lines(true, false, true, 200).1,
+        );
     }
 
     #[test]

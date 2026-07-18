@@ -3,7 +3,7 @@ source: tests/cli.rs
 expression: "plain(&[\"--tensor\", \"model.layers.0.mlp.down_proj.weight\", \"--histogram\"])"
 ---
 Tensor Details                                                                                                       [×]
-──────────────
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 Name: model.layers.0.mlp.down_proj.weight
 Data Type: U16
 Shape: (3, 4, 5)
@@ -37,8 +37,8 @@ Histogram: 60 values  (<time>)
 14677 │▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆ 1 (1.7%)
 15436 │▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆ 2 (3.3%)
 16195 │▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆ 1 (1.7%)
-… 18 more bins (enlarge the terminal)
+16954 │▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆ 1 (1.7%)
+… 17 more bins (enlarge the terminal)
 
-Press m for a heatmap, v for numeric values, h for a histogram, b to set its bin count, d to reinterpret the dtype,
-r to reshape, Tab for the file layout, yy to copy the screen, y to copy the command, l for the legend,
-Space / : for commands, ⌫ / \ to step back / forward, any other key to return...                               editable
+m heatmap · v values · h histogram · b bins · s stats · d dtype · r reshape · Tab file layout · Space/: commands
+l legend · yy copy screen · y copy command · ⌫/\ back/fwd                                                      editable
