@@ -3,7 +3,7 @@ source: tests/cli.rs
 expression: "plain(&[\"--tensor\", &t])"
 ---
 Tensor Details                                                                                                       [×]
-──────────────
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 Name: model.layers.0.block_sparse_moe.experts.down_proj.weight
 Data Type: U16 as u3×5 (unpacked)
 Shape: (6, 3, 4) as (30, 3, 4)
@@ -39,6 +39,6 @@ Statistics: press s to scan the full tensor
 
 
 
-Press m for a heatmap, v for numeric values, h for a histogram, b to set its bin count, d to reinterpret the dtype,
-r to reshape, yy to copy the screen, y to copy the command, l for the legend, Space / : for commands,
-⌫ / \ to step back / forward, any other key to return...                                                      read-only
+
+m heatmap · v values · h histogram · b bins · s stats · d dtype · r reshape · Space/: commands · l legend
+yy copy screen · y copy command · ⌫/\ back/fwd                                                                read-only

@@ -6227,7 +6227,7 @@ fn detail_field_lines(
         "Tensor Details",
         Style::default().fg(palette::ACCENT),
     )));
-    lines.push(Line::from(dim_span("─".repeat(14))));
+    lines.push(Line::from(dim_span("─".repeat(width as usize))));
     lines.push(Line::from(vec![
         dim_span("Name: "),
         Span::raw(tensor.name.clone()),
@@ -6465,119 +6465,60 @@ fn detail_field_lines(
     (lines, stats_gauge_row, links)
 }
 
-/// The detail screen's footer hint as wrapped [`Line`]s, split into `key label,`
-/// chips that wrap at `width` (so a chip is never broken across lines). Mirrors
-/// the tree's [`tree_hint_lines`] wrapping.
-fn detail_footer_lines(
+/// The detail screen's footer hint chips — the same borderless, ` · `-separated
+/// `key label` format (and clickable [`ChipHit`]s) every other view uses, via the
+/// shared [`wrap_hint_items`]. `overridable` gates `d`/`r`; `layout` gates `Tab`;
+/// `remote` (metadata-only) hides `s` (there's nothing local to scan).
+pub(crate) fn detail_footer_lines(
     overridable: bool,
     remote: bool,
     layout: bool,
     width: u16,
 ) -> (Vec<Line<'static>>, Vec<ChipHit>) {
-    // Each chunk is a run of spans that should not be split across lines; the
-    // trailing text of each (the comma + space) keeps the on-screen wording. The
-    // second field lists the chunk's clickable glyphs as `(char offset within the
-    // chunk, glyph width, key)` so a click can be turned into the equivalent key.
-    type Chunk = (Vec<Span<'static>>, Vec<(usize, u16, KeyEvent)>);
-    let key_chunk = |glyph: &'static str, rest: &'static str, key: KeyEvent| -> Chunk {
-        (
-            vec![key_span(glyph), Span::raw(rest)],
-            vec![(0, glyph.chars().count() as u16, key)],
-        )
-    };
-    // The data views (heatmap/values/histogram/bins) need local bytes: dim their
-    // hints for a remote (metadata-only) source so it's clear they're inactive
-    // (still clickable → the same metadata-only notice as pressing the key).
-    let data_chunk = |glyph: &'static str, rest: &'static str, key: KeyEvent| -> Chunk {
-        if remote {
-            (
-                vec![dim_span(glyph), dim_span(rest)],
-                vec![(0, glyph.chars().count() as u16, key)],
-            )
-        } else {
-            key_chunk(glyph, rest, key)
-        }
-    };
-    let mut chunks: Vec<Chunk> = vec![(vec![Span::raw("Press ")], vec![])];
-    chunks.push(data_chunk("m", " for a heatmap, ", hint_key('m')));
-    chunks.push(data_chunk("v", " for numeric values, ", hint_key('v')));
-    chunks.push(data_chunk("h", " for a histogram, ", hint_key('h')));
-    chunks.push(data_chunk("b", " to set its bin count, ", hint_key('b')));
+    use KeyCode::{Backspace, Char, Tab};
+    let plain = KeyModifiers::NONE;
+    let mut items: Vec<(Vec<Seg>, &str)> = vec![
+        (vec![Seg::Key("m", hint_key('m'))], "heatmap"),
+        (vec![Seg::Key("v", hint_key('v'))], "values"),
+        (vec![Seg::Key("h", hint_key('h'))], "histogram"),
+        (vec![Seg::Key("b", hint_key('b'))], "bins"),
+    ];
+    if !remote {
+        items.push((vec![Seg::Key("s", hint_key('s'))], "stats"));
+    }
     if overridable {
-        chunks.push(key_chunk("d", " to reinterpret the dtype, ", hint_key('d')));
-        chunks.push(key_chunk("r", " to reshape, ", hint_key('r')));
+        items.push((vec![Seg::Key("d", hint_key('d'))], "dtype"));
+        items.push((vec![Seg::Key("r", hint_key('r'))], "reshape"));
     }
     if layout {
-        chunks.push(key_chunk(
-            "Tab",
-            " for the file layout, ",
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        items.push((
+            vec![Seg::Key("Tab", KeyEvent::new(Tab, plain))],
+            "file layout",
         ));
     }
-    chunks.push(key_chunk(
-        "yy",
-        " to copy the screen, ",
-        KeyEvent::new(KeyCode::Char('\u{6}'), KeyModifiers::NONE),
-    ));
-    chunks.push(key_chunk("y", " to copy the command, ", hint_key('y')));
-    chunks.push(key_chunk("l", " for the legend, ", hint_key('l')));
-    chunks.push(key_chunk("Space", " / : for commands, ", hint_key(' ')));
-    // The dual ⌫ / \ chunk: two independently clickable glyphs. `\` sits at char
-    // offset 4 (after "⌫" + " / ").
-    chunks.push((
+    items.push((
         vec![
-            key_span("⌫"),
-            Span::raw(" / "),
-            key_span("\\"),
-            Span::raw(" to step back / forward, any other key to return..."),
+            Seg::Key("Space", hint_key(' ')),
+            Seg::Sep("/"),
+            Seg::Key(":", hint_key(':')),
         ],
-        vec![
-            (0, 1, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
-            (4, 1, hint_key('\\')),
-        ],
+        "commands",
     ));
-
-    // Greedily pack chunks onto lines, breaking before a chunk that would overflow
-    // (each chunk already carries its own separator, so no extra is inserted).
-    let width = (width as usize).max(1);
-    let chunk_w = |c: &[Span]| -> usize { c.iter().map(|s| s.content.chars().count()).sum() };
-    let mut lines: Vec<Line> = Vec::new();
-    let mut chips: Vec<ChipHit> = Vec::new();
-    let mut spans: Vec<Span> = Vec::new();
-    let mut col = 0usize;
-    for (chunk, keys) in chunks {
-        let w = chunk_w(&chunk);
-        if !spans.is_empty() && col + w > width {
-            lines.push(Line::from(std::mem::take(&mut spans)));
-            col = 0;
-        }
-        // This chunk starts at column `col` on line `lines.len()`. A single-action
-        // chunk is clickable across its whole width (key + wording); the dual ⌫/\
-        // chunk keeps one region per glyph (the shared wording is ambiguous).
-        if keys.len() == 1 {
-            chips.push(ChipHit {
-                line: lines.len() as u16,
-                col: col as u16,
-                width: w as u16,
-                key: keys[0].2,
-            });
-        } else {
-            for (off, glyph_w, key) in keys {
-                chips.push(ChipHit {
-                    line: lines.len() as u16,
-                    col: (col + off) as u16,
-                    width: glyph_w,
-                    key,
-                });
-            }
-        }
-        spans.extend(chunk);
-        col += w;
-    }
-    if !spans.is_empty() {
-        lines.push(Line::from(spans));
-    }
-    (lines, chips)
+    items.push((vec![Seg::Key("l", hint_key('l'))], "legend"));
+    items.push((
+        vec![Seg::Key("yy", KeyEvent::new(Char('\u{6}'), plain))],
+        "copy screen",
+    ));
+    items.push((vec![Seg::Key("y", hint_key('y'))], "copy command"));
+    items.push((
+        vec![
+            Seg::Key("⌫", KeyEvent::new(Backspace, plain)),
+            Seg::Sep("/"),
+            Seg::Key("\\", hint_key('\\')),
+        ],
+        "back/fwd",
+    ));
+    wrap_hint_items(items, width)
 }
 
 /// Render the value histogram into `rect` — the Ratatui port of
