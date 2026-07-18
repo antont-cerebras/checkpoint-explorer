@@ -722,16 +722,19 @@ it's deliberately harder to hit) or use the command palette → *File: Rename te
 in place…* to open the **rename editor** — a full-screen mode (like the tensor
 detail view), no regex required:
 
-- **Rule pairs.** Each rule is a **source** field and a **new-name** field. Type a
-  substring in the source (matching is number-agnostic) and press **`Tab`** to
-  autocomplete it to a tensor's **schema**, where each layer / expert index becomes
-  a `{layer}` / `{expert}` / `{n0}` **placeholder**; the new name is prefilled from
-  it. Keep the placeholders and one rule renames the tensor across **every** layer
-  and expert at once; type a **concrete** number instead (e.g. `…layers.0.…`) and
-  it renames only that one.
-- **Editing.** `↑`/`↓` move between fields (`↓` past the last field adds a new rule
-  pair); `←`/`→`/Home/End move the caret; `^N` adds a rule, `^D` removes the
-  focused one — so you can build up several renames at once.
+- **Rule pairs + autocomplete.** Each rule is a **source** field and a **new-name**
+  field. As you type in either (matching is number-agnostic), a **completion
+  dropdown** pops up under the field — pgcli-style — listing the matching tensor
+  **schemas**, each with a `×N` count of how many tensors it covers. Move the
+  highlight with **`↑`/`↓`** and accept with **`Tab`** or **`Enter`** (or click a
+  row); **`Esc`** closes the dropdown. Accepting turns each layer / expert index
+  into a `{layer}` / `{expert}` / `{n0}` **placeholder** (and prefills the new name
+  from the source). Keep the placeholders and one rule renames the tensor across
+  **every** layer and expert at once; type a **concrete** number instead (e.g.
+  `…layers.0.…`) and it renames only that one.
+- **Editing.** With the dropdown **closed**, `↑`/`↓` move between fields (`↓` past
+  the last field adds a new rule pair); `←`/`→`/Home/End move the caret; `^N` adds a
+  rule, `^D` removes the focused one — so you can build up several renames at once.
 - **Live before→after preview.** A pane updates as you type with a **per-rule**
   summary: the schema `from → to`, how many tensors it touches, and whether they
   can be applied in place — `⚠ N won't fit in place` (the new names are longer than

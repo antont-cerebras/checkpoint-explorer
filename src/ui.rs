@@ -398,6 +398,18 @@ pub struct RenameRuleView {
     pub shards: Vec<crate::rename::ShardFit>,
 }
 
+/// One entry in the rename editor's autocomplete dropdown: a tensor-family schema,
+/// how many tensors it covers, and (optionally) the char range of the typed query
+/// within it to embolden.
+pub struct RenameCompletion {
+    pub text: String,
+    /// Tensors this family schema covers — shown as a dim `×N` metadata column.
+    pub count: usize,
+    /// `(start, end)` char range of the literal query match, to embolden; `None`
+    /// for a number-agnostic match (where the query has no literal counterpart).
+    pub hl: Option<(usize, usize)>,
+}
+
 /// Everything [`UI::render_rename`] draws: the dynamic list of source→new-name rule
 /// pairs (with the focused field + its autocomplete) and a compact, per-rule
 /// before→after preview marking each rule's in-place feasibility.
@@ -410,11 +422,12 @@ pub struct RenameView<'a> {
     pub on_target: bool,
     /// Caret position (char index) within the focused field.
     pub cursor: usize,
-    /// Whether to show the source's autocomplete list (hidden after a completion).
-    pub show_suggestions: bool,
-    /// Autocomplete suggestions for the focused source (empty on a new-name field);
-    /// the first is what `Tab` accepts.
-    pub suggestions: &'a [&'a str],
+    /// Whether the autocomplete dropdown is open at the focused field.
+    pub menu_open: bool,
+    /// The highlighted candidate in the dropdown (an index into `completions`).
+    pub menu_sel: usize,
+    /// Autocomplete candidates for the focused field; empty ⇒ no dropdown drawn.
+    pub completions: &'a [RenameCompletion],
     /// One summary per complete rule (the before→after preview).
     pub rules: &'a [RenameRuleView],
     /// Total tensors renamed across all rules (for the header).
@@ -1308,11 +1321,11 @@ impl UI {
     pub fn render_rename(
         frame: &mut Frame,
         view: &RenameView,
-    ) -> (usize, ChipRegions, LinkRegions) {
+    ) -> (usize, ChipRegions, LinkRegions, Vec<Rect>) {
         let area = frame.area();
         let (width, height) = (area.width, area.height);
         if height < 7 || width < 12 {
-            return (0, Vec::new(), Vec::new());
+            return (0, Vec::new(), Vec::new(), Vec::new());
         }
 
         // Header: a title line then a full-width rule, matching the other views'
@@ -1356,7 +1369,11 @@ impl UI {
         };
 
         // --- rule-pair editor lines ---
+        // The focused field's row index within `editor` — the autocomplete dropdown
+        // floats just beneath it (resolved to an absolute row once `editor` is laid
+        // out). The dropdown itself is drawn last, over the content below.
         let mut editor: Vec<Line<'static>> = Vec::new();
+        let mut focus_line = 0usize;
         for (i, (src, tgt)) in view.pairs.iter().enumerate() {
             if view.pairs.len() > 1 {
                 editor.push(Line::from(Span::styled(
@@ -1368,30 +1385,12 @@ impl UI {
             }
             let focused_src = i == view.focus_pair && !view.on_target;
             let focused_tgt = i == view.focus_pair && view.on_target;
+            if focused_src {
+                focus_line = editor.len();
+            }
             editor.push(field_row("from", src, focused_src));
-            if focused_src && view.show_suggestions {
-                if view.suggestions.is_empty() {
-                    editor.push(Line::from(dim_span(
-                        "       (no tensor matches — type part of a name)",
-                    )));
-                } else {
-                    // The first suggestion is what Tab accepts — highlight just its
-                    // marker + name (not the leading indent).
-                    for (j, name) in view.suggestions.iter().enumerate() {
-                        let top = j == 0;
-                        let style = if top {
-                            Style::default()
-                                .fg(palette::SELECT_FG)
-                                .bg(palette::SELECT_BG)
-                        } else {
-                            Style::default()
-                        };
-                        editor.push(Line::from(vec![
-                            Span::raw("       "),
-                            Span::styled(format!("{} {name}", if top { "▶" } else { " " }), style),
-                        ]));
-                    }
-                }
+            if focused_tgt {
+                focus_line = editor.len();
             }
             editor.push(field_row("to", tgt, focused_tgt));
             editor.push(Line::from(Span::raw("")));
@@ -1671,7 +1670,20 @@ impl UI {
         // Footer chips → absolute clickable regions (each replays its key).
         let chips = chip_regions(&chip_hits, footer_top);
 
-        (max_scroll, chips, clicks)
+        // The autocomplete dropdown floats over everything, anchored just below the
+        // focused field (when it's on-screen) — drawn last so nothing overpaints it.
+        let mut menu_rects = Vec::new();
+        if view.menu_open && !view.completions.is_empty() && focus_line < editor_h as usize {
+            menu_rects = render_completion_menu(
+                frame,
+                RENAME_MENU_X,
+                header_h + focus_line as u16,
+                view.completions,
+                view.menu_sel,
+            );
+        }
+
+        (max_scroll, chips, clicks, menu_rects)
     }
 
     /// Float a sidecar file preview over the file browser: a scrollable pop-up of
@@ -3826,6 +3838,140 @@ fn stats_footer_line(copied: Option<&'static str>, fold: Option<bool>, bg: Color
 /// coordinates to rows. `fixed_inner_w`, when set, pins the content width (lines
 /// wider than it are clipped) so the box is a constant size regardless of its
 /// content — otherwise the box sizes to the widest line.
+/// The left column the rename editor's autocomplete dropdown anchors at — under
+/// the field's value box (2-space indent + 4-wide label + space).
+const RENAME_MENU_X: u16 = 7;
+
+/// Draw the rename editor's autocomplete dropdown: a background-filled block (no
+/// box-drawing border — it's outlined by its fill colour), floating just below the
+/// focused field, one candidate per row with the highlighted one inverted, the
+/// matched substring emboldened, and a dim right-aligned `×N` tensor count. A final
+/// dim caption row spells out the keys. `field_row` is the focused field's absolute
+/// row; the box drops beneath it, or flips above when it would overflow the frame.
+/// Returns each candidate row's on-screen rect (the caption excluded) so a click
+/// can accept it.
+fn render_completion_menu(
+    frame: &mut Frame,
+    anchor_x: u16,
+    field_row: u16,
+    cands: &[RenameCompletion],
+    selected: usize,
+) -> Vec<Rect> {
+    let area = frame.area();
+    if cands.is_empty() || area.width <= anchor_x {
+        return Vec::new();
+    }
+    const CAPTION: &str = "↑/↓ pick · Tab/↵ accept · Esc close";
+    let count_label = |n: usize| format!("×{n}");
+    let name_w = cands
+        .iter()
+        .map(|c| c.text.chars().count())
+        .max()
+        .unwrap_or(0);
+    let count_w = cands
+        .iter()
+        .map(|c| count_label(c.count).chars().count())
+        .max()
+        .unwrap_or(0);
+    // 1 lead + name + 2 gap + count + 1 trail, but at least wide enough for the
+    // caption, and never past the frame's right edge.
+    let inner_w = (1 + name_w + 2 + count_w + 1).max(CAPTION.chars().count() + 2);
+    let box_w = (inner_w as u16).min(area.width - anchor_x).max(1);
+    let box_h = (cands.len() as u16 + 1).min(area.height); // +1 caption row
+    // Prefer dropping below the field; flip above when there's no room beneath.
+    let below = field_row + 1;
+    let box_y = if below + box_h <= area.height {
+        below
+    } else {
+        field_row.saturating_sub(box_h)
+    };
+    let box_x = anchor_x.min(area.width.saturating_sub(box_w));
+    let rect = Rect {
+        x: box_x,
+        y: box_y,
+        width: box_w,
+        height: box_h,
+    };
+    let base = Style::default().fg(palette::INPUT_FG).bg(palette::PANEL_BG);
+    let sel_style = Style::default()
+        .fg(palette::SELECT_FG)
+        .bg(palette::SELECT_BG);
+    Clear.render(rect, frame.buffer_mut());
+    Block::default()
+        .style(base)
+        .render(rect, frame.buffer_mut());
+
+    let mut rects = Vec::new();
+    for (i, c) in cands.iter().enumerate() {
+        let row_y = box_y + i as u16;
+        let picked = i == selected;
+        let row = if picked { sel_style } else { base };
+        let count_style = if picked {
+            sel_style
+        } else {
+            Style::default().fg(palette::META).bg(palette::PANEL_BG)
+        };
+        let mut spans = vec![Span::styled(" ", row)];
+        for (ci, ch) in c.text.chars().enumerate() {
+            let mut st = row;
+            if let Some((s, e)) = c.hl
+                && ci >= s
+                && ci < e
+            {
+                st = st.add_modifier(Modifier::BOLD);
+                if !picked {
+                    st = st.fg(palette::ACCENT);
+                }
+            }
+            spans.push(Span::styled(ch.to_string(), st));
+        }
+        let name_len = c.text.chars().count();
+        if name_len < name_w {
+            spans.push(Span::styled(" ".repeat(name_w - name_len), row));
+        }
+        spans.push(Span::styled("  ", row));
+        let cl = count_label(c.count);
+        let cl_w = cl.chars().count();
+        if cl_w < count_w {
+            spans.push(Span::styled(" ".repeat(count_w - cl_w), count_style));
+        }
+        spans.push(Span::styled(cl, count_style));
+        Paragraph::new(Line::from(spans)).render(
+            Rect {
+                x: box_x,
+                y: row_y,
+                width: box_w,
+                height: 1,
+            },
+            frame.buffer_mut(),
+        );
+        rects.push(Rect {
+            x: box_x,
+            y: row_y,
+            width: box_w,
+            height: 1,
+        });
+    }
+    // The key caption, dimmed, on the last row.
+    Paragraph::new(Line::from(vec![
+        Span::styled(" ", base),
+        Span::styled(
+            CAPTION,
+            Style::default().fg(palette::DIM).bg(palette::PANEL_BG),
+        ),
+    ]))
+    .render(
+        Rect {
+            x: box_x,
+            y: box_y + cands.len() as u16,
+            width: box_w,
+            height: 1,
+        },
+        frame.buffer_mut(),
+    );
+    rects
+}
+
 fn render_popup_box(
     frame: &mut Frame,
     title: &str,
@@ -7379,8 +7525,9 @@ mod tests {
             focus_pair: 0,
             on_target: true,
             cursor: 0,
-            show_suggestions: false,
-            suggestions: &[],
+            menu_open: false,
+            menu_sel: 0,
+            completions: &[],
             rules: &rules,
             total: 48,
             warnings: &[],
@@ -7394,7 +7541,7 @@ mod tests {
         };
         let mut clicks = Vec::new();
         let out = crate::tui::headless_render(120, 30, |f| {
-            let (_, _chips, c) = UI::render_rename(f, &view);
+            let (_, _chips, c, _menu) = UI::render_rename(f, &view);
             clicks = c;
         })
         .unwrap();
@@ -7416,6 +7563,57 @@ mod tests {
             )),
             "expected a clickable shard region"
         );
+    }
+
+    #[test]
+    fn render_rename_dropdown_lists_candidates_with_counts_and_click_targets() {
+        let pairs = vec![("q_proj".to_string(), String::new())];
+        let cands = vec![
+            RenameCompletion {
+                text: "model.layers.{layer}.self_attn.q_proj.weight".into(),
+                count: 32,
+                hl: Some((0, 5)),
+            },
+            RenameCompletion {
+                text: "model.layers.{layer}.self_attn.k_proj.weight".into(),
+                count: 32,
+                hl: None,
+            },
+        ];
+        let view = RenameView {
+            root: "/ckpt",
+            pairs: &pairs,
+            focus_pair: 0,
+            on_target: false,
+            cursor: 6,
+            menu_open: true,
+            menu_sel: 0,
+            completions: &cands,
+            rules: &[],
+            total: 0,
+            warnings: &[],
+            has_index: false,
+            applicable: false,
+            scroll: 0,
+            error: None,
+            confirming: false,
+            cli: None,
+            copied: None,
+        };
+        let mut menu = Vec::new();
+        let out = crate::tui::headless_render(120, 30, |f| {
+            let (_, _chips, _links, m) = UI::render_rename(f, &view);
+            menu = m;
+        })
+        .unwrap();
+        let plain = strip_ansi_codes(&out);
+        // Both candidates, the `×N` metadata column, and the key caption are drawn.
+        assert!(plain.contains("self_attn.q_proj.weight"), "{plain}");
+        assert!(plain.contains("self_attn.k_proj.weight"), "{plain}");
+        assert!(plain.contains("×32"), "count column: {plain}");
+        assert!(plain.contains("Tab/↵ accept"), "key caption: {plain}");
+        // One click target per candidate row (the caption row is not clickable).
+        assert_eq!(menu.len(), 2, "a click rect per candidate");
     }
 
     #[test]
