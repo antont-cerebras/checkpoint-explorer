@@ -368,6 +368,24 @@ fn plain_tree_expanded() {
     settings().bind(|| insta::assert_snapshot!(plain(&["--tree-state", "expanded"])));
 }
 
+/// The file browser screen (`Tab` / `--files`).
+#[test]
+fn files_view() {
+    settings().bind(|| insta::assert_snapshot!(plain(&["--files"])));
+}
+
+/// The safetensors byte-layout map (`--layout <file>`).
+#[test]
+fn layout_view() {
+    settings().bind(|| insta::assert_snapshot!(plain(&["--layout", FIXTURE])));
+}
+
+/// The in-place rename editor (`R` / `--rename`).
+#[test]
+fn rename_view() {
+    settings().bind(|| insta::assert_snapshot!(plain(&["--rename"])));
+}
+
 #[test]
 fn y_roundtrips() {
     ensure_fixture();

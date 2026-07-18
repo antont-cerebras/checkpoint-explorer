@@ -1,0 +1,44 @@
+---
+source: tests/cli.rs
+expression: "plain(&[\"--files\"])"
+---
+File browser - tests/fixtures                                                                                        [×]
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+▾ fixtures/  80.1 KiB · 9 files
+  ▦ diff_group_new.safetensors  728 B
+  ▦ diff_group_old.safetensors  728 B
+  ▦ diff_map_new.safetensors  404 B
+  ▦ diff_map_old.safetensors  348 B
+  ▦ diff_meta.safetensors  540 B
+  ▦ diff_new.safetensors  644 B
+  ▦ diff_old.safetensors  540 B
+  ▦ [FIXTURE]  75.4 KiB
+  ▦ [FIXTURE]  888 B
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+↑/↓ navigate · ←/→ collapse/expand · PgUp/PgDn page · Enter open/preview · Tab tensor tree · Space/: commands · l legend
+f copy path · yy copy screen · y copy command · ⌫/\ back/fwd · q quit
+ ▪ tests/fixtures                                                                                              editable

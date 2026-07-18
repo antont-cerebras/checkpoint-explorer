@@ -4739,6 +4739,12 @@ impl Explorer {
         let want_health = want_health_findings || self.open.as_ref().is_some_and(|r| r.health);
         let want_stats_shards = self.open.as_ref().is_some_and(|r| r.stats_shards);
         let want_stats_popup = want_stats_shards || self.open.as_ref().is_some_and(|r| r.stats);
+        // The file-browser / layout-map / rename-editor screens (headless): rendered
+        // directly below via their own frames, so `--plain` covers every screen (not
+        // just tree / detail / data). Captured before the request is consumed.
+        let want_files = self.open.as_ref().is_some_and(|r| r.files_view);
+        let want_layout = self.open.as_ref().and_then(|r| r.layout_file.clone());
+        let want_rename = self.open.as_ref().is_some_and(|r| r.rename);
         if let Some(n) = bins {
             self.histogram_bins.set(Some(n));
         }
@@ -4782,6 +4788,71 @@ impl Explorer {
                 );
             }
             println!("{cmd}");
+            return Ok(());
+        }
+
+        // The file browser (`--files`): build the directory rows, then render its
+        // frame headlessly — so `--plain` covers this screen like the others.
+        if want_files && self.file_view_available() {
+            if self.file_tree.is_none() {
+                self.file_tree = Some(crate::filetree::build(&self.browse_root, 8));
+                self.rebuild_file_rows();
+            }
+            let text = crate::tui::headless_render(120, 40, |f| self.render_files_frame(f, false))?;
+            println!("{text}");
+            return Ok(());
+        }
+        // The safetensors byte-layout map (`--layout <file>`).
+        if let Some(path) = want_layout {
+            let mode = LayoutMode::new(path, 0, 0);
+            if let Err(e) = &mode.map {
+                anyhow::bail!("{e}");
+            }
+            let text = crate::tui::headless_render(120, 40, |f| mode.render_frame(self, f))?;
+            println!("{text}");
+            return Ok(());
+        }
+        // The in-place rename editor (`--rename`), with any `--rename-rule` seeds
+        // applied. Rendered with an empty preview (headless can't run the live
+        // per-keystroke recompute), which is the editor's initial state anyway.
+        if want_rename && self.rename_target().is_some() {
+            let target = self.rename_target().expect("checked above");
+            let loaded = crate::rename::load(&target).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for n in loaded.names() {
+                *counts.entry(crate::rename::generalize(n).0).or_default() += 1;
+            }
+            let mut seen = HashSet::new();
+            let schemas: Vec<(String, usize)> = loaded
+                .names()
+                .iter()
+                .map(|n| crate::rename::generalize(n).0)
+                .filter(|s| seen.insert(s.clone()))
+                .map(|s| {
+                    let c = counts[&s];
+                    (s, c)
+                })
+                .collect();
+            let root = loaded.root().display().to_string();
+            let editor = RenameMode::default();
+            let rules_view: Vec<crate::ui::RenameRuleView> = Vec::new();
+            let text = crate::tui::headless_render(120, 40, |f| {
+                draw_rename_frame(
+                    f,
+                    &root,
+                    &editor,
+                    &schemas,
+                    &rules_view,
+                    0,
+                    &[],
+                    false,
+                    false,
+                    &None,
+                    None,
+                    None,
+                );
+            })?;
+            println!("{text}");
             return Ok(());
         }
 
