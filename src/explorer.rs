@@ -1899,14 +1899,15 @@ impl Mode for RenameMode2 {
             }
             // The copy-screen chip / palette sentinel (`\u{1}`).
             KeyCode::Char('\u{1}') => self.do_copy_screen(),
-            // Tab accepts the highlighted candidate, or opens the dropdown when it's
-            // closed (so a bare Tab still offers completions).
-            KeyCode::Tab if menu_open => {
-                self.editor.accept(&self.schemas);
+            // Tab opens the dropdown and extends the field to the candidates' longest
+            // common prefix (shell-style). Enter / a click accept the highlight — so
+            // the two keys stay distinct.
+            KeyCode::Tab => {
+                self.editor.open_menu();
+                self.editor.complete_prefix(&self.schemas);
                 self.editor.error = None;
                 self.dirty = true;
             }
-            KeyCode::Tab => self.editor.open_menu(),
             // Enter accepts a highlighted candidate; only with the dropdown closed
             // does it stage the apply.
             KeyCode::Enter if menu_open => {
@@ -9746,6 +9747,29 @@ impl RenameMode {
         self.menu = Some((cur + delta).rem_euclid(n as isize) as usize);
     }
 
+    /// `Tab`: extend the focused field to the longest common prefix of every schema
+    /// that matches it (shell-style — fill in as much as is unambiguous), leaving the
+    /// dropdown open so ↑/↓ + `Enter` can pick from what's left. Distinct from
+    /// `accept`, so Tab and Enter don't do the same thing. A no-op when the prefix
+    /// wouldn't grow the field, or wouldn't keep the typed text (which would broaden
+    /// the match rather than narrow it, since matching is by substring).
+    fn complete_prefix(&mut self, schemas: &[(String, usize)]) {
+        let q = self.field_ref().trim().to_string();
+        let nq = normalize_for_match(&q);
+        // The common prefix over *all* matches (uncapped, unlike `completions`).
+        let matches: Vec<&str> = schemas
+            .iter()
+            .filter(|(s, _)| nq.is_empty() || normalize_for_match(s).contains(&nq))
+            .map(|(s, _)| s.as_str())
+            .collect();
+        let prefix = longest_common_prefix(&matches);
+        if prefix.chars().count() > q.chars().count() && (q.is_empty() || prefix.contains(&q)) {
+            *self.field() = prefix;
+            self.caret_to_end();
+            self.menu = Some(0);
+        }
+    }
+
     /// Accept the highlighted candidate into the focused field: numbers stay
     /// generalized to `{layer}`/`{expert}` placeholders so one rule covers a whole
     /// family. Accepting into a source also prefills a still-empty new name from it.
@@ -9854,6 +9878,27 @@ impl RenameMode {
             }
         }
     }
+}
+
+/// The longest common prefix (by character) shared by every string in `items` —
+/// what `Tab` extends a rename field to. Empty for an empty list.
+fn longest_common_prefix(items: &[&str]) -> String {
+    let Some((first, rest)) = items.split_first() else {
+        return String::new();
+    };
+    let mut end = first.chars().count();
+    for s in rest {
+        let common = first
+            .chars()
+            .zip(s.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        end = end.min(common);
+        if end == 0 {
+            break;
+        }
+    }
+    first.chars().take(end).collect()
 }
 
 /// Normalize a name / query for the rename autocomplete's number-agnostic match:
@@ -10661,6 +10706,49 @@ mod tests {
         assert_eq!(mode.pairs.len(), before + 1);
         assert_eq!(mode.focus_pair, before);
         assert!(!mode.on_target);
+    }
+
+    #[test]
+    fn rename_tab_completes_longest_common_prefix_not_the_first_match() {
+        let names: Vec<String> = [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let schemas: Vec<(String, usize)> = {
+            let mut seen = HashSet::new();
+            names
+                .iter()
+                .map(|n| crate::rename::generalize(n).0)
+                .filter(|s| seen.insert(s.clone()))
+                .map(|s| (s, 1))
+                .collect()
+        };
+        let mut mode = RenameMode::default();
+
+        // Two `self_attn` families share a stem → Tab fills up to it (not to either
+        // full candidate — that's Enter's job), and leaves the dropdown open.
+        mode.pairs[0].source = "self_attn".to_string();
+        mode.complete_prefix(&schemas);
+        assert_eq!(mode.pairs[0].source, "model.layers.{layer}.self_attn.");
+        assert!(mode.menu.is_some(), "dropdown stays open after Tab");
+
+        // Narrowed to a single family → Tab can complete the whole schema.
+        mode.pairs[0].source = "q_proj".to_string();
+        mode.complete_prefix(&schemas);
+        assert_eq!(
+            mode.pairs[0].source,
+            "model.layers.{layer}.self_attn.q_proj.weight"
+        );
+
+        // A mid-token query whose matches' common prefix would *drop* it (broadening
+        // the filter) is left untouched — Tab never clobbers the typed text.
+        mode.pairs[0].source = "proj".to_string();
+        mode.complete_prefix(&schemas);
+        assert_eq!(mode.pairs[0].source, "proj");
     }
 
     #[test]
