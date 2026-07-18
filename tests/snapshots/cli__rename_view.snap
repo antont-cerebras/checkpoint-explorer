@@ -1,0 +1,44 @@
+---
+source: tests/cli.rs
+expression: "plain(&[\"--rename\"])"
+---
+Rename tensors in place — tests/fixtures
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  from  █
+  to
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Preview — 0 tensor(s) across 0 rule(s)
+  autocomplete a source and edit its new name to preview the changes
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+enter a rename above to get the `convert --map` command that applies it
+Space/: commands · Tab complete · ↑/↓ fields · ↵ next field · ←/→ caret · ^N add rule · ^D remove · PgUp/PgDn scroll
+^R apply (fix issues) · ^L legend · ^Y^Y copy screen · ^Y copy command · ^A copy apply cmd · Esc back
