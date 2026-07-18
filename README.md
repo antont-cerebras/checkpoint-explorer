@@ -315,7 +315,7 @@ what it does (handy while you're still learning the keys).
 | `E` / `C` | Expand all / collapse all groups |
 | `/` | Enter search mode to filter tensors |
 | `l` | Show a legend explaining the symbols on the current screen (works on every screen) |
-| `c` | Copy the current screen's text to the clipboard (works on every screen) |
+| `yy` | Copy the current screen's text to the clipboard — a double-press of `y` (`y` alone copies the reopen command); in the rename editor it's `^Y^Y` |
 | `t` | (Tree) open a menu to copy the tree or a flat tensor list — text or JSON, plain or verbose (every `--print-*` variant) — to the clipboard |
 | `f` | Copy the selected row's File path (tensor file, or a group/root's file or directory) |
 | `n` | Copy the selected tensor's Name to the clipboard |
@@ -334,7 +334,8 @@ tree, a tensor's detail, and its data views), so if you leave a screen by a
 stray key you can step right back to it — and forward again. (While the tree's
 search box is active, `Backspace` edits the query instead.)
 
-`c` copies the **text of the current screen** to the clipboard — the tree
+`yy` (a double-press of `y`; `y` alone copies the reopen command) copies the
+**text of the current screen** to the clipboard — the tree
 listing, a tensor's detail, or a data view's grid — via the OSC 52 terminal
 escape, so it reaches your local clipboard even over SSH/tmux (when the terminal
 supports it). `t` (in the tree) opens a small menu to copy the **whole
@@ -390,8 +391,9 @@ again (or `Backspace`) returns to the tensor tree; launch straight into it with
   text.
 - anything else shows a short info pop-up (no preview).
 
-The file view has the same command palette (`Space` / `:`), `l` legend, `c` /
-`f` / `y` copies, and `y` round-trips through `--files`, like the tree.
+The file view has the same command palette (`Space` / `:`), `l` legend, `yy` /
+`f` / `y` copies (screen / file path / command), and `y` round-trips through
+`--files`, like the tree.
 
 The file browser and layout map read the checkpoint's directory and files
 locally, so they're unavailable for a remote (`--ssh-read`) checkpoint.
@@ -758,7 +760,7 @@ detail view), no regex required:
   the editor's commands are **Ctrl keys** — the same commands as the non-editing
   modes' bare letters, Ctrl-prefixed so every character stays typeable, and each a
   real, clickable footer button with its key shown: `^R` apply, `^N`/`^D` add /
-  remove a rule, `^L` legend, `^S` copy screen, `^Y` copy the command to reopen this
+  remove a rule, `^L` legend, `^Y^Y` copy screen (double `^Y`), `^Y` copy the command to reopen this
   view (the `y` of the other views), `^A` copy the apply command. Every command is
   reachable both by its key and from the palette — none are palette-only.
 
@@ -957,7 +959,7 @@ mismatch on startup it points you to `h`.
 
 ```
 Checkpoint Explorer - model.safetensors (1/1)
-↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · Enter open · Space/: commands · E/C all · / search · l legend · h health · s stats · c copy screen · t copy tree · f copy file · n copy name · y copy command · ⌫/\ back/fwd · q quit
+↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · Enter open · Space/: commands · E/C all · / search · l legend · h health · s stats · yy copy screen · t copy tree · f copy file · n copy name · y copy command · ⌫/\ back/fwd · q quit
 ────────────────────────────────────────────────────────────────────────────────
 
 ▾ model.safetensors (▦ 342, 1.5B params, 1.2 GiB)
