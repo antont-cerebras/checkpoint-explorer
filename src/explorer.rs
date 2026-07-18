@@ -3386,6 +3386,11 @@ pub struct Explorer {
     /// time the popup opens.
     cached_check: RefCell<Option<crate::check::CheckReport>>,
     checkpoint_stats_cache: RefCell<Option<crate::stats::CheckpointStats>>,
+    /// Whether the checkpoint's shard files are actually writable — probed once (a
+    /// local safetensors checkpoint on a read-only filesystem, e.g. an `ro` SSH
+    /// mount, or a read-only file, looks local but can't be renamed in place).
+    /// Gates the `editable` badge and the whole in-place-rename capability.
+    writable: Cell<Option<bool>>,
     /// The selected node's distinct source files (keyed by selection index, tree
     /// length, and search mode), so a selected *group* isn't re-walked
     /// (`collect_source_paths`, O(tensors)) on every status-bar redraw *and* every
@@ -3470,6 +3475,7 @@ impl Explorer {
             hovered_shortcut: Cell::new(None),
             cached_check: RefCell::new(None),
             checkpoint_stats_cache: RefCell::new(None),
+            writable: Cell::new(None),
             cached_group_files: RefCell::new(None),
             browse_root,
             file_tree: None,
@@ -5055,8 +5061,8 @@ impl Explorer {
         }
         // `--rename` (+ `--rename-rule 'SRC=>TGT'`): open the in-place rename editor
         // seeded with those schema pairs. Skip silently for a checkpoint that can't
-        // be renamed in place (remote / non-safetensors) — same guard as the `R` key.
-        if want_rename && self.rename_target().is_some() {
+        // be renamed in place (remote / non-safetensors / read-only) — the `R` gate.
+        if want_rename && self.can_rename() {
             let pairs: Vec<(String, String)> = want_rename_rules
                 .iter()
                 .filter_map(|rule| {
@@ -6118,10 +6124,11 @@ impl Explorer {
     }
 
     /// Which access badge the bottom-right status line shows: `Editable` when the
-    /// open checkpoint is one the in-place rename can rewrite (a local safetensors
-    /// checkpoint — see [`Self::rename_target`]), else `ReadOnly`.
+    /// open checkpoint is one the in-place rename can actually rewrite (a local
+    /// safetensors checkpoint whose files are writable — see [`Self::can_rename`]),
+    /// else `ReadOnly` (including a read-only mount / file).
     fn access_badge(&self) -> crate::ui::AccessBadge {
-        if self.rename_target().is_some() {
+        if self.can_rename() {
             crate::ui::AccessBadge::Editable
         } else {
             crate::ui::AccessBadge::ReadOnly
@@ -6163,18 +6170,22 @@ impl Explorer {
             }
             Cmd::Repack => self.repack_checkpoint(term),
             Cmd::Rename => {
-                if self.rename_target().is_some() {
+                if self.can_rename() {
                     return Some(Nav::Open(Screen::Rename { pairs: Vec::new() }));
                 }
-                // Not a local safetensors checkpoint — say so rather than opening an
-                // empty editor (the palette already hides it; a bare `r` can still
-                // reach here).
+                // Can't rename — say why rather than opening an empty editor (the
+                // palette already hides it; a bare `r` can still reach here). A local
+                // safetensors checkpoint that's merely read-only gets a distinct hint
+                // from a non-safetensors / remote source.
+                let msg = if self.rename_target().is_some() {
+                    "This checkpoint's files are read-only (a read-only filesystem or \
+                     read-only files) — in-place rename can't rewrite them."
+                } else {
+                    "In-place rename is available for a local safetensors checkpoint only."
+                };
                 self.float_until_dismissed(term, |f| {
                     self.render_tree_frame(f, true);
-                    UI::render_notice(
-                        f,
-                        "In-place rename is available for a local safetensors checkpoint only.",
-                    );
+                    UI::render_notice(f, msg);
                 });
             }
             Cmd::Quit => return Some(Nav::Quit),
@@ -6191,7 +6202,7 @@ impl Explorer {
             .copied()
             .filter(|(cmd, _, _, _)| match cmd {
                 Cmd::Repack => self.repack_input().is_some(),
-                Cmd::Rename => self.rename_target().is_some(),
+                Cmd::Rename => self.can_rename(),
                 Cmd::ViewFiles => self.file_view_available(),
                 _ => true,
             })
@@ -8303,6 +8314,32 @@ impl Explorer {
         }
     }
 
+    /// Whether the checkpoint's shard files can actually be written — a local
+    /// safetensors checkpoint on a read-only filesystem (an `ro` SSH mount) or a
+    /// read-only file exists and looks local but the in-place rename would fail.
+    /// Probed once by opening each shard for writing (which changes nothing — no
+    /// truncate) and cached, since the badge / palette re-check it every frame.
+    fn checkpoint_writable(&self) -> bool {
+        if let Some(w) = self.writable.get() {
+            return w;
+        }
+        let w = !self.files.is_empty()
+            && self
+                .files
+                .iter()
+                .all(|f| std::fs::OpenOptions::new().write(true).open(f).is_ok());
+        self.writable.set(Some(w));
+        w
+    }
+
+    /// Whether the open checkpoint can be renamed in place: a local safetensors
+    /// checkpoint ([`Self::rename_target`]) whose files are writable
+    /// ([`Self::checkpoint_writable`]). The single gate for the `editable` badge,
+    /// the `Rename` command, the `R` key, and `--rename`.
+    fn can_rename(&self) -> bool {
+        self.rename_target().is_some() && self.checkpoint_writable()
+    }
+
     /// The `convert --map …` CLI command equivalent to the renames staged in `mode`
     /// (one `--map 'PATTERN=>REPLACEMENT'` per complete pair), or `None` until a pair
     /// is complete. Shown in the editor and copyable with `^Y`.
@@ -10296,19 +10333,40 @@ mod tests {
         );
         assert_eq!(available.len(), TREE_COMMANDS.len() - 2);
 
-        // A local safetensors checkpoint (even one shard) does offer Rename.
-        let st = Explorer::new(
-            vec![PathBuf::from("model.safetensors")],
-            Vec::new(),
-            None,
-            false,
-        );
+        // A *writable* local safetensors checkpoint (even one shard) offers Rename.
+        let dir = std::env::temp_dir().join(format!("ce_rename_gate_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("model.safetensors");
+        std::fs::write(&f, b"").unwrap();
+        let st = Explorer::new(vec![f.clone()], Vec::new(), None, false);
         assert!(st.rename_target().is_some());
+        assert!(st.can_rename(), "a writable local safetensors is editable");
         assert!(
             st.available_commands()
                 .iter()
                 .any(|&(c, ..)| c == Cmd::Rename)
         );
+
+        // A read-only file (the read-only-mount case) is structurally a local
+        // safetensors but can't be renamed in place, so it's NOT editable and the
+        // Rename command is hidden.
+        let mut perms = std::fs::metadata(&f).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&f, perms.clone()).unwrap();
+        let ro = Explorer::new(vec![f.clone()], Vec::new(), None, false);
+        assert!(ro.rename_target().is_some(), "still local safetensors");
+        assert!(
+            !ro.can_rename(),
+            "a read-only file can't be renamed in place"
+        );
+        assert!(
+            !ro.available_commands()
+                .iter()
+                .any(|&(c, ..)| c == Cmd::Rename)
+        );
+        // Removing the file only needs a writable parent dir, so the read-only file
+        // cleans up fine.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
