@@ -1157,18 +1157,27 @@ impl UI {
     }
 
     /// The first terminal row of the file browser's body — its header height
-    /// (title + hint line(s) + separator rule). Shared with the mouse handler so a
-    /// click at row `r >= this` maps to file row `scroll + (r - this)`.
-    pub fn files_header_rows(width: u16) -> usize {
-        1 + files_hint_lines(width).0.len() + 1 // title + hint(s) + rule
+    /// (title + separator rule; the key hints are a bottom-pinned footer now).
+    /// Shared with the mouse handler so a click at row `r >= this` maps to file row
+    /// `scroll + (r - this)`.
+    pub fn files_header_rows(_width: u16) -> usize {
+        2 // title + rule
+    }
+
+    /// Rows the bottom-pinned key-hint footer occupies (above the one-line status
+    /// bar). Kept in sync with [`Self::render_files`] so scroll / hit-testing align.
+    pub fn files_hint_rows(width: u16) -> usize {
+        files_hint_lines(width).0.len()
     }
 
     /// Body rows visible in the file browser at the given size (header + the
-    /// one-line status bar footer), so the scroll offset stays consistent with
-    /// [`Self::render_files`]'s layout.
+    /// bottom-pinned hint footer + the one-line status bar), so the scroll offset
+    /// stays consistent with [`Self::render_files`]'s layout.
     pub fn files_visible_rows(width: u16, height: u16) -> usize {
         (height as usize)
-            .saturating_sub(Self::files_header_rows(width) + FILES_FOOTER_HEIGHT)
+            .saturating_sub(
+                Self::files_header_rows(width) + Self::files_hint_rows(width) + FILES_FOOTER_HEIGHT,
+            )
             .max(1)
     }
 
@@ -1217,18 +1226,20 @@ impl UI {
             return Vec::new();
         }
 
-        // --- header + file rows (above the status line) ---
-        let mut lines: Vec<Line> = Vec::new();
-        lines.push(Line::from(Span::raw(format!("File browser - {root}"))));
+        // --- header (title + rule); the key hints are a bottom-pinned footer ---
+        let lines: Vec<Line> = vec![
+            Line::from(Span::raw(format!("File browser - {root}"))),
+            Line::from(Span::styled(
+                "─".repeat(width as usize),
+                Style::default().fg(palette::DIM),
+            )),
+        ];
         let (hint_lines, chips) = files_hint_lines(width);
-        lines.extend(hint_lines);
-        lines.push(Line::from(Span::styled(
-            "─".repeat(width as usize),
-            Style::default().fg(palette::DIM),
-        )));
+        let hint_rows = hint_lines.len();
 
         let header_rows = lines.len();
-        let body_rows = (height as usize).saturating_sub(header_rows + FILES_FOOTER_HEIGHT);
+        let body_rows =
+            (height as usize).saturating_sub(header_rows + hint_rows + FILES_FOOTER_HEIGHT);
 
         let scrollbar = if interactive {
             Self::files_scrollbar(width, height, rows.len())
@@ -1284,6 +1295,18 @@ impl UI {
             );
         }
 
+        // --- key-hint footer, pinned just above the one-line status bar ---
+        let hint_y = height.saturating_sub(1 + hint_rows as u16);
+        Paragraph::new(hint_lines).render(
+            Rect {
+                x: 0,
+                y: hint_y,
+                width,
+                height: hint_rows as u16,
+            },
+            frame.buffer_mut(),
+        );
+
         // --- one-line status bar (selected entry, or a copy confirmation) ---
         let reserve = Self::badge_bar_width(badges) as usize;
         let max_text = (width as usize).saturating_sub(6 + reserve);
@@ -1316,9 +1339,9 @@ impl UI {
         );
         Self::render_badge_bar(frame, badges, hovered_badge);
 
-        // Clickable footer chips (hint block starts at row 1, below the title)
+        // Clickable footer chips (the bottom-pinned hint block, at `hint_y`)
         // plus the top-right `[×]` (→ switch back to the tensor tree).
-        let mut regions = chip_regions(&chips, 1);
+        let mut regions = chip_regions(&chips, hint_y);
         regions.extend(close_button(
             frame,
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
