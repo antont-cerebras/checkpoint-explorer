@@ -340,8 +340,11 @@ pub struct DrawConfig<'a> {
     /// groups).
     pub status_secondary: &'a str,
     /// Whether the loaded checkpoint can be repacked (a single HDF5 file), which
-    /// gates the `R` hint.
+    /// gates the `r` hint.
     pub can_repack: bool,
+    /// Whether the loaded checkpoint can be renamed in place (a writable local
+    /// safetensors checkpoint), which gates the `R` hint.
+    pub can_rename: bool,
     /// `source_path`s of tensors present on disk but not listed in the index
     /// (a stale `model.safetensors.index.json`), flagged in the tree.
     pub unindexed: &'a HashSet<String>,
@@ -887,8 +890,9 @@ impl UI {
         height: u16,
         search_mode: bool,
         can_repack: bool,
+        can_rename: bool,
     ) -> usize {
-        let header = Self::tree_header_rows(width, search_mode, can_repack);
+        let header = Self::tree_header_rows(width, search_mode, can_repack, can_rename);
         (height as usize)
             .saturating_sub(header + TREE_FOOTER_HEIGHT)
             .max(1)
@@ -898,11 +902,16 @@ impl UI {
     /// hint/search line(s) + rule). Used for mouse hit-testing: a click at row
     /// `r >= tree_header_rows()` and above the 2-line status bar lands on tree
     /// row `scroll_offset + (r - tree_header_rows())`.
-    pub fn tree_header_rows(width: u16, search_mode: bool, can_repack: bool) -> usize {
+    pub fn tree_header_rows(
+        width: u16,
+        search_mode: bool,
+        can_repack: bool,
+        can_rename: bool,
+    ) -> usize {
         let hint_rows = if search_mode {
             1
         } else {
-            tree_hint_lines(can_repack, width).0.len()
+            tree_hint_lines(can_repack, can_rename, width).0.len()
         };
         1 + hint_rows + 1 // title + hint(s) + rule
     }
@@ -917,15 +926,16 @@ impl UI {
         height: u16,
         search_mode: bool,
         can_repack: bool,
+        can_rename: bool,
         total: usize,
     ) -> Option<TreeScrollbar> {
-        let rows = Self::tree_visible_rows(width, height, search_mode, can_repack);
+        let rows = Self::tree_visible_rows(width, height, search_mode, can_repack, can_rename);
         if width < 2 || total <= rows {
             return None; // nothing to scroll (or no room for a bar + content)
         }
         Some(TreeScrollbar {
             col: width - 1,
-            top: Self::tree_header_rows(width, search_mode, can_repack) as u16,
+            top: Self::tree_header_rows(width, search_mode, can_repack, can_rename) as u16,
             rows: rows as u16,
             max_offset: total - rows,
         })
@@ -960,7 +970,8 @@ impl UI {
         if config.search_mode {
             lines.push(tree_search_line(config));
         } else {
-            let (hint_lines, hint_chips) = tree_hint_lines(config.can_repack, width);
+            let (hint_lines, hint_chips) =
+                tree_hint_lines(config.can_repack, config.can_rename, width);
             lines.extend(hint_lines);
             chips = hint_chips;
         }
@@ -984,6 +995,7 @@ impl UI {
                 height,
                 config.search_mode,
                 config.can_repack,
+                config.can_rename,
                 config.tree.len(),
             )
         } else {
@@ -5198,7 +5210,11 @@ fn tree_span(selected: bool, color: Color, text: impl Into<String>) -> Span<'sta
 
 /// The tree browser's key-hint line(s), word-wrapped to `width` on the
 /// ` · `-separated `key label` chips (the long hint spills onto a second line).
-fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
+fn tree_hint_lines(
+    can_repack: bool,
+    can_rename: bool,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<ChipHit>) {
     use KeyCode::{Backspace, Down, Enter, Left, PageDown, PageUp, Right, Tab, Up};
     let plain = KeyModifiers::NONE;
     let shift = KeyModifiers::SHIFT;
@@ -5276,7 +5292,10 @@ fn tree_hint_lines(can_repack: bool, width: u16) -> (Vec<Line<'static>>, Vec<Chi
         ),
     ];
     if can_repack {
-        items.push((vec![Seg::Key("R", hint_key('R'))], "repack"));
+        items.push((vec![Seg::Key("r", hint_key('r'))], "repack"));
+    }
+    if can_rename {
+        items.push((vec![Seg::Key("R", hint_key('R'))], "rename"));
     }
     items.push((vec![Seg::Key("q", hint_key('q'))], "quit"));
     wrap_hint_items(items, width)
@@ -7277,18 +7296,18 @@ mod tests {
     #[test]
     fn tree_scrollbar_geometry_and_mapping() {
         // Everything fits the viewport → no bar.
-        assert!(UI::tree_scrollbar(80, 40, false, false, 5).is_none());
+        assert!(UI::tree_scrollbar(80, 40, false, false, false, 5).is_none());
         // Too narrow for a bar plus content → no bar.
-        assert!(UI::tree_scrollbar(1, 40, false, false, 999).is_none());
+        assert!(UI::tree_scrollbar(1, 40, false, false, false, 999).is_none());
 
         // Overflow → a bar in the rightmost column, tracking the visible rows.
-        let visible = UI::tree_visible_rows(80, 20, false, false);
-        let sb =
-            UI::tree_scrollbar(80, 20, false, false, visible + 50).expect("overflow shows bar");
+        let visible = UI::tree_visible_rows(80, 20, false, false, false);
+        let sb = UI::tree_scrollbar(80, 20, false, false, false, visible + 50)
+            .expect("overflow shows bar");
         assert_eq!(sb.col, 79);
         assert_eq!(sb.rows as usize, visible);
         assert_eq!(sb.max_offset, 50);
-        assert_eq!(sb.top as usize, UI::tree_header_rows(80, false, false));
+        assert_eq!(sb.top as usize, UI::tree_header_rows(80, false, false, false));
 
         // Track top → offset 0, track bottom → max_offset; outside the track clamps.
         assert_eq!(sb.offset_at(sb.top), 0);
@@ -7338,6 +7357,7 @@ mod tests {
                 status_bar: "",
                 status_secondary: "",
                 can_repack: false,
+                can_rename: false,
                 unindexed,
                 packing_schemas: schemas,
                 copied_flash: None,
@@ -7441,6 +7461,7 @@ mod tests {
             status_bar: "model.safetensors",
             status_secondary: "",
             can_repack: false,
+            can_rename: false,
             unindexed: &unindexed,
             packing_schemas: &schemas,
             copied_flash: None,

@@ -1219,7 +1219,13 @@ impl Mode for TreeMode {
                 ex.update_tree_scroll(sz.width, sz.height); // snap to the moved selection
                 self.last_sel = ex.selected_idx;
             }
-            let body = UI::tree_visible_rows(sz.width, sz.height, ex.search_mode, ex.can_repack());
+            let body = UI::tree_visible_rows(
+                sz.width,
+                sz.height,
+                ex.search_mode,
+                ex.can_repack(),
+                ex.can_rename(),
+            );
             let total = ex.current_tree_len();
             ex.scroll_offset = ex.scroll_offset.min(total.saturating_sub(body));
         }
@@ -1414,6 +1420,7 @@ impl Mode for TreeMode {
                     sz.height,
                     ex.search_mode,
                     ex.can_repack(),
+                    ex.can_rename(),
                     ex.current_tree_len(),
                 ) && sb.hit(col, row)
                 {
@@ -1421,8 +1428,12 @@ impl Mode for TreeMode {
                     self.scrollbar_drag = true;
                     return MouseOutcome::Redraw;
                 }
-                let body_top =
-                    UI::tree_header_rows(sz.width, ex.search_mode, ex.can_repack()) as u16;
+                let body_top = UI::tree_header_rows(
+                    sz.width,
+                    ex.search_mode,
+                    ex.can_repack(),
+                    ex.can_rename(),
+                ) as u16;
                 let body_bottom = sz.height.saturating_sub(2); // status bar
                 if row >= body_top && row < body_bottom {
                     let idx = ex.scroll_offset + (row - body_top) as usize;
@@ -1470,6 +1481,7 @@ impl Mode for TreeMode {
                     sz.height,
                     ex.search_mode,
                     ex.can_repack(),
+                    ex.can_rename(),
                     ex.current_tree_len(),
                 ) {
                     ex.scroll_offset = sb.offset_at(row);
@@ -5328,6 +5340,7 @@ impl Explorer {
             status_bar: &status_bar,
             status_secondary: &status_secondary,
             can_repack: self.repack_input().is_some(),
+            can_rename: self.can_rename(),
             unindexed: &self.unindexed,
             packing_schemas: &self.packing_schemas,
             copied_flash: self.copied_flash.as_ref().map(|(what, _)| what.as_str()),
@@ -5974,7 +5987,13 @@ impl Explorer {
     }
 
     fn update_tree_scroll(&mut self, width: u16, height: u16) {
-        let body = UI::tree_visible_rows(width, height, self.search_mode, self.can_repack());
+        let body = UI::tree_visible_rows(
+            width,
+            height,
+            self.search_mode,
+            self.can_repack(),
+            self.can_rename(),
+        );
         let sel = self.selected_idx;
         self.scroll_offset = if sel >= self.scroll_offset + body {
             sel.saturating_sub(body - 1)
