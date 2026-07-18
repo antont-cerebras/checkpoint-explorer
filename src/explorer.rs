@@ -10897,6 +10897,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             crate::ui::detail_footer_lines(true, false, true, 200).1,
         );
+        // The data view's footer is state-dependent: the `m`/`v` switch shows only the
+        // *other* representation, and zebra/base only in the numeric grid — so no
+        // single state shows every command. Union the two representations (numeric +
+        // heatmap, both overridable) and require they cover every DATA_COMMANDS key.
+        let data_chips = {
+            let state = |heatmap: bool| {
+                crate::ui::data_view_footer_wrapped_lines(
+                    crate::sample::SampleMode::Grid,
+                    1,
+                    true,
+                    heatmap,
+                    crate::ui::StripeMode::Rows,
+                    crate::ui::NumBase::Decimal,
+                    200,
+                )
+                .1
+            };
+            let mut c = state(false);
+            c.extend(state(true));
+            c
+        };
+        check(
+            "data",
+            &DATA_COMMANDS
+                .iter()
+                .map(|&(_, g, _, c)| (g, c))
+                .collect::<Vec<_>>(),
+            data_chips,
+        );
     }
 
     #[test]
