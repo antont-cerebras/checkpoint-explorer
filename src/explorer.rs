@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind},
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{self, ClearType},
 };
@@ -569,6 +571,2263 @@ enum Nav {
     Forward,
     /// Quit the app.
     Quit,
+}
+
+/// The declarative facets of an interactive mode that the generic
+/// [`Explorer::run_mode`] driver needs — the small, per-mode data that used to be
+/// scattered across each hand-rolled `run_*` loop.
+struct ModeSpec {
+    /// Help / badge / hover context for this screen.
+    id: HelpCtx,
+    /// Ctrl-C quits the process immediately (detail / data / rename) vs returning
+    /// `Nav::Quit` to the navigator (tree / files / layout).
+    ctrlc_quits_immediately: bool,
+}
+
+/// The result of a mode handling a key (or `on_enter`): stay in the loop, or leave
+/// with a [`Nav`].
+enum Outcome {
+    Stay,
+    Leave(Nav),
+}
+
+/// What a mode's own mouse handler did with an event the driver didn't consume.
+enum MouseOutcome {
+    /// Not handled.
+    Ignored,
+    /// Handled; just redraw.
+    Redraw,
+    /// Treat it as this keypress (run it through `handle_key`).
+    SynthKey(KeyEvent),
+    /// Leave the mode.
+    Leave(Nav),
+}
+
+/// What opening the command palette produced — folds the old per-mode dispatch
+/// styles (return-a-`Nav`, synthesize-a-key, mutate-in-place) into one contract.
+enum PaletteResult {
+    /// Dismissed (Esc / click-off) or handled in place — stay.
+    Handled,
+    /// Leave the mode.
+    Nav(Nav),
+    /// Re-feed this key through `handle_key` (the detail / data "synthesize a key" style).
+    #[allow(dead_code)] // constructed once detail/data migrate (Step 4)
+    SynthKey(KeyEvent),
+}
+
+/// Whether the mode has live background work (a stats scan) whose spinner needs the
+/// event loop to poll on a timeout, vs blocking on input.
+enum Bg {
+    Idle,
+    /// A scan is running — poll on a timeout so its spinner animates.
+    #[allow(dead_code)] // constructed once detail/data migrate (Step 4)
+    Poll,
+}
+
+/// How often the event loop wakes to advance a background scan's spinner.
+const SCAN_TICK: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// One interactive screen, driven by the generic [`Explorer::run_mode`]. A mode is
+/// a small state struct plus these callbacks; the driver owns all the shared chrome
+/// and event plumbing — the command palette, the copied-flash lifecycle, hover
+/// bubbles, footer-chip / link / badge clicks, Ctrl-C, and the wrong-keyboard-layout
+/// hint — so a mode physically cannot diverge from the others on those.
+trait Mode {
+    fn spec(&self) -> ModeSpec;
+    /// Whether typed letters are field input here (rename, tree-in-search), so the
+    /// driver skips the wrong-layout hint and badge-click actions.
+    fn accepts_text(&self, _ex: &Explorer) -> bool {
+        false
+    }
+    /// Draw the whole frame (chrome + body); records `self.clickable` / `self.links`.
+    fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame);
+    /// Recompute pre-draw derived state that needs `&mut` (scroll clamping, keeping
+    /// the selection visible). Runs before `render_frame` when input has settled.
+    fn pre_draw(&mut self, _ex: &mut Explorer, _term: &mut crate::tui::LiveTerminal) {}
+    /// One-time setup on entry (lazy build / deferred load / guard); may bail with a
+    /// `Nav`. `Result` so it can propagate a load error.
+    fn on_enter(
+        &mut self,
+        _ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+    ) -> Result<Outcome> {
+        Ok(Outcome::Stay)
+    }
+    /// Whether Space / `:` opens the command palette here. Default yes; the tree
+    /// turns it off while searching (so `:` types into the query, Space is ignored).
+    fn palette_on_space(&self, _ex: &Explorer) -> bool {
+        true
+    }
+    /// Advance any background job (the detail / data stats scan); returns whether the
+    /// loop should poll on a timeout so the spinner animates.
+    fn tick_background(&mut self, _ex: &mut Explorer) -> Bg {
+        Bg::Idle
+    }
+    /// Pause / resume a running background scan while input is pending, so a
+    /// keypress's own file read isn't stuck behind the scan's block. No-op by default.
+    fn set_background_paused(&self, _paused: bool) {}
+    /// The in-frame overlay (legend / copied-command / notice), if one is up.
+    fn overlay(&self) -> Option<&Overlay> {
+        None
+    }
+    /// Dismiss any in-frame overlay; returns whether one was showing.
+    fn dismiss_overlay(&mut self) -> bool {
+        false
+    }
+    /// Open the command palette (Space / `:`) and dispatch the choice.
+    fn open_palette(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+    ) -> PaletteResult;
+    /// Handle a real or chip-synthesized keypress. `Result` so a handler that has to
+    /// finish a deferred load (e.g. reveal a tensor) can propagate an I/O error.
+    fn handle_key(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+        key: KeyEvent,
+    ) -> Result<Outcome>;
+    /// Handle a mouse event the driver didn't consume (rows / scrollbar / band / wheel).
+    fn handle_mouse(
+        &mut self,
+        _ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+        _m: MouseEvent,
+    ) -> MouseOutcome {
+        MouseOutcome::Ignored
+    }
+    /// The screen to record in history for back / forward restore.
+    fn residual(&self) -> Screen;
+}
+
+/// The file browser ([`Screen::Files`]) as a [`Mode`]: lists the checkpoint's
+/// directory (fold with `←`/`→`, `Enter` opens a checkpoint / previews a sidecar),
+/// `Tab`/Backspace return to the tree. Its selection/scroll live on [`Explorer`];
+/// this holds only the transient click/drag bookkeeping the old `run_files` kept as
+/// loop locals.
+struct FilesMode {
+    /// Last left-click (time + row) for double-click detection.
+    last_click: Option<(std::time::Instant, u16)>,
+    /// The selection the scroll was last kept-visible for (so a moved selection
+    /// re-scrolls once). `usize::MAX` forces the first frame to update.
+    last_sel: usize,
+    /// Whether a scrollbar drag is in progress.
+    scrollbar_drag: bool,
+}
+
+impl FilesMode {
+    fn new() -> Self {
+        Self {
+            last_click: None,
+            last_sel: usize::MAX,
+            scrollbar_drag: false,
+        }
+    }
+}
+
+impl Mode for FilesMode {
+    fn spec(&self) -> ModeSpec {
+        ModeSpec {
+            id: HelpCtx::Files,
+            ctrlc_quits_immediately: false,
+        }
+    }
+
+    fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
+        ex.render_files_frame(f, true);
+    }
+
+    fn on_enter(
+        &mut self,
+        ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+    ) -> Result<Outcome> {
+        // Build the directory tree lazily on first entry, then keep it (fold state
+        // persists across `Tab` toggles).
+        if ex.file_tree.is_none() {
+            ex.file_tree = Some(crate::filetree::build(&ex.browse_root, 8));
+            ex.rebuild_file_rows();
+        }
+        Ok(Outcome::Stay)
+    }
+
+    fn pre_draw(&mut self, ex: &mut Explorer, term: &mut crate::tui::LiveTerminal) {
+        if let Ok(sz) = term.size() {
+            if ex.file_selected != self.last_sel {
+                ex.update_files_scroll(sz.width, sz.height);
+                self.last_sel = ex.file_selected;
+            }
+            let body = UI::files_visible_rows(sz.width, sz.height);
+            let total = ex.file_flattened.len();
+            ex.file_scroll = ex.file_scroll.min(total.saturating_sub(body));
+        }
+    }
+
+    fn open_palette(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+    ) -> PaletteResult {
+        if let Some(cmd) = ex.file_command_palette(term)
+            && let Some(nav) = ex.run_file_command(cmd, term)
+        {
+            return PaletteResult::Nav(nav);
+        }
+        PaletteResult::Handled
+    }
+
+    fn handle_key(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+        key: KeyEvent,
+    ) -> Result<Outcome> {
+        let total = ex.file_flattened.len();
+        match key.code {
+            // Every lettered command dispatches through the registry (like the tree),
+            // so key and palette entry can't drift.
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && file_command_for_key(c).is_some() =>
+            {
+                let cmd = file_command_for_key(c).expect("guarded by is_some");
+                if let Some(nav) = ex.run_file_command(cmd, term) {
+                    return Ok(Outcome::Leave(nav));
+                }
+            }
+            KeyCode::Tab | KeyCode::Backspace => return Ok(Outcome::Leave(Nav::Back)),
+            KeyCode::Char('\\') => return Ok(Outcome::Leave(Nav::Forward)),
+            KeyCode::Up => {
+                let step = ex.held_step(KeyCode::Up, accel_step_row) as i32;
+                ex.move_file_selection(-step);
+            }
+            KeyCode::Down => {
+                let step = ex.held_step(KeyCode::Down, accel_step_row) as i32;
+                ex.move_file_selection(step);
+            }
+            KeyCode::PageUp => {
+                let step =
+                    (ex.file_page_rows() * ex.held_step(KeyCode::PageUp, accel_step_page)) as i32;
+                ex.move_file_selection(-step);
+            }
+            KeyCode::PageDown => {
+                let step =
+                    (ex.file_page_rows() * ex.held_step(KeyCode::PageDown, accel_step_page)) as i32;
+                ex.move_file_selection(step);
+            }
+            KeyCode::Home => ex.file_selected = 0,
+            KeyCode::End => ex.file_selected = total.saturating_sub(1),
+            KeyCode::Left => ex.file_collapse_or_parent(),
+            KeyCode::Right => ex.file_expand_or_child(),
+            KeyCode::Enter => {
+                if let Some(nav) = ex.activate_file_selection() {
+                    return Ok(Outcome::Leave(nav));
+                }
+            }
+            _ => {}
+        }
+        Ok(Outcome::Stay)
+    }
+
+    fn handle_mouse(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+        m: MouseEvent,
+    ) -> MouseOutcome {
+        let Ok(sz) = term.size() else {
+            return MouseOutcome::Ignored;
+        };
+        let total = ex.file_flattened.len();
+        let (col, row) = (m.column, m.row);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.scrollbar_drag = false;
+                if let Some(sb) = UI::files_scrollbar(sz.width, sz.height, total)
+                    && sb.hit(col, row)
+                {
+                    ex.file_scroll = sb.offset_at(row);
+                    self.scrollbar_drag = true;
+                    return MouseOutcome::Redraw;
+                }
+                let body_top = UI::files_header_rows(sz.width) as u16;
+                let body_bottom = sz.height.saturating_sub(FILES_FOOTER_ROWS as u16);
+                if row >= body_top && row < body_bottom {
+                    let idx = ex.file_scroll + (row - body_top) as usize;
+                    if let Some(fr) = ex.file_flattened.get(idx).cloned() {
+                        // A click on a directory's ▸/▾ twisty (column `2*depth`)
+                        // toggles it on a single click.
+                        let on_arrow = fr.is_dir && col == 2 * fr.depth as u16;
+                        ex.file_selected = idx;
+                        if on_arrow {
+                            self.last_click = None;
+                            ex.activate_file_selection();
+                        } else {
+                            let double = matches!(
+                                self.last_click,
+                                Some((t, r)) if r == row && t.elapsed() < DOUBLE_CLICK
+                            );
+                            if double {
+                                self.last_click = None;
+                                if let Some(nav) = ex.activate_file_selection() {
+                                    return MouseOutcome::Leave(nav);
+                                }
+                            } else {
+                                self.last_click = Some((std::time::Instant::now(), row));
+                            }
+                        }
+                    }
+                }
+                MouseOutcome::Redraw
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.scrollbar_drag => {
+                if let Some(sb) = UI::files_scrollbar(sz.width, sz.height, total) {
+                    ex.file_scroll = sb.offset_at(row);
+                }
+                MouseOutcome::Redraw
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.scrollbar_drag = false;
+                MouseOutcome::Redraw
+            }
+            MouseEventKind::ScrollDown => {
+                ex.file_scroll = ex.file_scroll.saturating_add(WHEEL_STEP);
+                MouseOutcome::Redraw
+            }
+            MouseEventKind::ScrollUp => {
+                ex.file_scroll = ex.file_scroll.saturating_sub(WHEEL_STEP);
+                MouseOutcome::Redraw
+            }
+            _ => MouseOutcome::Ignored,
+        }
+    }
+
+    fn residual(&self) -> Screen {
+        Screen::Files
+    }
+}
+
+/// The safetensors layout map ([`Screen::Layout`]) as a [`Mode`]: a scrollable
+/// vertical strip of one file's byte layout. Its selection/scroll are the drill-down
+/// residual (written back to history), and the parsed map lives here for the visit.
+struct LayoutMode {
+    path: String,
+    /// The parsed map, or the parse error to report on entry.
+    map: std::result::Result<crate::safelayout::LayoutMap, String>,
+    selected: usize,
+    scroll: usize,
+    scroll_max: usize,
+    last_sel: usize,
+}
+
+impl LayoutMode {
+    fn new(path: String, selected: usize, scroll: usize) -> Self {
+        let map = crate::safelayout::parse(Path::new(&path)).map_err(|e| format!("{e:#}"));
+        Self {
+            path,
+            map,
+            selected,
+            scroll,
+            scroll_max: 0,
+            last_sel: usize::MAX,
+        }
+    }
+
+    /// The parsed map — only reached after `on_enter` has bailed on a parse error.
+    fn map(&self) -> &crate::safelayout::LayoutMap {
+        self.map.as_ref().expect("on_enter leaves on a parse error")
+    }
+}
+
+impl Mode for LayoutMode {
+    fn spec(&self) -> ModeSpec {
+        ModeSpec {
+            id: HelpCtx::Layout,
+            ctrlc_quits_immediately: false,
+        }
+    }
+
+    fn on_enter(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+    ) -> Result<Outcome> {
+        match &self.map {
+            Ok(map) => {
+                self.selected = self.selected.min(map.segments.len().saturating_sub(1));
+                Ok(Outcome::Stay)
+            }
+            Err(e) => {
+                let body = vec![
+                    Line::from(Span::raw(format!(
+                        "Can't read the layout of {}:",
+                        self.path
+                    ))),
+                    Line::default(),
+                    Line::from(crate::ui::dim_span(e.clone())),
+                ];
+                ex.float_scroll_popup(term, "Layout", body, PopupBackdrop::Files, None);
+                Ok(Outcome::Leave(Nav::Back))
+            }
+        }
+    }
+
+    fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
+        let flash = ex.copied_flash.as_ref().map(|(w, _)| w.clone());
+        let (_max, regions, links) = UI::render_layout(
+            f,
+            self.map(),
+            self.selected,
+            self.scroll,
+            flash.as_deref(),
+            true,
+        );
+        *ex.clickable.borrow_mut() = regions;
+        *ex.links.borrow_mut() = links; // tensor band name → tree
+    }
+
+    fn pre_draw(&mut self, _ex: &mut Explorer, term: &mut crate::tui::LiveTerminal) {
+        // Compute the scroll bounds from the band layout up front, then snap so the
+        // selected band's label row stays visible when the selection moved.
+        let Ok(sz) = term.size() else { return };
+        let starts = match &self.map {
+            Ok(m) => UI::layout_band_starts(m, sz.width, sz.height),
+            Err(_) => return,
+        };
+        let body = UI::layout_visible_rows(sz.width, sz.height);
+        let total_rows = starts.last().copied().unwrap_or(0);
+        self.scroll_max = total_rows.saturating_sub(body);
+        if self.selected != self.last_sel {
+            let band_start = starts.get(self.selected).copied().unwrap_or(0);
+            if band_start < self.scroll {
+                self.scroll = band_start;
+            } else if band_start >= self.scroll + body {
+                self.scroll = band_start + 1 - body;
+            }
+            self.last_sel = self.selected;
+        }
+        self.scroll = self.scroll.min(self.scroll_max);
+    }
+
+    fn open_palette(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+    ) -> PaletteResult {
+        let map = match &self.map {
+            Ok(m) => m,
+            Err(_) => return PaletteResult::Handled,
+        };
+        if let Some(cmd) = ex.layout_command_palette(term, map, self.selected, self.scroll)
+            && let Some(nav) =
+                ex.run_layout_command(cmd, &self.path, map, self.selected, self.scroll, term)
+        {
+            return PaletteResult::Nav(nav);
+        }
+        PaletteResult::Handled
+    }
+
+    fn handle_key(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+        key: KeyEvent,
+    ) -> Result<Outcome> {
+        let n = self.map().segments.len();
+        let move_sel = |sel: usize, delta: i32| -> usize {
+            if delta < 0 {
+                sel.saturating_sub((-delta) as usize)
+            } else {
+                (sel + delta as usize).min(n.saturating_sub(1))
+            }
+        };
+        match key.code {
+            // Every lettered command dispatches through the registry (`q`/`l`/`c`/`y`)
+            // so key and palette entry can't drift.
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && layout_command_for_key(ch).is_some() =>
+            {
+                let cmd = layout_command_for_key(ch).expect("guarded by is_some");
+                if let Some(nav) = ex.run_layout_command(
+                    cmd,
+                    &self.path,
+                    self.map(),
+                    self.selected,
+                    self.scroll,
+                    term,
+                ) {
+                    return Ok(Outcome::Leave(nav));
+                }
+            }
+            KeyCode::Backspace | KeyCode::Tab | KeyCode::Esc => {
+                return Ok(Outcome::Leave(Nav::Back));
+            }
+            KeyCode::Char('\\') => return Ok(Outcome::Leave(Nav::Forward)),
+            KeyCode::Up => {
+                let step = ex.held_step(KeyCode::Up, accel_step_row) as i32;
+                self.selected = move_sel(self.selected, -step);
+            }
+            KeyCode::Down => {
+                let step = ex.held_step(KeyCode::Down, accel_step_row) as i32;
+                self.selected = move_sel(self.selected, step);
+            }
+            KeyCode::PageUp => {
+                let page = ex.layout_page_segments(self.map(), term.size().ok());
+                let step = (page * ex.held_step(KeyCode::PageUp, accel_step_page)) as i32;
+                self.selected = move_sel(self.selected, -step);
+            }
+            KeyCode::PageDown => {
+                let page = ex.layout_page_segments(self.map(), term.size().ok());
+                let step = (page * ex.held_step(KeyCode::PageDown, accel_step_page)) as i32;
+                self.selected = move_sel(self.selected, step);
+            }
+            KeyCode::Home => self.selected = 0,
+            KeyCode::End => self.selected = n.saturating_sub(1),
+            // Enter on the header previews the raw JSON header; on a tensor it jumps
+            // to that tensor's place in the tree.
+            KeyCode::Enter => match self.map().segments.get(self.selected).map(|s| s.kind) {
+                Some(crate::safelayout::SegmentKind::Header) => {
+                    ex.preview_header_json(
+                        term,
+                        &self.path,
+                        self.map(),
+                        self.selected,
+                        self.scroll,
+                    );
+                }
+                Some(crate::safelayout::SegmentKind::Tensor) => {
+                    if let Some(nav) = ex.reveal_layout_selection(self.map(), self.selected)? {
+                        return Ok(Outcome::Leave(nav));
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Ok(Outcome::Stay)
+    }
+
+    fn handle_mouse(
+        &mut self,
+        _ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+        m: MouseEvent,
+    ) -> MouseOutcome {
+        let (col, row) = (m.column, m.row);
+        match m.kind {
+            // A click on a band selects it (link / chip clicks are handled by the
+            // driver's route_mouse before this).
+            MouseEventKind::Down(MouseButton::Left) => {
+                let _ = col;
+                if let Ok(sz) = term.size() {
+                    let top = UI::layout_header_rows() as u16;
+                    let body = UI::layout_visible_rows(sz.width, sz.height);
+                    if row >= top && (row as usize) < top as usize + body {
+                        let content_row = self.scroll + (row - top) as usize;
+                        let starts = UI::layout_band_starts(self.map(), sz.width, sz.height);
+                        if let Some(seg) = starts
+                            .windows(2)
+                            .position(|w| content_row >= w[0] && content_row < w[1])
+                        {
+                            let n = self.map().segments.len();
+                            self.selected = seg.min(n.saturating_sub(1));
+                        }
+                    }
+                }
+                MouseOutcome::Redraw
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll = (self.scroll + WHEEL_STEP).min(self.scroll_max);
+                MouseOutcome::Redraw
+            }
+            MouseEventKind::ScrollUp => {
+                self.scroll = self.scroll.saturating_sub(WHEEL_STEP);
+                MouseOutcome::Redraw
+            }
+            _ => MouseOutcome::Ignored,
+        }
+    }
+
+    fn residual(&self) -> Screen {
+        Screen::Layout {
+            path: self.path.clone(),
+            selected: self.selected,
+            scroll: self.scroll,
+        }
+    }
+}
+
+/// The tensor tree ([`Screen::Tree`]) as a [`Mode`] — the root browser, including
+/// the search sub-machine. Its selection/scroll/search state live on [`Explorer`];
+/// this holds only the transient click/drag bookkeeping.
+struct TreeMode {
+    last_click: Option<(std::time::Instant, u16)>,
+    last_sel: usize,
+    scrollbar_drag: bool,
+}
+
+impl TreeMode {
+    fn new() -> Self {
+        Self {
+            last_click: None,
+            last_sel: usize::MAX,
+            scrollbar_drag: false,
+        }
+    }
+}
+
+impl Mode for TreeMode {
+    fn spec(&self) -> ModeSpec {
+        ModeSpec {
+            id: HelpCtx::Tree,
+            ctrlc_quits_immediately: false,
+        }
+    }
+
+    // While searching, typed letters edit the query — skip the wrong-layout hint,
+    // the badge-click actions, and the Space/`:` palette trigger.
+    fn accepts_text(&self, ex: &Explorer) -> bool {
+        ex.search_mode
+    }
+    fn palette_on_space(&self, ex: &Explorer) -> bool {
+        !ex.search_mode
+    }
+
+    fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
+        ex.render_tree_frame(f, true);
+    }
+
+    fn on_enter(
+        &mut self,
+        ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+    ) -> Result<Outcome> {
+        // The browser needs the whole checkpoint; finish a deferred `--tensor` load.
+        ex.ensure_full_load()?;
+        Ok(Outcome::Stay)
+    }
+
+    fn pre_draw(&mut self, ex: &mut Explorer, term: &mut crate::tui::LiveTerminal) {
+        if let Ok(sz) = term.size() {
+            if ex.selected_idx != self.last_sel {
+                ex.update_tree_scroll(sz.width, sz.height); // snap to the moved selection
+                self.last_sel = ex.selected_idx;
+            }
+            let body = UI::tree_visible_rows(sz.width, sz.height, ex.search_mode, ex.can_repack());
+            let total = ex.current_tree_len();
+            ex.scroll_offset = ex.scroll_offset.min(total.saturating_sub(body));
+        }
+    }
+
+    fn open_palette(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+    ) -> PaletteResult {
+        if let Some(cmd) = ex.command_palette(term)
+            && let Some(nav) = ex.run_command(cmd, term)
+        {
+            return PaletteResult::Nav(nav);
+        }
+        PaletteResult::Handled
+    }
+
+    fn handle_key(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+        key: KeyEvent,
+    ) -> Result<Outcome> {
+        match key {
+            // Every tree command dispatches through the registry (the same path the
+            // palette uses). In search mode the letters fall through to the query.
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            } if !ex.search_mode
+                && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && tree_command_for_key(c).is_some() =>
+            {
+                let cmd = tree_command_for_key(c).expect("guarded by is_some");
+                if let Some(nav) = ex.run_command(cmd, term) {
+                    return Ok(Outcome::Leave(nav));
+                }
+            }
+            // '/' is ignored rather than typed into the query.
+            KeyEvent {
+                code: KeyCode::Char('/'),
+                ..
+            } => {}
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if ex.search_mode => ex.exit_search_mode(),
+            // Shift+↑/↓ jump to the previous/next sibling — before the plain arrows.
+            KeyEvent {
+                code: KeyCode::Up,
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => ex.move_to_sibling(false),
+            KeyEvent {
+                code: KeyCode::Down,
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => ex.move_to_sibling(true),
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => {
+                let step = ex.held_step(KeyCode::Up, accel_step_row) as i32;
+                ex.move_selection(-step);
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => {
+                let step = ex.held_step(KeyCode::Down, accel_step_row) as i32;
+                ex.move_selection(step);
+            }
+            // While searching, ←/→ move the query caret (Shift = start/end).
+            KeyEvent {
+                code: KeyCode::Left,
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } if ex.search_mode => ex.search_cursor = 0,
+            KeyEvent {
+                code: KeyCode::Right,
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } if ex.search_mode => ex.search_cursor = ex.search_query.chars().count(),
+            KeyEvent {
+                code: KeyCode::Left,
+                ..
+            } if ex.search_mode => ex.search_cursor = ex.search_cursor.saturating_sub(1),
+            KeyEvent {
+                code: KeyCode::Right,
+                ..
+            } if ex.search_mode => {
+                ex.search_cursor = (ex.search_cursor + 1).min(ex.search_query.chars().count());
+            }
+            KeyEvent {
+                code: KeyCode::Home,
+                ..
+            } if ex.search_mode => ex.selected_idx = 0,
+            KeyEvent {
+                code: KeyCode::End, ..
+            } if ex.search_mode => {
+                ex.selected_idx = ex.filtered_tree.len().saturating_sub(1);
+            }
+            KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            } => {
+                let step = (ex.page_rows() * ex.held_step(KeyCode::PageUp, accel_step_page)) as i32;
+                ex.move_selection(-step);
+            }
+            KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            } => {
+                let step =
+                    (ex.page_rows() * ex.held_step(KeyCode::PageDown, accel_step_page)) as i32;
+                ex.move_selection(step);
+            }
+            // ← jumps to the parent group; → enters the group's first child.
+            KeyEvent {
+                code: KeyCode::Left,
+                ..
+            } => ex.move_to_parent(),
+            KeyEvent {
+                code: KeyCode::Right,
+                ..
+            } => ex.move_to_first_child(),
+            // While searching, Tab reveals the highlighted result in the tree
+            // (leaving search); otherwise Tab toggles to the file browser.
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            } if ex.search_mode => ex.reveal_search_result(),
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            } => {
+                if let Some(nav) = ex.run_command(Cmd::ViewFiles, term) {
+                    return Ok(Outcome::Leave(nav));
+                }
+            }
+            // Enter acts on the highlighted row: expand a group, or open a tensor.
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => {
+                if let Some(nav) = ex.activate_selection() {
+                    return Ok(Outcome::Leave(nav));
+                }
+            }
+            // While searching, Space is ignored rather than typed into the query.
+            KeyEvent {
+                code: KeyCode::Char(' '),
+                ..
+            } => {}
+            // Backspace edits the query while searching, else steps back.
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } if ex.search_mode => ex.search_backspace(),
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => return Ok(Outcome::Leave(Nav::Back)),
+            KeyEvent {
+                code: KeyCode::Char('\\'),
+                ..
+            } if !ex.search_mode => return Ok(Outcome::Leave(Nav::Forward)),
+            // Any other char while searching is inserted into the query.
+            KeyEvent {
+                code: KeyCode::Char(c),
+                ..
+            } if ex.search_mode => ex.search_insert(c),
+            _ => {}
+        }
+        Ok(Outcome::Stay)
+    }
+
+    fn handle_mouse(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+        m: MouseEvent,
+    ) -> MouseOutcome {
+        let Ok(sz) = term.size() else {
+            return MouseOutcome::Ignored;
+        };
+        let (col, row) = (m.column, m.row);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // A press on the scroll bar scrubs the viewport; holding then drags.
+                self.scrollbar_drag = false;
+                if let Some(sb) = UI::tree_scrollbar(
+                    sz.width,
+                    sz.height,
+                    ex.search_mode,
+                    ex.can_repack(),
+                    ex.current_tree_len(),
+                ) && sb.hit(col, row)
+                {
+                    ex.scroll_offset = sb.offset_at(row);
+                    self.scrollbar_drag = true;
+                    return MouseOutcome::Redraw;
+                }
+                let body_top =
+                    UI::tree_header_rows(sz.width, ex.search_mode, ex.can_repack()) as u16;
+                let body_bottom = sz.height.saturating_sub(2); // status bar
+                if row >= body_top && row < body_bottom {
+                    let idx = ex.scroll_offset + (row - body_top) as usize;
+                    if idx < ex.current_tree_len() {
+                        // A click exactly on a group's ▸/▾ twisty (column `2*depth`)
+                        // toggles it on a single click.
+                        let on_arrow = {
+                            let tree = if ex.search_mode {
+                                &ex.filtered_tree
+                            } else {
+                                &ex.flattened_tree
+                            };
+                            matches!(
+                                tree.get(idx),
+                                Some((TreeNode::Group { .. }, depth)) if col == 2 * *depth as u16
+                            )
+                        };
+                        ex.selected_idx = idx;
+                        if on_arrow {
+                            self.last_click = None;
+                            ex.activate_selection();
+                        } else {
+                            let double = matches!(
+                                self.last_click,
+                                Some((t, r)) if r == row && t.elapsed() < DOUBLE_CLICK
+                            );
+                            if double {
+                                self.last_click = None;
+                                if ex.search_mode {
+                                    ex.reveal_search_result();
+                                } else if let Some(nav) = ex.activate_selection() {
+                                    return MouseOutcome::Leave(nav);
+                                }
+                            } else {
+                                self.last_click = Some((std::time::Instant::now(), row));
+                            }
+                        }
+                    }
+                }
+                MouseOutcome::Redraw
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.scrollbar_drag => {
+                if let Some(sb) = UI::tree_scrollbar(
+                    sz.width,
+                    sz.height,
+                    ex.search_mode,
+                    ex.can_repack(),
+                    ex.current_tree_len(),
+                ) {
+                    ex.scroll_offset = sb.offset_at(row);
+                }
+                MouseOutcome::Redraw
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.scrollbar_drag = false;
+                MouseOutcome::Redraw
+            }
+            MouseEventKind::ScrollDown => {
+                ex.scroll_offset = ex.scroll_offset.saturating_add(WHEEL_STEP);
+                MouseOutcome::Redraw
+            }
+            MouseEventKind::ScrollUp => {
+                ex.scroll_offset = ex.scroll_offset.saturating_sub(WHEEL_STEP);
+                MouseOutcome::Redraw
+            }
+            _ => MouseOutcome::Ignored,
+        }
+    }
+
+    fn residual(&self) -> Screen {
+        Screen::Tree
+    }
+}
+
+/// The in-place rename editor ([`Screen::Rename`]) as a [`Mode`]. Owns the editor
+/// model plus the cached shard headers and the dirty-gated preview (so pure caret /
+/// focus moves don't re-scan the checkpoint). `scroll_max` is a `Cell` because it's
+/// learned during the (`&self`) draw and read back by key/mouse handling.
+struct RenameMode2 {
+    /// Seed pairs from a prior visit / `--rename-rule`, consumed by `on_enter`.
+    saved_pairs: Vec<(String, String)>,
+    target: std::path::PathBuf,
+    loaded: Option<crate::rename::Loaded>,
+    schemas: Vec<String>,
+    root: String,
+    editor: RenameMode,
+    /// What was last copied (the `✓ copied …` flash), cleared on the next key.
+    copied: Option<&'static str>,
+    // Derived, recomputed only when the rule pairs change (`dirty`).
+    rules_view: Vec<crate::ui::RenameRuleView>,
+    total: usize,
+    warnings: Vec<String>,
+    has_index: bool,
+    applicable: bool,
+    synth_err: Option<String>,
+    cli: Option<String>,
+    dirty: bool,
+    scroll_max: std::cell::Cell<usize>,
+    /// Set once a rename is applied — the rules are spent, so `residual` clears them.
+    applied: bool,
+}
+
+impl RenameMode2 {
+    fn new(saved_pairs: Vec<(String, String)>) -> Self {
+        Self {
+            saved_pairs,
+            target: std::path::PathBuf::new(),
+            loaded: None,
+            schemas: Vec::new(),
+            root: String::new(),
+            editor: RenameMode::default(),
+            copied: None,
+            rules_view: Vec::new(),
+            total: 0,
+            warnings: Vec::new(),
+            has_index: false,
+            applicable: false,
+            synth_err: None,
+            cli: None,
+            dirty: true,
+            scroll_max: std::cell::Cell::new(0),
+            applied: false,
+        }
+    }
+
+    fn loaded(&self) -> &crate::rename::Loaded {
+        self.loaded.as_ref().expect("on_enter loads or leaves")
+    }
+
+    /// The current rules to persist / restore (dropping fully-blank pairs).
+    fn pairs(&self) -> Vec<(String, String)> {
+        self.editor
+            .pairs
+            .iter()
+            .filter(|p| !(p.source.trim().is_empty() && p.target.trim().is_empty()))
+            .map(|p| (p.source.clone(), p.target.clone()))
+            .collect()
+    }
+
+    fn do_copy_apply(&mut self) {
+        self.copied = (self.cli.is_some()
+            && copy_to_clipboard(self.cli.as_deref().unwrap_or_default()))
+        .then_some("the apply command");
+    }
+
+    fn do_copy_screen(&mut self) {
+        let text = crate::tui::headless_render(120, 40, |f| {
+            let _ = draw_rename_frame(
+                f,
+                &self.root,
+                &self.editor,
+                &self.schemas,
+                &self.rules_view,
+                self.total,
+                &self.warnings,
+                self.has_index,
+                self.applicable,
+                &self.synth_err,
+                self.cli.as_deref(),
+                None,
+            );
+        });
+        if let Ok(text) = text {
+            self.copied = copy_to_clipboard(&text).then_some("the screen text");
+        }
+    }
+
+    /// Stage the rename (Enter) if it's clean, else flash why it can't apply yet.
+    fn stage_apply(&mut self) {
+        if self.applicable {
+            self.editor.confirming = true;
+            self.editor.error = None;
+        } else {
+            self.editor.error =
+                Some("can't apply yet — fix the blocked rows / warnings above".to_string());
+        }
+    }
+}
+
+impl Mode for RenameMode2 {
+    fn spec(&self) -> ModeSpec {
+        ModeSpec {
+            id: HelpCtx::Rename,
+            ctrlc_quits_immediately: true,
+        }
+    }
+
+    // The name fields take arbitrary text; skip the wrong-layout hint. Space / `:`
+    // still open the palette (a tensor-name schema never contains either).
+    fn accepts_text(&self, _ex: &Explorer) -> bool {
+        true
+    }
+
+    fn on_enter(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+    ) -> Result<Outcome> {
+        let Some(target) = ex.rename_target() else {
+            return Ok(Outcome::Leave(Nav::Back)); // gated; bail safely if it slips
+        };
+        // Read every shard header once, so the preview is instant as the user types.
+        let loaded = match crate::rename::load(&target) {
+            Ok(l) => l,
+            Err(e) => {
+                let msg = format!("Cannot open the rename editor: {e:#}");
+                ex.float_until_dismissed(term, |f| {
+                    ex.render_tree_frame(f, true);
+                    UI::render_notice(f, &msg);
+                });
+                return Ok(Outcome::Leave(Nav::Back));
+            }
+        };
+        // Autocomplete over the deduped *generalized* schemas (one per tensor family).
+        let mut seen = HashSet::new();
+        self.schemas = loaded
+            .names()
+            .iter()
+            .map(|n| crate::rename::generalize(n).0)
+            .filter(|s| seen.insert(s.clone()))
+            .collect();
+        self.root = loaded.root().display().to_string();
+        if !self.saved_pairs.is_empty() {
+            self.editor.pairs = std::mem::take(&mut self.saved_pairs)
+                .into_iter()
+                .map(|(source, target)| RenamePair { source, target })
+                .collect();
+        }
+        self.target = target;
+        self.loaded = Some(loaded);
+        Ok(Outcome::Stay)
+    }
+
+    fn pre_draw(&mut self, ex: &mut Explorer, _term: &mut crate::tui::LiveTerminal) {
+        if self.dirty {
+            // Compute into locals first, then assign (so the `loaded` borrow ends
+            // before the `&mut self` field writes).
+            let (warnings, has_index, applicable, err, cli, rules_view, total) = {
+                let loaded = self.loaded();
+                let (preview, notes, err) = match self.editor.build_map() {
+                    Ok((map, notes)) => (loaded.preview(&map), notes, None),
+                    Err(e) => (crate::rename::RenamePreview::default(), Vec::new(), Some(e)),
+                };
+                let mut warnings = preview.warnings.clone();
+                warnings.extend(notes);
+                let has_index = preview.has_index;
+                let applicable = err.is_none() && preview.applicable();
+                let cli = ex.rename_cli_command(&self.target, &self.editor);
+                let mut rules_view: Vec<crate::ui::RenameRuleView> = Vec::new();
+                let mut total = 0usize;
+                for p in &self.editor.pairs {
+                    if p.source.trim().is_empty() || p.target.trim().is_empty() {
+                        continue;
+                    }
+                    let Ok((pat, rep)) = crate::rename::rule_from_fields(&p.source, &p.target)
+                    else {
+                        continue;
+                    };
+                    let Ok(single) = crate::diff::NameMap::from_pairs([(pat, rep)]) else {
+                        continue;
+                    };
+                    let pv = loaded.preview(&single);
+                    let mut v = crate::ui::RenameRuleView {
+                        from: p.source.clone(),
+                        to: p.target.clone(),
+                        total: pv.rows.len(),
+                        matched: single.match_count(loaded.names().iter().map(String::as_str)),
+                        ok: 0,
+                        collide: 0,
+                        wont_fit: 0,
+                        invalid: 0,
+                        shards: loaded.shard_fits(&single),
+                    };
+                    for r in &pv.rows {
+                        match r.status {
+                            crate::rename::RenameStatus::Ok => v.ok += 1,
+                            crate::rename::RenameStatus::Collision => v.collide += 1,
+                            crate::rename::RenameStatus::WontFit => v.wont_fit += 1,
+                            crate::rename::RenameStatus::Invalid => v.invalid += 1,
+                        }
+                    }
+                    total += v.total;
+                    rules_view.push(v);
+                }
+                (warnings, has_index, applicable, err, cli, rules_view, total)
+            };
+            self.warnings = warnings;
+            self.has_index = has_index;
+            self.applicable = applicable;
+            self.synth_err = err;
+            self.cli = cli;
+            self.rules_view = rules_view;
+            self.total = total;
+            self.dirty = false;
+        }
+        self.editor.scroll = self.editor.scroll.min(self.scroll_max.get());
+    }
+
+    fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
+        let (max, chips, clicks) = draw_rename_frame(
+            f,
+            &self.root,
+            &self.editor,
+            &self.schemas,
+            &self.rules_view,
+            self.total,
+            &self.warnings,
+            self.has_index,
+            self.applicable,
+            &self.synth_err,
+            self.cli.as_deref(),
+            self.copied,
+        );
+        self.scroll_max.set(max);
+        *ex.clickable.borrow_mut() = chips; // footer chips (replay a key)
+        *ex.links.borrow_mut() = clicks; // shard → layout, tensor → tree
+    }
+
+    fn open_palette(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+    ) -> PaletteResult {
+        let entries =
+            available_rename_commands(self.applicable, self.cli.is_some(), self.editor.pairs.len());
+        let chosen = ex.run_palette(term, entries, HelpCtx::Rename, |_s, f| {
+            let _ = draw_rename_frame(
+                f,
+                &self.root,
+                &self.editor,
+                &self.schemas,
+                &self.rules_view,
+                self.total,
+                &self.warnings,
+                self.has_index,
+                self.applicable,
+                &self.synth_err,
+                self.cli.as_deref(),
+                self.copied,
+            );
+        });
+        match chosen {
+            Some(RenameCmd::Back) => PaletteResult::Nav(Nav::Back),
+            Some(RenameCmd::Quit) => PaletteResult::Nav(Nav::Quit),
+            Some(RenameCmd::AddRule) => {
+                self.editor.add_pair();
+                self.editor.error = None;
+                self.dirty = true;
+                PaletteResult::Handled
+            }
+            Some(RenameCmd::RemoveRule) => {
+                self.editor.remove_pair();
+                self.editor.error = None;
+                self.dirty = true;
+                PaletteResult::Handled
+            }
+            Some(RenameCmd::Apply) => {
+                self.stage_apply();
+                PaletteResult::Handled
+            }
+            Some(RenameCmd::CopyApplyCmd) => {
+                self.do_copy_apply();
+                PaletteResult::Handled
+            }
+            Some(RenameCmd::CopyReopenCmd) => {
+                let cmd = ex.command_for_rename(&self.pairs());
+                self.copied = copy_to_clipboard(&cmd).then_some("the reopen command");
+                PaletteResult::Handled
+            }
+            Some(RenameCmd::CopyScreen) => {
+                self.do_copy_screen();
+                PaletteResult::Handled
+            }
+            Some(RenameCmd::Legend) => {
+                ex.float_until_dismissed(term, |f| {
+                    let _ = draw_rename_frame(
+                        f,
+                        &self.root,
+                        &self.editor,
+                        &self.schemas,
+                        &self.rules_view,
+                        self.total,
+                        &self.warnings,
+                        self.has_index,
+                        self.applicable,
+                        &self.synth_err,
+                        self.cli.as_deref(),
+                        self.copied,
+                    );
+                    UI::render_legend_band(f, Legend::Rename);
+                });
+                PaletteResult::Handled
+            }
+            None => PaletteResult::Handled,
+        }
+    }
+
+    fn handle_key(
+        &mut self,
+        ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+        key: KeyEvent,
+    ) -> Result<Outcome> {
+        let KeyEvent {
+            code, modifiers, ..
+        } = key;
+        // `^Y` copies the `convert --map` command that applies the rename.
+        if code == KeyCode::Char('y') && modifiers.contains(KeyModifiers::CONTROL) {
+            self.do_copy_apply();
+            return Ok(Outcome::Stay);
+        }
+        self.copied = None;
+        // Confirm gate: a clean rename staged by Enter needs a second Enter to
+        // actually rewrite the files; any other key cancels it.
+        if self.editor.confirming {
+            if code == KeyCode::Enter {
+                match ex.apply_rename_mode(self.loaded(), &self.editor) {
+                    Ok(nav) => {
+                        self.applied = true; // rules spent → residual clears them
+                        return Ok(Outcome::Leave(nav));
+                    }
+                    Err(e) => {
+                        self.editor.error = Some(e);
+                        self.editor.confirming = false;
+                    }
+                }
+            } else {
+                self.editor.confirming = false;
+            }
+            return Ok(Outcome::Stay);
+        }
+        match code {
+            KeyCode::Esc => return Ok(Outcome::Leave(Nav::Back)),
+            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.editor.add_pair();
+                self.editor.error = None;
+                self.dirty = true;
+            }
+            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.editor.remove_pair();
+                self.editor.error = None;
+                self.dirty = true;
+            }
+            // The copy-screen chip / palette sentinel (`\u{1}`).
+            KeyCode::Char('\u{1}') => self.do_copy_screen(),
+            KeyCode::Tab => {
+                self.editor.autocomplete(&self.schemas);
+                self.editor.error = None;
+                self.dirty = true;
+            }
+            KeyCode::Enter => self.stage_apply(),
+            KeyCode::Up => self.editor.focus_up(),
+            KeyCode::Down => self.editor.focus_down(),
+            KeyCode::Left => self.editor.left(),
+            KeyCode::Right => self.editor.right(),
+            KeyCode::Home => self.editor.cursor = 0,
+            KeyCode::End => self.editor.caret_to_end(),
+            KeyCode::PageUp => self.editor.scroll = self.editor.scroll.saturating_sub(SCROLL_PAGE),
+            KeyCode::PageDown => {
+                self.editor.scroll = (self.editor.scroll + SCROLL_PAGE).min(self.scroll_max.get());
+            }
+            KeyCode::Backspace => {
+                self.editor.backspace();
+                self.editor.error = None;
+                self.dirty = true;
+            }
+            KeyCode::Delete => {
+                self.editor.delete();
+                self.editor.error = None;
+                self.dirty = true;
+            }
+            KeyCode::Char(c)
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.editor.insert_char(c);
+                self.editor.error = None;
+                self.dirty = true;
+            }
+            _ => {}
+        }
+        Ok(Outcome::Stay)
+    }
+
+    fn handle_mouse(
+        &mut self,
+        _ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+        m: MouseEvent,
+    ) -> MouseOutcome {
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                self.editor.scroll = (self.editor.scroll + 3).min(self.scroll_max.get());
+                MouseOutcome::Redraw
+            }
+            MouseEventKind::ScrollUp => {
+                self.editor.scroll = self.editor.scroll.saturating_sub(3);
+                MouseOutcome::Redraw
+            }
+            _ => MouseOutcome::Ignored,
+        }
+    }
+
+    fn residual(&self) -> Screen {
+        Screen::Rename {
+            pairs: if self.applied {
+                Vec::new()
+            } else {
+                self.pairs()
+            },
+        }
+    }
+}
+
+/// The tensor detail screen ([`Screen::Detail`]) as a [`Mode`]. Runs the exact-stats
+/// scan on a worker thread (via `tick_background` + `Bg::Poll`) and floats the legend
+/// / copied-command as an in-frame `overlay` so a running scan animates behind it.
+struct DetailMode {
+    tensor_name: String,
+    slice: usize,
+    stats_start: StatsStart,
+    interaction: Interaction,
+    tensor: Option<TensorInfo>,
+    overridable: bool,
+    unindexed: bool,
+    remote: bool,
+    warm: bool,
+    scan: Option<ScanJob>,
+    spin: std::cell::Cell<usize>,
+    overlay: Option<Overlay>,
+}
+
+impl DetailMode {
+    fn new(
+        tensor_name: String,
+        slice: usize,
+        stats_start: StatsStart,
+        interaction: Interaction,
+    ) -> Self {
+        Self {
+            tensor_name,
+            slice,
+            stats_start,
+            interaction,
+            tensor: None,
+            overridable: false,
+            unindexed: false,
+            remote: false,
+            warm: false,
+            scan: None,
+            spin: std::cell::Cell::new(0),
+            overlay: None,
+        }
+    }
+
+    fn tensor(&self) -> &TensorInfo {
+        self.tensor.as_ref().expect("on_enter resolves or leaves")
+    }
+
+    fn shape(&self, ex: &Explorer) -> Vec<usize> {
+        let t = self.tensor();
+        ex.shape_overrides
+            .borrow()
+            .get(&t.name)
+            .cloned()
+            .unwrap_or_else(|| t.shape.clone())
+    }
+
+    /// The current statistics view — cached result, a live scan spinner, or pending.
+    /// `stats` is the caller's local so the returned `StatsView` can borrow it.
+    fn stats_view<'a>(&self, stats: &'a Option<Stats>) -> StatsView<'a> {
+        match stats {
+            Some(s) => StatsView::Ready(s),
+            None if self.warm && self.scan.is_some() => {
+                let job = self.scan.as_ref().unwrap();
+                if job.started.elapsed() >= std::time::Duration::from_millis(120) {
+                    self.spin.set(self.spin.get().wrapping_add(1));
+                    StatsView::Computing {
+                        spinner: STATS_SPINNER[self.spin.get() % STATS_SPINNER.len()],
+                        elapsed: job.started.elapsed(),
+                        progress: job.progress(),
+                    }
+                } else {
+                    StatsView::Pending
+                }
+            }
+            None => StatsView::Pending,
+        }
+    }
+
+    fn layout_ok(&self) -> bool {
+        !self.remote
+            && std::path::Path::new(&self.tensor().source_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"))
+    }
+}
+
+impl Mode for DetailMode {
+    fn spec(&self) -> ModeSpec {
+        ModeSpec {
+            id: HelpCtx::Detail,
+            ctrlc_quits_immediately: true,
+        }
+    }
+
+    fn set_background_paused(&self, paused: bool) {
+        if let Some(job) = &self.scan {
+            job.pause.store(paused, Ordering::Relaxed);
+        }
+    }
+
+    fn overlay(&self) -> Option<&Overlay> {
+        self.overlay.as_ref()
+    }
+    fn dismiss_overlay(&mut self) -> bool {
+        self.overlay.take().is_some()
+    }
+
+    fn on_enter(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+    ) -> Result<Outcome> {
+        let Some(tensor) = ex
+            .tensors
+            .iter()
+            .find(|t| t.name == self.tensor_name)
+            .cloned()
+        else {
+            return Ok(Outcome::Leave(Nav::Open(Screen::Tree)));
+        };
+        self.overridable = dtype_overridable(&tensor);
+        self.unindexed = ex.unindexed.contains(&tensor.source_path);
+        self.remote = crate::remote::is_remote_source(&tensor.source_path);
+        // Background pre-warm scan: only when interactive, overridable, local, and
+        // not already doing a synchronous `--compute-stats` scan.
+        self.warm = ex.preload
+            && self.stats_start != StatsStart::Auto
+            && self.interaction == Interaction::Interactive
+            && self.overridable
+            && !self.remote;
+        // `--compute-stats`: kick off the scan synchronously on open, animating the
+        // spinner right here.
+        if self.stats_start == StatsStart::Auto && !self.remote {
+            let view = ex.active_view(&tensor.name);
+            let shape = ex
+                .shape_overrides
+                .borrow()
+                .get(&tensor.name)
+                .cloned()
+                .unwrap_or_else(|| tensor.shape.clone());
+            let (overridable, unindexed) = (self.overridable, self.unindexed);
+            ex.compute_stats_animated(term, &tensor, view, |f, sv| {
+                ex.render_detail_frame(
+                    f,
+                    &tensor,
+                    &shape,
+                    view,
+                    overridable,
+                    unindexed,
+                    sv,
+                    None,
+                    None,
+                    None,
+                );
+            });
+        }
+        self.tensor = Some(tensor);
+        Ok(Outcome::Stay)
+    }
+
+    fn tick_background(&mut self, ex: &mut Explorer) -> Bg {
+        if !self.warm {
+            return Bg::Idle;
+        }
+        let tensor = self.tensor().clone();
+        let view = ex.active_view(&tensor.name);
+        if ex.cached_stats(&tensor, view).is_some() {
+            self.scan = None;
+            return Bg::Idle;
+        }
+        // (Re)start the scan for the current view; harvest it when finished.
+        if self.scan.as_ref().is_none_or(|j| j.view != view) {
+            self.scan = Some(ex.spawn_stats_scan(&tensor, view));
+        }
+        let finished = self
+            .scan
+            .as_ref()
+            .and_then(|j| j.handle.as_ref())
+            .is_some_and(|h| h.is_finished());
+        if finished {
+            let mut job = self.scan.take().unwrap();
+            if let Some(h) = job.handle.take()
+                && let Ok(Ok(s)) = h.join()
+            {
+                ex.stats_cache
+                    .borrow_mut()
+                    .insert((tensor.name.clone(), view), s);
+            }
+        }
+        if self.scan.is_some() {
+            Bg::Poll
+        } else {
+            Bg::Idle
+        }
+    }
+
+    fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
+        let tensor = self.tensor();
+        let view = ex.active_view(&tensor.name);
+        let shape = self.shape(ex);
+        let stats = ex.cached_stats(tensor, view);
+        let stats_view = self.stats_view(&stats);
+        let hist = ex
+            .histogram_cache
+            .borrow()
+            .get(&(tensor.name.clone(), view, ex.histogram_bins.get()))
+            .cloned();
+        ex.render_detail_frame(
+            f,
+            tensor,
+            &shape,
+            view,
+            self.overridable,
+            self.unindexed,
+            stats_view,
+            hist.as_ref(),
+            None,
+            self.overlay.as_ref(),
+        );
+        if let Some((what, _)) = &ex.copied_flash {
+            UI::render_copied_flash(f, what);
+        }
+    }
+
+    fn open_palette(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+    ) -> PaletteResult {
+        let tensor = self.tensor();
+        let view = ex.active_view(&tensor.name);
+        let shape = self.shape(ex);
+        let stats = ex.cached_stats(tensor, view);
+        let stats_view = self.stats_view(&stats);
+        let hist = ex
+            .histogram_cache
+            .borrow()
+            .get(&(tensor.name.clone(), view, ex.histogram_bins.get()))
+            .cloned();
+        let entries = available_detail_commands(self.overridable, self.layout_ok());
+        let (overridable, unindexed) = (self.overridable, self.unindexed);
+        let chosen = ex.run_palette(term, entries, HelpCtx::Detail, |s, f| {
+            s.render_detail_frame(
+                f,
+                tensor,
+                &shape,
+                view,
+                overridable,
+                unindexed,
+                stats_view,
+                hist.as_ref(),
+                None,
+                None,
+            );
+        });
+        match chosen {
+            Some(cmd) => PaletteResult::SynthKey(detail_cmd_key(cmd)),
+            None => PaletteResult::Handled,
+        }
+    }
+
+    fn handle_key(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+        key: KeyEvent,
+    ) -> Result<Outcome> {
+        let tensor = self.tensor().clone();
+        let view = ex.active_view(&tensor.name);
+        let shape = self.shape(ex);
+        // Metadata-only (remote): the data keys can't run without local bytes, so
+        // float a notice instead of a read that fails.
+        if self.remote
+            && matches!(
+                key.code,
+                KeyCode::Char('m' | 'v' | 'h' | 's' | 'S' | 'b' | 'B')
+            )
+        {
+            self.overlay = Some(Overlay::Notice(
+                "Read remotely with --ssh-read: only the structure is here. Data views \
+                 (heatmap, values, histogram, statistics) need the file locally — copy the \
+                 checkpoint down to preview its values."
+                    .to_string(),
+            ));
+            return Ok(Outcome::Stay);
+        }
+        match key.code {
+            KeyCode::Char('m') => {
+                return Ok(Outcome::Leave(Nav::Open(Screen::Data {
+                    tensor: tensor.name.clone(),
+                    repr: Representation::Heatmap,
+                    slice: self.slice,
+                })));
+            }
+            KeyCode::Char('v') => {
+                return Ok(Outcome::Leave(Nav::Open(Screen::Data {
+                    tensor: tensor.name.clone(),
+                    repr: Representation::Values,
+                    slice: self.slice,
+                })));
+            }
+            KeyCode::Tab => {
+                if let Some(screen) = ex.tensor_layout_screen(&tensor) {
+                    return Ok(Outcome::Leave(Nav::Open(screen)));
+                }
+            }
+            KeyCode::Char('h') => {
+                ex.ensure_detail_histogram(
+                    term,
+                    &tensor,
+                    view,
+                    &shape,
+                    self.overridable,
+                    self.unindexed,
+                );
+            }
+            KeyCode::Char('b') | KeyCode::Char('B') => {
+                let (overridable, unindexed) = (self.overridable, self.unindexed);
+                let stats = ex.cached_stats(&tensor, view);
+                let stats_view = self.stats_view(&stats);
+                let hist = ex
+                    .histogram_cache
+                    .borrow()
+                    .get(&(tensor.name.clone(), view, ex.histogram_bins.get()))
+                    .cloned();
+                let background = |f: &mut ratatui::Frame| {
+                    ex.render_detail_frame(
+                        f,
+                        &tensor,
+                        &shape,
+                        view,
+                        overridable,
+                        unindexed,
+                        stats_view,
+                        hist.as_ref(),
+                        None,
+                        None,
+                    );
+                };
+                let changed = match ex.prompt_bins(term, background, ex.histogram_bins.get()) {
+                    BinsChoice::Set(n) => {
+                        ex.histogram_bins.set(Some(n));
+                        true
+                    }
+                    BinsChoice::Clear => {
+                        ex.histogram_bins.set(None);
+                        true
+                    }
+                    BinsChoice::Cancel => false,
+                };
+                if changed {
+                    ex.ensure_detail_histogram(
+                        term,
+                        &tensor,
+                        view,
+                        &shape,
+                        self.overridable,
+                        self.unindexed,
+                    );
+                }
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                let (overridable, unindexed) = (self.overridable, self.unindexed);
+                ex.compute_stats_animated(term, &tensor, view, |f, sv| {
+                    ex.render_detail_frame(
+                        f,
+                        &tensor,
+                        &shape,
+                        view,
+                        overridable,
+                        unindexed,
+                        sv,
+                        None,
+                        None,
+                        None,
+                    );
+                });
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') if self.overridable => {
+                if let Some(chosen) = ex.prompt_dtype(term, &tensor, DtypePreview::Detail) {
+                    let def = ex.default_view(&tensor.name);
+                    let mut overrides = ex.dtype_overrides.borrow_mut();
+                    if chosen == def {
+                        overrides.remove(&tensor.name);
+                    } else {
+                        overrides.insert(tensor.name.clone(), chosen);
+                    }
+                }
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') if self.overridable => {
+                let current = ex.shape_overrides.borrow().get(&tensor.name).cloned();
+                let (overridable, unindexed) = (self.overridable, self.unindexed);
+                let stats = ex.cached_stats(&tensor, view);
+                let stats_view = self.stats_view(&stats);
+                let hist = ex
+                    .histogram_cache
+                    .borrow()
+                    .get(&(tensor.name.clone(), view, ex.histogram_bins.get()))
+                    .cloned();
+                let background = |f: &mut ratatui::Frame| {
+                    ex.render_detail_frame(
+                        f,
+                        &tensor,
+                        &shape,
+                        view,
+                        overridable,
+                        unindexed,
+                        stats_view,
+                        hist.as_ref(),
+                        None,
+                        None,
+                    );
+                };
+                match ex.prompt_reshape(term, background, &tensor, current.as_deref()) {
+                    ReshapeChoice::Set(s) => {
+                        ex.shape_overrides
+                            .borrow_mut()
+                            .insert(tensor.name.clone(), s);
+                    }
+                    ReshapeChoice::Clear => {
+                        ex.shape_overrides.borrow_mut().remove(&tensor.name);
+                    }
+                    ReshapeChoice::Cancel => {}
+                }
+            }
+            KeyCode::Char('c') => {
+                let stats = ex.cached_stats(&tensor, view);
+                let stats_view = self.stats_view(&stats);
+                let hist = ex
+                    .histogram_cache
+                    .borrow()
+                    .get(&(tensor.name.clone(), view, ex.histogram_bins.get()))
+                    .cloned();
+                if let Ok(text) = ex.detail_plain(
+                    &tensor,
+                    &shape,
+                    view,
+                    self.overridable,
+                    self.unindexed,
+                    stats_view,
+                    hist.as_ref(),
+                    None,
+                ) {
+                    copy_to_clipboard(&text);
+                }
+                ex.copied_flash = Some(("screen contents".to_string(), std::time::Instant::now()));
+            }
+            KeyCode::Char('y') => {
+                let cmd = ex.command_for_detail(&tensor);
+                copy_to_clipboard(&cmd);
+                self.overlay = Some(Overlay::Command(cmd));
+            }
+            KeyCode::Char('l') => self.overlay = Some(Overlay::Legend(Legend::Detail)),
+            KeyCode::Backspace => return Ok(Outcome::Leave(Nav::Back)),
+            KeyCode::Char('\\') => return Ok(Outcome::Leave(Nav::Forward)),
+            // Any other key goes back to the tree.
+            _ => return Ok(Outcome::Leave(Nav::Open(Screen::Tree))),
+        }
+        Ok(Outcome::Stay)
+    }
+
+    fn residual(&self) -> Screen {
+        Screen::Detail {
+            tensor: self.tensor_name.clone(),
+            slice: self.slice,
+        }
+    }
+}
+
+/// The tensor data view ([`Screen::Data`]) as a [`Mode`] — the heatmap / numeric
+/// grid. Like the detail screen it runs the exact-stats scan on a worker thread
+/// (`tick_background`/`Bg::Poll`, paused while input flows). `slice`/`slices`/
+/// `overridable` are `Cell`s because they're learned during the (`&self`) sample.
+struct DataMode {
+    tensor_name: String,
+    repr: Representation,
+    slice: std::cell::Cell<usize>,
+    interaction: Interaction,
+    tensor: Option<TensorInfo>,
+    scan: Option<ScanJob>,
+    spin: std::cell::Cell<usize>,
+    overlay: Option<Overlay>,
+    slices: std::cell::Cell<usize>,
+    overridable: std::cell::Cell<bool>,
+}
+
+impl DataMode {
+    fn new(
+        tensor_name: String,
+        repr: Representation,
+        slice: usize,
+        interaction: Interaction,
+    ) -> Self {
+        Self {
+            tensor_name,
+            repr,
+            slice: std::cell::Cell::new(slice),
+            interaction,
+            tensor: None,
+            scan: None,
+            spin: std::cell::Cell::new(0),
+            overlay: None,
+            slices: std::cell::Cell::new(1),
+            overridable: std::cell::Cell::new(false),
+        }
+    }
+
+    fn tensor(&self) -> &TensorInfo {
+        self.tensor.as_ref().expect("on_enter resolves or leaves")
+    }
+
+    /// The current statistics view — cached, a live scan spinner (data always
+    /// scans when uncached), or pending. `stats` is the caller's local.
+    fn stats_view<'a>(&self, stats: &'a Option<Stats>) -> StatsView<'a> {
+        match stats {
+            Some(s) => StatsView::Ready(s),
+            None if self.scan.is_some() => {
+                let job = self.scan.as_ref().unwrap();
+                if job.started.elapsed() >= std::time::Duration::from_millis(120) {
+                    self.spin.set(self.spin.get().wrapping_add(1));
+                    StatsView::Computing {
+                        spinner: STATS_SPINNER[self.spin.get() % STATS_SPINNER.len()],
+                        elapsed: job.started.elapsed(),
+                        progress: job.progress(),
+                    }
+                } else {
+                    StatsView::Pending
+                }
+            }
+            None => StatsView::Pending,
+        }
+    }
+}
+
+impl Mode for DataMode {
+    fn spec(&self) -> ModeSpec {
+        ModeSpec {
+            id: HelpCtx::Data,
+            ctrlc_quits_immediately: true,
+        }
+    }
+
+    fn set_background_paused(&self, paused: bool) {
+        if let Some(job) = &self.scan {
+            job.pause.store(paused, Ordering::Relaxed);
+        }
+    }
+
+    fn overlay(&self) -> Option<&Overlay> {
+        self.overlay.as_ref()
+    }
+    fn dismiss_overlay(&mut self) -> bool {
+        self.overlay.take().is_some()
+    }
+
+    fn on_enter(
+        &mut self,
+        ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+    ) -> Result<Outcome> {
+        let Some(tensor) = ex
+            .tensors
+            .iter()
+            .find(|t| t.name == self.tensor_name)
+            .cloned()
+        else {
+            return Ok(Outcome::Leave(Nav::Back));
+        };
+        // One-shot (`--exit`): compute the stats synchronously so the single frame
+        // shows them (interactively the scan runs in the background via tick).
+        if self.interaction == Interaction::OneShot {
+            let view = ex.active_view(&tensor.name);
+            ex.compute_stats_sync(&tensor, view);
+        }
+        self.tensor = Some(tensor);
+        Ok(Outcome::Stay)
+    }
+
+    fn tick_background(&mut self, ex: &mut Explorer) -> Bg {
+        let tensor = self.tensor().clone();
+        let view = ex.active_view(&tensor.name);
+        if ex.cached_stats(&tensor, view).is_some() {
+            self.scan = None;
+            return Bg::Idle;
+        }
+        if self.scan.as_ref().is_none_or(|j| j.view != view) {
+            self.scan = Some(ex.spawn_stats_scan(&tensor, view));
+        }
+        let finished = self
+            .scan
+            .as_ref()
+            .and_then(|j| j.handle.as_ref())
+            .is_some_and(|h| h.is_finished());
+        if finished {
+            let mut job = self.scan.take().unwrap();
+            if let Some(h) = job.handle.take()
+                && let Ok(Ok(s)) = h.join()
+            {
+                ex.stats_cache
+                    .borrow_mut()
+                    .insert((tensor.name.clone(), view), s);
+            }
+        }
+        if self.scan.is_some() {
+            Bg::Poll
+        } else {
+            Bg::Idle
+        }
+    }
+
+    fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
+        let tensor = self.tensor();
+        let view = ex.active_view(&tensor.name);
+        let mode = ex.data_sample_mode();
+        let stats = ex.cached_stats(tensor, view);
+        let stats_view = self.stats_view(&stats);
+        let stripe = ex.data_view_stripe.get();
+        let base = ex.data_view_base.get();
+        match ex.render_data_frame(
+            f,
+            tensor,
+            self.repr,
+            self.slice.get(),
+            view,
+            mode,
+            stats_view,
+            stripe,
+            base,
+            self.overlay.as_ref(),
+        ) {
+            Ok((slices, overridable, clamped)) => {
+                self.slices.set(slices);
+                self.overridable.set(overridable);
+                self.slice.set(clamped);
+            }
+            Err(msg) => UI::render_message(f, "Data preview unavailable", &msg),
+        }
+        if let Some((what, _)) = &ex.copied_flash {
+            UI::render_copied_flash(f, what);
+        }
+    }
+
+    fn open_palette(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+    ) -> PaletteResult {
+        let tensor = self.tensor();
+        let view = ex.active_view(&tensor.name);
+        let mode = ex.data_sample_mode();
+        let stats = ex.cached_stats(tensor, view);
+        let stats_view = self.stats_view(&stats);
+        let stripe = ex.data_view_stripe.get();
+        let base = ex.data_view_base.get();
+        let (repr, slice) = (self.repr, self.slice.get());
+        let entries = available_data_commands(self.overridable.get());
+        let chosen = ex.run_palette(term, entries, HelpCtx::Data, |s, f| {
+            let _ = s.render_data_frame(
+                f, tensor, repr, slice, view, mode, stats_view, stripe, base, None,
+            );
+        });
+        match chosen {
+            Some(cmd) => PaletteResult::SynthKey(data_cmd_key(cmd)),
+            None => PaletteResult::Handled,
+        }
+    }
+
+    fn handle_key(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+        key: KeyEvent,
+    ) -> Result<Outcome> {
+        let tensor = self.tensor().clone();
+        let view = ex.active_view(&tensor.name);
+        let mode = ex.data_sample_mode();
+        let slices = self.slices.get();
+        let overridable = self.overridable.get();
+        let stripe = ex.data_view_stripe.get();
+        let base = ex.data_view_base.get();
+        let KeyEvent {
+            code, modifiers, ..
+        } = key;
+        let shift = modifiers.contains(KeyModifiers::SHIFT);
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+        let edges = matches!(mode, SampleMode::Edges { .. });
+        let window = matches!(mode, SampleMode::Window { .. });
+        // One arrow press moves the divider by a single index; Shift snaps to an end.
+        let nudge = |cell: &Cell<f32>, toward_tail: bool, budget: usize| {
+            let step = if shift {
+                1.0
+            } else {
+                1.0 / budget.max(1) as f32
+            };
+            let delta = if toward_tail { step } else { -step };
+            cell.set((cell.get() + delta).clamp(0.0, 1.0));
+        };
+        // Pan the window along one axis (Ctrl → edge, Shift → screenful, else plain).
+        let pan = |cell: &Cell<usize>, forward: bool, page: usize, plain: usize| {
+            let cur = cell.get();
+            let next = if ctrl {
+                if forward { usize::MAX } else { 0 }
+            } else {
+                let step = if shift { page.max(1) } else { plain.max(1) };
+                if forward {
+                    cur.saturating_add(step)
+                } else {
+                    cur.saturating_sub(step)
+                }
+            };
+            cell.set(next);
+        };
+        match code {
+            KeyCode::Char('m') => self.repr = Representation::Heatmap,
+            KeyCode::Char('v') => self.repr = Representation::Values,
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                ex.data_view_layout.set(ex.data_view_layout.get().next())
+            }
+            KeyCode::Char('z') | KeyCode::Char('Z') => {
+                ex.data_view_stripe.set(ex.data_view_stripe.get().next())
+            }
+            KeyCode::Char('b') | KeyCode::Char('B') => {
+                ex.data_view_base.set(ex.data_view_base.get().next())
+            }
+            KeyCode::Up if edges => nudge(&ex.data_view_row_tail, true, ex.edge_row_budget.get()),
+            KeyCode::Down if edges => {
+                nudge(&ex.data_view_row_tail, false, ex.edge_row_budget.get())
+            }
+            KeyCode::Left if edges => nudge(&ex.data_view_col_tail, true, ex.edge_col_budget.get()),
+            KeyCode::Right if edges => {
+                nudge(&ex.data_view_col_tail, false, ex.edge_col_budget.get())
+            }
+            KeyCode::Up if window => pan(
+                &ex.data_view_win_row,
+                false,
+                ex.win_page_rows.get(),
+                ex.held_step(KeyCode::Up, accel_step_row),
+            ),
+            KeyCode::Down if window => pan(
+                &ex.data_view_win_row,
+                true,
+                ex.win_page_rows.get(),
+                ex.held_step(KeyCode::Down, accel_step_row),
+            ),
+            KeyCode::Left if window => pan(
+                &ex.data_view_win_col,
+                false,
+                ex.win_page_cols.get(),
+                ex.held_step(KeyCode::Left, accel_step_row),
+            ),
+            KeyCode::Right if window => pan(
+                &ex.data_view_win_col,
+                true,
+                ex.win_page_cols.get(),
+                ex.held_step(KeyCode::Right, accel_step_row),
+            ),
+            KeyCode::Home if window => ex.data_view_win_col.set(0),
+            KeyCode::End if window => ex.data_view_win_col.set(usize::MAX),
+            KeyCode::PageUp if window => ex.data_view_win_row.set(0),
+            KeyCode::PageDown if window => ex.data_view_win_row.set(usize::MAX),
+            KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
+                if let Some(chosen) = ex.prompt_dtype(
+                    term,
+                    &tensor,
+                    DtypePreview::Data {
+                        repr: self.repr,
+                        slice: self.slice.get(),
+                        mode,
+                    },
+                ) {
+                    let def = ex.default_view(&tensor.name);
+                    let mut overrides = ex.dtype_overrides.borrow_mut();
+                    if chosen == def {
+                        overrides.remove(&tensor.name);
+                    } else {
+                        overrides.insert(tensor.name.clone(), chosen);
+                    }
+                }
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') if overridable => {
+                let current = ex.shape_overrides.borrow().get(&tensor.name).cloned();
+                let stats = ex.cached_stats(&tensor, view);
+                let stats_view = self.stats_view(&stats);
+                let repr = self.repr;
+                let background = |f: &mut ratatui::Frame| {
+                    ex.render_cached_data(f, &tensor, repr, stats_view, stripe, base);
+                };
+                match ex.prompt_reshape(term, background, &tensor, current.as_deref()) {
+                    ReshapeChoice::Set(s) => {
+                        ex.shape_overrides
+                            .borrow_mut()
+                            .insert(tensor.name.clone(), s);
+                        self.slice.set(0);
+                    }
+                    ReshapeChoice::Clear => {
+                        ex.shape_overrides.borrow_mut().remove(&tensor.name);
+                        self.slice.set(0);
+                    }
+                    ReshapeChoice::Cancel => {}
+                }
+            }
+            KeyCode::Char('/') if slices > 1 => {
+                let stats = ex.cached_stats(&tensor, view);
+                let stats_view = self.stats_view(&stats);
+                let repr = self.repr;
+                let background = |f: &mut ratatui::Frame| {
+                    ex.render_cached_data(f, &tensor, repr, stats_view, stripe, base);
+                };
+                if let Some(n) = ex.prompt_slice(term, background, slices) {
+                    self.slice.set(n);
+                }
+            }
+            KeyCode::Right if slices > 1 && shift => self
+                .slice
+                .set((self.slice.get() + slice_step(slices)) % slices),
+            KeyCode::Left if slices > 1 && shift => self
+                .slice
+                .set((self.slice.get() + slices - slice_step(slices)) % slices),
+            KeyCode::Char(']') | KeyCode::Right if slices > 1 => {
+                self.slice.set((self.slice.get() + 1) % slices)
+            }
+            KeyCode::Char('[') | KeyCode::Left if slices > 1 => {
+                self.slice.set((self.slice.get() + slices - 1) % slices)
+            }
+            KeyCode::Char('c') => {
+                let stats = ex.cached_stats(&tensor, view);
+                let stats_view = self.stats_view(&stats);
+                if let Ok(text) = ex.data_plain(
+                    &tensor,
+                    self.repr,
+                    self.slice.get(),
+                    view,
+                    mode,
+                    stats_view,
+                    stripe,
+                    base,
+                    None,
+                ) {
+                    copy_to_clipboard(&text);
+                }
+                ex.copied_flash = Some(("screen contents".to_string(), std::time::Instant::now()));
+            }
+            KeyCode::Char('y') => {
+                let cmd = ex.command_for_data(&tensor, self.repr, self.slice.get());
+                copy_to_clipboard(&cmd);
+                self.overlay = Some(Overlay::Command(cmd));
+            }
+            KeyCode::Char('l') => {
+                self.overlay = Some(Overlay::Legend(match self.repr {
+                    Representation::Heatmap => Legend::Heatmap,
+                    Representation::Values => Legend::Values,
+                }));
+            }
+            KeyCode::Backspace => return Ok(Outcome::Leave(Nav::Back)),
+            KeyCode::Char('\\') => return Ok(Outcome::Leave(Nav::Forward)),
+            // Any other key goes back to the detail screen.
+            _ => {
+                return Ok(Outcome::Leave(Nav::Open(Screen::Detail {
+                    tensor: tensor.name.clone(),
+                    slice: self.slice.get(),
+                })));
+            }
+        }
+        Ok(Outcome::Stay)
+    }
+
+    fn handle_mouse(
+        &mut self,
+        _ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+        m: MouseEvent,
+    ) -> MouseOutcome {
+        let slices = self.slices.get();
+        match m.kind {
+            MouseEventKind::ScrollDown if slices > 1 => {
+                self.slice.set((self.slice.get() + 1) % slices);
+                MouseOutcome::Redraw
+            }
+            MouseEventKind::ScrollUp if slices > 1 => {
+                self.slice.set((self.slice.get() + slices - 1) % slices);
+                MouseOutcome::Redraw
+            }
+            _ => MouseOutcome::Ignored,
+        }
+    }
+
+    fn residual(&self) -> Screen {
+        Screen::Data {
+            tensor: self.tensor_name.clone(),
+            repr: self.repr,
+            slice: self.slice.get(),
+        }
+    }
 }
 
 /// A command the palette lists and runs, and the single action every tree
@@ -2179,22 +4438,6 @@ impl Explorer {
             .map(|(_, l)| l.clone())
     }
 
-    /// Resolve a link click that needs no mutation — a [`Link::Layout`](crate::ui::Link)
-    /// → open that file's layout map. For the detail view, whose loop borrows `self`
-    /// immutably (so it can't call [`Self::link_click`]) and whose only link is the
-    /// `File:` path. A `Link::Tree` (which reveals a tensor, needing `&mut self`)
-    /// can't originate there, so it's ignored.
-    fn layout_link_at(&self, col: u16, row: u16) -> Option<Nav> {
-        match self.link_at(col, row)? {
-            crate::ui::Link::Layout(path) => Some(Nav::Open(Screen::Layout {
-                path,
-                selected: 0,
-                scroll: 0,
-            })),
-            crate::ui::Link::Tree(_) => None,
-        }
-    }
-
     /// Move the tree cursor onto the leaf named `name` — a tensor or a metadata
     /// entry — expanding any collapsed groups so it's visible. Used when
     /// returning to the tree from a detail/data view, and when the app was
@@ -2836,13 +5079,14 @@ impl Explorer {
             };
 
             let nav = match history[cursor].clone() {
-                Screen::Tree => self.run_tree()?,
-                Screen::Files => self.run_files()?,
+                Screen::Tree => self.run_mode(&mut TreeMode::new())?,
+                Screen::Files => self.run_mode(&mut FilesMode::new())?,
                 Screen::Rename { pairs } => {
                     // Persist the typed rules so a round-trip (e.g. clicking a shard
                     // to view its layout) returns to the same editor state.
-                    let (nav, pairs) = self.run_rename(pairs)?;
-                    history[cursor] = Screen::Rename { pairs };
+                    let mut mode = RenameMode2::new(pairs);
+                    let nav = self.run_mode(&mut mode)?;
+                    history[cursor] = mode.residual();
                     nav
                 }
                 Screen::Layout {
@@ -2852,20 +5096,17 @@ impl Explorer {
                 } => {
                     // Record where the user left the layout map so back/forward
                     // returns to the same segment (like the data view's slice/repr).
-                    let (nav, selected, scroll) = self.run_layout(&path, selected, scroll)?;
-                    history[cursor] = Screen::Layout {
-                        path,
-                        selected,
-                        scroll,
-                    };
+                    let mut mode = LayoutMode::new(path, selected, scroll);
+                    let nav = self.run_mode(&mut mode)?;
+                    history[cursor] = mode.residual();
                     nav
                 }
-                Screen::Detail { tensor, slice } => self.run_detail(
-                    &tensor,
+                Screen::Detail { tensor, slice } => self.run_mode(&mut DetailMode::new(
+                    tensor,
                     slice,
                     StatsStart::OnDemand,
                     Interaction::Interactive,
-                ),
+                ))?,
                 Screen::Data {
                     tensor,
                     repr,
@@ -2873,13 +5114,9 @@ impl Explorer {
                 } => {
                     // Re-record the screen with where the user left it (slice /
                     // representation), so back/forward returns there faithfully.
-                    let (nav, repr, slice) =
-                        self.run_data(&tensor, repr, slice, Interaction::Interactive);
-                    history[cursor] = Screen::Data {
-                        tensor,
-                        repr,
-                        slice,
-                    };
+                    let mut mode = DataMode::new(tensor, repr, slice, Interaction::Interactive);
+                    let nav = self.run_mode(&mut mode)?;
+                    history[cursor] = mode.residual();
                     nav
                 }
             };
@@ -3454,6 +5691,23 @@ impl Explorer {
     /// clamped_slice)` (or the error message [`Self::draw_data_view`] would
     /// have), so the loop can clamp the slice and gate slice/dtype hints.
     #[allow(clippy::too_many_arguments)] // mirrors the data-view sampler's params
+    /// The data view's current sampling mode, from the session-remembered layout
+    /// prefs (overview / edges split / window offset).
+    fn data_sample_mode(&self) -> SampleMode {
+        match self.data_view_layout.get() {
+            DataLayout::Edges => SampleMode::Edges {
+                row_tail: self.data_view_row_tail.get(),
+                col_tail: self.data_view_col_tail.get(),
+            },
+            DataLayout::Overview => SampleMode::Grid,
+            DataLayout::Window => SampleMode::Window {
+                row_off: self.data_view_win_row.get(),
+                col_off: self.data_view_win_col.get(),
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // mirrors the data-view sampler's params
     fn render_data_frame(
         &self,
         frame: &mut ratatui::Frame,
@@ -3614,6 +5868,248 @@ impl Explorer {
         out
     }
 
+    /// The generic interactive driver: run one [`Mode`] until it returns a [`Nav`].
+    /// Owns the live terminal (taken into a local for the loop, like the old
+    /// detail/data screens) and all the shared plumbing — the input-drain gate, the
+    /// draw (frame + overlay + hover), the copied-flash lifecycle, footer-chip / link
+    /// / badge clicks, hover, Ctrl-C, the wrong-layout hint, and the command palette
+    /// — so a mode only supplies its content (`render_frame` / `handle_key` /
+    /// `handle_mouse` / `open_palette`). Replaces the six hand-rolled `run_*` loops.
+    fn run_mode(&mut self, mode: &mut dyn Mode) -> Result<Nav> {
+        let spec = mode.spec();
+        let mut term = self
+            .terminal
+            .take()
+            .expect("interactive loop owns the terminal");
+        match mode.on_enter(self, &mut term) {
+            Ok(Outcome::Leave(nav)) => {
+                self.terminal = Some(term);
+                return Ok(nav);
+            }
+            Ok(Outcome::Stay) => {}
+            Err(e) => {
+                self.terminal = Some(term);
+                return Err(e);
+            }
+        }
+        let _ = term.clear();
+        let mut layout_hint: Option<char> = None;
+
+        let nav = loop {
+            // Coalesce a burst of queued input before painting (held arrows stay
+            // snappy), then advance any background scan.
+            let input_pending = event::poll(std::time::Duration::ZERO).unwrap_or(false);
+            let bg = mode.tick_background(self);
+
+            if !input_pending {
+                mode.pre_draw(self, &mut term);
+                let hint = layout_hint;
+                let drawn = term.draw(|f| {
+                    mode.render_frame(self, f);
+                    if let Some(o) = mode.overlay() {
+                        match o {
+                            Overlay::Legend(l) => UI::render_legend_band(f, *l),
+                            Overlay::Command(c) => UI::render_command_band(f, c),
+                            Overlay::Notice(m) => UI::render_notice_box(f, m),
+                        }
+                    }
+                    if let Some(c) = hint {
+                        UI::render_notice(f, &layout_hint_msg(c));
+                    }
+                    self.render_shortcut_hover(f);
+                });
+                if drawn.is_err() {
+                    break Nav::Quit;
+                }
+            }
+            layout_hint = None;
+
+            // Wait for an event: the copied-flash expires on its own after
+            // COPY_FLASH, and a live scan (Bg::Poll) ticks every SCAN_TICK so its
+            // spinner animates — pausing the scan while input is pending so a
+            // keypress's own file read isn't stuck behind the scan's block.
+            let ev = if let Some((_, at)) = &self.copied_flash {
+                let remaining = COPY_FLASH.saturating_sub(at.elapsed());
+                if remaining.is_zero() || !event::poll(remaining).unwrap_or(false) {
+                    self.copied_flash = None;
+                    continue;
+                }
+                event::read()?
+            } else if matches!(bg, Bg::Poll) {
+                if event::poll(SCAN_TICK).unwrap_or(false) {
+                    mode.set_background_paused(true);
+                    event::read()?
+                } else {
+                    mode.set_background_paused(false);
+                    continue; // tick → redraw (advance the spinner / harvest)
+                }
+            } else {
+                event::read()?
+            };
+
+            // A floating overlay (detail/data legend/command/notice) swallows the
+            // next input: any key or click closes it; Ctrl-C still quits.
+            if mode.overlay().is_some() {
+                match &ev {
+                    Event::Key(k) if is_ctrl_c(k) => {
+                        if spec.ctrlc_quits_immediately {
+                            quit_immediately();
+                        } else {
+                            break Nav::Quit;
+                        }
+                    }
+                    Event::Key(k) => {
+                        if let Some(c) = wrong_layout_char(k) {
+                            layout_hint = Some(c);
+                        } else {
+                            mode.dismiss_overlay();
+                        }
+                    }
+                    Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved) => {
+                        if let Ok(sz) = term.size() {
+                            self.update_hovers(spec.id, sz.width, sz.height, m.column, m.row);
+                        }
+                    }
+                    Event::Mouse(m) if matches!(m.kind, MouseEventKind::Down(_)) => {
+                        mode.dismiss_overlay();
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            self.hovered_shortcut.set(None);
+
+            // Resolve the event to a key: a real keypress, a footer-chip / badge
+            // click (which replays a key), a link click (leaves), or a mode-specific
+            // mouse action.
+            let key = match ev {
+                Event::Key(k) => k,
+                Event::Mouse(m) => match self.route_mouse(&mut term, mode, &spec, m)? {
+                    MouseOutcome::Leave(nav) => break nav,
+                    MouseOutcome::SynthKey(k) => k,
+                    MouseOutcome::Redraw | MouseOutcome::Ignored => continue,
+                },
+                _ => continue,
+            };
+
+            if is_ctrl_c(&key) {
+                if spec.ctrlc_quits_immediately {
+                    quit_immediately();
+                } else {
+                    break Nav::Quit;
+                }
+            }
+            // A fresh key clears the copied-flash confirmation.
+            self.copied_flash = None;
+
+            // Space / `:` opens the command palette (unless the mode takes it as
+            // input — the tree while searching).
+            if matches!(key.code, KeyCode::Char(' ') | KeyCode::Char(':'))
+                && mode.palette_on_space(self)
+            {
+                match mode.open_palette(self, &mut term) {
+                    PaletteResult::Nav(n) => break n,
+                    PaletteResult::SynthKey(k) => {
+                        if let Outcome::Leave(n) = mode.handle_key(self, &mut term, k)? {
+                            break n;
+                        }
+                    }
+                    PaletteResult::Handled => {}
+                }
+                continue;
+            }
+
+            // A non-Latin key (wrong keyboard layout) matches no shortcut — flash a
+            // hint rather than silently ignoring it (unless the mode takes text).
+            if !mode.accepts_text(self)
+                && let Some(c) = wrong_layout_char(&key)
+            {
+                layout_hint = Some(c);
+                continue;
+            }
+
+            if let Outcome::Leave(nav) = mode.handle_key(self, &mut term, key)? {
+                break nav;
+            }
+        };
+
+        self.terminal = Some(term);
+        Ok(nav)
+    }
+
+    /// Render one [`Mode`] frame and return — the one-shot (`--exit`) path. Runs
+    /// `on_enter` (which handles a `--compute-stats` synchronous scan) then draws a
+    /// single frame, leaving it on screen. No event loop.
+    fn run_mode_once(&mut self, mode: &mut dyn Mode) -> Result<()> {
+        let mut term = self
+            .terminal
+            .take()
+            .expect("interactive loop owns the terminal");
+        let leave = matches!(mode.on_enter(self, &mut term), Ok(Outcome::Leave(_)));
+        if !leave {
+            let _ = term.draw(|f| mode.render_frame(self, f));
+        }
+        self.terminal = Some(term);
+        Ok(())
+    }
+
+    /// The shared mouse routing every mode gets for free: hover on move; on a left
+    /// click, follow an underlined link, else act a status-badge click as its key,
+    /// else a footer chip as its key; anything else (rows / scrollbar / band / wheel)
+    /// goes to the mode's own [`Mode::handle_mouse`].
+    fn route_mouse(
+        &mut self,
+        term: &mut crate::tui::LiveTerminal,
+        mode: &mut dyn Mode,
+        spec: &ModeSpec,
+        m: MouseEvent,
+    ) -> Result<MouseOutcome> {
+        let (col, row) = (m.column, m.row);
+        match m.kind {
+            MouseEventKind::Moved => {
+                if let Ok(sz) = term.size() {
+                    self.update_hovers(spec.id, sz.width, sz.height, col, row);
+                }
+                Ok(MouseOutcome::Redraw)
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.copied_flash = None;
+                // An underlined link (a filename → layout, a tensor → tree).
+                if let Some(nav) = self.link_click(col, row) {
+                    return Ok(MouseOutcome::Leave(nav));
+                }
+                // A status badge (e.g. the health badge → `h`), unless letters are
+                // field input here.
+                if !mode.accepts_text(self)
+                    && let Ok(sz) = term.size()
+                    && let Some(k) = self.badge_action_at(spec.id, sz.width, sz.height, col, row)
+                {
+                    return Ok(MouseOutcome::SynthKey(k));
+                }
+                // A footer chip / `[×]`.
+                if let Some(k) = crate::ui::region_hit(&self.clickable.borrow(), col, row) {
+                    return Ok(MouseOutcome::SynthKey(k));
+                }
+                Ok(mode.handle_mouse(self, term, m))
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                self.copied_flash = None;
+                Ok(mode.handle_mouse(self, term, m))
+            }
+            _ => Ok(mode.handle_mouse(self, term, m)), // drag / release
+        }
+    }
+
+    /// The key a click on a status badge synthesizes (the health badge → `h`), or
+    /// `None` if the click missed the bar or the badge has no action.
+    fn badge_action_at(&self, id: HelpCtx, w: u16, h: u16, col: u16, row: u16) -> Option<KeyEvent> {
+        let badges = self.screen_badges(id);
+        UI::badge_bar_hit(w, h, col, row, &badges)
+            .and_then(|i| badges.get(i).and_then(|b| b.action()))
+            .map(|k| KeyEvent::new(KeyCode::Char(k), KeyModifiers::NONE))
+    }
+
     /// Whether the file browser / layout map are usable: they read the checkpoint
     /// directory and files locally, so they're unavailable for a remote
     /// (`--ssh-read`) source, which has no local bytes.
@@ -3635,7 +6131,7 @@ impl Explorer {
     /// Perform a tree command, from its key or the palette. Returns `Some(Nav)` for
     /// a command that leaves the tree (only `Quit` so far), else `None`. Pop-up
     /// commands borrow the terminal via [`Self::with_terminal`].
-    fn run_command(&mut self, cmd: Cmd) -> Option<Nav> {
+    fn run_command(&mut self, cmd: Cmd, term: &mut crate::tui::LiveTerminal) -> Option<Nav> {
         match cmd {
             Cmd::Search => self.enter_search_mode(),
             Cmd::ExpandAll => self.set_all_expanded(true),
@@ -3646,28 +6142,26 @@ impl Explorer {
                 }
                 // Remote checkpoint: no local directory to browse — say so rather
                 // than opening an empty view.
-                self.with_terminal(|s, t| {
-                    s.float_until_dismissed(t, |f| {
-                        s.render_tree_frame(f, true);
-                        UI::render_notice(
-                            f,
-                            "The file browser is available for local checkpoints only.",
-                        );
-                    });
+                self.float_until_dismissed(term, |f| {
+                    self.render_tree_frame(f, true);
+                    UI::render_notice(
+                        f,
+                        "The file browser is available for local checkpoints only.",
+                    );
                 });
             }
             Cmd::CopyScreen => self.copy_tree_screen(),
             Cmd::CopyPath => self.copy_selected_path(),
             Cmd::CopyName => self.copy_selected_name(),
-            Cmd::Stats => self.with_terminal(|s, t| s.show_stats(t, false)),
-            Cmd::Health => self.with_terminal(|s, t| s.show_check_report(t, false)),
-            Cmd::Legend => self.with_terminal(|s, t| s.show_legend(t, Legend::Tree, None)),
-            Cmd::CopyTree => self.with_terminal(|s, t| s.copy_menu(t)),
+            Cmd::Stats => self.show_stats(term, false),
+            Cmd::Health => self.show_check_report(term, false),
+            Cmd::Legend => self.show_legend(term, Legend::Tree, None),
+            Cmd::CopyTree => self.copy_menu(term),
             Cmd::CopyCommand => {
                 let c = self.command_for_tree_selection();
-                self.with_terminal(|s, t| s.copy_command(t, &c, None));
+                self.copy_command(term, &c, None);
             }
-            Cmd::Repack => self.with_terminal(|s, t| s.repack_checkpoint(t)),
+            Cmd::Repack => self.repack_checkpoint(term),
             Cmd::Rename => {
                 if self.rename_target().is_some() {
                     return Some(Nav::Open(Screen::Rename { pairs: Vec::new() }));
@@ -3675,14 +6169,12 @@ impl Explorer {
                 // Not a local safetensors checkpoint — say so rather than opening an
                 // empty editor (the palette already hides it; a bare `r` can still
                 // reach here).
-                self.with_terminal(|s, t| {
-                    s.float_until_dismissed(t, |f| {
-                        s.render_tree_frame(f, true);
-                        UI::render_notice(
-                            f,
-                            "In-place rename is available for a local safetensors checkpoint only.",
-                        );
-                    });
+                self.float_until_dismissed(term, |f| {
+                    self.render_tree_frame(f, true);
+                    UI::render_notice(
+                        f,
+                        "In-place rename is available for a local safetensors checkpoint only.",
+                    );
                 });
             }
             Cmd::Quit => return Some(Nav::Quit),
@@ -4236,15 +6728,19 @@ impl Explorer {
 
     /// Run a file-browser command, from its key or the palette. Returns `Some(Nav)`
     /// for a command that leaves the file view (`Tab` → tensor tree, `q` → quit).
-    fn run_file_command(&mut self, cmd: FileCmd) -> Option<Nav> {
+    fn run_file_command(
+        &mut self,
+        cmd: FileCmd,
+        term: &mut crate::tui::LiveTerminal,
+    ) -> Option<Nav> {
         match cmd {
             FileCmd::TensorTree => return Some(Nav::Back),
-            FileCmd::Legend => self.with_terminal(|s, t| s.show_files_legend(t)),
+            FileCmd::Legend => self.show_files_legend(term),
             FileCmd::CopyPath => self.copy_file_path(),
             FileCmd::CopyScreen => self.copy_files_screen(),
             FileCmd::CopyCommand => {
                 let c = self.command_for_files();
-                self.with_terminal(|s, t| s.copy_command(t, &c, None));
+                self.copy_command(term, &c, None);
             }
             FileCmd::Quit => return Some(Nav::Quit),
         }
@@ -4261,25 +6757,24 @@ impl Explorer {
         map: &crate::safelayout::LayoutMap,
         selected: usize,
         scroll: usize,
+        term: &mut crate::tui::LiveTerminal,
     ) -> Option<Nav> {
         match cmd {
             LayoutCmd::TensorTree => return Some(Nav::Back),
             LayoutCmd::Quit => return Some(Nav::Quit),
             LayoutCmd::Legend => {
                 let body = layout_legend_lines();
-                self.with_terminal(|s, t| {
-                    s.float_scroll_popup(
-                        t,
-                        "Layout legend",
-                        body,
-                        PopupBackdrop::Layout {
-                            map,
-                            selected,
-                            scroll,
-                        },
-                        None,
-                    )
-                });
+                self.float_scroll_popup(
+                    term,
+                    "Layout legend",
+                    body,
+                    PopupBackdrop::Layout {
+                        map,
+                        selected,
+                        scroll,
+                    },
+                    None,
+                );
             }
             LayoutCmd::CopyScreen => {
                 copy_to_clipboard(&layout_to_text(map));
@@ -4289,11 +6784,9 @@ impl Explorer {
                 let select = Self::layout_selected_tensor(map, selected);
                 let command = self.command_for_layout(path, select.as_deref());
                 copy_to_clipboard(&command);
-                self.with_terminal(|s, t| {
-                    s.float_until_dismissed(t, |f| {
-                        UI::render_layout(f, map, selected, scroll, None, true);
-                        UI::render_command_band(f, &command);
-                    });
+                self.float_until_dismissed(term, |f| {
+                    UI::render_layout(f, map, selected, scroll, None, true);
+                    UI::render_command_band(f, &command);
                 });
             }
         }
@@ -4335,264 +6828,6 @@ impl Explorer {
         self.flash_copied("screen contents");
     }
 
-    /// The file browser. Lists the checkpoint's directory (directories fold with
-    /// `←`/`→`, `Enter` opens a checkpoint / previews a sidecar), `Tab` /
-    /// Backspace return to the tensor tree, `\` steps forward. Returns the chosen
-    /// [`Nav`].
-    fn run_files(&mut self) -> Result<Nav> {
-        // Build the directory tree lazily on first entry (a session that never
-        // opens the file view never stats the directory), then keep it — its fold
-        // state persists across `Tab` toggles.
-        if self.file_tree.is_none() {
-            self.file_tree = Some(crate::filetree::build(&self.browse_root, 8));
-            self.rebuild_file_rows();
-        }
-        let mut first = true;
-        let mut last_click: Option<(std::time::Instant, u16)> = None;
-        let mut last_sel = usize::MAX;
-        let mut scrollbar_drag = false;
-        // A wrong-keyboard-layout key flashes a hint rather than being silently
-        // ignored (as on the tree / detail views); cleared on the next input.
-        let mut layout_hint: Option<char> = None;
-        loop {
-            let input_pending = event::poll(std::time::Duration::ZERO).unwrap_or(false);
-            let mut term = self
-                .terminal
-                .take()
-                .expect("interactive loop owns the terminal");
-            if first {
-                term.clear()?;
-                first = false;
-            }
-            let size = term.size().ok();
-            let total = self.file_flattened.len();
-            if !input_pending {
-                if let Some(sz) = size {
-                    if self.file_selected != last_sel {
-                        self.update_files_scroll(sz.width, sz.height);
-                        last_sel = self.file_selected;
-                    }
-                    let body = UI::files_visible_rows(sz.width, sz.height);
-                    self.file_scroll = self.file_scroll.min(total.saturating_sub(body));
-                }
-                let hint = layout_hint;
-                term.draw(|f| {
-                    self.render_files_frame(f, true);
-                    if let Some(c) = hint {
-                        UI::render_notice(f, &layout_hint_msg(c));
-                    }
-                })?;
-            }
-            self.terminal = Some(term);
-
-            let ev = if let Some((_, at)) = &self.copied_flash {
-                let remaining = COPY_FLASH.saturating_sub(at.elapsed());
-                if remaining.is_zero() || !event::poll(remaining).unwrap_or(false) {
-                    self.copied_flash = None;
-                    continue;
-                }
-                event::read()?
-            } else {
-                event::read()?
-            };
-            self.hovered_shortcut.set(None);
-            layout_hint = None;
-
-            // Mouse: scrollbar scrub/drag, row select / double-click activate, the
-            // wheel scrolls the viewport, and a footer chip / `[×]` acts like its key.
-            let mut synth: Option<KeyEvent> = None;
-            if let Event::Mouse(m) = &ev {
-                let (kind, row, col) = (m.kind, m.row, m.column);
-                match kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        self.copied_flash = None;
-                        scrollbar_drag = false;
-                        if let Some(sz) = size
-                            && let Some(sb) = UI::files_scrollbar(sz.width, sz.height, total)
-                            && sb.hit(col, row)
-                        {
-                            self.file_scroll = sb.offset_at(row);
-                            scrollbar_drag = true;
-                            continue;
-                        }
-                        if let Some(k) = crate::ui::region_hit(&self.clickable.borrow(), col, row) {
-                            synth = Some(k); // a footer chip / [×]
-                        } else if let Some(sz) = size {
-                            let body_top = UI::files_header_rows(sz.width) as u16;
-                            let body_bottom = sz.height.saturating_sub(FILES_FOOTER_ROWS as u16);
-                            if row >= body_top && row < body_bottom {
-                                let idx = self.file_scroll + (row - body_top) as usize;
-                                let fr = self.file_flattened.get(idx).cloned();
-                                if let Some(fr) = fr {
-                                    // A click on a directory's ▸/▾ twisty (column
-                                    // `2 * depth`) toggles it on a single click.
-                                    let on_arrow = fr.is_dir && col == 2 * fr.depth as u16;
-                                    self.file_selected = idx;
-                                    if on_arrow {
-                                        last_click = None;
-                                        self.activate_file_selection();
-                                    } else {
-                                        let double = matches!(
-                                            last_click,
-                                            Some((t, r)) if r == row && t.elapsed() < DOUBLE_CLICK
-                                        );
-                                        if double {
-                                            last_click = None;
-                                            if let Some(nav) = self.activate_file_selection() {
-                                                return Ok(nav);
-                                            }
-                                        } else {
-                                            last_click = Some((std::time::Instant::now(), row));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    MouseEventKind::Drag(MouseButton::Left) if scrollbar_drag => {
-                        if let Some(sz) = size
-                            && let Some(sb) = UI::files_scrollbar(sz.width, sz.height, total)
-                        {
-                            self.file_scroll = sb.offset_at(row);
-                        }
-                    }
-                    MouseEventKind::Up(MouseButton::Left) => scrollbar_drag = false,
-                    MouseEventKind::ScrollDown => {
-                        self.copied_flash = None;
-                        self.file_scroll = self.file_scroll.saturating_add(WHEEL_STEP);
-                    }
-                    MouseEventKind::ScrollUp => {
-                        self.copied_flash = None;
-                        self.file_scroll = self.file_scroll.saturating_sub(WHEEL_STEP);
-                    }
-                    MouseEventKind::Moved => {
-                        if let Some(sz) = size {
-                            self.update_hovers(HelpCtx::Files, sz.width, sz.height, col, row);
-                        }
-                    }
-                    _ => {}
-                }
-                if synth.is_none() {
-                    continue;
-                }
-            }
-
-            let key_event = match synth {
-                Some(k) => k,
-                None => match ev {
-                    Event::Key(k) => k,
-                    _ => continue,
-                },
-            };
-            self.copied_flash = None;
-            // A non-Latin key (wrong keyboard layout) matches no shortcut — flash a
-            // hint rather than silently ignoring it.
-            if let Some(c) = wrong_layout_char(&key_event) {
-                layout_hint = Some(c);
-                continue;
-            }
-            match key_event {
-                KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                } => return Ok(Nav::Quit),
-                // Space or `:` opens the file browser's command palette.
-                KeyEvent {
-                    code: KeyCode::Char(' ') | KeyCode::Char(':'),
-                    ..
-                } => {
-                    if let Some(cmd) = self.with_terminal(|s, t| s.file_command_palette(t))
-                        && let Some(nav) = self.run_file_command(cmd)
-                    {
-                        return Ok(nav);
-                    }
-                }
-                // Every lettered file command dispatches through the registry,
-                // like the tree — so key and palette entry can't drift.
-                KeyEvent {
-                    code: KeyCode::Char(c),
-                    modifiers,
-                    ..
-                } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && file_command_for_key(c).is_some() =>
-                {
-                    let cmd = file_command_for_key(c).expect("guarded by is_some");
-                    if let Some(nav) = self.run_file_command(cmd) {
-                        return Ok(nav);
-                    }
-                }
-                // Tab / Backspace return to the tensor tree; `\` steps forward.
-                KeyEvent {
-                    code: KeyCode::Tab, ..
-                }
-                | KeyEvent {
-                    code: KeyCode::Backspace,
-                    ..
-                } => return Ok(Nav::Back),
-                KeyEvent {
-                    code: KeyCode::Char('\\'),
-                    ..
-                } => return Ok(Nav::Forward),
-                KeyEvent {
-                    code: KeyCode::Up, ..
-                } => {
-                    let step = self.held_step(KeyCode::Up, accel_step_row) as i32;
-                    self.move_file_selection(-step);
-                }
-                KeyEvent {
-                    code: KeyCode::Down,
-                    ..
-                } => {
-                    let step = self.held_step(KeyCode::Down, accel_step_row) as i32;
-                    self.move_file_selection(step);
-                }
-                KeyEvent {
-                    code: KeyCode::PageUp,
-                    ..
-                } => {
-                    let step = (self.file_page_rows()
-                        * self.held_step(KeyCode::PageUp, accel_step_page))
-                        as i32;
-                    self.move_file_selection(-step);
-                }
-                KeyEvent {
-                    code: KeyCode::PageDown,
-                    ..
-                } => {
-                    let step = (self.file_page_rows()
-                        * self.held_step(KeyCode::PageDown, accel_step_page))
-                        as i32;
-                    self.move_file_selection(step);
-                }
-                KeyEvent {
-                    code: KeyCode::Home,
-                    ..
-                } => self.file_selected = 0,
-                KeyEvent {
-                    code: KeyCode::End, ..
-                } => self.file_selected = total.saturating_sub(1),
-                KeyEvent {
-                    code: KeyCode::Left,
-                    ..
-                } => self.file_collapse_or_parent(),
-                KeyEvent {
-                    code: KeyCode::Right,
-                    ..
-                } => self.file_expand_or_child(),
-                KeyEvent {
-                    code: KeyCode::Enter,
-                    ..
-                } => {
-                    if let Some(nav) = self.activate_file_selection() {
-                        return Ok(nav);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
     /// The command that reopens the layout map for `path` (`--layout`): the launch
     /// path(s) plus the flag. The file is emitted **relative to the checkpoint
     /// directory** (which the launch path already names), so the path isn't
@@ -4624,275 +6859,6 @@ impl Explorer {
             .get(selected)
             .filter(|s| s.kind == crate::safelayout::SegmentKind::Tensor)
             .map(|s| s.name.clone())
-    }
-
-    /// The safetensors layout map for one file: a scrollable vertical strip of its
-    /// byte layout. A drill-down like the detail / data views — Backspace / `Tab`
-    /// / `[×]` return to where it was opened from (the file browser, or the tree
-    /// for `--layout`), `\` steps forward, `l` / `c` / `y` and `q` as elsewhere.
-    fn run_layout(
-        &mut self,
-        path: &str,
-        initial_selected: usize,
-        initial_scroll: usize,
-    ) -> Result<(Nav, usize, usize)> {
-        let map = match crate::safelayout::parse(Path::new(path)) {
-            Ok(m) => m,
-            Err(e) => {
-                let body = vec![
-                    Line::from(Span::raw(format!("Can't read the layout of {path}:"))),
-                    Line::default(),
-                    Line::from(crate::ui::dim_span(e)),
-                ];
-                self.with_terminal(|s, t| {
-                    s.float_scroll_popup(t, "Layout", body, PopupBackdrop::Files, None)
-                });
-                return Ok((Nav::Back, initial_selected, initial_scroll));
-            }
-        };
-        let n = map.segments.len();
-        let mut first = true;
-        // Restore where the user left this map (clamped to the current segments).
-        let mut selected = initial_selected.min(n.saturating_sub(1));
-        let mut last_sel = usize::MAX;
-        let mut scroll = initial_scroll;
-        let mut scroll_max = 0usize;
-        // A wrong-keyboard-layout key flashes a hint instead of being silently
-        // ignored (as on the tree / detail views); cleared on the next input.
-        let mut layout_hint: Option<char> = None;
-        let nav = loop {
-            let input_pending = event::poll(std::time::Duration::ZERO).unwrap_or(false);
-            let mut term = self
-                .terminal
-                .take()
-                .expect("interactive loop owns the terminal");
-            if first {
-                term.clear()?;
-                first = false;
-            }
-            let size = term.size().ok();
-            // Compute the scroll bounds from the band layout up front (not from the
-            // last frame's draw, which is 0 on entry — that would clamp away the
-            // snap below and leave the view stuck at the top). Then snap so the
-            // selected band's label row is visible when the selection moved (the
-            // wheel can otherwise scroll freely past it).
-            if let Some(sz) = size {
-                let starts = UI::layout_band_starts(&map, sz.width, sz.height);
-                let body = UI::layout_visible_rows(sz.width, sz.height);
-                let total_rows = starts.last().copied().unwrap_or(0);
-                scroll_max = total_rows.saturating_sub(body);
-                if selected != last_sel {
-                    let band_start = starts.get(selected).copied().unwrap_or(0);
-                    if band_start < scroll {
-                        scroll = band_start;
-                    } else if band_start >= scroll + body {
-                        scroll = band_start + 1 - body;
-                    }
-                    last_sel = selected;
-                }
-                scroll = scroll.min(scroll_max);
-            }
-            if !input_pending {
-                let flash = self.copied_flash.as_ref().map(|(w, _)| w.clone());
-                let hint = layout_hint;
-                term.draw(|f| {
-                    let (max, regions, links) =
-                        UI::render_layout(f, &map, selected, scroll, flash.as_deref(), true);
-                    scroll_max = max;
-                    *self.clickable.borrow_mut() = regions;
-                    *self.links.borrow_mut() = links; // tensor band name → tree
-                    if let Some(c) = hint {
-                        UI::render_notice(f, &layout_hint_msg(c));
-                    }
-                })?;
-            }
-            self.terminal = Some(term);
-
-            let ev = if let Some((_, at)) = &self.copied_flash {
-                let remaining = COPY_FLASH.saturating_sub(at.elapsed());
-                if remaining.is_zero() || !event::poll(remaining).unwrap_or(false) {
-                    self.copied_flash = None;
-                    continue;
-                }
-                event::read()?
-            } else {
-                event::read()?
-            };
-            self.hovered_shortcut.set(None);
-            layout_hint = None;
-
-            // Mouse: a click on a band selects it, the wheel scrolls the strip, a
-            // footer chip / `[×]` acts like its key.
-            let mut synth: Option<KeyEvent> = None;
-            if let Event::Mouse(m) = &ev {
-                let (kind, row, col) = (m.kind, m.row, m.column);
-                match kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        self.copied_flash = None;
-                        // A click on a tensor band's (underlined) name jumps to it in
-                        // the tree — the shared link path (before the chip hit-test).
-                        if let Some(nav) = self.link_click(col, row) {
-                            break nav;
-                        }
-                        if let Some(k) = crate::ui::region_hit(&self.clickable.borrow(), col, row) {
-                            synth = Some(k); // a footer chip / [×]
-                        } else if let Some(sz) = size {
-                            let top = UI::layout_header_rows() as u16;
-                            let body = UI::layout_visible_rows(sz.width, sz.height);
-                            if row >= top && (row as usize) < top as usize + body {
-                                let content_row = scroll + (row - top) as usize;
-                                let starts = UI::layout_band_starts(&map, sz.width, sz.height);
-                                // The band whose [start, next) contains this row.
-                                if let Some(seg) = starts
-                                    .windows(2)
-                                    .position(|w| content_row >= w[0] && content_row < w[1])
-                                {
-                                    selected = seg.min(n.saturating_sub(1));
-                                }
-                            }
-                        }
-                    }
-                    MouseEventKind::ScrollDown => {
-                        self.copied_flash = None;
-                        scroll = (scroll + WHEEL_STEP).min(scroll_max);
-                    }
-                    MouseEventKind::ScrollUp => {
-                        self.copied_flash = None;
-                        scroll = scroll.saturating_sub(WHEEL_STEP);
-                    }
-                    MouseEventKind::Moved => {
-                        if let Some(sz) = size {
-                            self.update_hovers(HelpCtx::Layout, sz.width, sz.height, col, row);
-                        }
-                    }
-                    _ => {}
-                }
-                if synth.is_none() {
-                    continue;
-                }
-            }
-
-            let key_event = match synth {
-                Some(k) => k,
-                None => match ev {
-                    Event::Key(k) => k,
-                    _ => continue,
-                },
-            };
-            self.copied_flash = None;
-            // A non-Latin key (wrong keyboard layout) matches no shortcut — flash a
-            // hint rather than silently ignoring it.
-            if let Some(c) = wrong_layout_char(&key_event) {
-                layout_hint = Some(c);
-                continue;
-            }
-            let move_sel = |sel: usize, delta: i32| -> usize {
-                if delta < 0 {
-                    sel.saturating_sub((-delta) as usize)
-                } else {
-                    (sel + delta as usize).min(n.saturating_sub(1))
-                }
-            };
-            match key_event {
-                KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                } => break Nav::Quit,
-                // Space or `:` opens the layout map's command palette.
-                KeyEvent {
-                    code: KeyCode::Char(' ') | KeyCode::Char(':'),
-                    ..
-                } => {
-                    if let Some(cmd) = self
-                        .with_terminal(|s, t| s.layout_command_palette(t, &map, selected, scroll))
-                        && let Some(nav) =
-                            self.run_layout_command(cmd, path, &map, selected, scroll)
-                    {
-                        break nav;
-                    }
-                }
-                // Every lettered layout command dispatches through the registry
-                // (`q` / `l` / `c` / `y`) — so the key and the palette can't drift.
-                KeyEvent {
-                    code: KeyCode::Char(ch),
-                    modifiers,
-                    ..
-                } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && layout_command_for_key(ch).is_some() =>
-                {
-                    let cmd = layout_command_for_key(ch).expect("guarded by is_some");
-                    if let Some(nav) = self.run_layout_command(cmd, path, &map, selected, scroll) {
-                        break nav;
-                    }
-                }
-                // Backspace / Tab / Esc return to where the map was opened from.
-                KeyEvent {
-                    code: KeyCode::Backspace | KeyCode::Tab | KeyCode::Esc,
-                    ..
-                } => break Nav::Back,
-                KeyEvent {
-                    code: KeyCode::Char('\\'),
-                    ..
-                } => break Nav::Forward,
-                KeyEvent {
-                    code: KeyCode::Up, ..
-                } => {
-                    let step = self.held_step(KeyCode::Up, accel_step_row) as i32;
-                    selected = move_sel(selected, -step);
-                }
-                KeyEvent {
-                    code: KeyCode::Down,
-                    ..
-                } => {
-                    let step = self.held_step(KeyCode::Down, accel_step_row) as i32;
-                    selected = move_sel(selected, step);
-                }
-                KeyEvent {
-                    code: KeyCode::PageUp,
-                    ..
-                } => {
-                    let page = self.layout_page_segments(&map, size);
-                    let step = (page * self.held_step(KeyCode::PageUp, accel_step_page)) as i32;
-                    selected = move_sel(selected, -step);
-                }
-                KeyEvent {
-                    code: KeyCode::PageDown,
-                    ..
-                } => {
-                    let page = self.layout_page_segments(&map, size);
-                    let step = (page * self.held_step(KeyCode::PageDown, accel_step_page)) as i32;
-                    selected = move_sel(selected, step);
-                }
-                KeyEvent {
-                    code: KeyCode::Home,
-                    ..
-                } => selected = 0,
-                KeyEvent {
-                    code: KeyCode::End, ..
-                } => selected = n.saturating_sub(1),
-                // Enter on the header previews the raw JSON header; on a tensor it
-                // jumps to that tensor's place in the checkpoint tree.
-                KeyEvent {
-                    code: KeyCode::Enter,
-                    ..
-                } => match map.segments.get(selected).map(|s| s.kind) {
-                    Some(crate::safelayout::SegmentKind::Header) => {
-                        self.with_terminal(|s, t| {
-                            s.preview_header_json(t, path, &map, selected, scroll)
-                        });
-                    }
-                    Some(crate::safelayout::SegmentKind::Tensor) => {
-                        if let Some(nav) = self.reveal_layout_selection(&map, selected)? {
-                            break nav;
-                        }
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
-        };
-        Ok((nav, selected, scroll))
     }
 
     /// How many segments to move the layout selection for one PageUp/PageDown —
@@ -5040,453 +7006,6 @@ impl Explorer {
             selected,
             scroll: 0,
         })
-    }
-
-    /// The tree browser. Handles in-place keys (navigation, search, expand) and
-    /// returns a [`Nav`] when the user opens a tensor (`Enter`), moves through
-    /// the screen history (Backspace / `\`), or quits.
-    fn run_tree(&mut self) -> Result<Nav> {
-        // The browser needs the whole checkpoint; bring it in now if a fast
-        // `--tensor` open deferred the full load.
-        self.ensure_full_load()?;
-        // Force a full repaint on entry so the tree fully overwrites whatever
-        // screen (detail/data view, or the loading frame) preceded it.
-        let mut first = true;
-        // The last left-click (time, terminal row), for double-click detection.
-        let mut last_click: Option<(std::time::Instant, u16)> = None;
-        // The selection as of the last frame: when it changes (arrows/click) we
-        // snap the viewport to keep it visible; when it's unchanged we leave the
-        // scroll offset alone so the wheel can scroll freely past the selection.
-        let mut last_sel = usize::MAX;
-        // A wrong-keyboard-layout hint to flash on the next frame (see
-        // `wrong_layout_char`); cleared as soon as the next input arrives.
-        let mut layout_hint: Option<char> = None;
-        // True while the left button is held after pressing on the scroll bar, so
-        // subsequent drag events keep scrubbing the viewport.
-        let mut scrollbar_drag = false;
-        loop {
-            // Skip the (relatively expensive) repaint whenever more input is
-            // already queued. A burst of mouse-wheel or motion events would
-            // otherwise trigger one full redraw *each*, and those repaints back
-            // the input queue up: scrolling lags behind, and later key presses —
-            // Ctrl-C included — are stuck behind the pile of pending redraws. By
-            // draining the whole burst first and painting only once it settles,
-            // scrolling stays snappy and the keyboard stays responsive.
-            let input_pending = event::poll(std::time::Duration::ZERO).unwrap_or(false);
-            let mut term = self
-                .terminal
-                .take()
-                .expect("interactive loop owns the terminal");
-            if first {
-                term.clear()?;
-                first = false;
-            }
-            let size = term.size().ok();
-            if !input_pending {
-                if let Some(sz) = size {
-                    if self.selected_idx != last_sel {
-                        self.update_tree_scroll(sz.width, sz.height); // snap to the moved selection
-                        last_sel = self.selected_idx;
-                    }
-                    // Clamp the (possibly wheel-scrolled) offset to the valid range.
-                    let body = UI::tree_visible_rows(
-                        sz.width,
-                        sz.height,
-                        self.search_mode,
-                        self.can_repack(),
-                    );
-                    let total = self.current_tree_len();
-                    self.scroll_offset = self.scroll_offset.min(total.saturating_sub(body));
-                }
-                let hint = layout_hint;
-                term.draw(|f| {
-                    self.render_tree_frame(f, true);
-                    if let Some(c) = hint {
-                        UI::render_notice(f, &layout_hint_msg(c));
-                    }
-                })?;
-            }
-            self.terminal = Some(term);
-
-            // While a copy confirmation is up, wake when it expires so it clears
-            // on its own after `COPY_FLASH` — not only on the next key press.
-            let ev = if let Some((_, at)) = &self.copied_flash {
-                let remaining = COPY_FLASH.saturating_sub(at.elapsed());
-                if remaining.is_zero() || !event::poll(remaining).unwrap_or(false) {
-                    self.copied_flash = None;
-                    continue; // expired — redraw without the confirmation
-                }
-                event::read()?
-            } else {
-                event::read()?
-            };
-            // Any input clears a prior layout hint; a fresh wrong-layout key re-sets
-            // it below. The shortcut bubble also clears (its chip may not exist on
-            // the next screen); the badge hovers persist and are refreshed by the
-            // mouse-move handler, so they stay live over a pop-up too.
-            layout_hint = None;
-            self.hovered_shortcut.set(None);
-
-            // Mouse: a click on a footer hint chip or the `[×]` acts like its key
-            // (routed through the key match below); a click on a tree row selects
-            // or opens it; the wheel scrolls the viewport.
-            let mut synth: Option<KeyEvent> = None;
-            if let Event::Mouse(m) = &ev {
-                let (kind, row, col) = (m.kind, m.row, m.column);
-                match kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        // A fresh click dismisses any lingering copy confirmation;
-                        // if it lands on a copy chip the key match below re-sets it.
-                        // (Don't clear on the button *release* or on drag/motion —
-                        // that would wipe the "Copied" a copy-chip click just set,
-                        // making it flicker.)
-                        self.copied_flash = None;
-                        // A press on the scroll bar scrubs the viewport (like the
-                        // wheel — the selection stays put); holding the button then
-                        // drags it. Checked before rows/chips so its column wins.
-                        scrollbar_drag = false;
-                        if let Some(sz) = size
-                            && let Some(sb) = UI::tree_scrollbar(
-                                sz.width,
-                                sz.height,
-                                self.search_mode,
-                                self.can_repack(),
-                                self.current_tree_len(),
-                            )
-                            && sb.hit(col, row)
-                        {
-                            self.scroll_offset = sb.offset_at(row);
-                            scrollbar_drag = true;
-                            continue;
-                        }
-                        // A click on a status badge acts as its key (the health
-                        // badge → `h`, opening the report); otherwise a hit on a
-                        // footer chip / `[×]` acts like its key.
-                        let badge_action =
-                            (!self.search_mode)
-                                .then_some(size)
-                                .flatten()
-                                .and_then(|sz| {
-                                    let badges = self.screen_badges(HelpCtx::Tree);
-                                    UI::badge_bar_hit(sz.width, sz.height, col, row, &badges)
-                                        .and_then(|i| badges.get(i).and_then(|b| b.action()))
-                                });
-                        let hit = if let Some(k) = badge_action {
-                            Some(KeyEvent::new(KeyCode::Char(k), KeyModifiers::NONE))
-                        } else {
-                            crate::ui::region_hit(&self.clickable.borrow(), col, row)
-                        };
-                        if let Some(k) = hit {
-                            synth = Some(k); // clicked a badge / a hint chip / [×]
-                        } else if let Some(sz) = size {
-                            let body_top =
-                                UI::tree_header_rows(sz.width, self.search_mode, self.can_repack())
-                                    as u16;
-                            let body_bottom = sz.height.saturating_sub(2); // status bar
-                            if row >= body_top && row < body_bottom {
-                                let idx = self.scroll_offset + (row - body_top) as usize;
-                                if idx < self.current_tree_len() {
-                                    // A click exactly on a group's ▸/▾ twisty (the
-                                    // arrow sits at column `2 * depth`) toggles it on
-                                    // a single click, like clicking a folder's arrow.
-                                    let on_arrow = {
-                                        let tree = if self.search_mode {
-                                            &self.filtered_tree
-                                        } else {
-                                            &self.flattened_tree
-                                        };
-                                        matches!(
-                                            tree.get(idx),
-                                            Some((TreeNode::Group { .. }, depth)) if col == 2 * *depth as u16
-                                        )
-                                    };
-                                    self.selected_idx = idx;
-                                    if on_arrow {
-                                        last_click = None;
-                                        self.activate_selection(); // group → toggle
-                                    } else {
-                                        // Otherwise a lone click just selects the row
-                                        // (highlight + status bar move there — visible
-                                        // feedback); a double-click opens it / toggles.
-                                        let double = matches!(
-                                            last_click,
-                                            Some((t, r)) if r == row && t.elapsed() < DOUBLE_CLICK
-                                        );
-                                        if double {
-                                            last_click = None;
-                                            if self.search_mode {
-                                                self.reveal_search_result();
-                                            } else if let Some(nav) = self.activate_selection() {
-                                                return Ok(nav);
-                                            }
-                                        } else {
-                                            last_click = Some((std::time::Instant::now(), row));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Dragging after a press on the scroll bar keeps scrubbing the
-                    // viewport to wherever the pointer is (clamped to the track).
-                    MouseEventKind::Drag(MouseButton::Left) if scrollbar_drag => {
-                        if let Some(sz) = size
-                            && let Some(sb) = UI::tree_scrollbar(
-                                sz.width,
-                                sz.height,
-                                self.search_mode,
-                                self.can_repack(),
-                                self.current_tree_len(),
-                            )
-                        {
-                            self.scroll_offset = sb.offset_at(row);
-                        }
-                    }
-                    // Releasing ends any scroll-bar drag.
-                    MouseEventKind::Up(MouseButton::Left) => scrollbar_drag = false,
-                    // Wheel scrolls the viewport (not the selection); the offset
-                    // is clamped to range before the next draw.
-                    MouseEventKind::ScrollDown => {
-                        self.copied_flash = None;
-                        self.scroll_offset = self.scroll_offset.saturating_add(WHEEL_STEP)
-                    }
-                    MouseEventKind::ScrollUp => {
-                        self.copied_flash = None;
-                        self.scroll_offset = self.scroll_offset.saturating_sub(WHEEL_STEP)
-                    }
-                    // Hovering the read-only / health badge floats its hint; a
-                    // footer chip floats its help; moving off any hides it.
-                    MouseEventKind::Moved => {
-                        if let Some(sz) = size {
-                            self.update_hovers(HelpCtx::Tree, sz.width, sz.height, col, row);
-                        }
-                    }
-                    _ => {}
-                }
-                // A clicked hint becomes a synthesized key handled below; any other
-                // mouse event was handled inline here.
-                if synth.is_none() {
-                    continue;
-                }
-            }
-
-            // Handle a real key press, or one synthesized from a clicked hint / [×].
-            let key_event = match synth {
-                Some(k) => k,
-                None => match ev {
-                    Event::Key(k) => k,
-                    _ => continue,
-                },
-            };
-            {
-                // Any key also dismisses the copy confirmation.
-                self.copied_flash = None;
-                // A non-Latin key (wrong layout) can't match a shortcut; outside
-                // search, flash a hint instead of silently ignoring it.
-                if !self.search_mode
-                    && let Some(c) = wrong_layout_char(&key_event)
-                {
-                    layout_hint = Some(c);
-                    continue;
-                }
-                match key_event {
-                    // Ctrl-C always quits (even mid-search).
-                    KeyEvent {
-                        code: KeyCode::Char('c'),
-                        modifiers: KeyModifiers::CONTROL,
-                        ..
-                    } => return Ok(Nav::Quit),
-                    // Space or `:` opens the command palette (a fuzzy launcher for
-                    // every tree command; Enter still opens/toggles the row). The
-                    // chosen command runs after the palette hands the terminal back.
-                    KeyEvent {
-                        code: KeyCode::Char(' ') | KeyCode::Char(':'),
-                        ..
-                    } if !self.search_mode => {
-                        if let Some(cmd) = self.with_terminal(|s, t| s.command_palette(t))
-                            && let Some(nav) = self.run_command(cmd)
-                        {
-                            return Ok(nav);
-                        }
-                    }
-                    // Every other tree command dispatches through the registry
-                    // ([`run_command`]) — the same path the palette uses — so the
-                    // key and the palette entry can't drift. In search mode the
-                    // letters fall through to the query instead.
-                    KeyEvent {
-                        code: KeyCode::Char(c),
-                        modifiers,
-                        ..
-                    } if !self.search_mode
-                        && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                        && tree_command_for_key(c).is_some() =>
-                    {
-                        let cmd = tree_command_for_key(c).expect("guarded by is_some");
-                        if let Some(nav) = self.run_command(cmd) {
-                            return Ok(nav);
-                        }
-                    }
-                    // While searching, '/' is ignored rather than typed into the query.
-                    KeyEvent {
-                        code: KeyCode::Char('/'),
-                        ..
-                    } => {}
-                    KeyEvent {
-                        code: KeyCode::Esc, ..
-                    } if self.search_mode => self.exit_search_mode(),
-                    // Shift+↑/↓ jump to the previous/next sibling (same depth,
-                    // same parent). These must precede the plain arrow arms,
-                    // which match any modifiers.
-                    KeyEvent {
-                        code: KeyCode::Up,
-                        modifiers: KeyModifiers::SHIFT,
-                        ..
-                    } => self.move_to_sibling(false),
-                    KeyEvent {
-                        code: KeyCode::Down,
-                        modifiers: KeyModifiers::SHIFT,
-                        ..
-                    } => self.move_to_sibling(true),
-                    KeyEvent {
-                        code: KeyCode::Up, ..
-                    } => {
-                        let step = self.held_step(KeyCode::Up, accel_step_row) as i32;
-                        self.move_selection(-step);
-                    }
-                    KeyEvent {
-                        code: KeyCode::Down,
-                        ..
-                    } => {
-                        let step = self.held_step(KeyCode::Down, accel_step_row) as i32;
-                        self.move_selection(step);
-                    }
-                    // While searching, the arrows edit the query: Shift+←/→ jump
-                    // the text caret to the start/end, plain ←/→ move it one
-                    // character at a time.
-                    KeyEvent {
-                        code: KeyCode::Left,
-                        modifiers: KeyModifiers::SHIFT,
-                        ..
-                    } if self.search_mode => self.search_cursor = 0,
-                    KeyEvent {
-                        code: KeyCode::Right,
-                        modifiers: KeyModifiers::SHIFT,
-                        ..
-                    } if self.search_mode => {
-                        self.search_cursor = self.search_query.chars().count();
-                    }
-                    KeyEvent {
-                        code: KeyCode::Left,
-                        ..
-                    } if self.search_mode => {
-                        self.search_cursor = self.search_cursor.saturating_sub(1);
-                    }
-                    KeyEvent {
-                        code: KeyCode::Right,
-                        ..
-                    } if self.search_mode => {
-                        self.search_cursor =
-                            (self.search_cursor + 1).min(self.search_query.chars().count());
-                    }
-                    // In the results list Home/End jump to the first/last match.
-                    KeyEvent {
-                        code: KeyCode::Home,
-                        ..
-                    } if self.search_mode => self.selected_idx = 0,
-                    KeyEvent {
-                        code: KeyCode::End, ..
-                    } if self.search_mode => {
-                        self.selected_idx = self.filtered_tree.len().saturating_sub(1);
-                    }
-                    // PageUp/PageDown move the cursor by one screenful — both while
-                    // browsing the tree and in the search results list — and by
-                    // several screenfuls while held (so paging through a big tree
-                    // accelerates, like the arrow keys).
-                    KeyEvent {
-                        code: KeyCode::PageUp,
-                        ..
-                    } => {
-                        let step = (self.page_rows()
-                            * self.held_step(KeyCode::PageUp, accel_step_page))
-                            as i32;
-                        self.move_selection(-step);
-                    }
-                    KeyEvent {
-                        code: KeyCode::PageDown,
-                        ..
-                    } => {
-                        let step = (self.page_rows()
-                            * self.held_step(KeyCode::PageDown, accel_step_page))
-                            as i32;
-                        self.move_selection(step);
-                    }
-                    // ← jumps to the parent group; → enters the group (its
-                    // first child), expanding it first if collapsed.
-                    KeyEvent {
-                        code: KeyCode::Left,
-                        ..
-                    } => self.move_to_parent(),
-                    KeyEvent {
-                        code: KeyCode::Right,
-                        ..
-                    } => self.move_to_first_child(),
-                    // While searching, Tab jumps to the highlighted result's
-                    // place in the tree (leaving search), so you can see it in
-                    // context — Enter still opens its detail.
-                    KeyEvent {
-                        code: KeyCode::Tab, ..
-                    } if self.search_mode => self.reveal_search_result(),
-                    // Otherwise Tab toggles to the file browser (the checkpoint's
-                    // directory) — routed through the registry so the key and the
-                    // `View: File browser` palette entry share one action.
-                    KeyEvent {
-                        code: KeyCode::Tab, ..
-                    } => {
-                        if let Some(nav) = self.run_command(Cmd::ViewFiles) {
-                            return Ok(nav);
-                        }
-                    }
-                    // Enter acts on the highlighted row in both modes: expand a
-                    // group, or open a tensor detail (returned to the navigator).
-                    // (Space no longer does this — it opens the command palette,
-                    // handled earlier.)
-                    KeyEvent {
-                        code: KeyCode::Enter,
-                        ..
-                    } => {
-                        if let Some(nav) = self.activate_selection() {
-                            return Ok(nav);
-                        }
-                    }
-                    // While searching, space is ignored rather than typed into the query.
-                    KeyEvent {
-                        code: KeyCode::Char(' '),
-                        ..
-                    } => {}
-                    // Backspace edits the query while searching, otherwise steps
-                    // back through the screen history.
-                    KeyEvent {
-                        code: KeyCode::Backspace,
-                        ..
-                    } if self.search_mode => self.search_backspace(),
-                    KeyEvent {
-                        code: KeyCode::Backspace,
-                        ..
-                    } => return Ok(Nav::Back),
-                    // `\` steps forward through the screen history.
-                    KeyEvent {
-                        code: KeyCode::Char('\\'),
-                        ..
-                    } if !self.search_mode => return Ok(Nav::Forward),
-                    KeyEvent {
-                        code: KeyCode::Char(c),
-                        ..
-                    } if self.search_mode => self.search_insert(c),
-                    // Remove left/right file navigation since we're showing all files merged
-                    _ => {}
-                }
-            }
-        }
     }
 
     /// Two-line status bar for the row under the cursor: a leading glyph, a
@@ -6137,14 +7656,24 @@ impl Explorer {
         if mode == OpenMode::OneShot {
             match &screen {
                 Screen::Detail { tensor, slice } => {
-                    self.run_detail(tensor, *slice, stats_start, Interaction::OneShot);
+                    self.run_mode_once(&mut DetailMode::new(
+                        tensor.clone(),
+                        *slice,
+                        stats_start,
+                        Interaction::OneShot,
+                    ))?;
                 }
                 Screen::Data {
                     tensor,
                     repr,
                     slice,
                 } => {
-                    self.run_data(tensor, *repr, *slice, Interaction::OneShot);
+                    self.run_mode_once(&mut DataMode::new(
+                        tensor.clone(),
+                        *repr,
+                        *slice,
+                        Interaction::OneShot,
+                    ))?;
                 }
                 // The tree renders itself; the file browser, layout map and rename
                 // editor are interactive-only (a `--files`/`--layout --exit` falls back).
@@ -6194,1207 +7723,6 @@ impl Explorer {
             self.terminal = Some(term);
         }
         Ok(Some(screen))
-    }
-
-    /// The tensor detail screen. Sub-views: `m` heatmap, `v` numeric values
-    /// (returned to the navigator as a new screen), `d` reinterpret dtype, `s`
-    /// compute statistics. Backspace / `\` step through the screen history; any
-    /// other key goes back to the tree. Returns the chosen [`Nav`].
-    fn run_detail(
-        &mut self,
-        tensor_name: &str,
-        start_slice: usize,
-        stats_start: StatsStart,
-        interaction: Interaction,
-    ) -> Nav {
-        // Own the live Ratatui terminal for the duration of the screen (taken out
-        // of `self` so the immutable-borrow draw closures can coexist with it),
-        // then hand it back — mirroring `run_tree`'s take/put-back.
-        let mut term = self
-            .terminal
-            .take()
-            .expect("interactive loop owns the terminal");
-        let nav = self.run_detail_loop(
-            &mut term,
-            tensor_name,
-            start_slice,
-            stats_start,
-            interaction,
-        );
-        self.terminal = Some(term);
-        nav
-    }
-
-    /// The detail screen's interactive loop, drawing through the borrowed live
-    /// `term`. Split out of [`Self::run_detail`] so the terminal can be lent as a
-    /// `&mut` separate from `&self` (the cached-stats / override reads go through
-    /// `RefCell`, so the loop only needs `&self`).
-    fn run_detail_loop(
-        &self,
-        term: &mut crate::tui::LiveTerminal,
-        tensor_name: &str,
-        start_slice: usize,
-        stats_start: StatsStart,
-        interaction: Interaction,
-    ) -> Nav {
-        let Some(tensor) = self.tensors.iter().find(|t| t.name == tensor_name).cloned() else {
-            return Nav::Open(Screen::Tree);
-        };
-        let tensor = &tensor;
-        let overridable = dtype_overridable(tensor);
-        let unindexed = self.unindexed.contains(&tensor.source_path);
-        // A remote (`--ssh-read`) source has no local bytes: statistics and the
-        // data views can't run, so we don't preload/scan and the data keys show a
-        // metadata-only notice instead of failing.
-        let remote = crate::remote::is_remote_source(&tensor.source_path);
-        // While this screen is up, compute the tensor's exact stats in the
-        // background and show the scan live on the Statistics line (a spinner +
-        // timer) rather than silently claiming "press s". The reduction streams
-        // the tensor in bounded blocks — never holding more than one block, so
-        // memory stays flat even for a multi-GB tensor — and warms the OS/disk
-        // cache (the dominant cost on NFS) as a side effect, so the heatmap /
-        // numeric view then opens fast; only the tiny result is kept. Dropping
-        // `scan` on any exit from this screen cancels the worker, so it never
-        // contends with the data-view scan we navigate into (whatever it warmed
-        // stays in the OS cache). Off via `--no-preload`; skipped when
-        // `--compute-stats` scans synchronously below, in one-shot mode, or for
-        // formats we don't byte-read (e.g. GGUF).
-        let warm = self.preload
-            && stats_start != StatsStart::Auto
-            && interaction == Interaction::Interactive
-            && overridable
-            && !remote;
-        let mut scan: Option<ScanJob> = None;
-        let mut spin_frame = 0usize;
-        let mut first = true;
-        // A floating pop-up (legend `l` / copied command `y`) shown over the live
-        // detail frame. While it's up the loop keeps redrawing and polling, so a
-        // running scan's progress animates behind it; any key dismisses it.
-        let mut overlay: Option<Overlay> = None;
-        // Set right after `c` copies the screen; confirmed on the bottom line
-        // until the next key or `COPY_FLASH` elapses.
-        let mut copied_since: Option<std::time::Instant> = None;
-        // A wrong-keyboard-layout hint to flash on the next frame; cleared on the
-        // next input.
-        let mut layout_hint: Option<char> = None;
-        loop {
-            let view = self.active_view(&tensor.name);
-            let shape = self
-                .shape_overrides
-                .borrow()
-                .get(&tensor.name)
-                .cloned()
-                .unwrap_or_else(|| tensor.shape.clone());
-            // `--compute-stats` kicks off the scan synchronously on first open,
-            // animating the spinner right here; normal browsing stays fast.
-            if first && stats_start == StatsStart::Auto && !remote {
-                self.compute_stats_animated(term, tensor, view, |f, sv| {
-                    self.render_detail_frame(
-                        f,
-                        tensor,
-                        &shape,
-                        view,
-                        overridable,
-                        unindexed,
-                        sv,
-                        None,
-                        None,
-                        None,
-                    );
-                });
-            }
-            // Stats: shown if cached, else — while warming — a live spinner for
-            // the background scan. Switching the dtype (`d`) restarts it for the
-            // new view; the result is cached the moment it lands.
-            let stats = self.cached_stats(tensor, view);
-            let stats_view = match &stats {
-                Some(s) => {
-                    scan = None;
-                    StatsView::Ready(s)
-                }
-                None if warm => {
-                    if scan.as_ref().is_none_or(|j| j.view != view) {
-                        scan = Some(self.spawn_stats_scan(tensor, view));
-                    }
-                    let finished = scan
-                        .as_ref()
-                        .and_then(|j| j.handle.as_ref())
-                        .is_some_and(|h| h.is_finished());
-                    if finished {
-                        let mut job = scan.take().unwrap();
-                        if let Some(h) = job.handle.take()
-                            && let Ok(Ok(s)) = h.join()
-                        {
-                            self.stats_cache
-                                .borrow_mut()
-                                .insert((tensor.name.clone(), view), s);
-                        }
-                        continue; // redraw with the freshly cached stats
-                    }
-                    // Hold off the spinner briefly so a quick scan doesn't flash it.
-                    let job = scan.as_ref().unwrap();
-                    if job.started.elapsed() >= std::time::Duration::from_millis(120) {
-                        spin_frame = spin_frame.wrapping_add(1);
-                        StatsView::Computing {
-                            spinner: STATS_SPINNER[spin_frame % STATS_SPINNER.len()],
-                            elapsed: job.started.elapsed(),
-                            progress: job.progress(),
-                        }
-                    } else {
-                        StatsView::Pending
-                    }
-                }
-                None => StatsView::Pending,
-            };
-            // Show the value histogram below the stats once it's been computed.
-            let hist = self
-                .histogram_cache
-                .borrow()
-                .get(&(tensor.name.clone(), view, self.histogram_bins.get()))
-                .cloned();
-            // Force a full repaint on the first frame so the detail fully
-            // overwrites whatever screen preceded it.
-            if first && term.clear().is_err() {
-                return Nav::Quit;
-            }
-            // Confirm a screen copy on the bottom line while the flash is still
-            // within its window (dismissed by the next key or the timed poll) —
-            // composited over the detail frame in the same draw.
-            let show_flash = copied_since.is_some_and(|t| t.elapsed() < COPY_FLASH);
-            let hint = layout_hint;
-            if term
-                .draw(|f| {
-                    self.render_detail_frame(
-                        f,
-                        tensor,
-                        &shape,
-                        view,
-                        overridable,
-                        unindexed,
-                        stats_view,
-                        hist.as_ref(),
-                        None,
-                        overlay.as_ref(),
-                    );
-                    if show_flash {
-                        UI::render_copied_flash(f, "screen contents");
-                    }
-                    if let Some(c) = hint {
-                        UI::render_notice(f, &layout_hint_msg(c));
-                    }
-                })
-                .is_err()
-            {
-                return Nav::Quit;
-            }
-            // One-shot mode: leave this frame up and exit without reading keys.
-            if first && interaction == Interaction::OneShot {
-                return Nav::Quit;
-            }
-            first = false;
-            // Block for a key when idle; while the background scan runs, poll so
-            // the spinner keeps ticking and a finished scan is harvested promptly.
-            // Pending input pauses the scan (it releases the file lock between
-            // blocks) so the keypress's own work isn't stuck behind a block read.
-            let ev = if overlay.is_some() {
-                // A pop-up is up: never pause the scan (the pop-up does no file
-                // I/O), and poll so its progress keeps animating behind it; with
-                // no scan there's nothing to animate, so just wait for the key.
-                if let Some(job) = &scan {
-                    job.pause.store(false, Ordering::Relaxed);
-                    if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false) {
-                        event::read()
-                    } else {
-                        continue;
-                    }
-                } else {
-                    event::read()
-                }
-            } else if let Some(job) = &scan {
-                if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false) {
-                    job.pause.store(true, Ordering::Relaxed);
-                    event::read()
-                } else {
-                    job.pause.store(false, Ordering::Relaxed);
-                    continue;
-                }
-            } else if let Some(t) = copied_since {
-                // A copy confirmation is up: wake when it expires so it can be
-                // cleared without a key press.
-                let remaining = COPY_FLASH.saturating_sub(t.elapsed());
-                if !remaining.is_zero() && event::poll(remaining).unwrap_or(false) {
-                    event::read()
-                } else {
-                    copied_since = None;
-                    continue; // flash window elapsed — redraw without it
-                }
-            } else {
-                event::read()
-            };
-            // A fresh key or click dismisses a lingering copy confirmation (`c`
-            // re-sets it below). The button *release* / drag / motion that follows
-            // a click must NOT, or the "Copied" the click set would flicker away.
-            let fresh = match &ev {
-                Ok(Event::Key(_)) => true,
-                Ok(Event::Mouse(m)) => matches!(
-                    m.kind,
-                    MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                ),
-                _ => false,
-            };
-            if fresh {
-                copied_since = None;
-            }
-            // The shortcut bubble clears on any input (its chip may be gone on the
-            // next screen); the read-only badge hover persists and is refreshed by
-            // the mouse-move handler, so it stays live over an overlay too.
-            self.hovered_shortcut.set(None);
-            // While a pop-up overlay is up, any key dismisses it (Ctrl-C still
-            // quits) rather than acting as a screen command; the loop then
-            // redraws the detail without it.
-            if overlay.is_some() {
-                // A key or a mouse click dismisses the pop-up; motion refreshes the
-                // hover bubbles behind it (so they stay live); drag/wheel are
-                // ignored so a modifier-drag to select doesn't close it.
-                match &ev {
-                    Ok(Event::Key(key)) => {
-                        if is_ctrl_c(key) {
-                            quit_immediately();
-                        }
-                        overlay = None;
-                    }
-                    Ok(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => {
-                        overlay = None;
-                    }
-                    Ok(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Moved) => {
-                        if let Ok(sz) = term.size() {
-                            self.update_hovers(
-                                HelpCtx::Detail,
-                                sz.width,
-                                sz.height,
-                                m.column,
-                                m.row,
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-            // A click on a footer chip / `[×]` acts like its key, routed through the
-            // match below; other mouse events (wheel, release, drag, motion) do
-            // nothing on the detail screen.
-            let mut ev = match ev {
-                Ok(Event::Mouse(m)) => {
-                    if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-                        // A click on the (underlined) `File:` path opens its layout
-                        // map — the shared link path, before the footer-chip hit-test.
-                        if let Some(nav) = self.layout_link_at(m.column, m.row) {
-                            return nav;
-                        }
-                        match crate::ui::region_hit(&self.clickable.borrow(), m.column, m.row) {
-                            Some(k) => Ok(Event::Key(k)),
-                            None => continue,
-                        }
-                    } else {
-                        // Hovering the read-only badge floats its hint; a footer chip
-                        // floats its help bubble; moving off (or any other motion)
-                        // hides them again on the next redraw.
-                        if matches!(m.kind, MouseEventKind::Moved)
-                            && let Ok(sz) = term.size()
-                        {
-                            self.update_hovers(
-                                HelpCtx::Detail,
-                                sz.width,
-                                sz.height,
-                                m.column,
-                                m.row,
-                            );
-                        }
-                        continue;
-                    }
-                }
-                other => other,
-            };
-            // Any input clears a prior layout hint; a non-Latin key (wrong layout)
-            // flashes the hint instead of being treated as "any other key" (which
-            // would navigate back to the tree).
-            layout_hint = None;
-            if let Ok(Event::Key(k)) = &ev
-                && let Some(c) = wrong_layout_char(k)
-            {
-                layout_hint = Some(c);
-                continue;
-            }
-            // Space or `:` opens the command palette; the chosen command is
-            // dispatched as its shortcut key (fed into the match below), so it runs
-            // through the same handlers.
-            if let Ok(Event::Key(KeyEvent {
-                code: KeyCode::Char(' ') | KeyCode::Char(':'),
-                ..
-            })) = &ev
-            {
-                let layout_ok = !remote
-                    && std::path::Path::new(&tensor.source_path)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
-                let entries = available_detail_commands(overridable, layout_ok);
-                let chosen = self.run_palette(term, entries, HelpCtx::Detail, |s, f| {
-                    s.render_detail_frame(
-                        f,
-                        tensor,
-                        &shape,
-                        view,
-                        overridable,
-                        unindexed,
-                        stats_view,
-                        hist.as_ref(),
-                        None,
-                        None,
-                    );
-                });
-                match chosen {
-                    Some(cmd) => ev = Ok(Event::Key(detail_cmd_key(cmd))),
-                    None => continue,
-                }
-            }
-            // Metadata-only (remote): the data keys can't run without local bytes, so
-            // float a notice over the detail explaining why instead of attempting a
-            // read that fails with an erasing pop-up.
-            if remote
-                && let Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Char('m' | 'v' | 'h' | 's' | 'S' | 'b' | 'B'),
-                    ..
-                })) = &ev
-            {
-                overlay = Some(Overlay::Notice(
-                    "Read remotely with --ssh-read: only the structure is here. Data views \
-                     (heatmap, values, histogram, statistics) need the file locally — copy the \
-                     checkpoint down to preview its values."
-                        .to_string(),
-                ));
-                continue;
-            }
-            match ev {
-                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
-                Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Char('m'),
-                    ..
-                })) => {
-                    return Nav::Open(Screen::Data {
-                        tensor: tensor.name.clone(),
-                        repr: Representation::Heatmap,
-                        slice: start_slice,
-                    });
-                }
-                Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Char('v'),
-                    ..
-                })) => {
-                    return Nav::Open(Screen::Data {
-                        tensor: tensor.name.clone(),
-                        repr: Representation::Values,
-                        slice: start_slice,
-                    });
-                }
-                // Tab jumps to this tensor's place in its shard's byte-layout map
-                // (local safetensors only; a no-op otherwise).
-                Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Tab, ..
-                })) => {
-                    if let Some(screen) = self.tensor_layout_screen(tensor) {
-                        return Nav::Open(screen);
-                    }
-                }
-                // Compute the whole-tensor value histogram, animating the bars
-                // filling in below the statistics.
-                Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Char('h'),
-                    ..
-                })) => {
-                    self.ensure_detail_histogram(
-                        term,
-                        tensor,
-                        view,
-                        &shape,
-                        overridable,
-                        unindexed,
-                    );
-                }
-                // Set the histogram's bucket count (then (re)compute and show it).
-                Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Char('b') | KeyCode::Char('B'),
-                    ..
-                })) => {
-                    // The bins prompt floats over the live detail frame; redraw it
-                    // (no overlay) as the prompt's background.
-                    let background = |f: &mut ratatui::Frame| {
-                        self.render_detail_frame(
-                            f,
-                            tensor,
-                            &shape,
-                            view,
-                            overridable,
-                            unindexed,
-                            stats_view,
-                            hist.as_ref(),
-                            None,
-                            None,
-                        );
-                    };
-                    let changed =
-                        match self.prompt_bins(term, background, self.histogram_bins.get()) {
-                            BinsChoice::Set(n) => {
-                                self.histogram_bins.set(Some(n));
-                                true
-                            }
-                            BinsChoice::Clear => {
-                                self.histogram_bins.set(None);
-                                true
-                            }
-                            BinsChoice::Cancel => false,
-                        };
-                    if changed {
-                        self.ensure_detail_histogram(
-                            term,
-                            tensor,
-                            view,
-                            &shape,
-                            overridable,
-                            unindexed,
-                        );
-                    }
-                }
-                // Compute exact whole-tensor statistics on demand, animating the
-                // spinner in the detail screen's Statistics line.
-                Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Char('s') | KeyCode::Char('S'),
-                    ..
-                })) => {
-                    self.compute_stats_animated(term, tensor, view, |f, sv| {
-                        self.render_detail_frame(
-                            f,
-                            tensor,
-                            &shape,
-                            view,
-                            overridable,
-                            unindexed,
-                            sv,
-                            None,
-                            None,
-                            None,
-                        );
-                    });
-                }
-                // Reinterpret the dtype from the detail screen too.
-                Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Char('d') | KeyCode::Char('D'),
-                    ..
-                })) if overridable => {
-                    if let Some(chosen) = self.prompt_dtype(term, tensor, DtypePreview::Detail) {
-                        let def = self.default_view(&tensor.name);
-                        let mut overrides = self.dtype_overrides.borrow_mut();
-                        if chosen == def {
-                            overrides.remove(&tensor.name);
-                        } else {
-                            overrides.insert(tensor.name.clone(), chosen);
-                        }
-                    }
-                }
-                // Reshape (shape override) from the detail screen too.
-                Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Char('r') | KeyCode::Char('R'),
-                    ..
-                })) if overridable => {
-                    let current = self.shape_overrides.borrow().get(&tensor.name).cloned();
-                    let background = |f: &mut ratatui::Frame| {
-                        self.render_detail_frame(
-                            f,
-                            tensor,
-                            &shape,
-                            view,
-                            overridable,
-                            unindexed,
-                            stats_view,
-                            hist.as_ref(),
-                            None,
-                            None,
-                        );
-                    };
-                    match self.prompt_reshape(term, background, tensor, current.as_deref()) {
-                        ReshapeChoice::Set(s) => {
-                            self.shape_overrides
-                                .borrow_mut()
-                                .insert(tensor.name.clone(), s);
-                        }
-                        ReshapeChoice::Clear => {
-                            self.shape_overrides.borrow_mut().remove(&tensor.name);
-                        }
-                        ReshapeChoice::Cancel => {}
-                    }
-                }
-                // Copy the detail screen's text to the clipboard.
-                Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Char('c'),
-                    ..
-                })) => {
-                    let hist = self
-                        .histogram_cache
-                        .borrow()
-                        .get(&(tensor.name.clone(), view, self.histogram_bins.get()))
-                        .cloned();
-                    // Capture the screen via the same Ratatui render as the live
-                    // frame (no overlay), so the copied text matches what's shown.
-                    if let Ok(text) = self.detail_plain(
-                        tensor,
-                        &shape,
-                        view,
-                        overridable,
-                        unindexed,
-                        stats_view,
-                        hist.as_ref(),
-                        None,
-                    ) {
-                        copy_to_clipboard(&text);
-                    }
-                    copied_since = Some(std::time::Instant::now());
-                }
-                // `y` copies the CLI command and raises it as a pop-up over the
-                // live frame; the loop keeps animating any running scan behind it.
-                Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Char('y'),
-                    ..
-                })) => {
-                    let cmd = self.command_for_detail(tensor);
-                    copy_to_clipboard(&cmd);
-                    overlay = Some(Overlay::Command(cmd));
-                }
-                // `l` raises the legend as a pop-up over the live frame (same:
-                // the detail, including a running scan's progress, animates on).
-                Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Char('l'),
-                    ..
-                })) => overlay = Some(Overlay::Legend(Legend::Detail)),
-                // History navigation.
-                Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Backspace,
-                    ..
-                })) => return Nav::Back,
-                Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Char('\\'),
-                    ..
-                })) => return Nav::Forward,
-                // Any other key goes back to the tree.
-                Ok(Event::Key(_)) => return Nav::Open(Screen::Tree),
-                Ok(_) => {} // resize etc.: just redraw the detail
-                Err(_) => return Nav::Quit,
-            }
-        }
-    }
-
-    /// Draw the heatmap or numeric grid for the tensor, sized to the terminal.
-    /// `m`/`v` switch representation in place (no trip back to the detail
-    /// screen). For 3D tensors this shows one 2D slice at a fixed first index
-    /// (the 0th by default); `[`/`]` and the ← → arrows step through the slices,
-    /// wrapping around at both ends. Any other key returns to the detail screen.
-    /// A tensor data view (heatmap or numeric grid). Handles its keys in place
-    /// (slice nav, `m`/`v`, `e`, `z`, `d`); Backspace / `\` step through the
-    /// screen history and any other key goes back to the detail screen. Returns
-    /// the chosen [`Nav`] plus where the user left it (representation, slice) so
-    /// the navigator can record it for back/forward.
-    ///
-    /// Owns the live Ratatui terminal for the screen's duration (taken out of
-    /// `self` so the immutable-borrow draw closures can coexist with it) and hands
-    /// it back — mirroring [`Self::run_detail`].
-    fn run_data(
-        &mut self,
-        tensor_name: &str,
-        repr: Representation,
-        start_slice: usize,
-        interaction: Interaction,
-    ) -> (Nav, Representation, usize) {
-        let mut term = self
-            .terminal
-            .take()
-            .expect("interactive loop owns the terminal");
-        let out = self.run_data_loop(&mut term, tensor_name, repr, start_slice, interaction);
-        self.terminal = Some(term);
-        out
-    }
-
-    /// The data view's interactive loop, drawing through the borrowed live `term`.
-    /// Split out of [`Self::run_data`] so the terminal can be lent as a `&mut`
-    /// separate from `&self` (the cached-stats / sample reads go through
-    /// `RefCell`, so the loop only needs `&self`).
-    fn run_data_loop(
-        &self,
-        term: &mut crate::tui::LiveTerminal,
-        tensor_name: &str,
-        repr: Representation,
-        start_slice: usize,
-        interaction: Interaction,
-    ) -> (Nav, Representation, usize) {
-        let Some(tensor) = self.tensors.iter().find(|t| t.name == tensor_name).cloned() else {
-            return (Nav::Back, repr, start_slice);
-        };
-        let tensor = &tensor;
-        let mut repr = repr;
-        let mut slice = start_slice;
-        // The exact-stats scan for the current `(tensor, view)`, running on a
-        // worker thread so the view stays interactive while it computes; `None`
-        // once the stats are cached. `spin_frame` advances the spinner.
-        let mut scan: Option<ScanJob> = None;
-        let mut spin_frame = 0usize;
-        // Set right after `c` copies the screen; shows a confirmation on the
-        // bottom line until the next key or `COPY_FLASH` elapses.
-        let mut copied_since: Option<std::time::Instant> = None;
-        // A floating pop-up (legend `l` / copied command `y`) shown over the live
-        // data frame; while it's up the loop keeps redrawing and polling so a
-        // running scan animates behind it, and any key dismisses it.
-        let mut overlay: Option<Overlay> = None;
-        // Force a full repaint on entry so the data view fully overwrites whatever
-        // screen preceded it.
-        let mut first = true;
-        // A wrong-keyboard-layout hint to flash on the next frame; cleared on the
-        // next input.
-        let mut layout_hint: Option<char> = None;
-        loop {
-            // The data-view layout is a session-remembered preference, so it
-            // sticks as you move between tensors and in/out of the preview.
-            let mode = match self.data_view_layout.get() {
-                DataLayout::Edges => SampleMode::Edges {
-                    row_tail: self.data_view_row_tail.get(),
-                    col_tail: self.data_view_col_tail.get(),
-                },
-                DataLayout::Overview => SampleMode::Grid,
-                DataLayout::Window => SampleMode::Window {
-                    row_off: self.data_view_win_row.get(),
-                    col_off: self.data_view_win_col.get(),
-                },
-            };
-            // The dtype reinterpretation remembered for this tensor, if any.
-            let view = self.active_view(&tensor.name);
-
-            // Exact stats power the value range, heatmap scale and stats line, but
-            // the scan can take a while on a big tensor. Run it on a worker thread
-            // and keep the view fully interactive while it computes: switching the
-            // dtype restarts the scan for the new view, while a layout/slice/pan
-            // change just re-renders (the stats are whole-tensor, layout-agnostic).
-            // The result is cached the moment it lands.
-            let stats = self.cached_stats(tensor, view);
-            let stats_view = match &stats {
-                Some(s) => {
-                    scan = None;
-                    StatsView::Ready(s)
-                }
-                None => {
-                    // (Re)start the scan when none is running or it's for a stale
-                    // view; dropping the old job cancels its worker.
-                    if scan.as_ref().is_none_or(|j| j.view != view) {
-                        scan = Some(self.spawn_stats_scan(tensor, view));
-                    }
-                    let finished = scan
-                        .as_ref()
-                        .and_then(|j| j.handle.as_ref())
-                        .is_some_and(|h| h.is_finished());
-                    // One-shot mode (`--exit`) has no interactivity, so just wait
-                    // for the scan; interactively, harvest it once it's finished.
-                    if interaction == Interaction::OneShot || finished {
-                        let mut job = scan.take().unwrap();
-                        if let Some(h) = job.handle.take()
-                            && let Ok(Ok(s)) = h.join()
-                        {
-                            self.stats_cache
-                                .borrow_mut()
-                                .insert((tensor.name.clone(), view), s);
-                        }
-                        continue; // redraw with the freshly cached stats
-                    }
-                    // Hold off the spinner briefly so a quick scan doesn't flash it.
-                    let job = scan.as_ref().unwrap();
-                    if job.started.elapsed() >= std::time::Duration::from_millis(120) {
-                        spin_frame = spin_frame.wrapping_add(1);
-                        StatsView::Computing {
-                            spinner: STATS_SPINNER[spin_frame % STATS_SPINNER.len()],
-                            elapsed: job.started.elapsed(),
-                            progress: job.progress(),
-                        }
-                    } else {
-                        StatsView::Pending
-                    }
-                }
-            };
-
-            let stripe = self.data_view_stripe.get();
-            let base = self.data_view_base.get();
-            // Force a full repaint on the first frame so the data view fully
-            // overwrites whatever screen preceded it.
-            if first && term.clear().is_err() {
-                return (Nav::Quit, repr, slice);
-            }
-            // Confirm a screen copy on the bottom line while the flash is still
-            // within its window — composited over the data frame in the same draw.
-            let show_flash = copied_since.is_some_and(|t| t.elapsed() < COPY_FLASH);
-            let hint = layout_hint;
-            // Size the grid to the live terminal (the same size the draw below
-            // renders into); fall back to a sane default if it can't be read.
-            let (cols, rows) = term
-                .size()
-                .map(|s| (s.width, s.height))
-                .unwrap_or((100, 40));
-            // (slices, overridable, clamped slice) on success — sample once, then
-            // draw the cached result through Ratatui (overlay composited last).
-            let (slices, overridable) = match self
-                .prepare_data_sample(tensor, repr, slice, view, mode, stats_view, cols, rows)
-            {
-                Ok((slices, overridable, clamped)) => {
-                    slice = clamped;
-                    if term
-                        .draw(|f| {
-                            let cache = self.sample_cache.borrow();
-                            let sample = &cache.as_ref().unwrap().sample;
-                            *self.clickable.borrow_mut() = match repr {
-                                Representation::Heatmap => {
-                                    UI::render_heatmap(f, tensor, sample, stats_view)
-                                }
-                                Representation::Values => {
-                                    UI::render_values(f, tensor, sample, stats_view, stripe, base)
-                                }
-                            };
-                            match overlay.as_ref() {
-                                Some(Overlay::Legend(l)) => UI::render_legend_band(f, *l),
-                                Some(Overlay::Command(c)) => UI::render_command_band(f, c),
-                                Some(Overlay::Notice(m)) => UI::render_notice_box(f, m),
-                                None => {}
-                            }
-                            if show_flash {
-                                UI::render_copied_flash(f, "screen contents");
-                            }
-                            if let Some(c) = hint {
-                                UI::render_notice(f, &layout_hint_msg(c));
-                            }
-                        })
-                        .is_err()
-                    {
-                        return (Nav::Quit, repr, slice);
-                    }
-                    (slices, overridable)
-                }
-                Err(msg) => {
-                    let _ = term.draw(|f| UI::render_message(f, "Data preview unavailable", &msg));
-                    if interaction == Interaction::Interactive
-                        && let Ok(Event::Key(key)) = event::read()
-                        && is_ctrl_c(&key)
-                    {
-                        quit_immediately();
-                    }
-                    return (
-                        Nav::Open(Screen::Detail {
-                            tensor: tensor.name.clone(),
-                            slice,
-                        }),
-                        repr,
-                        slice,
-                    );
-                }
-            };
-
-            first = false;
-
-            // One-shot mode (`--exit`): stats are computed above and the final
-            // frame is now drawn, so leave it up and exit without reading keys.
-            if interaction == Interaction::OneShot {
-                return (Nav::Quit, repr, slice);
-            }
-
-            // Read one event, then coalesce any buffered follow-ups (an arrow
-            // key's auto-repeat) before redrawing. Each redraw re-samples the
-            // tensor — slower than the key-repeat rate — so without draining, held
-            // keys pile up and the separator keeps "coasting" through the backlog
-            // after release. Applying the whole burst, then redrawing once, keeps
-            // it smooth and stops the moment the key lifts. While a scan is
-            // running we poll instead of blocking, so the spinner keeps ticking
-            // and a finished scan is harvested promptly.
-            let mut pending = if overlay.is_some() {
-                // A pop-up is up: never pause the scan (the pop-up does no file
-                // I/O), and poll so its progress keeps animating behind it; with
-                // no scan there's nothing to animate, so just wait for the key.
-                if let Some(job) = &scan {
-                    job.pause.store(false, Ordering::Relaxed);
-                    if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false) {
-                        event::read()
-                    } else {
-                        continue;
-                    }
-                } else {
-                    event::read()
-                }
-            } else if let Some(job) = &scan {
-                if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false) {
-                    // Input pending — give the foreground priority: pause the scan
-                    // (it releases the HDF5 lock between blocks) so the re-sample
-                    // this keypress triggers isn't stuck behind a long block read,
-                    // which is what made dtype/layout changes lag and buffer keys.
-                    // It resumes the moment input goes idle (the else branch).
-                    job.pause.store(true, Ordering::Relaxed);
-                    event::read()
-                } else {
-                    job.pause.store(false, Ordering::Relaxed);
-                    continue; // idle — let the scan run; spinner reuses the cache
-                }
-            } else if let Some(t) = copied_since {
-                // A copy confirmation is up: wake when it expires so it can be
-                // cleared without a key press.
-                let remaining = COPY_FLASH.saturating_sub(t.elapsed());
-                if !remaining.is_zero() && event::poll(remaining).unwrap_or(false) {
-                    event::read()
-                } else {
-                    copied_since = None;
-                    continue; // flash window elapsed — redraw without it
-                }
-            } else {
-                event::read()
-            };
-            // While a pop-up overlay is up, any key dismisses it (Ctrl-C still
-            // quits) rather than acting as a screen command; the loop then redraws
-            // the data view without it.
-            if overlay.is_some() {
-                // A key or a mouse click dismisses the pop-up; motion refreshes the
-                // hover bubbles behind it (so they stay live); drag/wheel are
-                // ignored so a modifier-drag to select doesn't close it.
-                match &pending {
-                    Ok(Event::Key(key)) => {
-                        if is_ctrl_c(key) {
-                            quit_immediately();
-                        }
-                        overlay = None;
-                    }
-                    Ok(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => {
-                        overlay = None;
-                    }
-                    Ok(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Moved) => {
-                        if let Ok(sz) = term.size() {
-                            self.update_hovers(HelpCtx::Data, sz.width, sz.height, m.column, m.row);
-                        }
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-            loop {
-                // Any input clears a prior layout hint; a fresh wrong-layout key
-                // re-sets it below. The shortcut bubble also clears; the read-only
-                // badge hover persists and is refreshed by the mouse-move handler,
-                // so it stays live over an overlay too.
-                layout_hint = None;
-                self.hovered_shortcut.set(None);
-                match pending {
-                    Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
-                    // A non-Latin key (wrong layout) can't match a shortcut; flash a
-                    // hint instead of treating it as "any other key" (→ back to detail).
-                    Ok(Event::Key(key)) if wrong_layout_char(&key).is_some() => {
-                        layout_hint = wrong_layout_char(&key);
-                        break;
-                    }
-                    Ok(Event::Key(KeyEvent {
-                        code, modifiers, ..
-                    })) => {
-                        // Any key dismisses a lingering copy confirmation; `c`
-                        // sets it again below.
-                        copied_since = None;
-                        let shift = modifiers.contains(KeyModifiers::SHIFT);
-                        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
-                        let edges = matches!(mode, SampleMode::Edges { .. });
-                        let window = matches!(mode, SampleMode::Window { .. });
-                        // One arrow press moves the divider by a single index
-                        // (step = 1 / budget); Shift snaps the split to one end.
-                        let nudge = |cell: &Cell<f32>, toward_tail: bool, budget: usize| {
-                            let step = if shift {
-                                1.0
-                            } else {
-                                1.0 / budget.max(1) as f32
-                            };
-                            let delta = if toward_tail { step } else { -step };
-                            cell.set((cell.get() + delta).clamp(0.0, 1.0));
-                        };
-                        // Pan the window along one axis. Ctrl jumps fully to an
-                        // edge (`usize::MAX` is clamped back to the last position
-                        // on the next draw), Shift strides one screenful, a plain
-                        // arrow moves `plain` rows/columns — 1 for a tap, more while
-                        // the arrow is held (see `held_step`).
-                        let pan = |cell: &Cell<usize>, forward: bool, page: usize, plain: usize| {
-                            let cur = cell.get();
-                            let next = if ctrl {
-                                if forward { usize::MAX } else { 0 }
-                            } else {
-                                let step = if shift { page.max(1) } else { plain.max(1) };
-                                if forward {
-                                    cur.saturating_add(step)
-                                } else {
-                                    cur.saturating_sub(step)
-                                }
-                            };
-                            cell.set(next);
-                        };
-                        match code {
-                            // Switch representation in place, keeping the current slice.
-                            KeyCode::Char('m') => repr = Representation::Heatmap,
-                            KeyCode::Char('v') => repr = Representation::Values,
-                            // Cycle the data-view layout overview → edges → window
-                            // → overview; remembered for the session.
-                            KeyCode::Char('e') | KeyCode::Char('E') => self
-                                .data_view_layout
-                                .set(self.data_view_layout.get().next()),
-                            // Cycle the numeric grid's zebra striping rows → cols →
-                            // off; remembered for the session.
-                            KeyCode::Char('z') | KeyCode::Char('Z') => self
-                                .data_view_stripe
-                                .set(self.data_view_stripe.get().next()),
-                            // Cycle the numeral base dec → hex → oct → bin
-                            // (numeric grid); remembered for the session.
-                            KeyCode::Char('b') | KeyCode::Char('B') => {
-                                self.data_view_base.set(self.data_view_base.get().next())
-                            }
-                            // In the edges view the arrows move the divider between
-                            // the first and last blocks (Shift pushes it fully to one
-                            // end): e.g. `→` slides the column divider right, growing
-                            // the first columns and shrinking the last; `↓` slides the
-                            // row divider down. They take precedence over slice
-                            // stepping, which stays on `[` / `]` and `/` while edges
-                            // is active.
-                            KeyCode::Up if edges => {
-                                nudge(&self.data_view_row_tail, true, self.edge_row_budget.get())
-                            }
-                            KeyCode::Down if edges => {
-                                nudge(&self.data_view_row_tail, false, self.edge_row_budget.get())
-                            }
-                            KeyCode::Left if edges => {
-                                nudge(&self.data_view_col_tail, true, self.edge_col_budget.get())
-                            }
-                            KeyCode::Right if edges => {
-                                nudge(&self.data_view_col_tail, false, self.edge_col_budget.get())
-                            }
-                            // In the window view the arrows pan the visible block
-                            // (Shift strides a screenful; Ctrl+arrow also jumps to
-                            // an edge on terminals that send it); slice stepping
-                            // stays on `[` / `]` and `/`.
-                            KeyCode::Up if window => pan(
-                                &self.data_view_win_row,
-                                false,
-                                self.win_page_rows.get(),
-                                self.held_step(KeyCode::Up, accel_step_row),
-                            ),
-                            KeyCode::Down if window => pan(
-                                &self.data_view_win_row,
-                                true,
-                                self.win_page_rows.get(),
-                                self.held_step(KeyCode::Down, accel_step_row),
-                            ),
-                            KeyCode::Left if window => pan(
-                                &self.data_view_win_col,
-                                false,
-                                self.win_page_cols.get(),
-                                self.held_step(KeyCode::Left, accel_step_row),
-                            ),
-                            KeyCode::Right if window => pan(
-                                &self.data_view_win_col,
-                                true,
-                                self.win_page_cols.get(),
-                                self.held_step(KeyCode::Right, accel_step_row),
-                            ),
-                            // Jump straight to an edge (clamped on the next draw):
-                            // Home/End to the first/last column, PageUp/PageDown to
-                            // the first/last row. Plain navigation keys, so they
-                            // work everywhere (unlike Ctrl+arrow).
-                            KeyCode::Home if window => self.data_view_win_col.set(0),
-                            KeyCode::End if window => self.data_view_win_col.set(usize::MAX),
-                            KeyCode::PageUp if window => self.data_view_win_row.set(0),
-                            KeyCode::PageDown if window => self.data_view_win_row.set(usize::MAX),
-                            // Open the dtype menu; `d` or `D`. The scan keeps
-                            // running (paused while input flows, see the event
-                            // wait below), so its live previews read uncontended
-                            // and an accidental press you `Esc` out of never throws
-                            // away a long computation. Picking a *different* dtype
-                            // changes the view, which restarts the scan for it.
-                            KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
-                                if let Some(chosen) = self.prompt_dtype(
-                                    term,
-                                    tensor,
-                                    DtypePreview::Data { repr, slice, mode },
-                                ) {
-                                    let def = self.default_view(&tensor.name);
-                                    let mut overrides = self.dtype_overrides.borrow_mut();
-                                    if chosen == def {
-                                        overrides.remove(&tensor.name);
-                                    } else {
-                                        overrides.insert(tensor.name.clone(), chosen);
-                                    }
-                                }
-                            }
-                            // Reshape: reinterpret the dimensions (`r`). The new
-                            // shape must have the same element count; an empty
-                            // entry clears the override. Reset the slice since the
-                            // slice count can change.
-                            KeyCode::Char('r') | KeyCode::Char('R') if overridable => {
-                                let current =
-                                    self.shape_overrides.borrow().get(&tensor.name).cloned();
-                                // The prompt floats over the current data view; redraw
-                                // it from the cached sample as the prompt's background.
-                                let background = |f: &mut ratatui::Frame| {
-                                    self.render_cached_data(
-                                        f, tensor, repr, stats_view, stripe, base,
-                                    );
-                                };
-                                match self.prompt_reshape(
-                                    term,
-                                    background,
-                                    tensor,
-                                    current.as_deref(),
-                                ) {
-                                    ReshapeChoice::Set(s) => {
-                                        self.shape_overrides
-                                            .borrow_mut()
-                                            .insert(tensor.name.clone(), s);
-                                        slice = 0;
-                                    }
-                                    ReshapeChoice::Clear => {
-                                        self.shape_overrides.borrow_mut().remove(&tensor.name);
-                                        slice = 0;
-                                    }
-                                    ReshapeChoice::Cancel => {}
-                                }
-                            }
-                            // Jump straight to a slice by typing its index.
-                            KeyCode::Char('/') if slices > 1 => {
-                                let background = |f: &mut ratatui::Frame| {
-                                    self.render_cached_data(
-                                        f, tensor, repr, stats_view, stripe, base,
-                                    );
-                                };
-                                if let Some(n) = self.prompt_slice(term, background, slices) {
-                                    slice = n;
-                                }
-                            }
-                            // Shift + arrows jump ~5% of the slices at once (wrapping).
-                            KeyCode::Right if slices > 1 && shift => {
-                                slice = (slice + slice_step(slices)) % slices
-                            }
-                            KeyCode::Left if slices > 1 && shift => {
-                                slice = (slice + slices - slice_step(slices)) % slices
-                            }
-                            // Plain arrows / brackets step one slice (wrapping).
-                            KeyCode::Char(']') | KeyCode::Right if slices > 1 => {
-                                slice = (slice + 1) % slices
-                            }
-                            KeyCode::Char('[') | KeyCode::Left if slices > 1 => {
-                                slice = (slice + slices - 1) % slices
-                            }
-                            // Copy the data view's text to the clipboard (the same
-                            // Ratatui render the `--plain` path emits).
-                            KeyCode::Char('c') => {
-                                if let Ok(text) = self.data_plain(
-                                    tensor, repr, slice, view, mode, stats_view, stripe, base, None,
-                                ) {
-                                    copy_to_clipboard(&text);
-                                }
-                                copied_since = Some(std::time::Instant::now());
-                            }
-                            // `y` copies the CLI command that reopens this exact
-                            // view and floats it over the live frame as a Ratatui
-                            // pop-up; the scan keeps running behind it.
-                            KeyCode::Char('y') => {
-                                let cmd = self.command_for_data(tensor, repr, slice);
-                                copy_to_clipboard(&cmd);
-                                overlay = Some(Overlay::Command(cmd));
-                            }
-                            // Open the legend for this representation as a pop-up
-                            // band over the live data view; the background stats
-                            // scan keeps running while it's up.
-                            KeyCode::Char('l') => {
-                                overlay = Some(Overlay::Legend(match repr {
-                                    Representation::Heatmap => Legend::Heatmap,
-                                    Representation::Values => Legend::Values,
-                                }));
-                            }
-                            // History navigation: Backspace back, `\` forward.
-                            KeyCode::Backspace => return (Nav::Back, repr, slice),
-                            KeyCode::Char('\\') => return (Nav::Forward, repr, slice),
-                            // Space or `:` opens the command palette; the chosen
-                            // command is dispatched as its shortcut key (re-fed
-                            // through this match).
-                            KeyCode::Char(' ') | KeyCode::Char(':') => {
-                                let entries = available_data_commands(overridable);
-                                let chosen =
-                                    self.run_palette(term, entries, HelpCtx::Data, |s, f| {
-                                        let _ = s.render_data_frame(
-                                            f, tensor, repr, slice, view, mode, stats_view, stripe,
-                                            base, None,
-                                        );
-                                    });
-                                if let Some(cmd) = chosen {
-                                    pending = Ok(Event::Key(data_cmd_key(cmd)));
-                                    continue;
-                                }
-                            }
-                            // Any other key goes back to the detail screen.
-                            _ => {
-                                return (
-                                    Nav::Open(Screen::Detail {
-                                        tensor: tensor.name.clone(),
-                                        slice,
-                                    }),
-                                    repr,
-                                    slice,
-                                );
-                            }
-                        }
-                    }
-                    Ok(Event::Mouse(m)) => match m.kind {
-                        // A click on a footer chip / `[×]` acts like its key: feed
-                        // the synthesized key back through this match.
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            if let Some(k) =
-                                crate::ui::region_hit(&self.clickable.borrow(), m.column, m.row)
-                            {
-                                pending = Ok(Event::Key(k));
-                                continue;
-                            }
-                        }
-                        // The wheel pages through the slices (like `]` / `[`).
-                        MouseEventKind::ScrollDown if slices > 1 => slice = (slice + 1) % slices,
-                        MouseEventKind::ScrollUp if slices > 1 => {
-                            slice = (slice + slices - 1) % slices
-                        }
-                        // Hovering the read-only badge floats its hint; a footer chip
-                        // floats its help bubble.
-                        MouseEventKind::Moved => {
-                            if let Ok(sz) = term.size() {
-                                self.update_hovers(
-                                    HelpCtx::Data,
-                                    sz.width,
-                                    sz.height,
-                                    m.column,
-                                    m.row,
-                                );
-                            }
-                        }
-                        _ => {}
-                    },
-                    Ok(_) => {} // resize etc.: re-sample and redraw the same slice
-                    Err(_) => return (Nav::Back, repr, slice),
-                }
-                // Drain the next buffered event without blocking; once the queue
-                // is empty, fall out to redraw exactly once for the whole burst.
-                // A just-opened pop-up stops the drain so the next iteration shows
-                // it (and any further keys dismiss it rather than acting as commands).
-                if overlay.is_none() && event::poll(std::time::Duration::ZERO).unwrap_or(false) {
-                    pending = event::read();
-                } else {
-                    break;
-                }
-            }
-        }
     }
 
     /// Compute and show the detail screen's value histogram (animating the bars
@@ -7972,444 +8300,6 @@ impl Explorer {
         match self.files.as_slice() {
             [one] => Some(one.clone()),
             many => Some(browse_root_of(many)),
-        }
-    }
-
-    /// The in-place **rename** mode ([`Screen::Rename`], opened with `R`): a
-    /// full-screen editor with a dynamic list of source→new-name rule pairs, `Tab`
-    /// autocomplete (numbers → `{layer}`/`{expert}` placeholders), and a before→after
-    /// diff preview marking each affected tensor OK / collides / won't-fit. `Enter`
-    /// stages the rename; a second `Enter` (the confirm gate) applies it in place and
-    /// reloads the tree. `^Y` copies the equivalent `convert --map` command.
-    ///
-    /// Keys: `Tab` autocomplete · `↑`/`↓` move between fields (`↓` past the end adds
-    /// a rule) · `←`/`→`/Home/End move the caret · `^N`/`^D` add / remove a rule ·
-    /// `PgUp`/`PgDn` scroll the preview · `Esc` back · `^C` quit.
-    fn run_rename(
-        &mut self,
-        saved_pairs: Vec<(String, String)>,
-    ) -> Result<(Nav, Vec<(String, String)>)> {
-        let Some(target) = self.rename_target() else {
-            return Ok((Nav::Back, saved_pairs)); // gated; bail safely if it slips
-        };
-        // Read every shard header once, so the preview is instant as the user types.
-        let loaded = match crate::rename::load(&target) {
-            Ok(l) => l,
-            Err(e) => {
-                let msg = format!("Cannot open the rename editor: {e:#}");
-                self.with_terminal(|s, t| {
-                    s.float_until_dismissed(t, |f| {
-                        s.render_tree_frame(f, true);
-                        UI::render_notice(f, &msg);
-                    });
-                });
-                return Ok((Nav::Back, saved_pairs));
-            }
-        };
-        // Autocomplete over the deduped *generalized* schemas (one per tensor family)
-        // rather than every concrete name — so a 48-layer model lists one entry.
-        let mut seen = HashSet::new();
-        let schemas: Vec<String> = loaded
-            .names()
-            .iter()
-            .map(|n| crate::rename::generalize(n).0)
-            .filter(|s| seen.insert(s.clone()))
-            .collect();
-        let root = loaded.root().display().to_string();
-        let mut mode = RenameMode::default();
-        // Restore the pairs from a prior visit (e.g. after inspecting a shard's
-        // layout), else start with one blank pair.
-        if !saved_pairs.is_empty() {
-            mode.pairs = saved_pairs
-                .into_iter()
-                .map(|(source, target)| RenamePair { source, target })
-                .collect();
-        }
-        // What was last copied to the clipboard (the `✓ copied …` flash label), or
-        // `None`. Cleared on the next key so the flash is transient.
-        let mut copied: Option<&'static str> = None;
-        let mut first = true;
-
-        // Derived state cached across frames — recomputed (`dirty`) only when the
-        // rule pairs change, so pure caret / focus / scroll moves don't re-preview
-        // the whole checkpoint (which was the source of the arrow-key lag).
-        let mut rules_view: Vec<crate::ui::RenameRuleView> = Vec::new();
-        let mut total = 0usize;
-        let mut warnings: Vec<String> = Vec::new();
-        let mut has_index = false;
-        let mut applicable = false;
-        let mut synth_err: Option<String> = None;
-        let mut cli: Option<String> = None;
-        let mut dirty = true;
-        let mut scroll_max = 0usize;
-
-        // The current rules to persist / restore (dropping fully-blank pairs).
-        let pairs_of = |m: &RenameMode| -> Vec<(String, String)> {
-            m.pairs
-                .iter()
-                .filter(|p| !(p.source.trim().is_empty() && p.target.trim().is_empty()))
-                .map(|p| (p.source.clone(), p.target.clone()))
-                .collect()
-        };
-
-        loop {
-            // Drain a burst of queued input (held arrows) before painting — redraw
-            // once it settles, so movement stays snappy.
-            let input_pending = event::poll(std::time::Duration::ZERO).unwrap_or(false);
-            if !input_pending {
-                if dirty {
-                    let (preview, notes, err) = match mode.build_map() {
-                        Ok((map, notes)) => (loaded.preview(&map), notes, None),
-                        Err(e) => (crate::rename::RenamePreview::default(), Vec::new(), Some(e)),
-                    };
-                    warnings = preview.warnings.clone();
-                    warnings.extend(notes);
-                    has_index = preview.has_index;
-                    applicable = err.is_none() && preview.applicable();
-                    synth_err = err;
-                    cli = self.rename_cli_command(&target, &mode);
-                    // Per-rule summaries (schema before→after, status counts, and the
-                    // per-shard header-fit detail behind a "won't fit" verdict).
-                    rules_view.clear();
-                    total = 0;
-                    for p in &mode.pairs {
-                        if p.source.trim().is_empty() || p.target.trim().is_empty() {
-                            continue;
-                        }
-                        let Ok((pat, rep)) = crate::rename::rule_from_fields(&p.source, &p.target)
-                        else {
-                            continue;
-                        };
-                        let Ok(single) = crate::diff::NameMap::from_pairs([(pat, rep)]) else {
-                            continue;
-                        };
-                        let pv = loaded.preview(&single);
-                        let mut v = crate::ui::RenameRuleView {
-                            from: p.source.clone(),
-                            to: p.target.clone(),
-                            total: pv.rows.len(),
-                            // Tensors the pattern matches (changed or not) — so a
-                            // just-autocompleted no-op rule reads as "matches N",
-                            // not "matches no tensors".
-                            matched: single.match_count(loaded.names().iter().map(String::as_str)),
-                            ok: 0,
-                            collide: 0,
-                            wont_fit: 0,
-                            invalid: 0,
-                            shards: loaded.shard_fits(&single),
-                        };
-                        for r in &pv.rows {
-                            match r.status {
-                                crate::rename::RenameStatus::Ok => v.ok += 1,
-                                crate::rename::RenameStatus::Collision => v.collide += 1,
-                                crate::rename::RenameStatus::WontFit => v.wont_fit += 1,
-                                crate::rename::RenameStatus::Invalid => v.invalid += 1,
-                            }
-                        }
-                        total += v.total;
-                        rules_view.push(v);
-                    }
-                    dirty = false;
-                }
-
-                let mut term = self
-                    .terminal
-                    .take()
-                    .expect("interactive loop owns the terminal");
-                if first {
-                    term.clear()?;
-                    first = false;
-                }
-                let mut sm = 0usize;
-                let mut chips = Vec::new();
-                let mut clicks = Vec::new();
-                term.draw(|f| {
-                    let (m, ch, c) = draw_rename_frame(
-                        f,
-                        &root,
-                        &mode,
-                        &schemas,
-                        &rules_view,
-                        total,
-                        &warnings,
-                        has_index,
-                        applicable,
-                        &synth_err,
-                        cli.as_deref(),
-                        copied,
-                    );
-                    sm = m;
-                    chips = ch;
-                    clicks = c;
-                    // Float the hovered footer chip's help bubble, like every view.
-                    self.render_shortcut_hover(f);
-                })?;
-                scroll_max = sm;
-                *self.clickable.borrow_mut() = chips; // footer chips (replay a key)
-                *self.links.borrow_mut() = clicks; // shard → layout, tensor → tree
-                self.terminal = Some(term);
-                mode.scroll = mode.scroll.min(scroll_max);
-            }
-
-            // Resolve the event to a key: a real keypress, a footer-chip click
-            // (which replays the chip's key, like the other views), or a mouse
-            // action handled inline (scroll / link / hover).
-            let key = match event::read()? {
-                Event::Key(k) => k,
-                Event::Mouse(m) => match m.kind {
-                    MouseEventKind::ScrollDown => {
-                        mode.scroll = (mode.scroll + 3).min(scroll_max);
-                        continue;
-                    }
-                    MouseEventKind::ScrollUp => {
-                        mode.scroll = mode.scroll.saturating_sub(3);
-                        continue;
-                    }
-                    MouseEventKind::Moved => {
-                        if let Some(sz) = self.terminal.as_ref().and_then(|t| t.size().ok()) {
-                            self.update_hovers(
-                                HelpCtx::Rename,
-                                sz.width,
-                                sz.height,
-                                m.column,
-                                m.row,
-                            );
-                        }
-                        continue;
-                    }
-                    // A preview link (shard → layout, concrete source → tree), else a
-                    // footer chip (replays its key). Typed rules are saved so
-                    // Backspace returns here.
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        if let Some(nav) = self.link_click(m.column, m.row) {
-                            return Ok((nav, pairs_of(&mode)));
-                        }
-                        match crate::ui::region_hit(&self.clickable.borrow(), m.column, m.row) {
-                            Some(k) => k,
-                            None => continue,
-                        }
-                    }
-                    _ => continue,
-                },
-                _ => continue,
-            };
-            if is_ctrl_c(&key) {
-                quit_immediately();
-            }
-            let KeyEvent {
-                code, modifiers, ..
-            } = key;
-            // `^Y` copies the `convert --map` command that applies the rename
-            // non-interactively (works while editing).
-            if code == KeyCode::Char('y') && modifiers.contains(KeyModifiers::CONTROL) {
-                copied = (cli.is_some() && copy_to_clipboard(cli.as_deref().unwrap_or_default()))
-                    .then_some("the apply command");
-                continue;
-            }
-            copied = None;
-            // Confirm gate: a clean rename staged by Enter needs a second Enter to
-            // actually rewrite the files; any other key cancels it.
-            if mode.confirming {
-                match code {
-                    KeyCode::Enter => match self.apply_rename_mode(&loaded, &mode) {
-                        // Applied — the rules are spent; return to the tree with no
-                        // saved pairs.
-                        Ok(nav) => return Ok((nav, Vec::new())),
-                        Err(e) => {
-                            mode.error = Some(e);
-                            mode.confirming = false;
-                        }
-                    },
-                    _ => mode.confirming = false,
-                }
-                continue;
-            }
-            match code {
-                KeyCode::Esc => return Ok((Nav::Back, pairs_of(&mode))),
-                // Space / `:` opens the command palette — the primary way to
-                // reach copy / legend / back (bare letters are typed into the
-                // fields). Safe: a tensor-name schema never has a space/colon.
-                KeyCode::Char(' ') | KeyCode::Char(':') => {
-                    let entries =
-                        available_rename_commands(applicable, cli.is_some(), mode.pairs.len());
-                    let chosen = self.with_terminal(|s, t| {
-                        s.run_palette(t, entries, HelpCtx::Rename, |_s, f| {
-                            let _ = draw_rename_frame(
-                                f,
-                                &root,
-                                &mode,
-                                &schemas,
-                                &rules_view,
-                                total,
-                                &warnings,
-                                has_index,
-                                applicable,
-                                &synth_err,
-                                cli.as_deref(),
-                                copied,
-                            );
-                        })
-                    });
-                    match chosen {
-                        Some(RenameCmd::Back) => {
-                            return Ok((Nav::Back, pairs_of(&mode)));
-                        }
-                        Some(RenameCmd::Quit) => {
-                            return Ok((Nav::Quit, pairs_of(&mode)));
-                        }
-                        Some(RenameCmd::AddRule) => {
-                            mode.add_pair();
-                            mode.error = None;
-                            dirty = true;
-                        }
-                        Some(RenameCmd::RemoveRule) => {
-                            mode.remove_pair();
-                            mode.error = None;
-                            dirty = true;
-                        }
-                        Some(RenameCmd::Apply) => {
-                            if applicable {
-                                mode.confirming = true;
-                                mode.error = None;
-                            } else {
-                                mode.error = Some(
-                                    "can't apply yet — fix the blocked rows / warnings above"
-                                        .to_string(),
-                                );
-                            }
-                        }
-                        Some(RenameCmd::CopyApplyCmd) => {
-                            copied = (cli.is_some()
-                                && copy_to_clipboard(cli.as_deref().unwrap_or_default()))
-                            .then_some("the apply command");
-                        }
-                        Some(RenameCmd::CopyReopenCmd) => {
-                            let cmd = self.command_for_rename(&pairs_of(&mode));
-                            copied = copy_to_clipboard(&cmd).then_some("the reopen command");
-                        }
-                        Some(RenameCmd::CopyScreen) => {
-                            let text = crate::tui::headless_render(120, 40, |f| {
-                                let _ = draw_rename_frame(
-                                    f,
-                                    &root,
-                                    &mode,
-                                    &schemas,
-                                    &rules_view,
-                                    total,
-                                    &warnings,
-                                    has_index,
-                                    applicable,
-                                    &synth_err,
-                                    cli.as_deref(),
-                                    None,
-                                );
-                            });
-                            if let Ok(text) = text {
-                                copied = copy_to_clipboard(&text).then_some("the screen text");
-                            }
-                        }
-                        Some(RenameCmd::Legend) => {
-                            self.with_terminal(|s, t| {
-                                s.float_until_dismissed(t, |f| {
-                                    let _ = draw_rename_frame(
-                                        f,
-                                        &root,
-                                        &mode,
-                                        &schemas,
-                                        &rules_view,
-                                        total,
-                                        &warnings,
-                                        has_index,
-                                        applicable,
-                                        &synth_err,
-                                        cli.as_deref(),
-                                        copied,
-                                    );
-                                    UI::render_legend_band(f, Legend::Rename);
-                                });
-                            });
-                        }
-                        None => {}
-                    }
-                }
-                KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    mode.add_pair();
-                    mode.error = None;
-                    dirty = true;
-                }
-                KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    mode.remove_pair();
-                    mode.error = None;
-                    dirty = true;
-                }
-                // The copy-screen chip / palette sentinel (`\u{1}`): copy the whole
-                // rendered screen as text (the universal `c` command; a bare `c`
-                // types into a field here).
-                KeyCode::Char('\u{1}') => {
-                    let text = crate::tui::headless_render(120, 40, |f| {
-                        let _ = draw_rename_frame(
-                            f,
-                            &root,
-                            &mode,
-                            &schemas,
-                            &rules_view,
-                            total,
-                            &warnings,
-                            has_index,
-                            applicable,
-                            &synth_err,
-                            cli.as_deref(),
-                            None,
-                        );
-                    });
-                    if let Ok(text) = text {
-                        copied = copy_to_clipboard(&text).then_some("the screen text");
-                    }
-                }
-                // Tab autocompletes the focused source (does NOT switch field).
-                KeyCode::Tab => {
-                    mode.autocomplete(&schemas);
-                    mode.error = None;
-                    dirty = true;
-                }
-                KeyCode::Enter => {
-                    if applicable {
-                        mode.confirming = true; // stage → confirm gate
-                        mode.error = None;
-                    } else {
-                        mode.error = Some(
-                            "can't apply yet — fix the blocked rows / warnings above".to_string(),
-                        );
-                    }
-                }
-                // Arrows move between fields; the caret moves with ←/→.
-                KeyCode::Up => mode.focus_up(),
-                KeyCode::Down => mode.focus_down(),
-                KeyCode::Left => mode.left(),
-                KeyCode::Right => mode.right(),
-                KeyCode::Home => mode.cursor = 0,
-                KeyCode::End => mode.caret_to_end(),
-                KeyCode::PageUp => mode.scroll = mode.scroll.saturating_sub(SCROLL_PAGE),
-                KeyCode::PageDown => mode.scroll = (mode.scroll + SCROLL_PAGE).min(scroll_max),
-                KeyCode::Backspace => {
-                    mode.backspace();
-                    mode.error = None;
-                    dirty = true;
-                }
-                KeyCode::Delete => {
-                    mode.delete();
-                    mode.error = None;
-                    dirty = true;
-                }
-                KeyCode::Char(c)
-                    if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                {
-                    mode.insert_char(c);
-                    mode.error = None;
-                    dirty = true;
-                }
-                _ => {}
-            }
         }
     }
 
