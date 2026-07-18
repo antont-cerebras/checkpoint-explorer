@@ -3,18 +3,18 @@ source: tests/cli.rs
 expression: "plain(&[\"--stats\"])"
 ---
 Checkpoint Explorer - [FIXTURE] (1/1)                                                          [×]
-↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · PgUp/PgDn page · Enter open · Tab files · Space/: commands
-E/C all · / search · l legend · h health · s stats · yy copy screen · t copy tree · f copy file · n copy name
-y copy command · ⌫/\ back/fwd · R rename · q quit
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-▾ [FIXTURE] (▦ 7, 124╭ Checkpoint stats ────────────────────────────────────────────╮
-  ▸ 🔧 Metadata (▦ 0, 0 B)  │ Overview                                                     │
-  · lm_head.weight [I32, (2,│   Parameters   124                                           │
-  ▾ model (▦ 6, 240 B)      │   Size         272 B                                         │
-    · embed_tokens.weight [F│                                                              │
-    ▸ layers.0 (▦ 3, 168 B) │ ▤ Files  ×1 safetensors                                      │
-    · norm.weight [F32, (4),│   Largest      272 B     [FIXTURE]                    │
-    · scale.u8 [U8, (8), 8 B│   Smallest     272 B     [FIXTURE]                    │
+▾ [FIXTURE] (▦ 7, 124 params, 272 B)
+  ▸ 🔧 Metadata (▦ 0, 0 B)
+  · lm_head.weight [I32, (2, 4), 32 B]
+  ▾ model (▦ 6, 240 B)      ╭ Checkpoint stats ────────────────────────────────────────────╮
+    · embed_tokens.weight [F│ Overview                                                     │
+    ▸ layers.0 (▦ 3, 168 B) │   Parameters   124                                           │
+    · norm.weight [F32, (4),│   Size         272 B                                         │
+    · scale.u8 [U8, (8), 8 B│                                                              │
+                            │ ▤ Files  ×1 safetensors                                      │
+                            │   Largest      272 B     [FIXTURE]                    │
+                            │   Smallest     272 B     [FIXTURE]                    │
                             │   Average      272 B                                         │
                             │   Median       272 B                                         │
                             │                                                              │
@@ -37,8 +37,8 @@ y copy command · ⌫/\ back/fwd · R rename · q quit
                             │   U8        8 B  1 tensor                                    │
                             │ c copy screen · r copy report · y copy command · Esc dismiss │
                             ╰──────────────────────────────────────────────────────────────╯
-
-
-
+↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · PgUp/PgDn page · Enter open · Tab files · Space/: commands
+E/C all · / search · l legend · h health · s stats · yy copy screen · t copy tree · f copy file · n copy name
+y copy command · ⌫/\ back/fwd · R rename · q quit
  ▪ [FIXTURE]
                                                                                                                editable

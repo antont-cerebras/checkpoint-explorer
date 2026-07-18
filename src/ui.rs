@@ -885,9 +885,26 @@ impl UI {
             .max(1)
     }
 
+    /// Rows the tree's bottom-pinned key-hint footer occupies (0 while searching —
+    /// the search bar rides the header instead). Kept in sync with
+    /// [`Self::render_tree`] so scroll / hit-testing align.
+    pub fn tree_hint_rows(
+        width: u16,
+        search_mode: bool,
+        can_repack: bool,
+        can_rename: bool,
+    ) -> usize {
+        if search_mode {
+            0
+        } else {
+            tree_hint_lines(can_repack, can_rename, width).0.len()
+        }
+    }
+
     /// Body rows visible in the tree at the given size — used to compute the
     /// scroll offset so it stays consistent with [`Self::render_tree`]'s layout
-    /// (header = title + hint/search line(s) + rule; footer = the two status lines).
+    /// (header = title + optional search line + rule; a bottom-pinned hint footer;
+    /// then the two status lines).
     pub fn tree_visible_rows(
         width: u16,
         height: u16,
@@ -895,28 +912,19 @@ impl UI {
         can_repack: bool,
         can_rename: bool,
     ) -> usize {
-        let header = Self::tree_header_rows(width, search_mode, can_repack, can_rename);
+        let header = Self::tree_header_rows(search_mode);
+        let hints = Self::tree_hint_rows(width, search_mode, can_repack, can_rename);
         (height as usize)
-            .saturating_sub(header + TREE_FOOTER_HEIGHT)
+            .saturating_sub(header + hints + TREE_FOOTER_HEIGHT)
             .max(1)
     }
 
-    /// The first terminal row of the tree body — the header height (title +
-    /// hint/search line(s) + rule). Used for mouse hit-testing: a click at row
-    /// `r >= tree_header_rows()` and above the 2-line status bar lands on tree
-    /// row `scroll_offset + (r - tree_header_rows())`.
-    pub fn tree_header_rows(
-        width: u16,
-        search_mode: bool,
-        can_repack: bool,
-        can_rename: bool,
-    ) -> usize {
-        let hint_rows = if search_mode {
-            1
-        } else {
-            tree_hint_lines(can_repack, can_rename, width).0.len()
-        };
-        1 + hint_rows + 1 // title + hint(s) + rule
+    /// The first terminal row of the tree body — the header height (title + the
+    /// search line while searching + rule; the key hints are a bottom footer now).
+    /// Used for mouse hit-testing: a click at row `r >= tree_header_rows()` and above
+    /// the hint footer lands on tree row `scroll_offset + (r - tree_header_rows())`.
+    pub fn tree_header_rows(search_mode: bool) -> usize {
+        if search_mode { 3 } else { 2 } // title + [search] + rule
     }
 
     /// Geometry of the tree's vertical scroll bar for this terminal size and a
@@ -938,7 +946,7 @@ impl UI {
         }
         Some(TreeScrollbar {
             col: width - 1,
-            top: Self::tree_header_rows(width, search_mode, can_repack, can_rename) as u16,
+            top: Self::tree_header_rows(search_mode) as u16,
             rows: rows as u16,
             max_offset: total - rows,
         })
@@ -953,8 +961,6 @@ impl UI {
         if height < (TREE_FOOTER_HEIGHT as u16 + 1) {
             return Vec::new();
         }
-        // Clickable footer chips (built below) become absolute screen rects here.
-        let mut chips: Vec<ChipHit> = Vec::new();
 
         // --- header + tree rows (the region above the 2-line status bar) ---
         let mut lines: Vec<Line> = Vec::new();
@@ -969,14 +975,10 @@ impl UI {
         ))];
         lines.push(Line::from(title));
 
-        // Hint line(s), or the search bar when searching.
+        // The search bar rides the header while searching; the key hints are a
+        // bottom-pinned footer (built below), so they don't push the tree down.
         if config.search_mode {
             lines.push(tree_search_line(config));
-        } else {
-            let (hint_lines, hint_chips) =
-                tree_hint_lines(config.can_repack, config.can_rename, width);
-            lines.extend(hint_lines);
-            chips = hint_chips;
         }
 
         // Separator rule.
@@ -985,9 +987,18 @@ impl UI {
             Style::default().fg(palette::DIM),
         )));
 
+        // The bottom hint footer (absent while searching — the search bar is the
+        // input, and the status bar spells out Esc/Enter).
+        let (hint_lines, chips) = if config.search_mode {
+            (Vec::new(), Vec::new())
+        } else {
+            tree_hint_lines(config.can_repack, config.can_rename, width)
+        };
+        let hint_rows = hint_lines.len();
+
         let header_rows = lines.len();
         let footer_rows = TREE_FOOTER_HEIGHT;
-        let body_rows = (height as usize).saturating_sub(header_rows + footer_rows);
+        let body_rows = (height as usize).saturating_sub(header_rows + hint_rows + footer_rows);
 
         // A vertical scroll bar rides the rightmost column when the tree
         // overflows the viewport — but only in the live TUI; a headless
@@ -1076,6 +1087,20 @@ impl UI {
             );
         }
 
+        // --- key-hint footer, pinned just above the two-line status bar ---
+        let hint_y = height.saturating_sub(TREE_FOOTER_HEIGHT as u16 + hint_rows as u16);
+        if hint_rows > 0 {
+            Paragraph::new(hint_lines).render(
+                Rect {
+                    x: 0,
+                    y: hint_y,
+                    width,
+                    height: hint_rows as u16,
+                },
+                frame.buffer_mut(),
+            );
+        }
+
         // --- bottom two-line status bar ---
         // Reserve room on the right of the bottom status line for the persistent
         // badges drawn there (access, and any health / metadata-only badge), so the
@@ -1149,9 +1174,9 @@ impl UI {
         // the hovered one's bubble — all through the one uniform bar.
         Self::render_badge_bar(frame, config.badges, config.hovered_badge);
 
-        // Clickable regions: each footer chip (the hint block starts at row 1,
-        // below the title) plus the top-right `[×]` (→ quit the tree).
-        let mut regions = chip_regions(&chips, 1);
+        // Clickable regions: each footer chip (the bottom-pinned hint block, at
+        // `hint_y`) plus the top-right `[×]` (→ quit the tree).
+        let mut regions = chip_regions(&chips, hint_y);
         regions.extend(close_button(frame, hint_key('q')));
         regions
     }
@@ -7397,10 +7422,7 @@ mod tests {
         assert_eq!(sb.col, 79);
         assert_eq!(sb.rows as usize, visible);
         assert_eq!(sb.max_offset, 50);
-        assert_eq!(
-            sb.top as usize,
-            UI::tree_header_rows(80, false, false, false)
-        );
+        assert_eq!(sb.top as usize, UI::tree_header_rows(false));
 
         // Track top → offset 0, track bottom → max_offset; outside the track clamps.
         assert_eq!(sb.offset_at(sb.top), 0);
