@@ -1596,14 +1596,87 @@ impl RenameMode2 {
         }
     }
 
-    /// Stage the rename (Enter) if it's clean, else flash why it can't apply yet.
-    fn stage_apply(&mut self) {
-        if self.applicable {
-            self.editor.confirming = true;
-            self.editor.error = None;
-        } else {
+    /// Apply the rename (`R`): flash why it can't yet if it isn't clean, else float a
+    /// confirmation modal and — only on an explicit confirm — rewrite the files.
+    /// Returns `Some(nav)` to leave the editor once applied. Shared by the `R` key
+    /// and the palette's *Apply* command.
+    fn try_apply(&mut self, ex: &mut Explorer, term: &mut crate::tui::LiveTerminal) -> Option<Nav> {
+        if !self.applicable {
             self.editor.error =
                 Some("can't apply yet — fix the blocked rows / warnings above".to_string());
+            return None;
+        }
+        if !self.confirm_apply(term) {
+            return None;
+        }
+        match ex.apply_rename_mode(self.loaded(), &self.editor) {
+            Ok(nav) => {
+                self.applied = true; // rules spent → residual clears them
+                Some(nav)
+            }
+            Err(e) => {
+                self.editor.error = Some(e);
+                None
+            }
+        }
+    }
+
+    /// Float the apply-confirmation modal over the live editor: a summary of what
+    /// will change (from [`crate::rename::Plan::summary_lines`]) plus an
+    /// `[Apply] [Cancel]` choice. Returns `true` only on an explicit confirm
+    /// (`Enter` on *Apply*, or `Y`); `Esc` / `N` / *Cancel* return `false`.
+    fn confirm_apply(&self, term: &mut crate::tui::LiveTerminal) -> bool {
+        let fallback = || vec!["Apply the entered renames in place?".to_string()];
+        let summary = match self.editor.build_map() {
+            Ok((map, _)) => match self.loaded().plan(&map) {
+                Ok(plan) => plan.summary_lines(8),
+                Err(_) => fallback(),
+            },
+            Err(_) => fallback(),
+        };
+        let mut idx = 1usize; // default to the safe choice (Cancel)
+        loop {
+            if term
+                .draw(|f| {
+                    let _ = draw_rename_frame(
+                        f,
+                        &self.root,
+                        &self.editor,
+                        &self.schemas,
+                        &self.rules_view,
+                        self.total,
+                        &self.warnings,
+                        self.has_index,
+                        self.applicable,
+                        &self.synth_err,
+                        self.cli.as_deref(),
+                        self.copied,
+                    );
+                    UI::render_confirm_popup(
+                        f,
+                        "Apply rename in place?",
+                        &summary,
+                        &["Apply", "Cancel"],
+                        idx,
+                    );
+                })
+                .is_err()
+            {
+                return false;
+            }
+            match event::read() {
+                Ok(Event::Key(key)) if is_ctrl_c(&key) => quit_immediately(),
+                Ok(Event::Key(KeyEvent { code, .. })) => match code {
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => idx = 1 - idx,
+                    KeyCode::Char('y' | 'Y') => return true,
+                    KeyCode::Char('n' | 'N') => return false,
+                    KeyCode::Enter => return idx == 0,
+                    KeyCode::Esc => return false,
+                    _ => {}
+                },
+                Ok(_) => {} // other mouse / resize: redraw
+                Err(_) => return false,
+            }
         }
     }
 }
@@ -1805,10 +1878,10 @@ impl Mode for RenameMode2 {
                 self.dirty = true;
                 PaletteResult::Handled
             }
-            Some(RenameCmd::Apply) => {
-                self.stage_apply();
-                PaletteResult::Handled
-            }
+            Some(RenameCmd::Apply) => match self.try_apply(ex, term) {
+                Some(nav) => PaletteResult::Nav(nav),
+                None => PaletteResult::Handled,
+            },
             Some(RenameCmd::CopyApplyCmd) => {
                 self.do_copy_apply();
                 PaletteResult::Handled
@@ -1849,7 +1922,7 @@ impl Mode for RenameMode2 {
     fn handle_key(
         &mut self,
         ex: &mut Explorer,
-        _term: &mut crate::tui::LiveTerminal,
+        term: &mut crate::tui::LiveTerminal,
         key: KeyEvent,
     ) -> Result<Outcome> {
         let KeyEvent {
@@ -1861,27 +1934,8 @@ impl Mode for RenameMode2 {
             return Ok(Outcome::Stay);
         }
         self.copied = None;
-        // Confirm gate: a clean rename staged by Enter needs a second Enter to
-        // actually rewrite the files; any other key cancels it.
-        if self.editor.confirming {
-            if code == KeyCode::Enter {
-                match ex.apply_rename_mode(self.loaded(), &self.editor) {
-                    Ok(nav) => {
-                        self.applied = true; // rules spent → residual clears them
-                        return Ok(Outcome::Leave(nav));
-                    }
-                    Err(e) => {
-                        self.editor.error = Some(e);
-                        self.editor.confirming = false;
-                    }
-                }
-            } else {
-                self.editor.confirming = false;
-            }
-            return Ok(Outcome::Stay);
-        }
-        // When the autocomplete dropdown is open, the arrows drive it and Tab/Enter
-        // accept the highlight (pgcli-style); otherwise they navigate fields / apply.
+        // When the autocomplete dropdown is open, the arrows drive it and Enter
+        // accepts the highlight (pgcli-style); otherwise Enter moves between fields.
         let cands = self.editor.completions(&self.schemas);
         let menu_open = self.editor.menu.is_some() && !cands.is_empty();
         match code {
@@ -1908,14 +1962,24 @@ impl Mode for RenameMode2 {
                 self.editor.error = None;
                 self.dirty = true;
             }
-            // Enter accepts a highlighted candidate; only with the dropdown closed
-            // does it stage the apply.
+            // Enter accepts a highlighted candidate; with the dropdown closed it
+            // moves to the next field (adding a rule past the last) — it never
+            // applies. Apply is `R` (below).
             KeyCode::Enter if menu_open => {
                 self.editor.accept(&self.schemas);
                 self.editor.error = None;
                 self.dirty = true;
             }
-            KeyCode::Enter => self.stage_apply(),
+            KeyCode::Enter => self.editor.focus_down(),
+            // `R` (capital — deliberately hard to hit, since it rewrites files)
+            // applies the rename, after a confirmation pop-up.
+            KeyCode::Char('R')
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(nav) = self.try_apply(ex, term) {
+                    return Ok(Outcome::Leave(nav));
+                }
+            }
             KeyCode::Up if menu_open => self.editor.menu_move(-1, cands.len()),
             KeyCode::Down if menu_open => self.editor.menu_move(1, cands.len()),
             KeyCode::Up => self.editor.focus_up(),
@@ -1930,11 +1994,13 @@ impl Mode for RenameMode2 {
             }
             KeyCode::Backspace => {
                 self.editor.backspace();
+                self.editor.remove_pair_if_empty();
                 self.editor.error = None;
                 self.dirty = true;
             }
             KeyCode::Delete => {
                 self.editor.delete();
+                self.editor.remove_pair_if_empty();
                 self.editor.error = None;
                 self.dirty = true;
             }
@@ -3098,12 +3164,13 @@ const DATA_COMMANDS: &[(DataCmd, &str, &str, char)] = &[
 ];
 
 /// The rename editor's command registry (palette order). The `char` is a *sentinel*
-/// (not a bare accelerator): control chars name the real trigger (`\r` = Enter,
-/// `^N`/`^D`/`^Y`, Esc, `^C`) and `\u{1}`/`\u{2}`/`\u{5}` are the palette-only copy /
-/// legend commands (no key label). [`key_label`] renders them; [`crate::ui::shortcut_help`]
-/// (the `Rename` arms) supplies each one's one-line help, keyed by the same char.
+/// (not a bare accelerator): `R` applies (a capital letter, so it never types into a
+/// field), control chars name the real trigger (`^N`/`^D`/`^Y`, Esc, `^C`) and
+/// `\u{1}`/`\u{2}`/`\u{5}` are the palette-only copy / legend commands (no key label).
+/// [`key_label`] renders them; [`crate::ui::shortcut_help`] (the `Rename` arms)
+/// supplies each one's one-line help, keyed by the same char.
 const RENAME_COMMANDS: &[(RenameCmd, &str, &str, char)] = &[
-    (RenameCmd::Apply, "Rename", "Apply the rename", '\r'),
+    (RenameCmd::Apply, "Rename", "Apply the rename", 'R'),
     (RenameCmd::AddRule, "Rename", "Add a rule", '\u{e}'),
     (
         RenameCmd::RemoveRule,
@@ -3264,7 +3331,6 @@ fn draw_rename_frame(
         applicable,
         scroll: mode.scroll,
         error: display_error.as_deref(),
-        confirming: mode.confirming,
         cli,
         copied,
     };
@@ -9596,8 +9662,6 @@ struct RenameMode {
     cursor: usize,
     /// Scroll offset of the preview pane.
     scroll: usize,
-    /// A staged rename awaiting a confirming second `Enter`.
-    confirming: bool,
     /// The autocomplete dropdown: `Some(i)` when open with candidate `i` highlighted,
     /// `None` when closed. Opens on typing, closes on accept / focus change / `Esc`.
     menu: Option<usize>,
@@ -9613,7 +9677,6 @@ impl Default for RenameMode {
             on_target: false,
             cursor: 0,
             scroll: 0,
-            confirming: false,
             menu: None,
             error: None,
         }
@@ -9834,6 +9897,30 @@ impl RenameMode {
             self.caret_to_end();
             self.menu = None;
         }
+    }
+
+    /// After an edit empties a rule entirely (both fields blank), drop it and move to
+    /// a neighbour — the end of the *previous* rule, or the *next* rule when the first
+    /// is the one removed — so backspacing a just-added rule out of existence Just
+    /// Works. Keeps at least one (blank) rule.
+    fn remove_pair_if_empty(&mut self) {
+        let p = &self.pairs[self.focus_pair];
+        if !(p.source.trim().is_empty() && p.target.trim().is_empty()) || self.pairs.len() <= 1 {
+            return;
+        }
+        let removing = self.focus_pair;
+        self.pairs.remove(removing);
+        if removing == 0 {
+            // No previous rule — land on the new first rule's source.
+            self.focus_pair = 0;
+            self.on_target = false;
+        } else {
+            // Land at the end of the previous rule (its new-name field).
+            self.focus_pair = removing - 1;
+            self.on_target = true;
+        }
+        self.caret_to_end();
+        self.menu = None;
     }
 
     /// The focused field's flat index (source = even, new-name = odd) — the order
@@ -10749,6 +10836,55 @@ mod tests {
         mode.pairs[0].source = "proj".to_string();
         mode.complete_prefix(&schemas);
         assert_eq!(mode.pairs[0].source, "proj");
+    }
+
+    #[test]
+    fn rename_backspacing_a_rule_to_empty_removes_it_and_moves_to_a_neighbor() {
+        let pair = |s: &str, t: &str| RenamePair {
+            source: s.to_string(),
+            target: t.to_string(),
+        };
+
+        // Deleting the last char of a middle/last rule (both fields then blank)
+        // removes it and lands at the end of the *previous* rule's new-name field.
+        let mut mode = RenameMode {
+            pairs: vec![pair("a", "b"), pair("c", "d"), pair("x", "")],
+            focus_pair: 2,
+            cursor: 1,
+            ..Default::default()
+        };
+        mode.backspace(); // "x" → ""
+        mode.remove_pair_if_empty();
+        assert_eq!(mode.pairs.len(), 2);
+        assert_eq!(mode.focus_pair, 1);
+        assert!(mode.on_target, "lands at the end of the previous rule");
+
+        // Removing the *first* rule moves to the new first rule's source instead.
+        let mut mode = RenameMode {
+            pairs: vec![pair("e", ""), pair("f", "g")],
+            cursor: 1,
+            ..Default::default()
+        };
+        mode.backspace(); // "e" → ""
+        mode.remove_pair_if_empty();
+        assert_eq!(mode.pairs.len(), 1);
+        assert_eq!(mode.focus_pair, 0);
+        assert!(!mode.on_target);
+        assert_eq!(mode.pairs[0].source, "f");
+
+        // A rule with content still in the *other* field is NOT removed.
+        let mut mode = RenameMode {
+            pairs: vec![pair("a", "b"), pair("", "keep")],
+            focus_pair: 1,
+            ..Default::default()
+        };
+        mode.remove_pair_if_empty();
+        assert_eq!(mode.pairs.len(), 2, "the new-name field still has content");
+
+        // The last remaining rule is never removed (always ≥1).
+        let mut mode = RenameMode::default();
+        mode.remove_pair_if_empty();
+        assert_eq!(mode.pairs.len(), 1);
     }
 
     #[test]
