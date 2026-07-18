@@ -41,4 +41,4 @@ Histogram: 360 values  (<time>)
 
 
 m heatmap · v values · h histogram · b bins · s stats · d dtype · r reshape · Space/: commands · l legend
-yy copy screen · y copy command · ⌫/\ back/fwd                                                                read-only
+c copy screen · y copy command · ⌫/\ back/fwd                                                                 read-only

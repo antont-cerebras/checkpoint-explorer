@@ -41,4 +41,4 @@ Statistics: min 0 · max 7 · mean 0.9667 · std 1.7854 · zeros 69.2%  (<time>)
 
 
 m heatmap · v values · h histogram · b bins · s stats · d dtype · r reshape · Space/: commands · l legend
-yy copy screen · y copy command · ⌫/\ back/fwd                                                                read-only
+c copy screen · y copy command · ⌫/\ back/fwd                                                                 read-only

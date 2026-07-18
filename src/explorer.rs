@@ -1969,6 +1969,11 @@ impl Mode for RenameMode2 {
                 self.editor.error = None;
                 self.dirty = true;
             }
+            // `^S` copies the whole screen (bare `c` types into a field here, so
+            // copy-screen is a Ctrl key in the editor).
+            KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.do_copy_screen()
+            }
             // `^L` shows the legend (bare `l` types into a field here).
             KeyCode::Char('l') if modifiers.contains(KeyModifiers::CONTROL) => {
                 ex.float_until_dismissed(term, |f| {
@@ -3105,7 +3110,7 @@ const TREE_COMMANDS: &[(Cmd, &str, &str, char)] = &[
     (Cmd::Stats, "View", "Checkpoint stats", 's'),
     (Cmd::Health, "View", "Health report", 'h'),
     (Cmd::Legend, "View", "Legend", 'l'),
-    (Cmd::CopyScreen, "Copy", "Screen text", '\u{6}'), // yy
+    (Cmd::CopyScreen, "Copy", "Screen text", 'c'),
     (Cmd::CopyTree, "Copy", "Tree / tensor list…", 't'),
     (Cmd::CopyPath, "Copy", "File path", 'f'),
     (Cmd::CopyName, "Copy", "Tensor name", 'n'),
@@ -3121,7 +3126,7 @@ const FILE_COMMANDS: &[(FileCmd, &str, &str, char)] = &[
     (FileCmd::TensorTree, "View", "Tensor tree", '\t'),
     (FileCmd::Legend, "View", "Legend", 'l'),
     (FileCmd::CopyPath, "Copy", "File path", 'f'),
-    (FileCmd::CopyScreen, "Copy", "Screen text", '\u{6}'), // yy
+    (FileCmd::CopyScreen, "Copy", "Screen text", 'c'),
     (
         FileCmd::CopyCommand,
         "Copy",
@@ -3136,7 +3141,7 @@ const FILE_COMMANDS: &[(FileCmd, &str, &str, char)] = &[
 const LAYOUT_COMMANDS: &[(LayoutCmd, &str, &str, char)] = &[
     (LayoutCmd::TensorTree, "View", "Tensor tree", '\t'),
     (LayoutCmd::Legend, "View", "Legend", 'l'),
-    (LayoutCmd::CopyScreen, "Copy", "Screen text", '\u{6}'), // yy
+    (LayoutCmd::CopyScreen, "Copy", "Screen text", 'c'),
     (
         LayoutCmd::CopyCommand,
         "Copy",
@@ -3158,7 +3163,7 @@ const DETAIL_COMMANDS: &[(DetailCmd, &str, &str, char)] = &[
     (DetailCmd::Reshape, "View", "Reshape…", 'r'),
     (DetailCmd::FileLayout, "View", "File layout", '\t'),
     (DetailCmd::Legend, "View", "Legend", 'l'),
-    (DetailCmd::CopyScreen, "Copy", "Screen text", '\u{6}'), // yy
+    (DetailCmd::CopyScreen, "Copy", "Screen text", 'c'),
     (
         DetailCmd::CopyCommand,
         "Copy",
@@ -3188,7 +3193,7 @@ const DATA_COMMANDS: &[(DataCmd, &str, &str, char)] = &[
     (DataCmd::Dtype, "View", "Reinterpret dtype…", 'd'),
     (DataCmd::Reshape, "View", "Reshape…", 'r'),
     (DataCmd::Legend, "View", "Legend", 'l'),
-    (DataCmd::CopyScreen, "Copy", "Screen text", '\u{6}'), // yy
+    (DataCmd::CopyScreen, "Copy", "Screen text", 'c'),
     (
         DataCmd::CopyCommand,
         "Copy",
@@ -3213,7 +3218,7 @@ const RENAME_COMMANDS: &[(RenameCmd, &str, &str, char)] = &[
         "Remove the focused rule",
         '\u{4}', // ^D
     ),
-    (RenameCmd::CopyScreen, "Copy", "Screen text", '\u{7}'), // ^Y^Y
+    (RenameCmd::CopyScreen, "Copy", "Screen text", '\u{13}'), // ^S
     (
         RenameCmd::CopyReopenCmd,
         "Copy",
@@ -3253,8 +3258,7 @@ fn key_label(c: char) -> String {
         '\t' => "Tab".to_string(),
         '\r' => "Enter".to_string(),
         '\u{12}' => "^R".to_string(),
-        '\u{6}' => "yy".to_string(),   // copy-screen: double-press `y`
-        '\u{7}' => "^Y^Y".to_string(), // copy-screen in an editing mode: double `^Y`
+        '\u{13}' => "^S".to_string(),
         '\u{e}' => "^N".to_string(),
         '\u{4}' => "^D".to_string(),
         '\u{19}' => "^Y".to_string(),
@@ -6135,22 +6139,6 @@ impl Explorer {
     /// / badge clicks, hover, Ctrl-C, the wrong-layout hint, and the command palette
     /// — so a mode only supplies its content (`render_frame` / `handle_key` /
     /// `handle_mouse` / `open_palette`). Replaces the six hand-rolled `run_*` loops.
-    /// Copy the whole screen's text — a headless render of the mode's own frame, so
-    /// every mode's copy-screen is identical and can't drift. Drives the `yy` / `^Y^Y`
-    /// double-press and the copy-screen footer chip.
-    fn copy_screen_frame(&mut self, mode: &dyn Mode, term: &mut crate::tui::LiveTerminal) {
-        let (w, h) = term
-            .size()
-            .map(|s| (s.width, s.height))
-            .unwrap_or((120, 40));
-        let rendered = crate::tui::headless_render(w, h, |f| mode.render_frame(self, f));
-        if let Ok(text) = rendered
-            && copy_to_clipboard(&text)
-        {
-            self.copied_flash = Some(("the screen text".to_string(), std::time::Instant::now()));
-        }
-    }
-
     fn run_mode(&mut self, mode: &mut dyn Mode) -> Result<Nav> {
         let spec = mode.spec();
         let mut term = self
@@ -6170,10 +6158,6 @@ impl Explorer {
         }
         let _ = term.clear();
         let mut layout_hint: Option<char> = None;
-        // Copy-screen is a *double-press* of the copy-command key (`yy`, or `^Y^Y` in
-        // an editing mode): the first press copies the reopen command (via the mode),
-        // a second copies the whole screen. `pending_copy` arms that second press.
-        let mut pending_copy = false;
 
         let nav = loop {
             // Coalesce a burst of queued input before painting (held arrows stay
@@ -6282,28 +6266,6 @@ impl Explorer {
             }
             // A fresh key clears the copied-flash confirmation.
             self.copied_flash = None;
-
-            // Copy-screen: a second press of the copy-command key (`yy` / `^Y^Y`), or
-            // a click on the `yy`/`^Y^Y` footer chip (which replays the `\u{6}`/`\u{7}`
-            // sentinel). Uniform for every mode — a headless render of its own frame.
-            let copy_cmd = KeyEvent::new(
-                KeyCode::Char('y'),
-                if mode.accepts_text(self) {
-                    KeyModifiers::CONTROL
-                } else {
-                    KeyModifiers::NONE
-                },
-            );
-            if matches!(key.code, KeyCode::Char('\u{6}') | KeyCode::Char('\u{7}'))
-                || (key == copy_cmd && pending_copy)
-            {
-                pending_copy = false;
-                self.copy_screen_frame(mode, &mut term);
-                continue;
-            }
-            // A lone copy-command arms the double-press (and falls through so the mode
-            // copies the reopen command); any other key disarms it.
-            pending_copy = key == copy_cmd;
 
             // Space / `:` opens the command palette (unless the mode takes it as
             // input — the tree while searching).
@@ -10833,8 +10795,6 @@ mod tests {
                 '\t' => KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
                 '\r' => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                 '\u{1b}' => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-                // Copy-screen sentinels: the footer chip replays them verbatim.
-                '\u{6}' | '\u{7}' => KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
                 c if (c as u32) < 32 => {
                     let letter = (b'a' + c as u8 - 1) as char;
                     KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL)

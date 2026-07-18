@@ -40,5 +40,5 @@ File browser - tests/fixtures                                                   
 
 
 ↑/↓ navigate · ←/→ collapse/expand · PgUp/PgDn page · Enter open/preview · Tab tensor tree · Space/: commands · l legend
-f copy path · yy copy screen · y copy command · ⌫/\ back/fwd · q quit
+f copy path · c copy screen · y copy command · ⌫/\ back/fwd · q quit
  ▪ tests/fixtures                                                                                              editable

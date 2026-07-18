@@ -41,4 +41,4 @@ Statistics: press s to scan the full tensor
 
 
 m heatmap · v values · h histogram · b bins · s stats · d dtype · r reshape · Tab file layout · Space/: commands
-l legend · yy copy screen · y copy command · ⌫/\ back/fwd                                                      editable
+l legend · c copy screen · y copy command · ⌫/\ back/fwd                                                       editable
