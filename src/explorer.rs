@@ -10633,6 +10633,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Guardrail: every command a mode offers (in its registry, currently available)
+    /// must be *shown* in that mode's footer with its real key — no bound-but-hidden
+    /// or mislabeled bindings (the class of bug behind the tree's old `R repack`).
+    /// Renders the tree with a writable safetensors so Rename is available, then
+    /// checks each available `TREE_COMMANDS` key appears among the footer chips.
+    #[test]
+    fn tree_footer_advertises_every_available_command_key() {
+        let ti = |name: &str| TensorInfo {
+            name: name.to_string(),
+            dtype: "F32".into(),
+            shape: vec![2, 2],
+            size_bytes: 16,
+            num_elements: 4,
+            storage: Storage::Unknown,
+            source_path: "/tmp/x.safetensors".into(),
+            layout: Layout::None,
+        };
+        let dir = std::env::temp_dir().join(format!("ce_footer_enforce_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("model.safetensors");
+        std::fs::write(&f, b"").unwrap();
+        let mut e = Explorer::new(vec![f], Vec::new(), None, false);
+        e.finalize_load(vec![ti("blk.0.a"), ti("blk.1.b")], Vec::new());
+        assert!(
+            e.can_rename(),
+            "a writable local safetensors → Rename available"
+        );
+
+        // Render populates `clickable` with the footer chips (Rect → KeyEvent).
+        crate::tui::headless_render(140, 30, |frame| e.render_tree_frame(frame, true)).unwrap();
+        let shown: HashSet<KeyEvent> = e.clickable.borrow().iter().map(|&(_, k)| k).collect();
+
+        for &(cmd, _, _, c) in TREE_COMMANDS {
+            if !e.available_commands().iter().any(|&(a, ..)| a == cmd) {
+                continue; // gated off in this context (e.g. Repack needs HDF5)
+            }
+            let want = if c == '\t' {
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+            } else {
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+            };
+            assert!(
+                shown.contains(&want),
+                "tree command {cmd:?} (key {c:?}) is bound but not shown in the footer"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn command_for_rename_round_trips_the_rule_pairs() {
         // The `y` command for the rename editor: `--rename` plus one
