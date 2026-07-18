@@ -3674,7 +3674,9 @@ impl UI {
     pub fn render_copied_flash(frame: &mut Frame, what: &str) {
         let area = frame.area();
         let width = area.width as usize;
-        let full = format!("✓ Copied {what} to the clipboard");
+        // The caller supplies the whole message (not just clipboard copies) — e.g.
+        // "copied the screen to the clipboard" or "statistics already computed".
+        let full = format!("✓ {what}");
         let msg: String = if full.chars().count() > width {
             full.chars()
                 .take(width.saturating_sub(1))

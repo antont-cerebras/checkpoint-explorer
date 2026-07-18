@@ -2464,21 +2464,30 @@ impl Mode for DetailMode {
                 }
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
-                let (overridable, unindexed) = (self.overridable, self.unindexed);
-                ex.compute_stats_animated(term, &tensor, view, |f, sv| {
-                    ex.render_detail_frame(
-                        f,
-                        &tensor,
-                        &shape,
-                        view,
-                        overridable,
-                        unindexed,
-                        sv,
-                        None,
-                        None,
-                        None,
-                    );
-                });
+                // `s` is a no-op once the stats are cached — say so rather than
+                // silently doing nothing (a key that appears not to work).
+                if ex.cached_stats(&tensor, view).is_some() {
+                    ex.copied_flash = Some((
+                        "statistics already computed".to_string(),
+                        std::time::Instant::now(),
+                    ));
+                } else {
+                    let (overridable, unindexed) = (self.overridable, self.unindexed);
+                    ex.compute_stats_animated(term, &tensor, view, |f, sv| {
+                        ex.render_detail_frame(
+                            f,
+                            &tensor,
+                            &shape,
+                            view,
+                            overridable,
+                            unindexed,
+                            sv,
+                            None,
+                            None,
+                            None,
+                        );
+                    });
+                }
             }
             KeyCode::Char('d') | KeyCode::Char('D') if self.overridable => {
                 if let Some(chosen) = ex.prompt_dtype(term, &tensor, DtypePreview::Detail) {
@@ -2547,7 +2556,10 @@ impl Mode for DetailMode {
                 ) {
                     copy_to_clipboard(&text);
                 }
-                ex.copied_flash = Some(("screen contents".to_string(), std::time::Instant::now()));
+                ex.copied_flash = Some((
+                    "copied the screen to the clipboard".to_string(),
+                    std::time::Instant::now(),
+                ));
             }
             KeyCode::Char('y') => {
                 let cmd = ex.command_for_detail(&tensor);
@@ -2942,7 +2954,10 @@ impl Mode for DataMode {
                 ) {
                     copy_to_clipboard(&text);
                 }
-                ex.copied_flash = Some(("screen contents".to_string(), std::time::Instant::now()));
+                ex.copied_flash = Some((
+                    "copied the screen to the clipboard".to_string(),
+                    std::time::Instant::now(),
+                ));
             }
             KeyCode::Char('y') => {
                 let cmd = ex.command_for_data(&tensor, self.repr, self.slice.get());
