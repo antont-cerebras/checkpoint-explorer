@@ -10710,6 +10710,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Guardrail across every static-footer mode (tree/files/layout/rename): each
+    /// command in the registry (except the `App` group — Back/Quit are handled via
+    /// Esc/⌫/`^C`/`q`, not a content chip) must appear in that mode's footer with its
+    /// real key. Calls the footer builders directly and matches their chips against
+    /// the registry keys — so a bound-but-hidden or mislabeled key fails CI (as the
+    /// tree's old `R repack` and the layout's missing `Tab` did).
+    #[test]
+    fn every_static_mode_footer_shows_its_command_keys() {
+        // A registry char → the KeyEvent its footer chip carries (matching
+        // `hint_key` for bare letters, and the rename registry's Ctrl sentinels).
+        fn footer_key(c: char) -> KeyEvent {
+            match c {
+                '\t' => KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+                '\r' => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                '\u{1b}' => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                c if (c as u32) < 32 => {
+                    let letter = (b'a' + c as u8 - 1) as char;
+                    KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL)
+                }
+                c => KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            }
+        }
+        fn check(name: &str, cmds: &[(&str, char)], chips: Vec<crate::ui::ChipHit>) {
+            let shown: HashSet<KeyEvent> = chips.into_iter().map(|c| c.key).collect();
+            for &(group, c) in cmds {
+                if group == "App" || key_label(c).is_empty() {
+                    continue; // Back/Quit are handled via Esc/⌫/^C/q, not a content chip
+                }
+                assert!(
+                    shown.contains(&footer_key(c)),
+                    "{name}: command key {c:?} ({}) is bound but not shown in the footer",
+                    key_label(c),
+                );
+            }
+        }
+        check(
+            "tree",
+            &TREE_COMMANDS
+                .iter()
+                .map(|&(_, g, _, c)| (g, c))
+                .collect::<Vec<_>>(),
+            crate::ui::tree_hint_lines(true, true, 200).1,
+        );
+        check(
+            "files",
+            &FILE_COMMANDS
+                .iter()
+                .map(|&(_, g, _, c)| (g, c))
+                .collect::<Vec<_>>(),
+            crate::ui::files_hint_lines(200).1,
+        );
+        check(
+            "layout",
+            &LAYOUT_COMMANDS
+                .iter()
+                .map(|&(_, g, _, c)| (g, c))
+                .collect::<Vec<_>>(),
+            crate::ui::layout_hint_lines(200).1,
+        );
+        check(
+            "rename",
+            &RENAME_COMMANDS
+                .iter()
+                .map(|&(_, g, _, c)| (g, c))
+                .collect::<Vec<_>>(),
+            crate::ui::rename_hint_lines(200, true).1,
+        );
+    }
+
     #[test]
     fn command_for_rename_round_trips_the_rule_pairs() {
         // The `y` command for the rename editor: `--rename` plus one
