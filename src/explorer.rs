@@ -8317,17 +8317,14 @@ impl Explorer {
     /// Whether the checkpoint's shard files can actually be written — a local
     /// safetensors checkpoint on a read-only filesystem (an `ro` SSH mount) or a
     /// read-only file exists and looks local but the in-place rename would fail.
-    /// Probed once by opening each shard for writing (which changes nothing — no
-    /// truncate) and cached, since the badge / palette re-check it every frame.
+    /// Uses the same [`crate::rename::is_writable`] probe the rename pre-flight does
+    /// (one source of truth), and caches it since the badge / palette re-check it
+    /// every frame.
     fn checkpoint_writable(&self) -> bool {
         if let Some(w) = self.writable.get() {
             return w;
         }
-        let w = !self.files.is_empty()
-            && self
-                .files
-                .iter()
-                .all(|f| std::fs::OpenOptions::new().write(true).open(f).is_ok());
+        let w = !self.files.is_empty() && self.files.iter().all(|f| crate::rename::is_writable(f));
         self.writable.set(Some(w));
         w
     }

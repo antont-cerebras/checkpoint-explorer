@@ -569,10 +569,42 @@ pub fn plan(path: &Path, map: &NameMap) -> Result<Plan> {
     load(path)?.plan(map)
 }
 
+/// Whether `path` can be opened for writing — the exact operation [`apply`]
+/// performs, so it accounts for a read-only mount, the permission bits, ACLs, and
+/// the immutable flag alike (a mode-bit check misses the mount; `access(2)` misses
+/// the immutable flag). Non-destructive: opens `O_WRONLY` without truncating, so it
+/// changes neither the contents nor the timestamps. Shared by the in-place-rename
+/// pre-flight below and the `editable` badge's `checkpoint_writable` probe.
+pub fn is_writable(path: &Path) -> bool {
+    fs::OpenOptions::new().write(true).open(path).is_ok()
+}
+
 /// Apply a validated [`Plan`]: rewrite each shard's header region in place, then
 /// update the index. Headers are written first so a rare mid-run I/O error can't
 /// leave an index that points at renames the shards don't yet have.
 pub fn apply(plan: &Plan) -> Result<()> {
+    // Pre-flight: confirm every shard *and* the index can be opened for writing
+    // before rewriting any of them, so a read-only file partway through can't leave
+    // a partially-renamed (inconsistent) checkpoint. Cheap relative to the rewrite,
+    // and turns a mid-run failure into a clean "nothing changed" one.
+    for sp in &plan.shards {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&sp.path)
+            .with_context(|| {
+                format!(
+                    "{} is not writable — nothing was renamed",
+                    sp.path.display()
+                )
+            })?;
+    }
+    if let Some((path, _)) = &plan.index {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .with_context(|| format!("{} is not writable — nothing was renamed", path.display()))?;
+    }
+
     for sp in &plan.shards {
         // The region after the 8-byte length is exactly `header_n` bytes: the new
         // JSON, space-padded back to that length so the data offsets stay valid.
@@ -906,6 +938,37 @@ mod tests {
         // Data untouched: the file still ends in the seven dummy data bytes.
         let raw = fs::read(&file).unwrap();
         assert!(raw.ends_with(&[7u8; 16]));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_bails_without_writing_when_a_shard_is_read_only() {
+        let dir = std::env::temp_dir().join("ce_rename_ro");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("model.safetensors");
+        write_st(&file, &[("aaa", "F32", 8), ("bbb", "F32", 8)], 0);
+        let map = map_from(&["a=>x", "b=>y"]);
+        let plan = plan(&file, &map).unwrap();
+        let before = fs::read(&file).unwrap();
+
+        // Read-only shard → the pre-flight refuses before rewriting anything.
+        let mut perms = fs::metadata(&file).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&file, perms).unwrap();
+
+        let err = apply(&plan).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not writable"),
+            "unexpected error: {err:#}"
+        );
+        // The file is still readable (0444), so compare without restoring write —
+        // and removing it only needs a writable parent dir.
+        assert_eq!(
+            fs::read(&file).unwrap(),
+            before,
+            "a read-only shard must be left byte-for-byte untouched"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
