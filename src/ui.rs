@@ -2447,7 +2447,9 @@ impl UI {
         // Bottom-pin the footer; the sampled content fills the region above it
         // (clipped if it would overflow), like every other view.
         let footer_len = footer.len() as u16;
-        let footer_top = area.height.saturating_sub(footer_len);
+        // Reserve the bottom row for the access badge (drawn by render_data_frame),
+        // so the footer's last chip never runs under it.
+        let footer_top = area.height.saturating_sub(footer_len + 1);
         Paragraph::new(lines).render(
             Rect {
                 x: 0,
@@ -2705,7 +2707,9 @@ impl UI {
         // Bottom-pin the footer; the value grid fills the region above it (clipped
         // if it would overflow), like every other view.
         let footer_len = footer.len() as u16;
-        let footer_top = area.height.saturating_sub(footer_len);
+        // Reserve the bottom row for the access badge (drawn by render_data_frame),
+        // so the footer's last chip never runs under it.
+        let footer_top = area.height.saturating_sub(footer_len + 1);
         Paragraph::new(lines).render(
             Rect {
                 x: 0,
@@ -4781,76 +4785,156 @@ fn view_footer_items(
     heatmap: bool,
     stripe: StripeMode,
     base: NumBase,
-) -> Vec<(&'static str, &'static str)> {
+) -> Vec<(Vec<Seg>, &'static str)> {
+    use KeyCode::{Backspace, Char, Down, End, Home, Left, PageDown, PageUp, Right, Up};
+    let plain = KeyModifiers::NONE;
+    let shift = KeyModifiers::SHIFT;
+    // The other representation to switch to (heatmap ⇆ numeric values).
     let switch = if heatmap {
-        ("v", "numeric values")
+        (vec![Seg::Key("v", hint_key('v'))], "numeric values")
     } else {
-        ("m", "heatmap")
+        (vec![Seg::Key("m", hint_key('m'))], "heatmap")
     };
-    let mut items = vec![switch];
+    let mut items: Vec<(Vec<Seg>, &str)> = vec![switch];
     let edges = matches!(mode, SampleMode::Edges { .. });
     let window = matches!(mode, SampleMode::Window { .. });
     // In the edges view the arrows rebalance first vs. last (Shift snaps to one
     // end); in the window view they pan the block (Shift a screenful, Ctrl to an
     // edge). Either way slice stepping moves to `[`/`]` so the arrows are free.
     if edges {
-        items.push(("← →", "first/last cols"));
-        items.push(("↑ ↓", "first/last rows"));
-        items.push(("+Shift", "one end"));
+        items.push((
+            vec![
+                Seg::Key("←", KeyEvent::new(Left, plain)),
+                Seg::Sep(" "),
+                Seg::Key("→", KeyEvent::new(Right, plain)),
+            ],
+            "first/last cols",
+        ));
+        items.push((
+            vec![
+                Seg::Key("↑", KeyEvent::new(Up, plain)),
+                Seg::Sep(" "),
+                Seg::Key("↓", KeyEvent::new(Down, plain)),
+            ],
+            "first/last rows",
+        ));
+        items.push((vec![Seg::Sep("+Shift")], "one end"));
     }
     if window {
-        items.push(("←↑↓→", "pan"));
-        items.push(("+Shift", "page"));
-        items.push(("Home/End", "col edge"));
-        items.push(("PgUp/Dn", "row edge"));
+        items.push((vec![Seg::Sep("←↑↓→")], "pan"));
+        items.push((vec![Seg::Sep("+Shift")], "page"));
+        items.push((
+            vec![
+                Seg::Key("Home", KeyEvent::new(Home, plain)),
+                Seg::Sep("/"),
+                Seg::Key("End", KeyEvent::new(End, plain)),
+            ],
+            "col edge",
+        ));
+        items.push((
+            vec![
+                Seg::Key("PgUp", KeyEvent::new(PageUp, plain)),
+                Seg::Sep("/"),
+                Seg::Key("PgDn", KeyEvent::new(PageDown, plain)),
+            ],
+            "row edge",
+        ));
     }
     if slices > 1 {
         if edges || window {
-            items.push(("[ ]", "slice"));
+            items.push((
+                vec![
+                    Seg::Key("[", hint_key('[')),
+                    Seg::Sep(" "),
+                    Seg::Key("]", hint_key(']')),
+                ],
+                "slice",
+            ));
         } else {
-            items.push(("← →", "step"));
-            items.push(("Shift+← →", "jump 5%"));
+            items.push((
+                vec![
+                    Seg::Key("←", KeyEvent::new(Left, plain)),
+                    Seg::Sep(" "),
+                    Seg::Key("→", KeyEvent::new(Right, plain)),
+                ],
+                "step",
+            ));
+            items.push((
+                vec![
+                    Seg::Sep("Shift+"),
+                    Seg::Key("←", KeyEvent::new(Left, shift)),
+                    Seg::Sep(" "),
+                    Seg::Key("→", KeyEvent::new(Right, shift)),
+                ],
+                "jump 5%",
+            ));
         }
-        items.push(("/", "index or %"));
+        items.push((vec![Seg::Key("/", hint_key('/'))], "index or %"));
     }
     if overridable {
-        items.push(("d", "dtype"));
-        items.push(("r", "reshape"));
+        items.push((vec![Seg::Key("d", hint_key('d'))], "dtype"));
+        items.push((vec![Seg::Key("r", hint_key('r'))], "reshape"));
     }
     // Cycle the layout overview → edges → window → overview; the label names the
     // layout `e` switches to next.
-    items.push(match mode {
-        SampleMode::Grid => ("e", "edges"),
-        SampleMode::Edges { .. } => ("e", "window"),
-        SampleMode::Window { .. } => ("e", "overview"),
-    });
+    items.push((
+        vec![Seg::Key("e", hint_key('e'))],
+        match mode {
+            SampleMode::Grid => "edges",
+            SampleMode::Edges { .. } => "window",
+            SampleMode::Window { .. } => "overview",
+        },
+    ));
     // Cycle the zebra striping / numeral base (numeric grid only).
     if !heatmap {
-        items.push(match stripe {
-            StripeMode::Rows => ("z", "zebra: rows"),
-            StripeMode::Cols => ("z", "zebra: cols"),
-            StripeMode::Off => ("z", "zebra: off"),
-        });
-        items.push(match base {
-            NumBase::Decimal => ("b", "base: dec"),
-            NumBase::Hex => ("b", "base: hex"),
-            NumBase::Octal => ("b", "base: oct"),
-            NumBase::Binary => ("b", "base: bin"),
-        });
+        items.push((
+            vec![Seg::Key("z", hint_key('z'))],
+            match stripe {
+                StripeMode::Rows => "zebra: rows",
+                StripeMode::Cols => "zebra: cols",
+                StripeMode::Off => "zebra: off",
+            },
+        ));
+        items.push((
+            vec![Seg::Key("b", hint_key('b'))],
+            match base {
+                NumBase::Decimal => "base: dec",
+                NumBase::Hex => "base: hex",
+                NumBase::Octal => "base: oct",
+                NumBase::Binary => "base: bin",
+            },
+        ));
     }
-    items.push(("yy", "copy screen"));
-    items.push(("y", "copy cmd"));
-    items.push(("l", "legend"));
-    items.push(("Space", "commands"));
-    items.push(("⌫", "back"));
-    items.push(("\\", "fwd"));
-    items.push(("", "any other key to return..."));
+    items.push((
+        vec![Seg::Key("yy", KeyEvent::new(Char('\u{6}'), plain))],
+        "copy screen",
+    ));
+    items.push((vec![Seg::Key("y", hint_key('y'))], "copy cmd"));
+    items.push((vec![Seg::Key("l", hint_key('l'))], "legend"));
+    items.push((
+        vec![
+            Seg::Key("Space", hint_key(' ')),
+            Seg::Sep("/"),
+            Seg::Key(":", hint_key(':')),
+        ],
+        "commands",
+    ));
+    items.push((
+        vec![
+            Seg::Key("⌫", KeyEvent::new(Backspace, plain)),
+            Seg::Sep("/"),
+            Seg::Key("\\", hint_key('\\')),
+        ],
+        "back/fwd",
+    ));
     items
 }
 
-/// Physical lines the data view footer occupies at `width`: the blank spacer
-/// line above it plus the hint line (one logical line the terminal auto-wraps).
-/// Used to size the grid so the header (tensor name + file) never scrolls off.
+/// Physical lines the data view footer occupies at `width`: the blank spacer row
+/// above it plus the wrapped hint line(s). Used to size the grid so the header
+/// (tensor name + file) never scrolls off. Shares [`wrap_hint_items`] with
+/// [`data_view_footer_wrapped_lines`] so the reservation can't drift from what's
+/// drawn.
 pub fn data_view_footer_lines(
     mode: SampleMode,
     slices: usize,
@@ -4861,23 +4945,7 @@ pub fn data_view_footer_lines(
     width: usize,
 ) -> usize {
     let items = view_footer_items(mode, slices, overridable, heatmap, stripe, base);
-    // Visible width: each item is `key`, `label`, or `key label`, joined by " · ".
-    let len: usize = items
-        .iter()
-        .enumerate()
-        .map(|(i, (k, l))| {
-            let sep = usize::from(i > 0) * 3;
-            let body = if k.is_empty() {
-                l.chars().count()
-            } else if l.is_empty() {
-                k.chars().count()
-            } else {
-                k.chars().count() + 1 + l.chars().count()
-            };
-            sep + body
-        })
-        .sum();
-    1 + len.div_ceil(width.max(1)).max(1)
+    1 + wrap_hint_items(items, width as u16).0.len().max(1)
 }
 
 /// The data-view title block as styled [`Line`]s — the Ratatui port of
@@ -4998,36 +5066,10 @@ fn hint_spans(items: &[(&str, &str)]) -> Vec<Span<'static>> {
     spans
 }
 
-/// The [`KeyEvent`] a click on a data-view footer chip synthesizes, or `None` for
-/// the non-clickable chips (the multi-arrow nav hints `← →`, `[ ]`, `Home/End`, …,
-/// and the trailing "any other key…" label). Every clickable chip is a single
-/// glyph, so it never straddles a wrap boundary.
-fn footer_key_event(key: &str) -> Option<KeyEvent> {
-    if key == "⌫" {
-        return Some(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-    }
-    if key == "Space" {
-        return Some(hint_key(' ')); // opens the command palette
-    }
-    if key == "yy" {
-        // Copy-screen: a click on the `yy` chip replays the copy-screen sentinel.
-        return Some(KeyEvent::new(KeyCode::Char('\u{6}'), KeyModifiers::NONE));
-    }
-    let mut chars = key.chars();
-    match (chars.next(), chars.next()) {
-        (Some(c), None) if "mvdrezbyl/\\".contains(c) => Some(hint_key(c)),
-        _ => None,
-    }
-}
-
-/// The data-view footer as styled [`Line`]s — the Ratatui port of
-/// [`write_view_footer`]. The raw footer is one logical line the terminal hard-
-/// wraps at the screen edge (mid-chip, even mid-word), so we hard-wrap the styled
-/// spans by character at `width` to match that exactly. Also returns the clickable
-/// command chips: their char position in the unwrapped run maps to a (line, col)
-/// by the same `width` hard wrap (each clickable chip is one glyph, so it never
-/// splits across lines).
-fn data_view_footer_wrapped_lines(
+/// The data-view footer as styled [`Line`]s + clickable chips — the shared
+/// ` · `-separated `key label` chip format via [`wrap_hint_items`], identical to
+/// every other view's footer (so the coloring / wrapping / hit-testing can't drift).
+pub(crate) fn data_view_footer_wrapped_lines(
     mode: SampleMode,
     slices: usize,
     overridable: bool,
@@ -5036,88 +5078,10 @@ fn data_view_footer_wrapped_lines(
     base: NumBase,
     width: usize,
 ) -> (Vec<Line<'static>>, Vec<ChipHit>) {
-    let items = view_footer_items(mode, slices, overridable, heatmap, stripe, base);
-    let lines = wrap_spans_hard(hint_spans(&items), width);
-
-    let w = width.max(1);
-    let mut chips: Vec<ChipHit> = Vec::new();
-    let mut pos = 0usize; // char offset into the unwrapped span run
-    for (i, (key, label)) in items.iter().enumerate() {
-        if i > 0 {
-            pos += 3; // " · " (kept inert — not part of any chip)
-        }
-        let key_chars = key.chars().count();
-        let advance = if key.is_empty() {
-            label.chars().count()
-        } else if label.is_empty() {
-            key_chars
-        } else {
-            key_chars + 1 + label.chars().count()
-        };
-        // A single-action chip is clickable across its whole "key label" span.
-        // The footer is hard-wrapped at `w`, so the span can straddle lines —
-        // emit one region per line it covers.
-        if let Some(kev) = footer_key_event(key) {
-            let (start, end) = (pos, pos + advance);
-            let mut c = start;
-            while c < end {
-                let line = c / w;
-                let seg_end = end.min((line + 1) * w);
-                chips.push(ChipHit {
-                    line: line as u16,
-                    col: (c % w) as u16,
-                    width: (seg_end - c) as u16,
-                    key: kev,
-                });
-                c = seg_end;
-            }
-        }
-        pos += advance;
-    }
-    (lines, chips)
-}
-
-/// Hard-wrap a styled span run at `width` characters, splitting mid-span (and
-/// mid-word) exactly where a terminal's line wrap would, so a footer built as
-/// one logical line lays out identically across the migration.
-fn wrap_spans_hard(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
-    let width = width.max(1);
-    let mut lines: Vec<Line> = Vec::new();
-    let mut cur: Vec<Span> = Vec::new();
-    let mut col = 0usize;
-    for span in spans {
-        let style = span.style;
-        let mut buf = String::new();
-        for ch in span.content.chars() {
-            if col == width {
-                buf.clear_into_line(&mut cur, style);
-                lines.push(Line::from(std::mem::take(&mut cur)));
-                col = 0;
-            }
-            buf.push(ch);
-            col += 1;
-        }
-        if !buf.is_empty() {
-            cur.push(Span::styled(buf, style));
-        }
-    }
-    if !cur.is_empty() {
-        lines.push(Line::from(cur));
-    }
-    lines
-}
-
-/// Helper for [`wrap_spans_hard`]: flush the in-progress char buffer to the
-/// current line as a styled span (no-op when empty), leaving the buffer cleared.
-trait FlushSpan {
-    fn clear_into_line(&mut self, cur: &mut Vec<Span<'static>>, style: Style);
-}
-impl FlushSpan for String {
-    fn clear_into_line(&mut self, cur: &mut Vec<Span<'static>>, style: Style) {
-        if !self.is_empty() {
-            cur.push(Span::styled(std::mem::take(self), style));
-        }
-    }
+    wrap_hint_items(
+        view_footer_items(mode, slices, overridable, heatmap, stripe, base),
+        width as u16,
+    )
 }
 
 /// One numeric-grid cell as styled span(s) — the Ratatui port of

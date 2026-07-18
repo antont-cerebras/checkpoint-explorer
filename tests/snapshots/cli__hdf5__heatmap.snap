@@ -39,6 +39,6 @@ expert 0 of 30 — stored word 0, field 0/5 (3-bit) — [ ] step · / index or %
 
 
 
-v numeric values · ← → first/last cols · ↑ ↓ first/last rows · +Shift one end · [ ] slice · / index or % · d dtype · r r
-eshape · e window · yy copy screen · y copy cmd · l legend · Space commands · ⌫ back · \ fwd · any other key to return..
-.                                                                                                             read-only
+v numeric values · ← → first/last cols · ↑ ↓ first/last rows · +Shift one end · [ ] slice · / index or % · d dtype
+r reshape · e window · yy copy screen · y copy cmd · l legend · Space/: commands · ⌫/\ back/fwd
+                                                                                                              read-only
