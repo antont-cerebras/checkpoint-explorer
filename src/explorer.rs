@@ -1940,8 +1940,15 @@ impl Mode for RenameMode2 {
         let KeyEvent {
             code, modifiers, ..
         } = key;
-        // `^Y` copies the `convert --map` command that applies the rename.
+        // `^Y` copies the command that reopens this editor (the universal
+        // copy-command, the `y` of the non-editing modes); `^A` copies the
+        // `convert --map` command that *applies* the rename.
         if code == KeyCode::Char('y') && modifiers.contains(KeyModifiers::CONTROL) {
+            let cmd = ex.command_for_rename(&self.pairs());
+            self.copied = copy_to_clipboard(&cmd).then_some("the reopen command");
+            return Ok(Outcome::Stay);
+        }
+        if code == KeyCode::Char('a') && modifiers.contains(KeyModifiers::CONTROL) {
             self.do_copy_apply();
             return Ok(Outcome::Stay);
         }
@@ -1967,6 +1974,26 @@ impl Mode for RenameMode2 {
             // copy-screen is a Ctrl key here — and a footer button + palette entry).
             KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.do_copy_screen()
+            }
+            // `^L` shows the legend (bare `l` types into a field here).
+            KeyCode::Char('l') if modifiers.contains(KeyModifiers::CONTROL) => {
+                ex.float_until_dismissed(term, |f| {
+                    let _ = draw_rename_frame(
+                        f,
+                        &self.root,
+                        &self.editor,
+                        &self.schemas,
+                        &self.rules_view,
+                        self.total,
+                        &self.warnings,
+                        self.has_index,
+                        self.applicable,
+                        &self.synth_err,
+                        self.cli.as_deref(),
+                        self.copied,
+                    );
+                    UI::render_legend_band(f, Legend::Rename);
+                });
             }
             // Tab opens the dropdown and extends the field to the candidates' longest
             // common prefix (shell-style). Enter / a click accept the highlight — so
@@ -3177,37 +3204,37 @@ const DATA_COMMANDS: &[(DataCmd, &str, &str, char)] = &[
 ];
 
 /// The rename editor's command registry (palette order). The `char` is a *sentinel*
-/// (not a bare accelerator): control chars name the real Ctrl trigger (`^R` apply,
-/// `^S` copy screen, `^N`/`^D`/`^Y`, Esc, `^C`) — Ctrl keys so every character stays
-/// typeable in the name fields — and `\u{2}`/`\u{5}` are the palette-only copy /
-/// legend commands (no key label). [`key_label`] renders them;
-/// [`crate::ui::shortcut_help`] (the `Rename` arms) supplies each one's one-line help,
-/// keyed by the same char.
+/// naming the real **Ctrl** trigger — Ctrl keys so every character stays typeable in
+/// the name fields, mirroring the non-editing modes' bare letters (`^R` apply, `^S`
+/// copy screen, `^Y` copy command, `^A` copy apply-command, `^L` legend, `^N`/`^D`
+/// add/remove, Esc back, `^C` quit). Every one has a footer key now — nothing is
+/// palette-only. [`key_label`] renders them; [`crate::ui::shortcut_help`] (the
+/// `Rename` arms) supplies each one's one-line help, keyed by the same char.
 const RENAME_COMMANDS: &[(RenameCmd, &str, &str, char)] = &[
-    (RenameCmd::Apply, "Rename", "Apply the rename", '\u{12}'),
-    (RenameCmd::AddRule, "Rename", "Add a rule", '\u{e}'),
+    (RenameCmd::Apply, "Rename", "Apply the rename", '\u{12}'), // ^R
+    (RenameCmd::AddRule, "Rename", "Add a rule", '\u{e}'),      // ^N
     (
         RenameCmd::RemoveRule,
         "Rename",
         "Remove the focused rule",
-        '\u{4}',
+        '\u{4}', // ^D
     ),
-    (RenameCmd::CopyScreen, "Copy", "Screen text", '\u{13}'),
+    (RenameCmd::CopyScreen, "Copy", "Screen text", '\u{13}'), // ^S
     (
         RenameCmd::CopyReopenCmd,
         "Copy",
         "Command to reopen this view",
-        '\u{2}',
+        '\u{19}', // ^Y (the universal copy-command, mirrors the tree's `y`)
     ),
     (
         RenameCmd::CopyApplyCmd,
         "Copy",
         "Command to apply this rename",
-        '\u{19}',
+        '\u{1}', // ^A
     ),
-    (RenameCmd::Legend, "View", "Legend", '\u{5}'),
-    (RenameCmd::Back, "App", "Back", '\u{1b}'),
-    (RenameCmd::Quit, "App", "Quit", '\u{3}'),
+    (RenameCmd::Legend, "View", "Legend", '\u{c}'), // ^L
+    (RenameCmd::Back, "App", "Back", '\u{1b}'),     // Esc
+    (RenameCmd::Quit, "App", "Quit", '\u{3}'),      // ^C
 ];
 
 /// A resolved palette entry for a command of type `T`: `(command, group, title,
@@ -3236,10 +3263,10 @@ fn key_label(c: char) -> String {
         '\u{e}' => "^N".to_string(),
         '\u{4}' => "^D".to_string(),
         '\u{19}' => "^Y".to_string(),
+        '\u{1}' => "^A".to_string(),
+        '\u{c}' => "^L".to_string(),
         '\u{1b}' => "Esc".to_string(),
         '\u{3}' => "^C".to_string(),
-        // Palette-only rename commands: no bare-key accelerator, so no key label.
-        '\u{1}' | '\u{2}' | '\u{5}' => String::new(),
         _ => c.to_string(),
     }
 }
@@ -10771,13 +10798,14 @@ mod tests {
 
     #[test]
     fn rename_palette_registry_labels_and_gating() {
-        // The control-char sentinels render as their real accelerators; the
-        // palette-only copy/legend commands have no key label.
+        // The control-char sentinels render as their real Ctrl accelerators — every
+        // rename command now has a shown footer key (none are palette-only).
         assert_eq!(key_label('\r'), "Enter");
         assert_eq!(key_label('\u{e}'), "^N");
         assert_eq!(key_label('\u{19}'), "^Y");
+        assert_eq!(key_label('\u{1}'), "^A");
+        assert_eq!(key_label('\u{c}'), "^L");
         assert_eq!(key_label('\u{1b}'), "Esc");
-        assert_eq!(key_label('\u{1}'), "");
 
         // Every rename command has one-line help, looked up by its sentinel char.
         for &(_, _, _, key) in RENAME_COMMANDS {

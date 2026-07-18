@@ -207,12 +207,14 @@ pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
         (Rename, Char('\r')) => "Move to the next field (past the last field, add a new rule).",
         (Rename, Char('\u{e}')) => "Add another source → new-name rule.",
         (Rename, Char('\u{4}')) => "Remove the focused rule.",
-        (Rename, Char('\u{19}')) => {
+        (Rename, Char('y') | Char('\u{19}')) => {
+            "Copy the CLI command that reopens this rename editor."
+        }
+        (Rename, Char('a') | Char('\u{1}')) => {
             "Copy the `convert --map` command that applies this rename non-interactively."
         }
         (Rename, Char('s') | Char('\u{13}')) => "Copy the whole screen's text to the clipboard.",
-        (Rename, Char('\u{2}')) => "Copy the CLI command that reopens this rename editor.",
-        (Rename, Char('\u{5}')) => "Show the legend for the rename editor's symbols.",
+        (Rename, Char('l') | Char('\u{c}')) => "Show the legend for the rename editor's symbols.",
         (Rename, Char('\u{1b}')) => "Go back to the previous view.",
         (Rename, Char('\u{3}')) => "Quit the explorer.",
         // Common to every screen.
@@ -1644,7 +1646,7 @@ impl UI {
                 Line::from(vec![
                     Span::styled("apply: ", Style::default().fg(palette::DIM)),
                     Span::styled(cmd.to_string(), Style::default().fg(palette::META)),
-                    Span::styled("   (^Y copy)", Style::default().fg(palette::DIM)),
+                    Span::styled("   (^A copy)", Style::default().fg(palette::DIM)),
                 ])
             } else {
                 Line::from(dim_span(
@@ -4621,7 +4623,7 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
             }
             lines.push(legend_row_line(None, "", "", col));
             lines.push(Line::from(dim_span(
-                "  Space / : palette · Tab autocomplete · ↑↓ fields · ←→ caret · ^N add · ^D remove · Enter apply · ^Y copy",
+                "  Space/: palette · Tab complete · ↑↓ fields · ↵ next field · ←→ caret · ^N add · ^D remove · ^R apply · ^S copy screen · ^Y copy cmd · ^A apply cmd",
             )));
         }
     }
@@ -5365,15 +5367,23 @@ fn rename_hint_lines(width: u16, applicable: bool) -> (Vec<Line<'static>>, Vec<C
             vec![Seg::Key("^R", KeyEvent::new(Char('r'), ctrl))],
             apply_label,
         ),
-        // Copy-screen: the universal `c` command, but a bare `c` types into a field
-        // here — so it's the Ctrl key `^S` (a real, clickable footer button), not a
-        // bare letter, plus a palette entry.
+        // The universal commands — bare `c`/`y`/`l` type into a field here, so they're
+        // the Ctrl keys `^S`/`^Y`/`^L` (real, clickable footer buttons), mirroring the
+        // non-editing modes' `c`/`y`/`l`. `^A` copies the apply (`convert --map`) cmd.
+        (
+            vec![Seg::Key("^L", KeyEvent::new(Char('l'), ctrl))],
+            "legend",
+        ),
         (
             vec![Seg::Key("^S", KeyEvent::new(Char('s'), ctrl))],
             "copy screen",
         ),
         (
             vec![Seg::Key("^Y", KeyEvent::new(Char('y'), ctrl))],
+            "copy command",
+        ),
+        (
+            vec![Seg::Key("^A", KeyEvent::new(Char('a'), ctrl))],
             "copy apply cmd",
         ),
         (vec![Seg::Key("Esc", KeyEvent::new(Esc, plain))], "back"),
@@ -7307,7 +7317,10 @@ mod tests {
         assert_eq!(sb.col, 79);
         assert_eq!(sb.rows as usize, visible);
         assert_eq!(sb.max_offset, 50);
-        assert_eq!(sb.top as usize, UI::tree_header_rows(80, false, false, false));
+        assert_eq!(
+            sb.top as usize,
+            UI::tree_header_rows(80, false, false, false)
+        );
 
         // Track top → offset 0, track bottom → max_offset; outside the track clamps.
         assert_eq!(sb.offset_at(sb.top), 0);
