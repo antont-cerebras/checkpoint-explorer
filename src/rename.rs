@@ -294,8 +294,11 @@ pub fn load(path: &Path) -> Result<Loaded> {
     let target = discover(path)?;
     // Read each shard header once, keeping the parsed object (preserve_order keeps
     // its entry order so a rewrite doesn't reshuffle the file).
-    let mut headers = Vec::with_capacity(target.shards.len());
-    for shard in &target.shards {
+    // Read + parse every shard header concurrently (scoped threads, one per shard):
+    // opening the rename editor for a many-shard checkpoint was noticeably slow when
+    // done sequentially, especially on a networked mount where each open pays latency.
+    // Results are collected in shard order so a rewrite doesn't reshuffle the set.
+    let read_one = |shard: &Path| -> Result<ShardHeader> {
         let (n, json) =
             safelayout::read_header_full(shard).map_err(|e| anyhow!("{}: {e}", shard.display()))?;
         let value: Value = serde_json::from_slice(&json)
@@ -304,12 +307,23 @@ pub fn load(path: &Path) -> Result<Loaded> {
             .as_object()
             .cloned()
             .ok_or_else(|| anyhow!("{}: header is not a JSON object", shard.display()))?;
-        headers.push(ShardHeader {
-            path: shard.clone(),
+        Ok(ShardHeader {
+            path: shard.to_path_buf(),
             n,
             obj,
-        });
-    }
+        })
+    };
+    let headers: Vec<ShardHeader> = std::thread::scope(|scope| {
+        let handles: Vec<_> = target
+            .shards
+            .iter()
+            .map(|shard| scope.spawn(move || read_one(shard)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("shard-header reader thread panicked"))
+            .collect::<Result<Vec<_>>>()
+    })?;
 
     let mut all_names: Vec<String> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();

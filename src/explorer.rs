@@ -1743,16 +1743,20 @@ impl Mode for RenameMode2 {
         };
         // Autocomplete over the deduped *generalized* schemas (one per tensor
         // family), each tagged with how many tensors it covers (the `×N` column).
+        // One `generalize` per name (it's the hot part of opening a big checkpoint),
+        // keeping first-seen order.
         let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
         for n in loaded.names() {
-            *counts.entry(crate::rename::generalize(n).0).or_default() += 1;
+            let schema = crate::rename::generalize(n).0;
+            let seen = counts.entry(schema.clone()).or_insert(0);
+            if *seen == 0 {
+                order.push(schema);
+            }
+            *seen += 1;
         }
-        let mut seen = HashSet::new();
-        self.schemas = loaded
-            .names()
-            .iter()
-            .map(|n| crate::rename::generalize(n).0)
-            .filter(|s| seen.insert(s.clone()))
+        self.schemas = order
+            .into_iter()
             .map(|s| {
                 let c = counts[&s];
                 (s, c)
