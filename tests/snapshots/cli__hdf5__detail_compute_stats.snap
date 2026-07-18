@@ -15,30 +15,30 @@ File: [FIXTURE]
 
 Statistics: min 0 · max 7 · mean 0.9667 · std 1.7854 · zeros 69.2%  (<time>)
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Press m for a heatmap, v for numeric values, h for a histogram, b to set its bin count, d to reinterpret the dtype,
 r to reshape, yy to copy the screen, y to copy the command, l for the legend, Space / : for commands,
-⌫ / \ to step back / forward, any other key to return...
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-                                                                                                              read-only
+⌫ / \ to step back / forward, any other key to return...                                                      read-only

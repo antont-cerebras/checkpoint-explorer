@@ -2053,29 +2053,27 @@ impl UI {
         let (footer, chips) = detail_footer_lines(overridable, remote, layout, width);
         let header_len = header.len();
         let footer_len = footer.len();
-        // The screen row the footer block begins on (filled in per layout branch
-        // below), so the relative chip lines can be made absolute for hit-testing.
-        let footer_top;
 
+        // Header at the top; the footer is pinned to the **bottom** (above the remote
+        // metadata-only banner), with any histogram filling the space between — the
+        // same bottom-pinned footer every other view has. `footer_top` is the footer's
+        // first screen row, so chip lines can be made absolute for hit-testing.
+        let banner = usize::from(remote);
+        let footer_top = (height as usize).saturating_sub(footer_len + banner) as u16;
+        Paragraph::new(header).render(
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: header_len as u16,
+            },
+            frame.buffer_mut(),
+        );
         if let Some(hist) = histogram {
-            // Header, then the histogram (capped to the rows the raw renderer's
-            // `term_h - body_rows - footer_rows - 1` budget would allow), then a
-            // blank spacer, then the footer flowed right below the bars — the raw
-            // path wrote these sequentially, so a small histogram leaves the footer
-            // near the top while a full one pushes it to the screen's bottom.
-            Paragraph::new(header).render(
-                Rect {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height: header_len as u16,
-                },
-                frame.buffer_mut(),
-            );
-            let section = (height as usize)
-                .saturating_sub(header_len + footer_len + 1)
-                .max(2);
-            let used = render_histogram(
+            // The histogram fills between the header and the footer (a blank spacer
+            // row above the footer), so the screen fills exactly with no scroll.
+            let section = (footer_top as usize).saturating_sub(header_len + 1).max(1);
+            render_histogram(
                 frame,
                 Rect {
                     x: 0,
@@ -2086,26 +2084,16 @@ impl UI {
                 hist,
                 hist_scanning,
             );
-            // Footer one blank row below the bars, clamped so it always fits.
-            let footer_y =
-                (header_len + used + 1).min((height as usize).saturating_sub(footer_len)) as u16;
-            footer_top = footer_y;
-            Paragraph::new(footer).render(
-                Rect {
-                    x: 0,
-                    y: footer_y,
-                    width,
-                    height: footer_len as u16,
-                },
-                frame.buffer_mut(),
-            );
-        } else {
-            // No histogram: header then footer, top-aligned, the rest left blank.
-            footer_top = header_len as u16;
-            let mut lines = header;
-            lines.extend(footer);
-            Paragraph::new(lines).render(area, frame.buffer_mut());
         }
+        Paragraph::new(footer).render(
+            Rect {
+                x: 0,
+                y: footer_top,
+                width,
+                height: footer_len as u16,
+            },
+            frame.buffer_mut(),
+        );
 
         // Metadata-only banner on the bottom row (remote `--ssh-read`) — the lower
         // part of the detail screen is otherwise blank, so it doesn't overlap.

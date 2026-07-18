@@ -15,9 +15,9 @@ File: [FIXTURE]
 
 Statistics: press s to scan the full tensor
        ╭ Legend — tensor details ──────────────────────────────────────────────────────────────────────────────╮
-Press m│   ⇩ lz4   on-disk compression codec; the N× beside it is the ratio (logical ÷ stored)                 │pe,
-r to re│   as      the active dtype reinterpretation (press d), e.g. 'BF16 as u4'                              │
-⌫ / \ t│   A – B   a byte range within the file (the tensor's data offsets)                                    │
+       │   ⇩ lz4   on-disk compression codec; the N× beside it is the ratio (logical ÷ stored)                 │
+       │   as      the active dtype reinterpretation (press d), e.g. 'BF16 as u4'                              │
+       │   A – B   a byte range within the file (the tensor's data offsets)                                    │
        │   ·       separates fields on a line                                                                  │
        │   ✚       this tensor is an extra: on disk but not listed in the index (model.safetensors.index.json) │
        │   ⠋       a statistics scan is running (press s to start; any key cancels)                            │
@@ -39,6 +39,6 @@ r to re│   as      the active dtype reinterpretation (press d), e.g. 'BF16 as 
 
 
 
-
-
-                                                                                                              read-only
+Press m for a heatmap, v for numeric values, h for a histogram, b to set its bin count, d to reinterpret the dtype,
+r to reshape, yy to copy the screen, y to copy the command, l for the legend, Space / : for commands,
+⌫ / \ to step back / forward, any other key to return...                                                      read-only
