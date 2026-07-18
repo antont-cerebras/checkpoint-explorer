@@ -2410,8 +2410,6 @@ impl UI {
         legend.push(Span::raw(format!(" high {hi}")));
         lines.push(Line::from(legend));
 
-        lines.push(Line::default());
-        let footer_top = lines.len() as u16;
         let (footer, chips) = data_view_footer_wrapped_lines(
             sample.mode,
             sample.slices,
@@ -2421,9 +2419,28 @@ impl UI {
             NumBase::Decimal,
             width,
         );
-        lines.extend(footer);
-
-        Paragraph::new(lines).render(area, frame.buffer_mut());
+        // Bottom-pin the footer; the sampled content fills the region above it
+        // (clipped if it would overflow), like every other view.
+        let footer_len = footer.len() as u16;
+        let footer_top = area.height.saturating_sub(footer_len);
+        Paragraph::new(lines).render(
+            Rect {
+                x: 0,
+                y: 0,
+                width: area.width,
+                height: footer_top,
+            },
+            frame.buffer_mut(),
+        );
+        Paragraph::new(footer).render(
+            Rect {
+                x: 0,
+                y: footer_top,
+                width: area.width,
+                height: footer_len,
+            },
+            frame.buffer_mut(),
+        );
         if let (Some(row), Some((ratio, label))) = (stats_gauge_row, computing_gauge(stats)) {
             render_line_gauge(
                 frame,
@@ -2651,8 +2668,6 @@ impl UI {
             }
         }
 
-        lines.push(Line::default());
-        let footer_top = lines.len() as u16;
         let (footer, chips) = data_view_footer_wrapped_lines(
             sample.mode,
             sample.slices,
@@ -2662,9 +2677,28 @@ impl UI {
             base,
             width,
         );
-        lines.extend(footer);
-
-        Paragraph::new(lines).render(area, frame.buffer_mut());
+        // Bottom-pin the footer; the value grid fills the region above it (clipped
+        // if it would overflow), like every other view.
+        let footer_len = footer.len() as u16;
+        let footer_top = area.height.saturating_sub(footer_len);
+        Paragraph::new(lines).render(
+            Rect {
+                x: 0,
+                y: 0,
+                width: area.width,
+                height: footer_top,
+            },
+            frame.buffer_mut(),
+        );
+        Paragraph::new(footer).render(
+            Rect {
+                x: 0,
+                y: footer_top,
+                width: area.width,
+                height: footer_len,
+            },
+            frame.buffer_mut(),
+        );
         if let (Some(row), Some((ratio, label))) = (stats_gauge_row, computing_gauge(stats)) {
             render_line_gauge(
                 frame,
