@@ -751,16 +751,16 @@ detail view), no regex required:
   layer. Apply stays disabled until every rule is clean.
 - **Apply command.** The equivalent `convert --map …` command that would apply the
   rename non-interactively is shown at the bottom (labelled `apply:`) and copied to
-  the clipboard with **`^Y`**.
+  the clipboard with **`^A`**.
 - **Command palette + copies.** Like every other view, the editor has a command
   palette — press **`Space`** or **`:`** (a tensor-name schema never contains
-  either, so they're free to use). From it you can *Apply*, *Add / Remove a rule*,
-  copy the **screen text**, copy the **command to reopen this view** (the `y`
-  equivalent — see below), copy the **apply command**, show the **legend**, or go
-  *Back* / *Quit*. Because bare letters type into the name fields, the editor's
-  commands are **Ctrl keys** (real, clickable footer buttons): `^R` apply, `^S` copy
-  screen, `^N`/`^D` add / remove a rule, `^Y` copy the apply command — so every
-  character stays typeable. Copy-reopen-command and the legend are palette-only.
+  either, so they're free to use). Because bare letters type into the name fields,
+  the editor's commands are **Ctrl keys** — the same commands as the non-editing
+  modes' bare letters, Ctrl-prefixed so every character stays typeable, and each a
+  real, clickable footer button with its key shown: `^R` apply, `^N`/`^D` add /
+  remove a rule, `^L` legend, `^S` copy screen, `^Y` copy the command to reopen this
+  view (the `y` of the other views), `^A` copy the apply command. Every command is
+  reachable both by its key and from the palette — none are palette-only.
 
 Press **`^R`** to apply (a Ctrl key, so every character stays typeable). A
 **confirmation pop-up** floats over the editor with a summary of what will change (and
