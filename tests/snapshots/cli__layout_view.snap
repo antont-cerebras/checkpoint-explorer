@@ -40,5 +40,5 @@ Layout - [FIXTURE]                                                              
                │ █                                                                                                     █
                │ █                                                                                                     █
                │ █                                                                                                     │
-↑/↓ select · PgUp/PgDn page · ↵ in tree · Tab tensor tree · Space/: commands · l legend · yy copy screen
-y copy command · ⌫/\ back/fwd · q quit
+↑/↓ select · PgUp/PgDn page · ↵ in tree · Tab tensor tree · Space/: commands · l legend · c copy screen · y copy command
+⌫/\ back/fwd · q quit

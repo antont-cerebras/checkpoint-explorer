@@ -41,4 +41,4 @@ Preview — 0 tensor(s) across 0 rule(s)
 
 enter a rename above to get the `convert --map` command that applies it
 Space/: commands · Tab complete · ↑/↓ fields · ↵ next field · ←/→ caret · ^N add rule · ^D remove · PgUp/PgDn scroll
-^R apply (fix issues) · ^L legend · ^Y^Y copy screen · ^Y copy command · ^A copy apply cmd · Esc back
+^R apply (fix issues) · ^L legend · ^S copy screen · ^Y copy command · ^A copy apply cmd · Esc back

@@ -40,5 +40,5 @@ slice 0 of 3 (fixed leading index) — [ ] step · / index or %
 
 
 m heatmap · ← → first/last cols · ↑ ↓ first/last rows · +Shift one end · [ ] slice · / index or % · d dtype · r reshape
-e window · z zebra: rows · b base: dec · yy copy screen · y copy cmd · l legend · Space/: commands · ⌫/\ back/fwd
+e window · z zebra: rows · b base: dec · c copy screen · y copy cmd · l legend · Space/: commands · ⌫/\ back/fwd
                                                                                                                editable

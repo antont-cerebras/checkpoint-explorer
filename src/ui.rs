@@ -213,14 +213,13 @@ pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
         (Rename, Char('a') | Char('\u{1}')) => {
             "Copy the `convert --map` command that applies this rename non-interactively."
         }
+        (Rename, Char('s') | Char('\u{13}')) => "Copy the whole screen's text to the clipboard.",
         (Rename, Char('l') | Char('\u{c}')) => "Show the legend for the rename editor's symbols.",
         (Rename, Char('\u{1b}')) => "Go back to the previous view.",
         (Rename, Char('\u{3}')) => "Quit the explorer.",
         // Common to every screen.
         (_, Char('l')) => "Show the legend for this screen's symbols and keys.",
-        // Copy-screen is a double-press of the copy-command key (`yy` / `^Y^Y`); the
-        // footer chip replays a `\u{6}`/`\u{7}` sentinel, hovered here.
-        (_, Char('\u{6}') | Char('\u{7}')) => "Copy the whole screen's text to the clipboard.",
+        (_, Char('c')) => "Copy the whole screen's text to the clipboard.",
         (_, Char('y')) => "Copy the CLI command that reopens this exact screen.",
         (_, Backspace) => "Step back through view history.",
         (_, Char('\\')) => "Step forward through view history.",
@@ -4786,7 +4785,7 @@ fn view_footer_items(
     stripe: StripeMode,
     base: NumBase,
 ) -> Vec<(Vec<Seg>, &'static str)> {
-    use KeyCode::{Backspace, Char, Down, End, Home, Left, PageDown, PageUp, Right, Up};
+    use KeyCode::{Backspace, Down, End, Home, Left, PageDown, PageUp, Right, Up};
     let plain = KeyModifiers::NONE;
     let shift = KeyModifiers::SHIFT;
     // The other representation to switch to (heatmap ⇆ numeric values).
@@ -4905,10 +4904,7 @@ fn view_footer_items(
             },
         ));
     }
-    items.push((
-        vec![Seg::Key("yy", KeyEvent::new(Char('\u{6}'), plain))],
-        "copy screen",
-    ));
+    items.push((vec![Seg::Key("c", hint_key('c'))], "copy screen"));
     items.push((vec![Seg::Key("y", hint_key('y'))], "copy cmd"));
     items.push((vec![Seg::Key("l", hint_key('l'))], "legend"));
     items.push((
@@ -5318,13 +5314,7 @@ pub(crate) fn tree_hint_lines(
         (vec![Seg::Key("l", hint_key('l'))], "legend"),
         (vec![Seg::Key("h", hint_key('h'))], "health"),
         (vec![Seg::Key("s", hint_key('s'))], "stats"),
-        (
-            vec![Seg::Key(
-                "yy",
-                KeyEvent::new(KeyCode::Char('\u{6}'), KeyModifiers::NONE),
-            )],
-            "copy screen",
-        ),
+        (vec![Seg::Key("c", hint_key('c'))], "copy screen"),
         (vec![Seg::Key("t", hint_key('t'))], "copy tree"),
         (vec![Seg::Key("f", hint_key('f'))], "copy file"),
         (vec![Seg::Key("n", hint_key('n'))], "copy name"),
@@ -5415,16 +5405,15 @@ pub(crate) fn rename_hint_lines(
             vec![Seg::Key("^R", KeyEvent::new(Char('r'), ctrl))],
             apply_label,
         ),
-        // The universal commands — bare `l`/`y` type into a field here, so they're the
-        // Ctrl keys `^L`/`^Y`, mirroring the non-editing modes' `l`/`y`; copy-screen is
-        // `^Y^Y` (double `^Y`, the editing form of `yy`), clickable via the `\u{7}`
-        // sentinel. `^A` copies the apply (`convert --map`) command.
+        // The universal commands — bare `c`/`l`/`y` type into a field here, so they're
+        // the Ctrl keys `^S`/`^L`/`^Y`, mirroring the non-editing modes' `c`/`l`/`y`.
+        // `^A` copies the apply (`convert --map`) command.
         (
             vec![Seg::Key("^L", KeyEvent::new(Char('l'), ctrl))],
             "legend",
         ),
         (
-            vec![Seg::Key("^Y^Y", KeyEvent::new(Char('\u{7}'), plain))],
+            vec![Seg::Key("^S", KeyEvent::new(Char('s'), ctrl))],
             "copy screen",
         ),
         (
@@ -5558,13 +5547,7 @@ pub(crate) fn files_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>)
         ),
         (vec![Seg::Key("l", hint_key('l'))], "legend"),
         (vec![Seg::Key("f", hint_key('f'))], "copy path"),
-        (
-            vec![Seg::Key(
-                "yy",
-                KeyEvent::new(KeyCode::Char('\u{6}'), KeyModifiers::NONE),
-            )],
-            "copy screen",
-        ),
+        (vec![Seg::Key("c", hint_key('c'))], "copy screen"),
         (vec![Seg::Key("y", hint_key('y'))], "copy command"),
         (
             vec![
@@ -5615,13 +5598,7 @@ pub(crate) fn layout_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>
             "commands",
         ),
         (vec![Seg::Key("l", hint_key('l'))], "legend"),
-        (
-            vec![Seg::Key(
-                "yy",
-                KeyEvent::new(KeyCode::Char('\u{6}'), KeyModifiers::NONE),
-            )],
-            "copy screen",
-        ),
+        (vec![Seg::Key("c", hint_key('c'))], "copy screen"),
         (vec![Seg::Key("y", hint_key('y'))], "copy command"),
         (
             vec![
@@ -6439,7 +6416,7 @@ pub(crate) fn detail_footer_lines(
     layout: bool,
     width: u16,
 ) -> (Vec<Line<'static>>, Vec<ChipHit>) {
-    use KeyCode::{Backspace, Char, Tab};
+    use KeyCode::{Backspace, Tab};
     let plain = KeyModifiers::NONE;
     let mut items: Vec<(Vec<Seg>, &str)> = vec![
         (vec![Seg::Key("m", hint_key('m'))], "heatmap"),
@@ -6469,10 +6446,7 @@ pub(crate) fn detail_footer_lines(
         "commands",
     ));
     items.push((vec![Seg::Key("l", hint_key('l'))], "legend"));
-    items.push((
-        vec![Seg::Key("yy", KeyEvent::new(Char('\u{6}'), plain))],
-        "copy screen",
-    ));
+    items.push((vec![Seg::Key("c", hint_key('c'))], "copy screen"));
     items.push((vec![Seg::Key("y", hint_key('y'))], "copy command"));
     items.push((
         vec![
