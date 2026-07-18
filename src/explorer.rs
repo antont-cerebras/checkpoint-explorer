@@ -1506,11 +1506,16 @@ struct RenameMode2 {
     saved_pairs: Vec<(String, String)>,
     target: std::path::PathBuf,
     loaded: Option<crate::rename::Loaded>,
-    schemas: Vec<String>,
+    /// The deduped generalized schemas the autocomplete offers, each with the count
+    /// of tensors it covers (the dropdown's `×N` column).
+    schemas: Vec<(String, usize)>,
     root: String,
     editor: RenameMode,
     /// What was last copied (the `✓ copied …` flash), cleared on the next key.
     copied: Option<&'static str>,
+    /// The autocomplete dropdown's row rects from the last frame, so a click can
+    /// accept the candidate under the cursor.
+    menu_rects: std::cell::RefCell<Vec<ratatui::layout::Rect>>,
     // Derived, recomputed only when the rule pairs change (`dirty`).
     rules_view: Vec<crate::ui::RenameRuleView>,
     total: usize,
@@ -1535,6 +1540,7 @@ impl RenameMode2 {
             root: String::new(),
             editor: RenameMode::default(),
             copied: None,
+            menu_rects: std::cell::RefCell::new(Vec::new()),
             rules_view: Vec::new(),
             total: 0,
             warnings: Vec::new(),
@@ -1636,13 +1642,22 @@ impl Mode for RenameMode2 {
                 return Ok(Outcome::Leave(Nav::Back));
             }
         };
-        // Autocomplete over the deduped *generalized* schemas (one per tensor family).
+        // Autocomplete over the deduped *generalized* schemas (one per tensor
+        // family), each tagged with how many tensors it covers (the `×N` column).
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for n in loaded.names() {
+            *counts.entry(crate::rename::generalize(n).0).or_default() += 1;
+        }
         let mut seen = HashSet::new();
         self.schemas = loaded
             .names()
             .iter()
             .map(|n| crate::rename::generalize(n).0)
             .filter(|s| seen.insert(s.clone()))
+            .map(|s| {
+                let c = counts[&s];
+                (s, c)
+            })
             .collect();
         self.root = loaded.root().display().to_string();
         if !self.saved_pairs.is_empty() {
@@ -1722,7 +1737,7 @@ impl Mode for RenameMode2 {
     }
 
     fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
-        let (max, chips, clicks) = draw_rename_frame(
+        let (max, chips, clicks, menu_rects) = draw_rename_frame(
             f,
             &self.root,
             &self.editor,
@@ -1737,6 +1752,17 @@ impl Mode for RenameMode2 {
             self.copied,
         );
         self.scroll_max.set(max);
+        // A preview link the open dropdown floats over must not steal the click that
+        // was meant for a candidate row (the generic router tries links first).
+        let clicks: crate::ui::LinkRegions = clicks
+            .into_iter()
+            .filter(|(r, _)| {
+                !menu_rects
+                    .iter()
+                    .any(|mr| r.y == mr.y && r.x < mr.x + mr.width && mr.x < r.x + r.width)
+            })
+            .collect();
+        *self.menu_rects.borrow_mut() = menu_rects; // dropdown rows (click to accept)
         *ex.clickable.borrow_mut() = chips; // footer chips (replay a key)
         *ex.links.borrow_mut() = clicks; // shard → layout, tensor → tree
     }
@@ -1854,7 +1880,12 @@ impl Mode for RenameMode2 {
             }
             return Ok(Outcome::Stay);
         }
+        // When the autocomplete dropdown is open, the arrows drive it and Tab/Enter
+        // accept the highlight (pgcli-style); otherwise they navigate fields / apply.
+        let cands = self.editor.completions(&self.schemas);
+        let menu_open = self.editor.menu.is_some() && !cands.is_empty();
         match code {
+            KeyCode::Esc if menu_open => self.editor.close_menu(),
             KeyCode::Esc => return Ok(Outcome::Leave(Nav::Back)),
             KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.editor.add_pair();
@@ -1868,12 +1899,24 @@ impl Mode for RenameMode2 {
             }
             // The copy-screen chip / palette sentinel (`\u{1}`).
             KeyCode::Char('\u{1}') => self.do_copy_screen(),
-            KeyCode::Tab => {
-                self.editor.autocomplete(&self.schemas);
+            // Tab accepts the highlighted candidate, or opens the dropdown when it's
+            // closed (so a bare Tab still offers completions).
+            KeyCode::Tab if menu_open => {
+                self.editor.accept(&self.schemas);
+                self.editor.error = None;
+                self.dirty = true;
+            }
+            KeyCode::Tab => self.editor.open_menu(),
+            // Enter accepts a highlighted candidate; only with the dropdown closed
+            // does it stage the apply.
+            KeyCode::Enter if menu_open => {
+                self.editor.accept(&self.schemas);
                 self.editor.error = None;
                 self.dirty = true;
             }
             KeyCode::Enter => self.stage_apply(),
+            KeyCode::Up if menu_open => self.editor.menu_move(-1, cands.len()),
+            KeyCode::Down if menu_open => self.editor.menu_move(1, cands.len()),
             KeyCode::Up => self.editor.focus_up(),
             KeyCode::Down => self.editor.focus_down(),
             KeyCode::Left => self.editor.left(),
@@ -1913,6 +1956,24 @@ impl Mode for RenameMode2 {
         m: MouseEvent,
     ) -> MouseOutcome {
         match m.kind {
+            // A click on a dropdown row highlights and accepts that candidate.
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = self.menu_rects.borrow().iter().position(|r| {
+                    m.column >= r.x
+                        && m.column < r.x + r.width
+                        && m.row >= r.y
+                        && m.row < r.y + r.height
+                });
+                if let Some(i) = hit {
+                    self.editor.menu = Some(i);
+                    self.editor.accept(&self.schemas);
+                    self.editor.error = None;
+                    self.dirty = true;
+                    MouseOutcome::Redraw
+                } else {
+                    MouseOutcome::Ignored
+                }
+            }
             MouseEventKind::ScrollDown => {
                 self.editor.scroll = (self.editor.scroll + 3).min(self.scroll_max.get());
                 MouseOutcome::Redraw
@@ -3156,7 +3217,7 @@ fn draw_rename_frame(
     f: &mut ratatui::Frame,
     root: &str,
     mode: &RenameMode,
-    schemas: &[String],
+    schemas: &[(String, usize)],
     rules_view: &[crate::ui::RenameRuleView],
     total: usize,
     warnings: &[String],
@@ -3165,12 +3226,21 @@ fn draw_rename_frame(
     synth_err: &Option<String>,
     cli: Option<&str>,
     copied: Option<&str>,
-) -> (usize, crate::ui::ChipRegions, crate::ui::LinkRegions) {
-    let sugg = if mode.show_sugg {
-        mode.suggestions(schemas)
+) -> (
+    usize,
+    crate::ui::ChipRegions,
+    crate::ui::LinkRegions,
+    Vec<ratatui::layout::Rect>,
+) {
+    let completions = if mode.menu.is_some() {
+        mode.completions(schemas)
     } else {
         Vec::new()
     };
+    let menu_sel = mode
+        .menu
+        .unwrap_or(0)
+        .min(completions.len().saturating_sub(1));
     let display_error = synth_err.clone().or_else(|| mode.error.clone());
     let pairs_disp: Vec<(String, String)> = mode
         .pairs
@@ -3183,8 +3253,9 @@ fn draw_rename_frame(
         focus_pair: mode.focus_pair,
         on_target: mode.on_target,
         cursor: mode.cursor,
-        show_suggestions: mode.show_sugg,
-        suggestions: &sugg,
+        menu_open: mode.menu.is_some(),
+        menu_sel,
+        completions: &completions,
         rules: rules_view,
         total,
         warnings,
@@ -9526,9 +9597,9 @@ struct RenameMode {
     scroll: usize,
     /// A staged rename awaiting a confirming second `Enter`.
     confirming: bool,
-    /// Whether to show the source field's autocomplete list — on while typing a
-    /// source, off after an autocomplete / focus change (so it's not in the way).
-    show_sugg: bool,
+    /// The autocomplete dropdown: `Some(i)` when open with candidate `i` highlighted,
+    /// `None` when closed. Opens on typing, closes on accept / focus change / `Esc`.
+    menu: Option<usize>,
     /// A transient error (a failed apply / rule synthesis) shown in the editor.
     error: Option<String>,
 }
@@ -9542,7 +9613,7 @@ impl Default for RenameMode {
             cursor: 0,
             scroll: 0,
             confirming: false,
-            show_sugg: true,
+            menu: None,
             error: None,
         }
     }
@@ -9583,7 +9654,7 @@ impl RenameMode {
             f.insert(byte, c);
         }
         self.cursor += 1;
-        self.show_sugg = !self.on_target; // typing a source re-opens its list
+        self.menu = Some(0); // typing (re)opens the dropdown at its top match
     }
 
     /// Delete the character before the caret (Backspace).
@@ -9599,7 +9670,7 @@ impl RenameMode {
             }
         }
         self.cursor -= 1;
-        self.show_sugg = !self.on_target;
+        self.menu = Some(0);
     }
 
     /// Delete the character at the caret (Delete).
@@ -9611,7 +9682,7 @@ impl RenameMode {
                 f.remove(byte);
             }
         }
-        self.show_sugg = !self.on_target;
+        self.menu = Some(0);
     }
 
     fn left(&mut self) {
@@ -9621,40 +9692,81 @@ impl RenameMode {
         self.cursor = (self.cursor + 1).min(self.field_ref().chars().count());
     }
 
-    /// Autocomplete suggestions for the focused source (empty on a new-name field):
+    /// Autocomplete candidates for the *focused* field (source or new-name alike):
     /// the deduped generalized schemas (numbers → `{layer}`/`{expert}`/`{n0}`) that
-    /// match the query number-agnostically. An empty query lists the first few.
-    fn suggestions<'a>(&self, schemas: &'a [String]) -> Vec<&'a str> {
+    /// match the query number-agnostically, each with the count of tensors it covers
+    /// and — for a literal match — the char range to embolden. An empty query lists
+    /// the first few for discovery.
+    fn completions(&self, schemas: &[(String, usize)]) -> Vec<crate::ui::RenameCompletion> {
         const MAX: usize = 8;
-        if self.on_target {
-            return Vec::new();
-        }
-        let q = normalize_for_match(self.pairs[self.focus_pair].source.trim());
+        let raw = self.field_ref().trim();
+        let q = normalize_for_match(raw);
+        let ql = raw.to_lowercase();
+        let len = raw.chars().count();
         schemas
             .iter()
-            .filter(|s| q.is_empty() || normalize_for_match(s).contains(&q))
-            .map(String::as_str)
+            .filter(|(s, _)| q.is_empty() || normalize_for_match(s).contains(&q))
             .take(MAX)
+            .map(|(s, count)| {
+                // Best-effort literal-substring highlight (skipped when the query
+                // only matches number-agnostically, e.g. `layers.5` vs `{layer}`).
+                let hl = (!ql.is_empty())
+                    .then(|| s.to_lowercase().find(&ql))
+                    .flatten()
+                    .map(|b| {
+                        let start = s.to_lowercase()[..b].chars().count();
+                        (start, start + len)
+                    });
+                crate::ui::RenameCompletion {
+                    text: s.clone(),
+                    count: *count,
+                    hl,
+                }
+            })
             .collect()
     }
 
-    /// `Tab`: replace the focused source with the top matching schema (its numbers
-    /// generalized to `{layer}`/`{expert}` placeholders) and prefill the new name
-    /// from it, so one rule covers the whole family. A no-op on a new-name field.
-    fn autocomplete(&mut self, schemas: &[String]) {
-        if self.on_target {
+    /// Open the dropdown at its top match.
+    fn open_menu(&mut self) {
+        self.menu = Some(0);
+    }
+
+    /// Close the dropdown.
+    fn close_menu(&mut self) {
+        self.menu = None;
+    }
+
+    /// Move the dropdown's highlight by `delta`, wrapping over `n` candidates (as
+    /// prompt_toolkit / pgcli do). A no-op when the menu is closed or empty.
+    fn menu_move(&mut self, delta: isize, n: usize) {
+        if n == 0 {
             return;
         }
-        let Some(top) = self.suggestions(schemas).first().map(|s| s.to_string()) else {
+        let cur = self.menu.unwrap_or(0) as isize;
+        self.menu = Some((cur + delta).rem_euclid(n as isize) as usize);
+    }
+
+    /// Accept the highlighted candidate into the focused field: numbers stay
+    /// generalized to `{layer}`/`{expert}` placeholders so one rule covers a whole
+    /// family. Accepting into a source also prefills a still-empty new name from it.
+    fn accept(&mut self, schemas: &[(String, usize)]) {
+        let Some(sel) = self.menu else { return };
+        let cands = self.completions(schemas);
+        let Some(text) = cands.get(sel).map(|c| c.text.clone()) else {
             return;
         };
+        let on_target = self.on_target;
         let pair = &mut self.pairs[self.focus_pair];
-        pair.source = top.clone();
-        if pair.target.trim().is_empty() {
-            pair.target = top;
+        if on_target {
+            pair.target = text;
+        } else {
+            pair.source = text.clone();
+            if pair.target.trim().is_empty() {
+                pair.target = text;
+            }
         }
         self.caret_to_end();
-        self.show_sugg = false; // hide the list once a completion is accepted
+        self.menu = None; // accepting a completion closes the dropdown
     }
 
     /// Build the combined rename map from every complete pair (via
@@ -9686,7 +9798,7 @@ impl RenameMode {
         self.focus_pair = self.pairs.len() - 1;
         self.on_target = false;
         self.caret_to_end();
-        self.show_sugg = false;
+        self.menu = None;
     }
 
     /// Remove the focused pair (keeping at least one), clamping focus.
@@ -9696,7 +9808,7 @@ impl RenameMode {
             self.focus_pair = self.focus_pair.min(self.pairs.len() - 1);
             self.on_target = false;
             self.caret_to_end();
-            self.show_sugg = false;
+            self.menu = None;
         }
     }
 
@@ -9711,7 +9823,7 @@ impl RenameMode {
         self.on_target = idx % 2 == 1;
         self.ensure_target_prefill();
         self.caret_to_end();
-        self.show_sugg = false; // don't pop the list just by moving focus
+        self.menu = None; // don't pop the dropdown just by moving focus
     }
 
     /// `↑`: focus the previous field.
@@ -10502,27 +10614,46 @@ mod tests {
         .collect();
 
         // Autocomplete matches the deduped, *generalized* schemas — number-agnostic,
-        // so a concrete "Q_PROJ" query finds the {layer} family.
-        let schemas: Vec<String> = {
+        // so a concrete "Q_PROJ" query finds the {layer} family. Each schema carries
+        // the count of tensors it covers (the dropdown's `×N` column).
+        let schemas: Vec<(String, usize)> = {
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for n in &names {
+                *counts.entry(crate::rename::generalize(n).0).or_default() += 1;
+            }
             let mut seen = HashSet::new();
             names
                 .iter()
                 .map(|n| crate::rename::generalize(n).0)
                 .filter(|s| seen.insert(s.clone()))
+                .map(|s| {
+                    let c = counts[&s];
+                    (s, c)
+                })
+                .collect()
+        };
+        let texts = |mode: &RenameMode| -> Vec<String> {
+            mode.completions(&schemas)
+                .iter()
+                .map(|c| c.text.clone())
                 .collect()
         };
         let mut mode = RenameMode::default();
         mode.pairs[0].source = "Q_PROJ".to_string();
         assert_eq!(
-            mode.suggestions(&schemas),
+            texts(&mode),
             vec!["model.layers.{layer}.self_attn.q_proj.weight"]
         );
         // Empty query lists all families for discovery.
         mode.pairs[0].source.clear();
-        assert_eq!(mode.suggestions(&schemas).len(), 3);
-        // No autocomplete on a new-name field.
+        assert_eq!(mode.completions(&schemas).len(), 3);
+        // The new-name field autocompletes too (both fields, pgcli-style).
         mode.on_target = true;
-        assert!(mode.suggestions(&schemas).is_empty());
+        mode.pairs[0].target = "up_proj".to_string();
+        assert_eq!(
+            texts(&mode),
+            vec!["model.layers.{layer}.mlp.up_proj.weight"]
+        );
 
         // ↓ past the last field grows a new pair and focuses its source.
         let before = mode.pairs.len();
