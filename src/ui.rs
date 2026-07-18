@@ -5212,7 +5212,7 @@ fn tree_span(selected: bool, color: Color, text: impl Into<String>) -> Span<'sta
 
 /// The tree browser's key-hint line(s), word-wrapped to `width` on the
 /// ` · `-separated `key label` chips (the long hint spills onto a second line).
-fn tree_hint_lines(
+pub(crate) fn tree_hint_lines(
     can_repack: bool,
     can_rename: bool,
     width: u16,
@@ -5307,7 +5307,10 @@ fn tree_hint_lines(
 /// clickable, hover-aware footer every other view has, opening with the common
 /// `Space / :` command-palette chip. The `^N`/`^D`/`^Y` chips synthesize their
 /// Ctrl combos; the rest are plain keys the editor loop already handles.
-fn rename_hint_lines(width: u16, applicable: bool) -> (Vec<Line<'static>>, Vec<ChipHit>) {
+pub(crate) fn rename_hint_lines(
+    width: u16,
+    applicable: bool,
+) -> (Vec<Line<'static>>, Vec<ChipHit>) {
     use KeyCode::{Char, Down, Enter, Esc, Left, PageDown, PageUp, Right, Tab, Up};
     let plain = KeyModifiers::NONE;
     let ctrl = KeyModifiers::CONTROL;
@@ -5463,7 +5466,7 @@ fn wrap_hint_items(items: Vec<(Vec<Seg>, &str)>, width: u16) -> (Vec<Line<'stati
 /// The file browser's key-hint line(s), wrapped to `width` like
 /// [`tree_hint_lines`] — the same `key label · …` chips and clickable
 /// [`ChipHit`]s, for the file-view footer.
-fn files_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
+pub(crate) fn files_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
     use KeyCode::{Backspace, Down, Enter, Left, PageDown, PageUp, Right, Tab, Up};
     let plain = KeyModifiers::NONE;
     let items: Vec<(Vec<Seg>, &str)> = vec![
@@ -5526,8 +5529,8 @@ fn files_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
 
 /// The layout map's footer hints (`↑↓ select · ↵ in tree · …`), wrapped to
 /// `width` like the tree's, with clickable [`ChipHit`]s.
-fn layout_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
-    use KeyCode::{Backspace, Down, Enter, PageDown, PageUp, Up};
+pub(crate) fn layout_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
+    use KeyCode::{Backspace, Down, Enter, PageDown, PageUp, Tab, Up};
     let plain = KeyModifiers::NONE;
     let items: Vec<(Vec<Seg>, &str)> = vec![
         (
@@ -5547,6 +5550,10 @@ fn layout_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>) {
             "page",
         ),
         (vec![Seg::Key("↵", KeyEvent::new(Enter, plain))], "in tree"),
+        (
+            vec![Seg::Key("Tab", KeyEvent::new(Tab, plain))],
+            "tensor tree",
+        ),
         (
             vec![
                 Seg::Key("Space", hint_key(' ')),
