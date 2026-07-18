@@ -1428,13 +1428,12 @@ impl Mode for TreeMode {
                     self.scrollbar_drag = true;
                     return MouseOutcome::Redraw;
                 }
-                let body_top = UI::tree_header_rows(
-                    sz.width,
-                    ex.search_mode,
-                    ex.can_repack(),
-                    ex.can_rename(),
-                ) as u16;
-                let body_bottom = sz.height.saturating_sub(2); // status bar
+                let body_top = UI::tree_header_rows(ex.search_mode) as u16;
+                // Body ends above the bottom-pinned hint footer + the 2-line status bar.
+                let hint_rows =
+                    UI::tree_hint_rows(sz.width, ex.search_mode, ex.can_repack(), ex.can_rename())
+                        as u16;
+                let body_bottom = sz.height.saturating_sub(2 + hint_rows);
                 if row >= body_top && row < body_bottom {
                     let idx = ex.scroll_offset + (row - body_top) as usize;
                     if idx < ex.current_tree_len() {

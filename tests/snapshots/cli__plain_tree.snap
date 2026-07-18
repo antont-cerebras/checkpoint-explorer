@@ -3,9 +3,6 @@ source: tests/cli.rs
 expression: "plain(&[])"
 ---
 Checkpoint Explorer - [FIXTURE] (1/1)                                                          [×]
-↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · PgUp/PgDn page · Enter open · Tab files · Space/: commands
-E/C all · / search · l legend · h health · s stats · yy copy screen · t copy tree · f copy file · n copy name
-y copy command · ⌫/\ back/fwd · R rename · q quit
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ▾ [FIXTURE] (▦ 7, 124 params, 272 B)
   ▸ 🔧 Metadata (▦ 0, 0 B)
@@ -40,5 +37,8 @@ y copy command · ⌫/\ back/fwd · R rename · q quit
 
 
 
+↑/↓ navigate · ←/→ parent/child · Shift+↑/↓ sibling · PgUp/PgDn page · Enter open · Tab files · Space/: commands
+E/C all · / search · l legend · h health · s stats · yy copy screen · t copy tree · f copy file · n copy name
+y copy command · ⌫/\ back/fwd · R rename · q quit
  ▪ [FIXTURE]
                                                                                                                editable
