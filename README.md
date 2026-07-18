@@ -726,8 +726,10 @@ detail view), no regex required:
   field. As you type in either (matching is number-agnostic), a **completion
   dropdown** pops up under the field — pgcli-style — listing the matching tensor
   **schemas**, each with a `×N` count of how many tensors it covers. Move the
-  highlight with **`↑`/`↓`** and accept with **`Tab`** or **`Enter`** (or click a
-  row); **`Esc`** closes the dropdown. Accepting turns each layer / expert index
+  highlight with **`↑`/`↓`** and accept with **`Enter`** (or click a row); **`Tab`**
+  extends the field to the candidates' longest common prefix (shell-style — fill in
+  as much as is unambiguous, then narrow further); **`Esc`** closes the dropdown.
+  Accepting turns each layer / expert index
   into a `{layer}` / `{expert}` / `{n0}` **placeholder** (and prefills the new name
   from the source). Keep the placeholders and one rule renames the tensor across
   **every** layer and expert at once; type a **concrete** number instead (e.g.

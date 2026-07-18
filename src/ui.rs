@@ -3861,7 +3861,7 @@ fn render_completion_menu(
     if cands.is_empty() || area.width <= anchor_x {
         return Vec::new();
     }
-    const CAPTION: &str = "↑/↓ pick · Tab/↵ accept · Esc close";
+    const CAPTION: &str = "↑/↓ pick · ↵ accept · Tab complete · Esc close";
     let count_label = |n: usize| format!("×{n}");
     let name_w = cands
         .iter()
@@ -7611,7 +7611,7 @@ mod tests {
         assert!(plain.contains("self_attn.q_proj.weight"), "{plain}");
         assert!(plain.contains("self_attn.k_proj.weight"), "{plain}");
         assert!(plain.contains("×32"), "count column: {plain}");
-        assert!(plain.contains("Tab/↵ accept"), "key caption: {plain}");
+        assert!(plain.contains("Tab complete"), "key caption: {plain}");
         // One click target per candidate row (the caption row is not clickable).
         assert_eq!(menu.len(), 2, "a click rect per candidate");
     }
