@@ -699,7 +699,7 @@ trait Mode {
         term: &mut crate::tui::LiveTerminal,
         key: KeyEvent,
     ) -> Result<Outcome>;
-    /// Handle a mouse event the driver didn't consume (rows / scrollbar / band / wheel).
+    /// Handle a mouse event the driver didn't consume (rows / band / wheel).
     fn handle_mouse(
         &mut self,
         _ex: &mut Explorer,
@@ -708,6 +708,10 @@ trait Mode {
     ) -> MouseOutcome {
         MouseOutcome::Ignored
     }
+    /// Scrub this mode's body to a scroll `offset` — the engine calls this when the
+    /// user clicks or drags the scroll bar. Default no-op (a mode that reports a
+    /// [`crate::ui::VScrollbar`] overrides it to move its own offset).
+    fn set_scroll(&mut self, _ex: &mut Explorer, _offset: usize) {}
     /// The screen to record in history for back / forward restore.
     fn residual(&self) -> Screen;
 }
@@ -723,8 +727,6 @@ struct FilesMode {
     /// The selection the scroll was last kept-visible for (so a moved selection
     /// re-scrolls once). `usize::MAX` forces the first frame to update.
     last_sel: usize,
-    /// Whether a scrollbar drag is in progress.
-    scrollbar_drag: bool,
 }
 
 impl FilesMode {
@@ -732,7 +734,6 @@ impl FilesMode {
         Self {
             last_click: None,
             last_sel: usize::MAX,
-            scrollbar_drag: false,
         }
     }
 }
@@ -856,18 +857,10 @@ impl Mode for FilesMode {
         let Ok(sz) = term.size() else {
             return MouseOutcome::Ignored;
         };
-        let total = ex.file_flattened.len();
         let (col, row) = (m.column, m.row);
         match m.kind {
+            // (Scroll-bar clicks / drags are handled by the engine's `route_mouse`.)
             MouseEventKind::Down(MouseButton::Left) => {
-                self.scrollbar_drag = false;
-                if let Some(sb) = UI::files_scrollbar(sz.width, sz.height, total)
-                    && sb.hit(col, row)
-                {
-                    ex.file_scroll = sb.offset_at(row);
-                    self.scrollbar_drag = true;
-                    return MouseOutcome::Redraw;
-                }
                 let body_top = UI::files_header_rows(sz.width) as u16;
                 let body_bottom = sz.height.saturating_sub(FILES_FOOTER_ROWS as u16);
                 if row >= body_top && row < body_bottom {
@@ -898,16 +891,6 @@ impl Mode for FilesMode {
                 }
                 MouseOutcome::Redraw
             }
-            MouseEventKind::Drag(MouseButton::Left) if self.scrollbar_drag => {
-                if let Some(sb) = UI::files_scrollbar(sz.width, sz.height, total) {
-                    ex.file_scroll = sb.offset_at(row);
-                }
-                MouseOutcome::Redraw
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                self.scrollbar_drag = false;
-                MouseOutcome::Redraw
-            }
             MouseEventKind::ScrollDown => {
                 ex.file_scroll = ex.file_scroll.saturating_add(WHEEL_STEP);
                 MouseOutcome::Redraw
@@ -918,6 +901,10 @@ impl Mode for FilesMode {
             }
             _ => MouseOutcome::Ignored,
         }
+    }
+
+    fn set_scroll(&mut self, ex: &mut Explorer, offset: usize) {
+        ex.file_scroll = offset;
     }
 
     fn residual(&self) -> Screen {
@@ -992,7 +979,7 @@ impl Mode for LayoutMode {
 
     fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
         let flash = ex.copied_flash.as_ref().map(|(w, _)| w.clone());
-        let (_max, regions, links) = UI::render_layout(
+        let (_max, regions, links, vscroll) = UI::render_layout(
             f,
             self.map(),
             self.selected,
@@ -1002,6 +989,7 @@ impl Mode for LayoutMode {
         );
         *ex.clickable.borrow_mut() = regions;
         *ex.links.borrow_mut() = links; // tensor band name → tree
+        *ex.vscrollbar.borrow_mut() = vscroll;
     }
 
     fn pre_draw(&mut self, _ex: &mut Explorer, term: &mut crate::tui::LiveTerminal) {
@@ -1174,6 +1162,10 @@ impl Mode for LayoutMode {
         }
     }
 
+    fn set_scroll(&mut self, _ex: &mut Explorer, offset: usize) {
+        self.scroll = offset;
+    }
+
     fn residual(&self) -> Screen {
         Screen::Layout {
             path: self.path.clone(),
@@ -1189,7 +1181,6 @@ impl Mode for LayoutMode {
 struct TreeMode {
     last_click: Option<(std::time::Instant, u16)>,
     last_sel: usize,
-    scrollbar_drag: bool,
 }
 
 impl TreeMode {
@@ -1197,7 +1188,6 @@ impl TreeMode {
         Self {
             last_click: None,
             last_sel: usize::MAX,
-            scrollbar_drag: false,
         }
     }
 }
@@ -1436,22 +1426,8 @@ impl Mode for TreeMode {
         };
         let (col, row) = (m.column, m.row);
         match m.kind {
+            // (Scroll-bar clicks / drags are handled by the engine's `route_mouse`.)
             MouseEventKind::Down(MouseButton::Left) => {
-                // A press on the scroll bar scrubs the viewport; holding then drags.
-                self.scrollbar_drag = false;
-                if let Some(sb) = UI::tree_scrollbar(
-                    sz.width,
-                    sz.height,
-                    ex.search_mode,
-                    ex.can_repack(),
-                    ex.can_rename(),
-                    ex.current_tree_len(),
-                ) && sb.hit(col, row)
-                {
-                    ex.scroll_offset = sb.offset_at(row);
-                    self.scrollbar_drag = true;
-                    return MouseOutcome::Redraw;
-                }
                 let body_top = UI::tree_header_rows(ex.search_mode) as u16;
                 // Body ends above the bottom-pinned hint footer + the 2-line status bar.
                 let hint_rows =
@@ -1498,23 +1474,6 @@ impl Mode for TreeMode {
                 }
                 MouseOutcome::Redraw
             }
-            MouseEventKind::Drag(MouseButton::Left) if self.scrollbar_drag => {
-                if let Some(sb) = UI::tree_scrollbar(
-                    sz.width,
-                    sz.height,
-                    ex.search_mode,
-                    ex.can_repack(),
-                    ex.can_rename(),
-                    ex.current_tree_len(),
-                ) {
-                    ex.scroll_offset = sb.offset_at(row);
-                }
-                MouseOutcome::Redraw
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                self.scrollbar_drag = false;
-                MouseOutcome::Redraw
-            }
             MouseEventKind::ScrollDown => {
                 ex.scroll_offset = ex.scroll_offset.saturating_add(WHEEL_STEP);
                 MouseOutcome::Redraw
@@ -1525,6 +1484,10 @@ impl Mode for TreeMode {
             }
             _ => MouseOutcome::Ignored,
         }
+    }
+
+    fn set_scroll(&mut self, ex: &mut Explorer, offset: usize) {
+        ex.scroll_offset = offset;
     }
 
     fn residual(&self) -> Screen {
@@ -1849,7 +1812,7 @@ impl Mode for RenameMode2 {
     }
 
     fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
-        let (max, chips, clicks, menu_rects) = draw_rename_frame(
+        let (max, chips, clicks, menu_rects, vscroll) = draw_rename_frame(
             f,
             &self.root,
             &self.editor,
@@ -1864,6 +1827,7 @@ impl Mode for RenameMode2 {
             self.copied,
         );
         self.scroll_max.set(max);
+        *ex.vscrollbar.borrow_mut() = vscroll;
         // A preview link the open dropdown floats over must not steal the click that
         // was meant for a candidate row (the generic router tries links first).
         let clicks: crate::ui::LinkRegions = clicks
@@ -2109,6 +2073,10 @@ impl Mode for RenameMode2 {
             }
             _ => MouseOutcome::Ignored,
         }
+    }
+
+    fn set_scroll(&mut self, _ex: &mut Explorer, offset: usize) {
+        self.editor.scroll = offset;
     }
 
     fn residual(&self) -> Screen {
@@ -2780,6 +2748,10 @@ impl Mode for StatsMode {
             }
             _ => MouseOutcome::Ignored,
         }
+    }
+
+    fn set_scroll(&mut self, _ex: &mut Explorer, offset: usize) {
+        self.scroll = offset;
     }
 
     fn residual(&self) -> Screen {
@@ -3596,6 +3568,7 @@ fn draw_rename_frame(
     crate::ui::ChipRegions,
     crate::ui::LinkRegions,
     Vec<ratatui::layout::Rect>,
+    Option<crate::ui::VScrollbar>,
 ) {
     let completions = if mode.menu.is_some() {
         mode.completions(schemas)
@@ -3752,6 +3725,14 @@ pub struct Explorer {
     /// The app-wide counterpart to `clickable` — rebuilt each frame by the screens
     /// that show such names; a click routes through [`Self::open_link`].
     links: RefCell<Vec<(ratatui::layout::Rect, crate::ui::Link)>>,
+    /// The current frame's vertical scroll bar, when the active mode's body
+    /// overflows. Recorded by each mode's render (like `clickable`) and drawn +
+    /// drag-scrubbed by the `run_mode` engine, so every mode gets a bar the same
+    /// way — see [`crate::ui::VScrollbar`].
+    vscrollbar: RefCell<Option<crate::ui::VScrollbar>>,
+    /// Whether a scroll-bar drag is in progress (engine-owned, shared by every
+    /// mode's bar).
+    scrollbar_drag: bool,
     /// Index/file mismatches, shown as a warning panel. Populated in
     /// [`Self::finalize_load`] from [`Self::index_specs`] once the tensors are
     /// read (plus any remote index health folded in by the loader).
@@ -3904,6 +3885,8 @@ impl Explorer {
             terminal: None,
             clickable: RefCell::new(Vec::new()),
             links: RefCell::new(Vec::new()),
+            vscrollbar: RefCell::new(None),
+            scrollbar_drag: false,
             health_reports: Vec::new(),
             index_specs,
             dtype_overrides: RefCell::new(HashMap::new()),
@@ -5758,6 +5741,21 @@ impl Explorer {
         };
         *self.clickable.borrow_mut() = UI::render_tree(frame, &config);
         self.links.borrow_mut().clear(); // tree rows navigate on their own
+        // The engine draws the scroll bar; report its geometry (live TUI only).
+        *self.vscrollbar.borrow_mut() = interactive
+            .then(|| {
+                let area = frame.area();
+                UI::tree_scrollbar(
+                    area.width,
+                    area.height,
+                    self.search_mode,
+                    self.repack_input().is_some(),
+                    self.can_rename(),
+                    tree_to_display.len(),
+                    self.scroll_offset,
+                )
+            })
+            .flatten();
         self.render_shortcut_hover(frame);
     }
 
@@ -6234,8 +6232,9 @@ impl Explorer {
         scroll: usize,
         shards_expanded: bool,
     ) -> usize {
-        let (max, regions) = UI::render_stats_frame(frame, stats, scroll, shards_expanded);
+        let (max, regions, vscroll) = UI::render_stats_frame(frame, stats, scroll, shards_expanded);
         *self.clickable.borrow_mut() = regions;
+        *self.vscrollbar.borrow_mut() = vscroll;
         let badges = self.screen_badges(HelpCtx::Stats);
         UI::render_badge_bar(frame, &badges, self.hovered_badge.get());
         max
@@ -6512,8 +6511,15 @@ impl Explorer {
             if !input_pending {
                 mode.pre_draw(self, &mut term);
                 let hint = layout_hint;
+                // Start each frame with no scroll bar; the mode's render records one
+                // (via `self.vscrollbar`) when its body overflows, and the engine
+                // draws it here — so a mode can't scroll without showing a bar.
+                *self.vscrollbar.borrow_mut() = None;
                 let drawn = term.draw(|f| {
                     mode.render_frame(self, f);
+                    if let Some(sb) = *self.vscrollbar.borrow() {
+                        UI::render_vscrollbar(f, &sb);
+                    }
                     if let Some(o) = mode.overlay() {
                         match o {
                             Overlay::Legend(l) => UI::render_legend_band(f, *l),
@@ -6717,13 +6723,35 @@ impl Explorer {
                 if let Some(k) = crate::ui::region_hit(&self.clickable.borrow(), col, row) {
                     return Ok(MouseOutcome::SynthKey(k));
                 }
+                // The vertical scroll bar (any mode): click the track to scrub to
+                // that offset and start a drag. `set_scroll` moves the mode's own
+                // offset, so this works uniformly for every scrolling mode.
+                let bar = *self.vscrollbar.borrow();
+                if let Some(bar) = bar
+                    && bar.hit(col, row)
+                {
+                    mode.set_scroll(self, bar.offset_at(row));
+                    self.scrollbar_drag = true;
+                    return Ok(MouseOutcome::Redraw);
+                }
+                Ok(mode.handle_mouse(self, term, m))
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.scrollbar_drag => {
+                let bar = *self.vscrollbar.borrow();
+                if let Some(bar) = bar {
+                    mode.set_scroll(self, bar.offset_at(row));
+                }
+                Ok(MouseOutcome::Redraw)
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.scrollbar_drag = false;
                 Ok(mode.handle_mouse(self, term, m))
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 self.copied_flash = None;
                 Ok(mode.handle_mouse(self, term, m))
             }
-            _ => Ok(mode.handle_mouse(self, term, m)), // drag / release
+            _ => Ok(mode.handle_mouse(self, term, m)), // other drags / releases
         }
     }
 
@@ -7013,6 +7041,18 @@ impl Explorer {
         );
         *self.clickable.borrow_mut() = regions;
         self.links.borrow_mut().clear(); // file rows activate on their own
+        // The engine draws the scroll bar; report its geometry (live TUI only).
+        *self.vscrollbar.borrow_mut() = interactive
+            .then(|| {
+                let area = frame.area();
+                UI::files_scrollbar(
+                    area.width,
+                    area.height,
+                    self.file_flattened.len(),
+                    self.file_scroll,
+                )
+            })
+            .flatten();
     }
 
     /// One screenful of file rows, to size a PageUp/PageDown jump.
