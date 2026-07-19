@@ -46,6 +46,10 @@ pub struct ShardListing {
     pub actual: BTreeSet<String>,
 }
 
+/// One directory's entries as `(name, size, is_dir)` — the file browser's view of
+/// a remote directory (see [`RemoteSession::walk_dir`]).
+pub type DirListing = Vec<(String, u64, bool)>;
+
 /// An authenticated SSH session. Constructed once per host, then reused for every
 /// read (SFTP for safetensors dirs, an exec channel for the cstorch dump), so a
 /// checkpoint — or two, for `diff` — costs one authentication / one password
@@ -168,6 +172,122 @@ impl RemoteSession {
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
         let sftp = self.session.sftp().context("opening the SFTP subsystem")?;
         read_all(&sftp, path)
+    }
+
+    /// Recursively list a remote directory tree (down to `max_depth`) over **one**
+    /// SFTP channel plus **one** `stat -L` exec — the backend for the file browser
+    /// on an SFTP checkpoint. Returns a map from each directory's path to its
+    /// entries `(name, size, is_dir)`, which [`crate::filetree::build_from`] then
+    /// assembles with zero further round-trips (so the first `Tab` isn't a per-
+    /// directory channel-open storm). Dotfiles (and `.`/`..`) are skipped.
+    ///
+    /// **Symlinks are followed for sizing.** `readdir` reports an `lstat` size — for
+    /// a symlinked shard that's the link *path* length (tens of bytes), not the
+    /// target it opens to; so every symlink is resolved in one batched `stat -L`
+    /// and its size becomes the target's. A symlink to a directory stays a **leaf**
+    /// (not descended), matching the local walk, so the tree can't cycle. This
+    /// keeps the browser's size equal to what the layout map reads when it opens
+    /// the file (both follow the link) — see [`read_header_sized`].
+    ///
+    /// The root listing must succeed (surfaces an auth/permission error); a deeper
+    /// directory that can't be listed degrades to empty.
+    pub fn walk_dir(&self, root: &str, max_depth: usize) -> Result<HashMap<String, DirListing>> {
+        let sftp = self.session.sftp().context("opening the SFTP subsystem")?;
+        let root = root.trim_end_matches('/').to_string();
+        let mut map: HashMap<String, DirListing> = HashMap::new();
+        // Symlinks to resolve after the walk, in one batch: (dir, row index, full).
+        let mut links: Vec<(String, usize, String)> = Vec::new();
+        let mut stack = vec![(root.clone(), 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            if depth >= max_depth {
+                continue;
+            }
+            let entries = match sftp.readdir(Path::new(&dir)) {
+                Ok(e) => e,
+                Err(err) => {
+                    if dir == root {
+                        return Err(err).with_context(|| format!("listing {root}"));
+                    }
+                    map.insert(dir, Vec::new()); // an unreadable subdir shows empty
+                    continue;
+                }
+            };
+            let mut rows: Vec<(String, u64, bool)> = Vec::new();
+            for (p, st) in entries {
+                let name = match p.file_name().and_then(|n| n.to_str()) {
+                    Some(n) if !n.starts_with('.') => n.to_string(),
+                    _ => continue,
+                };
+                let full = format!("{dir}/{name}");
+                // A symlink (S_IFLNK) is sized by a follow-up `stat -L`; the link's
+                // own size is a fallback if that can't run (broken link / no GNU
+                // stat). It stays a leaf, so it's never descended.
+                let is_symlink = st.perm.is_some_and(|m| m & 0o170000 == 0o120000);
+                if is_symlink {
+                    links.push((dir.clone(), rows.len(), full));
+                    rows.push((name, st.size.unwrap_or(0), false));
+                } else {
+                    let is_dir = st.is_dir();
+                    let size = if is_dir { 0 } else { st.size.unwrap_or(0) };
+                    if is_dir && depth + 1 < max_depth {
+                        stack.push((full, depth + 1));
+                    }
+                    rows.push((name, size, is_dir));
+                }
+            }
+            map.insert(dir, rows);
+        }
+        // Follow every symlink in one `stat -L` and replace its fallback size with
+        // the target's (a symlinked dir stays a size-0 leaf — never descended).
+        if !links.is_empty() {
+            let paths: Vec<String> = links.iter().map(|(_, _, p)| p.clone()).collect();
+            let resolved = self.resolve_links(&paths);
+            for (dir, idx, full) in &links {
+                if let Some((is_dir, size)) = resolved.get(full)
+                    && let Some(rows) = map.get_mut(dir)
+                {
+                    rows[*idx].1 = if *is_dir { 0 } else { *size };
+                }
+            }
+        }
+        Ok(map)
+    }
+
+    /// Follow `paths` (symlinks) in one `stat -L` over an SSH exec channel,
+    /// returning `full-path → (is_dir, followed size)` for each that resolved.
+    /// Best-effort: broken links / a non-GNU `stat` just leave entries absent (the
+    /// caller keeps the `lstat` fallback), so this never fails the browse.
+    fn resolve_links(&self, paths: &[String]) -> HashMap<String, (bool, u64)> {
+        let mut out = HashMap::new();
+        if paths.is_empty() {
+            return out;
+        }
+        let args: String = paths
+            .iter()
+            .map(|p| format!(" {}", shell_single_quote(p)))
+            .collect();
+        // `-L` follows the link; `%s` target size, `%F` target type, `%n` the path
+        // as given (tab-separated so a spaced type like "regular file" is one field).
+        let command = format!("stat -L -c '%s\t%F\t%n' --{args}");
+        // Ignore the exit status (a broken link makes it non-zero) — the good lines
+        // are already delivered to the callback.
+        let _ = self.exec_capture(&command, "", |line| {
+            let mut it = line.splitn(3, '\t');
+            if let (Some(sz), Some(kind), Some(name)) = (it.next(), it.next(), it.next())
+                && let Ok(sz) = sz.trim().parse::<u64>()
+            {
+                out.insert(name.to_string(), (kind == "directory", sz));
+            }
+        });
+        out
+    }
+
+    /// Read a remote safetensors header over SFTP together with the file's total
+    /// size — the `(total_len, header_json)` a remote [`crate::safelayout`] map
+    /// needs — without touching the tensor data. Read-only.
+    pub fn read_header_sized(&self, path: &str) -> Result<(u64, Vec<u8>)> {
+        let sftp = self.session.sftp().context("opening the SFTP subsystem")?;
+        read_header_sized(&sftp, path)
     }
 
     /// The on-disk footprint of each path via a single read-only `stat` syscall
@@ -548,6 +668,25 @@ fn read_header(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<u8>> {
     f.read_exact(&mut header)
         .with_context(|| format!("reading header of {path}"))?;
     Ok(header)
+}
+
+/// Like [`read_header`], but also returns the file's total size (from a `stat`
+/// on the open handle) — the layout map needs it to size the trailing data gap.
+fn read_header_sized(sftp: &ssh2::Sftp, path: &str) -> Result<(u64, Vec<u8>)> {
+    let mut f = open_readonly(sftp, path)?;
+    let total_len = f
+        .stat()
+        .with_context(|| format!("stat of {path}"))?
+        .size
+        .unwrap_or(0);
+    let mut len_buf = [0u8; 8];
+    f.read_exact(&mut len_buf)
+        .with_context(|| format!("reading header length of {path}"))?;
+    let n = Explorer::safetensors_header_len(u64::from_le_bytes(len_buf), path)?;
+    let mut header = vec![0u8; n];
+    f.read_exact(&mut header)
+        .with_context(|| format!("reading header of {path}"))?;
+    Ok((total_len, header))
 }
 
 /// Read a small remote file (the shard index) in full over SFTP.

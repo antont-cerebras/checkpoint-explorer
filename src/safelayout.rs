@@ -89,13 +89,32 @@ pub fn parse(path: &Path) -> Result<LayoutMap, String> {
     let mut json = vec![0u8; n as usize];
     file.read_exact(&mut json)
         .map_err(|_| "truncated safetensors header".to_string())?;
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    parse_from(&name, total_len, &json)
+}
+
+/// Parse a safetensors layout from its already-read header — shared by the local
+/// [`parse`] and the remote SFTP read. `header_json` is the `N` bytes after the
+/// 8-byte length prefix; `total_len` is the whole file's size (for the trailing
+/// data gap); `name` is the display label.
+pub fn parse_from(name: &str, total_len: u64, header_json: &[u8]) -> Result<LayoutMap, String> {
+    let n = header_json.len() as u64;
+    if n == 0 {
+        return Err("empty safetensors header".to_string());
+    }
+    let header_len = 8 + n;
+    if header_len > total_len {
+        return Err("header length is out of range (not a safetensors file?)".to_string());
+    }
     let value: serde_json::Value =
-        serde_json::from_slice(&json).map_err(|e| format!("invalid header JSON: {e}"))?;
+        serde_json::from_slice(header_json).map_err(|e| format!("invalid header JSON: {e}"))?;
     let obj = value
         .as_object()
         .ok_or_else(|| "header is not a JSON object".to_string())?;
 
-    let header_len = 8 + n;
     let data_start = header_len;
 
     // Collect tensor entries (everything but `__metadata__`), resolving offsets to
@@ -179,13 +198,8 @@ pub fn parse(path: &Path) -> Result<LayoutMap, String> {
         segments.push(gap(cursor, total_len));
     }
 
-    let name = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned());
-
     Ok(LayoutMap {
-        name,
+        name: name.to_string(),
         total_len,
         header_len,
         tensor_count,
@@ -288,6 +302,40 @@ mod tests {
         // Data is contiguous, so no trailing gap.
         assert!(map.segments.iter().all(|s| s.kind != SegmentKind::Gap));
         assert_eq!(map.total_len, hlen + 24);
+    }
+
+    #[test]
+    fn parse_from_matches_parse_and_finds_trailing_gap() {
+        // The same header bytes the fixture writes, fed straight to the pure core.
+        let header = r#"{"w1":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]},"w2":{"dtype":"F32","shape":[2],"data_offsets":[16,24]},"__metadata__":{"format":"pt"}}"#;
+        let header_len = 8 + header.len() as u64;
+        let total_len = header_len + 24;
+
+        // Matches `parse` on the equivalent temp file, segment for segment.
+        let path = std::env::temp_dir().join("ce_safelayout_parsefrom.safetensors");
+        write_fixture(&path);
+        let via_file = parse(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let via_core = parse_from(
+            "ce_safelayout_parsefrom.safetensors",
+            total_len,
+            header.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(via_core.name, via_file.name);
+        assert_eq!(via_core.header_len, via_file.header_len);
+        assert_eq!(via_core.tensor_count, via_file.tensor_count);
+        assert_eq!(via_core.metadata, via_file.metadata);
+        assert_eq!(via_core.segments.len(), via_file.segments.len());
+
+        // A larger `total_len` than the tensors occupy yields a trailing Gap.
+        let padded = parse_from("x.safetensors", total_len + 512, header.as_bytes()).unwrap();
+        let last = padded.segments.last().unwrap();
+        assert_eq!(last.kind, SegmentKind::Gap);
+        assert_eq!(last.end, total_len + 512);
+
+        // Guard: a header claiming more than the file holds is rejected.
+        assert!(parse_from("x", 4, header.as_bytes()).is_err());
     }
 
     #[test]
