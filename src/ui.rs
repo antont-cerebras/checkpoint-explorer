@@ -3445,14 +3445,40 @@ impl UI {
                 n.to_string()
             }));
 
-            // Composition: one 100%-stacked bar over the whole stack, then the
-            // shares. attn → accent, ffn/experts → dtype amber, other → slate.
+            // Composition: a swatch + % key on the "Composition" line, and the
+            // 100%-stacked bar just below it (indented under, so the pure-glyph bar
+            // isn't mistaken for part of the key). attn → accent, ffn/experts →
+            // dtype amber, other → slate.
             let comp = pl.composition_totals();
             let total: usize = comp.iter().sum();
             if total > 0 {
                 let colors = [palette::ACCENT, palette::DTYPE, palette::META];
-                let cells = crate::stats::alloc_rows(comp, crate::stats::BAR_W);
-                let mut bar = vec![plain(format!("  {:<LBL$}  ", "Composition"))];
+                let names = ["attention", "ffn/experts", "other"];
+                let pct = |x: usize| -> String {
+                    let p = (x * 100 + total / 2) / total;
+                    if x > 0 && p == 0 {
+                        "<1%".into()
+                    } else {
+                        format!("{p}%")
+                    }
+                };
+                // Key row: `Composition   █ attention 3% · ▓ ffn/experts 97% · …`.
+                let mut key = vec![plain(format!("  {:<LBL$}  ", "Composition"))];
+                for i in 0..3 {
+                    if i > 0 {
+                        key.push(dim(" · ".into()));
+                    }
+                    key.push(sty(
+                        format!("{} ", crate::stats::SHADES[i]),
+                        Style::default().fg(colors[i]),
+                    ));
+                    key.push(plain(format!("{} {}", names[i], pct(comp[i]))));
+                }
+                lines.push(Line::from(key));
+                // Bar row (indented under the key), pure coloured glyphs; any
+                // non-zero share shows at least a one-cell sliver.
+                let cells = crate::stats::composition_cells(comp, crate::stats::BAR_W);
+                let mut bar = vec![plain(format!("  {:<LBL$}  ", ""))];
                 for (i, &n) in cells.iter().enumerate() {
                     if n > 0 {
                         bar.push(sty(
@@ -3462,17 +3488,6 @@ impl UI {
                     }
                 }
                 lines.push(Line::from(bar));
-                let pct = |x: usize| (x * 100 + total / 2) / total;
-                let names = ["attention", "ffn/experts", "other"];
-                let mut legend = vec![plain(format!("  {:<LBL$}  ", ""))];
-                for i in 0..3 {
-                    legend.push(sty(
-                        format!("{} ", crate::stats::SHADES[i]),
-                        Style::default().fg(colors[i]),
-                    ));
-                    legend.push(plain(format!("{}% {}   ", pct(comp[i]), names[i])));
-                }
-                lines.push(Line::from(legend));
             }
         }
 

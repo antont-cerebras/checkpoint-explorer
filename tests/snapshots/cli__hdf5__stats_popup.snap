@@ -35,8 +35,8 @@ Per-layer profile
   Size/layer     █▁▁  624 B–664 B
   Params/layer   █▁▁  292–312
   Tensors/layer  █▁▁  6–7
-  Composition    ████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░
-                 █ 10% attention   ▓ 85% ffn/experts   ░ 5% other
+  Composition    █ attention 10% · ▓ ffn/experts 85% · ░ other 5%
+                 ████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░
 
 By dtype
 ↑↓ PgUp/PgDn scroll · 1–35 of 40
