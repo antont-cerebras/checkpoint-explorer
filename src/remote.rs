@@ -162,6 +162,29 @@ impl RemoteRead {
         crate::config::ModelConfig::parse(&text).filter(crate::config::ModelConfig::is_meaningful)
     }
 
+    /// List the objects under an `s3://…` checkpoint's prefix over an already-open
+    /// session — `(prefix-relative key, size)` per object — via a tiny boto3
+    /// `list_objects_v2` (list only, **no** per-object HEAD, so it's one cheap
+    /// paginated call). Read-only; the s3-native file browser turns these keys into
+    /// a tree ([`crate::filetree::build_from_keys`]).
+    pub fn list_s3(&self, session: &RemoteSession, uri: &str) -> Result<Vec<(String, u64)>> {
+        let script = list_script(uri);
+        let command = format!("source {}/bin/activate && python3 -", self.venv);
+        let out = session.exec_capture(&command, &script, |_| {})?;
+        let json = out
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix(SENTINEL))
+            .ok_or_else(|| {
+                anyhow!(
+                    "no object listing returned from {} — remote output was:\n{}",
+                    self.host,
+                    out.trim()
+                )
+            })?;
+        parse_list(json)
+    }
+
     /// Open an authenticated SSH session to the host, reusing/recording a password
     /// so a subsequent session to the same host authenticates without prompting
     /// again — used to read two checkpoints in parallel, and a dir's shards across
@@ -506,6 +529,76 @@ emit({"tensors": tensors, "metadata": [], "s3_objects": s3_objects, "s3_warnings
         .replace("__PROGRESS__", PROGRESS_TAG)
 }
 
+/// The boto3 object-listing script for an `s3://…` checkpoint: a single paginated
+/// `list_objects_v2` emitting one sentinel-tagged JSON line
+/// `{objects:[[rel_key,size],…]}` (or `{error:…}`). Keys are made
+/// prefix-relative so the browser shows them s3-natively. Distinct from
+/// [`dump_script`]'s S3 phase, which additionally HEADs each object for the diff
+/// metadata compare — this is **list only**, no per-object request.
+///
+/// **Read-only:** `list_objects_v2` is a read; the script never writes.
+fn list_script(uri: &str) -> String {
+    let src_lit = serde_json::to_string(uri).unwrap_or_else(|_| "\"\"".into());
+    const TEMPLATE: &str = r#"
+import sys, json
+SRC = __URI__
+S = "__SENTINEL__"
+def emit(obj):
+    sys.stdout.write(S + json.dumps(obj) + "\n"); sys.stdout.flush()
+try:
+    import boto3
+    from urllib.parse import urlparse
+except Exception as e:
+    emit({"error": "import boto3 failed: %r" % (e,)}); sys.exit(0)
+try:
+    u = urlparse(SRC)
+    bucket, prefix = u.netloc, u.path.lstrip("/")
+    cli = boto3.client("s3")
+    objects, tok = [], None
+    while True:
+        kw = {"Bucket": bucket, "Prefix": prefix}
+        if tok: kw["ContinuationToken"] = tok
+        resp = cli.list_objects_v2(**kw)
+        for it in resp.get("Contents", []):
+            k = it["Key"]
+            rel = k[len(prefix):].lstrip("/") if k.startswith(prefix) else k
+            if rel:
+                objects.append([rel, int(it.get("Size", 0))])
+        if resp.get("IsTruncated"): tok = resp.get("NextContinuationToken")
+        else: break
+except Exception as e:
+    emit({"error": "s3 list failed: %r" % (e,)}); sys.exit(0)
+emit({"objects": objects})
+"#;
+    TEMPLATE
+        .replace("__URI__", &src_lit)
+        .replace("__SENTINEL__", SENTINEL)
+}
+
+/// Parse the object-listing JSON (`{objects:[[key,size],…]}` or `{error:…}`) into
+/// `(prefix-relative key, size)` pairs. Malformed entries are skipped.
+fn parse_list(json: &str) -> Result<Vec<(String, u64)>> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).with_context(|| format!("parsing object listing: {json}"))?;
+    if let Some(e) = v.get("error").and_then(serde_json::Value::as_str) {
+        bail!("{e}");
+    }
+    let arr = v
+        .get("objects")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("object listing had no `objects` array"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for it in arr {
+        if let Some(pair) = it.as_array()
+            && pair.len() == 2
+            && let (Some(k), Some(sz)) = (pair[0].as_str(), pair[1].as_u64())
+        {
+            out.push((k.to_string(), sz));
+        }
+    }
+    Ok(out)
+}
+
 /// Parse the remote JSON (`{tensors:[…], metadata:[…]}` or `{error:…}`) into
 /// [`TensorInfo`]s + [`MetadataInfo`], stamping each tensor with `source_path`
 /// (already remote-marked; see [`RemoteRead::source_path`]) so display, the `y`
@@ -735,6 +828,43 @@ mod tests {
                 "script must stay read-only: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn list_script_is_read_only_list_and_embeds_uri() {
+        let s = list_script("s3://bucket/ckpt");
+        assert!(s.contains("SRC = \"s3://bucket/ckpt\""));
+        assert!(s.contains("boto3.client(\"s3\")"));
+        assert!(s.contains("list_objects_v2"));
+        assert!(s.contains(SENTINEL));
+        // List only — no per-object HEAD/tag calls, and nothing that mutates.
+        for forbidden in [
+            "head_object",
+            "get_object_tagging",
+            "put_object",
+            "upload",
+            "delete_object",
+            "copy_object",
+        ] {
+            assert!(
+                !s.contains(forbidden),
+                "list script must stay list-only + read-only: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_list_reads_pairs_and_surfaces_errors() {
+        let ok = parse_list(r#"{"objects":[["a/b.bin",100],["c.json",5]]}"#).unwrap();
+        assert_eq!(
+            ok,
+            vec![("a/b.bin".to_string(), 100), ("c.json".to_string(), 5)]
+        );
+        // A remote error becomes an Err.
+        assert!(parse_list(r#"{"error":"access denied"}"#).is_err());
+        // Malformed entries are skipped, not fatal.
+        let mixed = parse_list(r#"{"objects":[["good",1],["bad"],[1,2]]}"#).unwrap();
+        assert_eq!(mixed, vec![("good".to_string(), 1)]);
     }
 
     #[test]

@@ -197,7 +197,9 @@ This is **metadata-only** (structure + dtype + shape) — flagged by a
 `metadata-only` badge on the tree's status line (beside the read-only / health
 badges; hover it for the why). The data views (heatmap / numeric grid / histogram
 / statistics) need the bytes locally, so copy the checkpoint down to preview its
-values. `diff` takes `--ssh-read` too, for a
+values. The **[file browser](#file-browser-tab)** (`Tab` / `--files`) *does* work
+remotely — it reads only directory listings and safetensors headers (see there).
+`diff` takes `--ssh-read` too, for a
 structural (dtype/shape) comparison of two remote checkpoints:
 ```bash
 checkpoint-explorer diff --ssh-read lab@usernode /opt/…/model-a /opt/…/model-b
@@ -410,8 +412,21 @@ The file view has the same command palette (`Space` / `:`), `l` legend, `c` /
 `f` / `y` copies (screen / file path / command), and `y` round-trips through
 `--files`, like the tree.
 
-The file browser and layout map read the checkpoint's directory and files
-locally, so they're unavailable for a remote (`--ssh-read`) checkpoint.
+**Remote checkpoints too** (`--ssh-read`) — the browser adapts to the source,
+reading only metadata (no tensor data leaves the host):
+
+- a **remote safetensors directory** is browsed over SFTP just like a local one —
+  the full directory tree, `Enter` on a shard opens its **layout map** (parsed
+  from the header alone), and `Enter` on `config.json` / a text sidecar previews
+  it (small read-only reads).
+- an **`s3://…` cstorch checkpoint** is listed **s3-natively** — its objects by
+  key with shared prefixes as folders and each object's size, via one boto3
+  `list_objects_v2`. It's **browse-only**: `Enter` on an object shows its full key
+  and size (cstorch objects aren't per-file safetensors, so there's no per-object
+  layout or preview).
+
+`y` round-trips the remote view too (`--ssh-read … --files`, and `--layout` for a
+remote shard).
 
 ### safetensors layout map
 
