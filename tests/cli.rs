@@ -77,6 +77,80 @@ fn write_fixture(path: &str) {
     safetensors::serialize_to_file(&data, &metadata, Path::new(path)).expect("write fixture");
 }
 
+// In its own directory (not `tests/fixtures/`) so it doesn't show up in the file
+// browser's listing of the main fixture directory (`cli__files_view`).
+const FIXTURE_MOE: &str = "tests/fixtures_moe/tiny_moe.safetensors";
+
+/// A small MoE checkpoint with 8 transformer layers — each with attention
+/// (q/k/v/o), two experts (down/gate/up), and two norms — sized so the per-layer
+/// graphs actually show shape (attention grows with depth, so the size / params
+/// sparklines ramp up; experts dominate the composition chart).
+fn write_moe_fixture(path: &str) {
+    let mut specs: Vec<(String, Dtype, Vec<usize>)> = vec![
+        ("model.embed_tokens.weight".into(), Dtype::F16, vec![32, 8]),
+        ("model.norm.weight".into(), Dtype::F32, vec![8]),
+        ("lm_head.weight".into(), Dtype::F16, vec![32, 8]),
+    ];
+    for l in 0..8usize {
+        // Attention grows slightly with depth so the size sparkline isn't flat.
+        let a = 4 + l;
+        for proj in ["q_proj", "k_proj", "v_proj"] {
+            specs.push((
+                format!("model.layers.{l}.self_attn.{proj}.weight"),
+                Dtype::BF16,
+                vec![a, 8],
+            ));
+        }
+        specs.push((
+            format!("model.layers.{l}.self_attn.o_proj.weight"),
+            Dtype::BF16,
+            vec![8, a],
+        ));
+        for e in 0..2 {
+            for proj in ["down_proj", "gate_proj", "up_proj"] {
+                specs.push((
+                    format!("model.layers.{l}.mlp.experts.{e}.{proj}.weight"),
+                    Dtype::F16,
+                    vec![8, 6],
+                ));
+            }
+        }
+        specs.push((
+            format!("model.layers.{l}.input_layernorm.weight"),
+            Dtype::F32,
+            vec![8],
+        ));
+        specs.push((
+            format!("model.layers.{l}.post_attention_layernorm.weight"),
+            Dtype::F32,
+            vec![8],
+        ));
+    }
+
+    let buffers: Vec<Vec<u8>> = specs
+        .iter()
+        .map(|(_, dt, shape)| {
+            let bytes = shape.iter().product::<usize>() * dtype_size(*dt);
+            (0..bytes).map(|i| (i % 251) as u8).collect()
+        })
+        .collect();
+    let data: HashMap<String, TensorView> = specs
+        .iter()
+        .zip(&buffers)
+        .map(|((name, dt, shape), buf)| {
+            (
+                name.clone(),
+                TensorView::new(*dt, shape.clone(), buf).expect("valid tensor view"),
+            )
+        })
+        .collect();
+    let metadata = Some(HashMap::from([("format".to_string(), "pt".to_string())]));
+    if let Some(parent) = Path::new(path).parent() {
+        std::fs::create_dir_all(parent).expect("create fixtures dir");
+    }
+    safetensors::serialize_to_file(&data, &metadata, Path::new(path)).expect("write MoE fixture");
+}
+
 fn dtype_size(dt: Dtype) -> usize {
     match dt {
         Dtype::U8 | Dtype::I8 | Dtype::BOOL => 1,
@@ -91,6 +165,12 @@ fn dtype_size(dt: Dtype) -> usize {
 fn ensure_fixture() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| write_fixture(FIXTURE));
+}
+
+/// Generate the multi-layer MoE fixture once.
+fn ensure_moe_fixture() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| write_moe_fixture(FIXTURE_MOE));
 }
 
 /// Run the binary with exactly `args` and return its stdout.
@@ -180,6 +260,8 @@ fn settings() -> insta::Settings {
     let mut s = insta::Settings::clone_current();
     // Match the fixture path/basename but not a surrounding quote, so JSON
     // exports (`"…tiny.safetensors"`) keep their delimiters in the snapshot.
+    // The MoE fixture is matched first (its name isn't caught by the `tiny.` rule).
+    s.add_filter(r#"[^\s"]*tiny_moe\.safetensors"#, "[FIXTURE]");
     s.add_filter(r#"[^\s"]*tiny\.(?:safetensors|hdf5)"#, "[FIXTURE]");
     // The statistics / histogram scan duration (e.g. `(2ms)`, `(1.0s)`) is timing.
     s.add_filter(r"\(\d+(?:\.\d+)?m?s\)", "(<time>)");
@@ -200,10 +282,19 @@ fn plain_tree() {
     settings().bind(|| insta::assert_snapshot!(plain(&[])));
 }
 
-/// The `s` popup: overall checkpoint stats composited over the tree.
+/// The `s` view: the full-screen checkpoint-stats report.
 #[test]
 fn stats_popup() {
     settings().bind(|| insta::assert_snapshot!(plain(&["--stats"])));
+}
+
+/// The per-layer graphs on a multi-layer MoE checkpoint — so the sparkline shape
+/// (attention ramps with depth) and the stacked composition bands are asserted,
+/// not just the degenerate single-layer case of the main fixture.
+#[test]
+fn stats_graphs() {
+    ensure_moe_fixture();
+    settings().bind(|| insta::assert_snapshot!(run_plain(FIXTURE_MOE, &["--stats"])));
 }
 
 /// Run a one-shot `--print-*` export (no `--plain`) and capture stdout.

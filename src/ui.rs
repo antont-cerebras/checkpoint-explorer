@@ -3392,6 +3392,75 @@ impl UI {
             }
         }
 
+        // ── Per-layer profile ───────────────────────────────────────────────────
+        // Per metric, a min-anchored sparkline when it varies across the stack, else
+        // a plain "uniform" note (a flat sparkline says nothing). Plus one
+        // 100%-stacked composition bar (attention / ffn-experts / other) — its
+        // segments are distinct glyphs *and* colours (colour is stripped headless).
+        const LBL: usize = 13;
+        if let Some(pl) = &s.per_layer {
+            lines.push(Line::from(sty(String::new(), Style::default())));
+            lines.push(header("Per-layer profile"));
+            let metric = |label: &str, vals: &[usize], fmt: fn(usize) -> String| -> Line<'static> {
+                let (lo, hi) = (
+                    vals.iter().copied().min().unwrap_or(0),
+                    vals.iter().copied().max().unwrap_or(0),
+                );
+                if lo == hi {
+                    Line::from(vec![
+                        plain(format!("  {label:<LBL$}  ")),
+                        dim(format!("uniform · {} each", fmt(lo))),
+                    ])
+                } else {
+                    let glyphs = crate::stats::spark_string(vals, crate::stats::GRAPH_W);
+                    Line::from(vec![
+                        plain(format!("  {label:<LBL$}  ")),
+                        sty(glyphs, Style::default().fg(palette::ACCENT)),
+                        dim(format!("  {}–{}", fmt(lo), fmt(hi))),
+                    ])
+                }
+            };
+            lines.push(metric("Size/layer", &pl.bytes_series(), format_size));
+            lines.push(metric(
+                "Params/layer",
+                &pl.params_series(),
+                format_parameters,
+            ));
+            lines.push(metric("Tensors/layer", &pl.tensor_series(), |n| {
+                n.to_string()
+            }));
+
+            // Composition: one 100%-stacked bar over the whole stack, then the
+            // shares. attn → accent, ffn/experts → dtype amber, other → slate.
+            let comp = pl.composition_totals();
+            let total: usize = comp.iter().sum();
+            if total > 0 {
+                let colors = [palette::ACCENT, palette::DTYPE, palette::META];
+                let cells = crate::stats::alloc_rows(comp, crate::stats::BAR_W);
+                let mut bar = vec![plain(format!("  {:<LBL$}  ", "Composition"))];
+                for (i, &n) in cells.iter().enumerate() {
+                    if n > 0 {
+                        bar.push(sty(
+                            crate::stats::SHADES[i].to_string().repeat(n),
+                            Style::default().fg(colors[i]),
+                        ));
+                    }
+                }
+                lines.push(Line::from(bar));
+                let pct = |x: usize| (x * 100 + total / 2) / total;
+                let names = ["attention", "ffn/experts", "other"];
+                let mut legend = vec![plain(format!("  {:<LBL$}  ", ""))];
+                for i in 0..3 {
+                    legend.push(sty(
+                        format!("{} ", crate::stats::SHADES[i]),
+                        Style::default().fg(colors[i]),
+                    ));
+                    legend.push(plain(format!("{}% {}   ", pct(comp[i]), names[i])));
+                }
+                lines.push(Line::from(legend));
+            }
+        }
+
         // ── dtype mix ─────────────────────────────────────────────────────────
         if !s.dtypes.is_empty() {
             lines.push(Line::from(sty(String::new(), Style::default())));
@@ -4859,6 +4928,26 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
                     None,
                     "each · total",
                     "a per-layer (or per-expert) average beside the whole-checkpoint total",
+                ),
+                (
+                    Some(palette::ACCENT),
+                    "▁▄█",
+                    "per-layer sparkline: each cell a layer, low → high across the min–max range (a uniform metric shows a note instead)",
+                ),
+                (
+                    Some(palette::ACCENT),
+                    "█",
+                    "composition bar: attention weights",
+                ),
+                (
+                    Some(palette::DTYPE),
+                    "▓",
+                    "composition bar: MLP / expert (FFN) weights",
+                ),
+                (
+                    Some(palette::META),
+                    "░",
+                    "composition bar: everything else (norms, router, rotary, …)",
                 ),
             ];
             let col = legend_desc_col(&rows, 0);
@@ -7451,6 +7540,55 @@ mod tests {
         .unwrap();
         assert!(folded.contains("per-shard breakdown"), "{folded}");
         assert!(!folded.contains("shard-saver.safetensors"), "{folded}");
+    }
+
+    #[test]
+    fn render_stats_frame_draws_per_layer_graphs() {
+        use crate::stats::CheckpointStats;
+        use crate::tree::{Layout, Storage, TensorInfo};
+        let ti = |name: &str, elems: usize| TensorInfo {
+            name: name.into(),
+            dtype: "F16".into(),
+            shape: vec![elems],
+            size_bytes: elems * 2,
+            num_elements: elems,
+            storage: Storage::Unknown,
+            source_path: "m.safetensors".into(),
+            layout: Layout::None,
+        };
+        // 6 layers, attention growing with depth (so the size sparkline ramps),
+        // an expert (ffn) and a norm (other) each layer for the composition chart.
+        let mut tensors = Vec::new();
+        for l in 0..6 {
+            tensors.push(ti(
+                &format!("model.layers.{l}.self_attn.q_proj.weight"),
+                4 + l * 2,
+            ));
+            tensors.push(ti(
+                &format!("model.layers.{l}.mlp.experts.0.down_proj.weight"),
+                20,
+            ));
+            tensors.push(ti(&format!("model.layers.{l}.input_layernorm.weight"), 2));
+        }
+        let stats = CheckpointStats::compute(&tensors, None, None);
+        // Render tall enough that the whole report fits (no scroll fold).
+        let out = crate::tui::headless_render(120, 60, |f| {
+            UI::render_stats_frame(f, &stats, 0, false);
+        })
+        .unwrap();
+        assert!(out.contains("Per-layer profile"), "{out}");
+        assert!(out.contains("Size/layer"), "{out}");
+        // The composition legend + all three stacked bands (glyphs, colour stripped).
+        assert!(
+            out.contains("attention") && out.contains("ffn/experts") && out.contains("other"),
+            "{out}"
+        );
+        assert!(
+            out.contains('▓') && out.contains('░'),
+            "composition bands:\n{out}"
+        );
+        // The size sparkline ramps with depth → both the lowest and highest glyphs.
+        assert!(out.contains('▁') && out.contains('█'), "sparkline:\n{out}");
     }
 
     #[test]
