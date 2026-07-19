@@ -309,13 +309,13 @@ struct ExploreArgs {
 
     #[arg(
         long,
-        help = "Open straight into the checkpoint-stats popup on the tree (the `s` key)"
+        help = "Open straight into the full-screen checkpoint-stats view (the `s` key)"
     )]
     stats: bool,
 
     #[arg(
         long,
-        help = "Like --stats, but with the on-disk per-shard breakdown expanded (the popup's `f` toggle)"
+        help = "Like --stats, but with the on-disk per-shard breakdown expanded (the view's `f` toggle)"
     )]
     stats_shards: bool,
 
