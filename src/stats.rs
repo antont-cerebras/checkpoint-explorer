@@ -115,10 +115,28 @@ pub(crate) fn alloc_rows(parts: [usize; 3], height: usize) -> [usize; 3] {
     out
 }
 
+/// Split `totals` into `width` cells by share (largest-remainder), but give any
+/// non-zero component at least one cell — a thin sliver — so a tiny attention or
+/// "other" share stays visible instead of rounding away. The sliver is borrowed
+/// from the widest segment (so the cells still sum to `width`).
+pub(crate) fn composition_cells(totals: [usize; 3], width: usize) -> [usize; 3] {
+    let mut cells = alloc_rows(totals, width);
+    for i in 0..3 {
+        if totals[i] > 0
+            && cells[i] == 0
+            && let Some(j) = (0..3).filter(|&j| cells[j] > 1).max_by_key(|&j| cells[j])
+        {
+            cells[j] -= 1;
+            cells[i] += 1;
+        }
+    }
+    cells
+}
+
 /// A 100%-stacked composition bar: `width` cells split `[attn, ffn, other]` by
-/// share (largest-remainder), each cell the matching [`SHADES`] glyph.
+/// share, each cell the matching [`SHADES`] glyph (non-zero parts always shown).
 pub(crate) fn composition_bar(totals: [usize; 3], width: usize) -> String {
-    alloc_rows(totals, width)
+    composition_cells(totals, width)
         .iter()
         .zip(SHADES)
         .flat_map(|(&n, ch)| std::iter::repeat_n(ch, n))
@@ -671,19 +689,23 @@ impl CheckpointStats {
             out.push(metric("Tensors/layer", &pl.tensor_series(), |n| {
                 n.to_string()
             }));
-            // Composition: one 100%-stacked bar over the whole stack, with shares.
+            // Composition: a swatch + % key on the "Composition" line, and the
+            // 100%-stacked bar just below it (indented under, so the pure-glyph bar
+            // isn't mistaken for part of the key).
             let comp = pl.composition_totals();
             let total: usize = comp.iter().sum();
             if total > 0 {
-                let pct = |x: usize| (x * 100 + total / 2) / total;
+                let pct = |x: usize| -> String {
+                    let p = (x * 100 + total / 2) / total;
+                    if x > 0 && p == 0 {
+                        "<1%".into()
+                    } else {
+                        format!("{p}%")
+                    }
+                };
                 out.push(format!(
-                    "  {:<LBL$}  {}",
+                    "  {:<LBL$}  {} attention {} · {} ffn/experts {} · {} other {}",
                     "Composition",
-                    composition_bar(comp, BAR_W)
-                ));
-                out.push(format!(
-                    "  {:<LBL$}  {} {}% attention · {} {}% ffn/experts · {} {}% other",
-                    "",
                     SHADES[0],
                     pct(comp[0]),
                     SHADES[1],
@@ -691,6 +713,7 @@ impl CheckpointStats {
                     SHADES[2],
                     pct(comp[2]),
                 ));
+                out.push(format!("  {:<LBL$}  {}", "", composition_bar(comp, BAR_W)));
             }
         }
 
@@ -1084,6 +1107,24 @@ mod tests {
         for parts in [[3, 1, 0], [7, 2, 1], [1, 0, 5]] {
             assert_eq!(alloc_rows(parts, 6).iter().sum::<usize>(), 6);
         }
+    }
+
+    #[test]
+    fn composition_cells_show_a_sliver_for_tiny_nonzero_shares() {
+        // A tiny but non-zero attention share (≈0.1%) still gets at least one cell.
+        let cells = composition_cells([1, 999, 0], 40);
+        assert!(
+            cells[0] >= 1,
+            "tiny attention should show a sliver: {cells:?}"
+        );
+        assert_eq!(cells[2], 0, "a genuinely zero component stays empty");
+        assert_eq!(
+            cells.iter().sum::<usize>(),
+            40,
+            "cells still fill the width"
+        );
+        // A component that is truly zero gets no sliver.
+        assert_eq!(composition_cells([0, 10, 0], 40)[0], 0);
     }
 
     #[test]

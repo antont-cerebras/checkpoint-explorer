@@ -36,8 +36,8 @@ Per-layer profile
   Size/layer     ▁▂▃▄▅▆▇█  896 B–1.3 KiB
   Params/layer   ▁▂▃▄▅▆▇█  432–656
   Tensors/layer  uniform · 12 each
-  Composition    █████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░
-                 █ 43% attention   ▓ 51% ffn/experts   ░ 6% other
+  Composition    █ attention 43% · ▓ ffn/experts 51% · ░ other 6%
+                 █████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░
 
 ↑↓ PgUp/PgDn scroll · 1–35 of 39
 ↑/↓ scroll · PgUp/PgDn page · r copy report · c copy screen · y copy command · l legend · ⌫ back · q quit

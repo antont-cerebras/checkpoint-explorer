@@ -28,8 +28,8 @@ Per-layer profile
   Size/layer     uniform · 168 B each
   Params/layer   uniform · 80 each
   Tensors/layer  uniform · 3 each
-  Composition    ████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░
-                 █ 19% attention   ▓ 71% ffn/experts   ░ 10% other
+  Composition    █ attention 19% · ▓ ffn/experts 71% · ░ other 10%
+                 ████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░
 
 By dtype
   U16     120 B  1 tensor
