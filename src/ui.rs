@@ -3435,15 +3435,20 @@ impl UI {
                     ])
                 }
             };
+            // A blank line between each graph so they read as separate charts.
+            let blank = || Line::from(sty(String::new(), Style::default()));
             lines.push(metric("Size/layer", &pl.bytes_series(), format_size));
+            lines.push(blank());
             lines.push(metric(
                 "Params/layer",
                 &pl.params_series(),
                 format_parameters,
             ));
+            lines.push(blank());
             lines.push(metric("Tensors/layer", &pl.tensor_series(), |n| {
                 n.to_string()
             }));
+            lines.push(blank());
 
             // Composition: a swatch + % key on the "Composition" line, and the
             // 100%-stacked bar just below it (indented under, so the pure-glyph bar
@@ -3462,32 +3467,31 @@ impl UI {
                         format!("{p}%")
                     }
                 };
-                // Key row: `Composition   █ attention 3% · ▓ ffn/experts 97% · …`.
-                let mut key = vec![plain(format!("  {:<LBL$}  ", "Composition"))];
-                for i in 0..3 {
-                    if i > 0 {
-                        key.push(dim(" · ".into()));
-                    }
-                    key.push(sty(
-                        format!("{} ", crate::stats::SHADES[i]),
-                        Style::default().fg(colors[i]),
-                    ));
-                    key.push(plain(format!("{} {}", names[i], pct(comp[i]))));
-                }
-                lines.push(Line::from(key));
-                // Bar row (indented under the key), pure coloured glyphs; any
-                // non-zero share shows at least a one-cell sliver.
+                // Bar and key on ONE line (bar first, then the swatch/percent key) —
+                // a separate key row directly above the bar reads as one stacked
+                // block. Any non-zero share shows at least a one-cell sliver.
                 let cells = crate::stats::composition_cells(comp, crate::stats::BAR_W);
-                let mut bar = vec![plain(format!("  {:<LBL$}  ", ""))];
+                let mut line = vec![plain(format!("  {:<LBL$}  ", "Composition"))];
                 for (i, &n) in cells.iter().enumerate() {
                     if n > 0 {
-                        bar.push(sty(
+                        line.push(sty(
                             crate::stats::SHADES[i].to_string().repeat(n),
                             Style::default().fg(colors[i]),
                         ));
                     }
                 }
-                lines.push(Line::from(bar));
+                line.push(plain("   ".into()));
+                for i in 0..3 {
+                    if i > 0 {
+                        line.push(dim(" · ".into()));
+                    }
+                    line.push(sty(
+                        format!("{} ", crate::stats::SHADES[i]),
+                        Style::default().fg(colors[i]),
+                    ));
+                    line.push(plain(format!("{} {}", names[i], pct(comp[i]))));
+                }
+                lines.push(Line::from(line));
             }
         }
 
