@@ -5,40 +5,40 @@ expression: "plain(&[\"--layout\", FIXTURE])"
 Layout - [FIXTURE]                                                                                            [×]
 888 B · 7 tensors · header 616 B · 1 metadata
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-0x000000000000 ┬ █  header (8 B length + JSON metadata)  616 B                                                         █
-               │ █  † format  pt                                                                                       █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-0x000000000268 │ ▒  model.layers.0.input_layernorm.weight  F32 (4)  16 B                                               █
-0x000000000278 │ ▒  model.norm.weight  F32 (4)  16 B                                                                   █
-0x000000000288 │ ▓  lm_head.weight  I32 (2, 4)  32 B                                                                   █
-0x0000000002a8 │ ▓  model.layers.0.self_attn.q_proj.weight  BF16 (4, 4)  32 B                                          █
-0x0000000002c8 │ ▓  model.embed_tokens.weight  F16 (6, 4)  48 B                                                        █
-               │ ▓                                                                                                     █
-0x0000000002f8 │ █  model.layers.0.mlp.down_proj.weight  U16 (3, 4, 5)  120 B                                          █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     █
-               │ █                                                                                                     │
+0x000000000000 ┬ █  header (8 B length + JSON metadata)  616 B
+               │ █  † format  pt
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+               │ █
+0x000000000268 │ ▒  model.layers.0.input_layernorm.weight  F32 (4)  16 B
+0x000000000278 │ ▒  model.norm.weight  F32 (4)  16 B
+0x000000000288 │ ▓  lm_head.weight  I32 (2, 4)  32 B
+0x0000000002a8 │ ▓  model.layers.0.self_attn.q_proj.weight  BF16 (4, 4)  32 B
+0x0000000002c8 │ ▓  model.embed_tokens.weight  F16 (6, 4)  48 B
+               │ ▓
+0x0000000002f8 │ █  model.layers.0.mlp.down_proj.weight  U16 (3, 4, 5)  120 B
+               │ █
+               │ █
+               │ █
+               │ █
 ↑/↓ select · PgUp/PgDn page · ↵ in tree · Tab tensor tree · Space/: commands · l legend · c copy screen · y copy command
 ⌫/\ back/fwd · q quit

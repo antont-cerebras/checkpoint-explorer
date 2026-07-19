@@ -637,21 +637,43 @@ const FILES_FOOTER_HEIGHT: usize = 1;
 /// summary, and the separator rule.
 const LAYOUT_HEADER_ROWS: usize = 3;
 
-/// Where the tree's vertical scroll bar sits and how a pointer over it maps to a
-/// scroll offset. Built by [`UI::tree_scrollbar`]; consumed by the renderer (to
-/// draw the bar) and the mouse handler (to scrub on click / drag).
-pub struct TreeScrollbar {
-    /// Rightmost terminal column, reserved for the bar.
+/// Where a mode's vertical scroll bar sits, how a pointer over it maps to a scroll
+/// offset, and its current position. Built by [`VScrollbar::for_body`] (or the
+/// tree/files wrappers); the `run_mode` engine draws it ([`UI::render_vscrollbar`])
+/// and drag-scrubs it, so every mode gets a bar the same way.
+#[derive(Clone, Copy)]
+pub struct VScrollbar {
+    /// Rightmost column of the body, reserved for the bar.
     pub col: u16,
     /// First body row (the terminal row just below the header).
     pub top: u16,
-    /// Track height in rows — the number of visible tree rows.
+    /// Track height in rows — the number of visible body rows.
     pub rows: u16,
     /// The largest valid scroll offset (`total - visible`).
     pub max_offset: usize,
+    /// The current scroll offset (first visible row), clamped to `max_offset`.
+    pub offset: usize,
 }
 
-impl TreeScrollbar {
+impl VScrollbar {
+    /// The bar for a scrollable `body` region showing `total` rows starting at
+    /// `offset`, or `None` when it all fits (or there's no room for a bar +
+    /// content). The bar rides `body`'s rightmost column.
+    pub fn for_body(body: Rect, total: usize, offset: usize) -> Option<VScrollbar> {
+        let rows = body.height as usize;
+        if body.width < 2 || rows == 0 || total <= rows {
+            return None;
+        }
+        let max_offset = total - rows;
+        Some(VScrollbar {
+            col: body.x + body.width - 1,
+            top: body.y,
+            rows: body.height,
+            max_offset,
+            offset: offset.min(max_offset),
+        })
+    }
+
     /// The scroll offset a pointer at terminal `row` scrubs to: the top of the
     /// track maps to offset 0 and the bottom to `max_offset`, proportionally
     /// (rows above/below the track clamp to the ends).
@@ -947,17 +969,45 @@ impl UI {
         can_repack: bool,
         can_rename: bool,
         total: usize,
-    ) -> Option<TreeScrollbar> {
+        offset: usize,
+    ) -> Option<VScrollbar> {
         let rows = Self::tree_visible_rows(width, height, search_mode, can_repack, can_rename);
-        if width < 2 || total <= rows {
-            return None; // nothing to scroll (or no room for a bar + content)
-        }
-        Some(TreeScrollbar {
-            col: width - 1,
-            top: Self::tree_header_rows(search_mode) as u16,
-            rows: rows as u16,
-            max_offset: total - rows,
-        })
+        VScrollbar::for_body(
+            Rect {
+                x: 0,
+                y: Self::tree_header_rows(search_mode) as u16,
+                width,
+                height: rows as u16,
+            },
+            total,
+            offset,
+        )
+    }
+
+    /// Draw a vertical scroll bar over its reserved column (the ratatui `Scrollbar`
+    /// widget — dim `│` track, accent `█` thumb). The `run_mode` engine calls this
+    /// for every mode that reports a [`VScrollbar`], so no mode draws its own.
+    pub fn render_vscrollbar(frame: &mut Frame, sb: &VScrollbar) {
+        let mut state = ScrollbarState::new(sb.max_offset + 1)
+            .position(sb.offset)
+            .viewport_content_length(sb.rows as usize);
+        StatefulWidget::render(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("█")
+                .track_style(Style::default().fg(palette::DIM))
+                .thumb_style(Style::default().fg(palette::ACCENT)),
+            Rect {
+                x: sb.col,
+                y: sb.top,
+                width: 1,
+                height: sb.rows,
+            },
+            frame.buffer_mut(),
+            &mut state,
+        );
     }
 
     /// Ratatui render of the tree browser: header (title, hint or search line,
@@ -1011,20 +1061,21 @@ impl UI {
         // A vertical scroll bar rides the rightmost column when the tree
         // overflows the viewport — but only in the live TUI; a headless
         // `--plain` / screen-copy render is a static dump with no viewport.
-        let scrollbar = if config.interactive {
-            Self::tree_scrollbar(
+        // The bar itself is drawn by the `run_mode` engine (via `TreeMode::vscrollbar`)
+        // so every mode gets it uniformly; here we only reserve its column so long
+        // tree rows don't underlap it (live TUI only — a headless dump has no bar).
+        let scrollbar = config.interactive
+            && Self::tree_scrollbar(
                 width,
                 height,
                 config.search_mode,
                 config.can_repack,
                 config.can_rename,
                 config.tree.len(),
+                config.scroll_offset,
             )
-        } else {
-            None
-        };
-        // Reserve the bar's column so long tree rows don't underlap it.
-        let body_width = width.saturating_sub(if scrollbar.is_some() { 1 } else { 0 });
+            .is_some();
+        let body_width = width.saturating_sub(if scrollbar { 1 } else { 0 });
 
         // Header (title, hint(s), rule) spans the full width.
         Paragraph::new(lines).render(
@@ -1069,31 +1120,7 @@ impl UI {
             );
         }
 
-        // The scroll bar itself, over its reserved column. `content_length` is
-        // the number of scroll positions (`max_offset + 1`) so the thumb reaches
-        // the very bottom exactly when scrolled to the last row.
-        if let Some(sb) = &scrollbar {
-            let mut state = ScrollbarState::new(sb.max_offset + 1)
-                .position(config.scroll_offset)
-                .viewport_content_length(body_rows);
-            StatefulWidget::render(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(None)
-                    .end_symbol(None)
-                    .track_symbol(Some("│"))
-                    .thumb_symbol("█")
-                    .track_style(Style::default().fg(palette::DIM))
-                    .thumb_style(Style::default().fg(palette::ACCENT)),
-                Rect {
-                    x: sb.col,
-                    y: sb.top,
-                    width: 1,
-                    height: sb.rows,
-                },
-                frame.buffer_mut(),
-                &mut state,
-            );
-        }
+        // (The scroll bar itself is drawn by the engine — see `render_vscrollbar`.)
 
         // --- key-hint footer, pinned just above the two-line status bar ---
         let hint_y = height.saturating_sub(TREE_FOOTER_HEIGHT as u16 + hint_rows as u16);
@@ -1219,19 +1246,25 @@ impl UI {
         Self::files_visible_rows(width, height)
     }
 
-    /// The file browser's scroll-bar geometry (reusing [`TreeScrollbar`]) for this
-    /// size and a listing of `total` rows, or `None` when it all fits.
-    pub fn files_scrollbar(width: u16, height: u16, total: usize) -> Option<TreeScrollbar> {
+    /// The file browser's scroll-bar geometry (reusing [`VScrollbar`]) for this
+    /// size and a listing of `total` rows at `offset`, or `None` when it all fits.
+    pub fn files_scrollbar(
+        width: u16,
+        height: u16,
+        total: usize,
+        offset: usize,
+    ) -> Option<VScrollbar> {
         let rows = Self::files_visible_rows(width, height);
-        if width < 2 || total <= rows {
-            return None;
-        }
-        Some(TreeScrollbar {
-            col: width - 1,
-            top: Self::files_header_rows(width) as u16,
-            rows: rows as u16,
-            max_offset: total - rows,
-        })
+        VScrollbar::for_body(
+            Rect {
+                x: 0,
+                y: Self::files_header_rows(width) as u16,
+                width,
+                height: rows as u16,
+            },
+            total,
+            offset,
+        )
     }
 
     /// Render the file browser: header (title, hint line(s), rule), the visible
@@ -1274,12 +1307,11 @@ impl UI {
         let body_rows =
             (height as usize).saturating_sub(header_rows + hint_rows + FILES_FOOTER_HEIGHT);
 
-        let scrollbar = if interactive {
-            Self::files_scrollbar(width, height, rows.len())
-        } else {
-            None
-        };
-        let body_width = width.saturating_sub(u16::from(scrollbar.is_some()));
+        // The bar is drawn by the engine (via `FilesMode::vscrollbar`); reserve its
+        // column here so long rows don't underlap it (live TUI only).
+        let scrollbar =
+            interactive && Self::files_scrollbar(width, height, rows.len(), scroll).is_some();
+        let body_width = width.saturating_sub(u16::from(scrollbar));
 
         Paragraph::new(lines).render(
             Rect {
@@ -1305,28 +1337,7 @@ impl UI {
             frame.buffer_mut(),
         );
 
-        if let Some(sb) = &scrollbar {
-            let mut state = ScrollbarState::new(sb.max_offset + 1)
-                .position(scroll)
-                .viewport_content_length(body_rows);
-            StatefulWidget::render(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(None)
-                    .end_symbol(None)
-                    .track_symbol(Some("│"))
-                    .thumb_symbol("█")
-                    .track_style(Style::default().fg(palette::DIM))
-                    .thumb_style(Style::default().fg(palette::ACCENT)),
-                Rect {
-                    x: sb.col,
-                    y: sb.top,
-                    width: 1,
-                    height: sb.rows,
-                },
-                frame.buffer_mut(),
-                &mut state,
-            );
-        }
+        // (The scroll bar itself is drawn by the engine — see `render_vscrollbar`.)
 
         // --- key-hint footer, pinned just above the one-line status bar ---
         let hint_y = height.saturating_sub(1 + hint_rows as u16);
@@ -1393,11 +1404,17 @@ impl UI {
     pub fn render_rename(
         frame: &mut Frame,
         view: &RenameView,
-    ) -> (usize, ChipRegions, LinkRegions, Vec<Rect>) {
+    ) -> (
+        usize,
+        ChipRegions,
+        LinkRegions,
+        Vec<Rect>,
+        Option<VScrollbar>,
+    ) {
         let area = frame.area();
         let (width, height) = (area.width, area.height);
         if height < 7 || width < 12 {
-            return (0, Vec::new(), Vec::new(), Vec::new());
+            return (0, Vec::new(), Vec::new(), Vec::new(), None);
         }
 
         // Header: a title line then a full-width rule, matching the other views'
@@ -1663,6 +1680,17 @@ impl UI {
         let visible = preview_h as usize;
         let max_scroll = preview.len().saturating_sub(visible);
         let scroll = view.scroll.min(max_scroll);
+        // The preview's scroll bar (drawn by the engine), over its last column.
+        let vscroll = VScrollbar::for_body(
+            Rect {
+                x: 0,
+                y: preview_y,
+                width,
+                height: preview_h,
+            },
+            preview.len(),
+            scroll,
+        );
         let window: Vec<Line> = preview.iter().skip(scroll).take(visible).cloned().collect();
         Paragraph::new(window).render(
             Rect {
@@ -1746,7 +1774,7 @@ impl UI {
             );
         }
 
-        (max_scroll, chips, clicks, menu_rects)
+        (max_scroll, chips, clicks, menu_rects, vscroll)
     }
 
     /// Float a sidecar file preview over the file browser: a scrollable pop-up of
@@ -1792,12 +1820,12 @@ impl UI {
         scroll: usize,
         copied: Option<&str>,
         interactive: bool,
-    ) -> (usize, ChipRegions, LinkRegions) {
+    ) -> (usize, ChipRegions, LinkRegions, Option<VScrollbar>) {
         use crate::safelayout::SegmentKind;
         let area = frame.area();
         let (width, height) = (area.width, area.height);
         if height < (LAYOUT_HEADER_ROWS as u16 + 2) {
-            return (0, Vec::new(), Vec::new());
+            return (0, Vec::new(), Vec::new(), None);
         }
         // A concrete tensor band's name links to that tensor in the tree; filled in
         // as the strip is drawn below.
@@ -1865,10 +1893,12 @@ impl UI {
         // --- the vertical strip (scrollable) ---
         let rows = band_rows(map, body_rows);
         let total_rows: usize = rows.iter().sum();
-        let scrollbar =
-            interactive.then(|| Self::files_scrollbar_like(width, total_rows, body_rows));
-        let scrollbar = scrollbar.flatten();
-        let strip_width = width.saturating_sub(u16::from(scrollbar.is_some()));
+        // The bar is drawn by the engine; reserve its column here so the strip
+        // doesn't underlap it (live TUI only), and hand the geometry back to draw.
+        let vscroll = interactive
+            .then(|| Self::layout_scrollbar(width, total_rows, body_rows, scroll))
+            .flatten();
+        let strip_width = width.saturating_sub(u16::from(vscroll.is_some()));
 
         let max_scroll = total_rows.saturating_sub(body_rows);
         let scroll = scroll.min(max_scroll);
@@ -1977,28 +2007,7 @@ impl UI {
             frame.buffer_mut(),
         );
 
-        if let Some(sb) = &scrollbar {
-            let mut state = ScrollbarState::new(sb.max_offset + 1)
-                .position(scroll)
-                .viewport_content_length(body_rows);
-            StatefulWidget::render(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(None)
-                    .end_symbol(None)
-                    .track_symbol(Some("│"))
-                    .thumb_symbol("█")
-                    .track_style(Style::default().fg(palette::DIM))
-                    .thumb_style(Style::default().fg(palette::ACCENT)),
-                Rect {
-                    x: sb.col,
-                    y: LAYOUT_HEADER_ROWS as u16,
-                    width: 1,
-                    height: body_rows as u16,
-                },
-                frame.buffer_mut(),
-                &mut state,
-            );
-        }
+        // (The scroll bar itself is drawn by the engine — see `render_vscrollbar`.)
 
         // Clickable footer chips (hints start at the footer's top row) + `[×]`
         // (→ back to the tensor tree, like the file view's close).
@@ -2008,21 +2017,27 @@ impl UI {
             frame,
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
         ));
-        (max_scroll, regions, links)
+        (max_scroll, regions, links, vscroll)
     }
 
-    /// A vertical scrollbar for a plain `total`-row list of `visible` rows sitting
-    /// just below the layout-map header — reusing [`TreeScrollbar`].
-    fn files_scrollbar_like(width: u16, total: usize, visible: usize) -> Option<TreeScrollbar> {
-        if width < 2 || total <= visible {
-            return None;
-        }
-        Some(TreeScrollbar {
-            col: width - 1,
-            top: LAYOUT_HEADER_ROWS as u16,
-            rows: visible as u16,
-            max_offset: total - visible,
-        })
+    /// The layout map's vertical scrollbar: a `total`-row band strip showing
+    /// `visible` rows from `offset`, just below the layout header.
+    fn layout_scrollbar(
+        width: u16,
+        total: usize,
+        visible: usize,
+        offset: usize,
+    ) -> Option<VScrollbar> {
+        VScrollbar::for_body(
+            Rect {
+                x: 0,
+                y: LAYOUT_HEADER_ROWS as u16,
+                width,
+                height: visible as u16,
+            },
+            total,
+            offset,
+        )
     }
 
     /// The cumulative start row of each layout-map band, plus the total row count
@@ -3555,7 +3570,7 @@ impl UI {
         s: &crate::stats::CheckpointStats,
         scroll: usize,
         shards_expanded: bool,
-    ) -> (usize, Vec<(Rect, KeyEvent)>) {
+    ) -> (usize, Vec<(Rect, KeyEvent)>, Option<VScrollbar>) {
         let area = frame.area();
         let (width, height) = (area.width, area.height);
 
@@ -3663,7 +3678,18 @@ impl UI {
             frame,
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
         ));
-        (max_scroll, regions)
+        // The scroll bar (drawn by the engine): over the body region's last column.
+        let vscroll = VScrollbar::for_body(
+            Rect {
+                x: 0,
+                y: header_len,
+                width,
+                height: visible as u16,
+            },
+            total,
+            scroll,
+        );
+        (max_scroll, regions, vscroll)
     }
 
     /// Borderless band shown when a chosen export is too big for the terminal
@@ -7251,7 +7277,7 @@ mod tests {
         };
         let mut links = Vec::new();
         crate::tui::headless_render(90, 24, |f| {
-            let (_, _, l) = UI::render_layout(f, &map, 1, 0, None, true);
+            let (_, _, l, _) = UI::render_layout(f, &map, 1, 0, None, true);
             links = l;
         })
         .unwrap();
@@ -7594,13 +7620,13 @@ mod tests {
     #[test]
     fn tree_scrollbar_geometry_and_mapping() {
         // Everything fits the viewport → no bar.
-        assert!(UI::tree_scrollbar(80, 40, false, false, false, 5).is_none());
+        assert!(UI::tree_scrollbar(80, 40, false, false, false, 5, 0).is_none());
         // Too narrow for a bar plus content → no bar.
-        assert!(UI::tree_scrollbar(1, 40, false, false, false, 999).is_none());
+        assert!(UI::tree_scrollbar(1, 40, false, false, false, 999, 0).is_none());
 
         // Overflow → a bar in the rightmost column, tracking the visible rows.
         let visible = UI::tree_visible_rows(80, 20, false, false, false);
-        let sb = UI::tree_scrollbar(80, 20, false, false, false, visible + 50)
+        let sb = UI::tree_scrollbar(80, 20, false, false, false, visible + 50, 0)
             .expect("overflow shows bar");
         assert_eq!(sb.col, 79);
         assert_eq!(sb.rows as usize, visible);
@@ -7684,15 +7710,19 @@ mod tests {
         let schemas = HashMap::new();
         let badges = status_badges(AccessBadge::ReadOnly, None, false);
 
-        // Interactive: the bar (thumb █ over a │ track) rides the right edge.
+        // Interactive: render_tree reserves the column and the engine draws the bar
+        // (thumb █ over a │ track) via render_vscrollbar — the live composition.
         let live = crate::tui::headless_render(80, 20, |f| {
             UI::render_tree(f, &cfg(&nodes, &unindexed, &schemas, &badges, true));
+            if let Some(sb) = UI::tree_scrollbar(80, 20, false, false, false, nodes.len(), 0) {
+                UI::render_vscrollbar(f, &sb);
+            }
         })
         .unwrap();
         assert!(live.contains('█'), "expected a thumb:\n{live}");
         assert!(live.contains('│'), "expected a track:\n{live}");
 
-        // Non-interactive (headless dump): no bar anywhere.
+        // Non-interactive (headless dump): render_tree draws no bar on its own.
         let plain = crate::tui::headless_render(80, 20, |f| {
             UI::render_tree(f, &cfg(&nodes, &unindexed, &schemas, &badges, false));
         })
@@ -7701,6 +7731,77 @@ mod tests {
             !plain.contains('█') && !plain.contains('│'),
             "headless dump must show no scroll bar:\n{plain}"
         );
+    }
+
+    #[test]
+    fn vscrollbar_for_body_reports_overflow_only() {
+        let body = Rect {
+            x: 0,
+            y: 3,
+            width: 40,
+            height: 10,
+        };
+        // Fits → no bar.
+        assert!(VScrollbar::for_body(body, 10, 0).is_none());
+        assert!(VScrollbar::for_body(body, 5, 0).is_none());
+        // Overflows → a bar in the last column; the offset clamps to max_offset.
+        let sb = VScrollbar::for_body(body, 30, 999).expect("overflow → bar");
+        assert_eq!((sb.col, sb.top, sb.rows), (39, 3, 10));
+        assert_eq!(sb.max_offset, 20); // 30 - 10
+        assert_eq!(sb.offset, 20); // clamped from 999
+        // Too narrow for a bar + content → none.
+        assert!(VScrollbar::for_body(Rect { width: 1, ..body }, 30, 0).is_none());
+    }
+
+    #[test]
+    fn render_vscrollbar_draws_thumb_and_track() {
+        let sb = VScrollbar {
+            col: 39,
+            top: 0,
+            rows: 10,
+            max_offset: 20,
+            offset: 5,
+        };
+        let out = crate::tui::headless_render(40, 10, |f| UI::render_vscrollbar(f, &sb)).unwrap();
+        assert!(out.contains('█'), "thumb:\n{out}");
+        assert!(out.contains('│'), "track:\n{out}");
+    }
+
+    // The stats mode (which previously scrolled with no bar) reports a scroll bar to
+    // the engine when its report overflows, and none when it fits — the engine draws
+    // it uniformly, so this is what makes "a scrolling mode with no bar" impossible.
+    #[test]
+    fn render_stats_frame_reports_a_scrollbar_when_overflowing() {
+        use crate::stats::CheckpointStats;
+        use crate::tree::{Layout, Storage, TensorInfo};
+        let ti = |name: &str| TensorInfo {
+            name: name.into(),
+            dtype: "F16".into(),
+            shape: vec![4],
+            size_bytes: 8,
+            num_elements: 4,
+            storage: Storage::Unknown,
+            source_path: "m.safetensors".into(),
+            layout: Layout::None,
+        };
+        let tensors: Vec<TensorInfo> = (0..40)
+            .map(|i| ti(&format!("model.layers.{i}.mlp.down_proj.weight")))
+            .collect();
+        let stats = CheckpointStats::compute(&tensors, None, None);
+        // A short frame → the report overflows → a bar is reported.
+        let mut overflow = false;
+        crate::tui::headless_render(120, 16, |f| {
+            overflow = UI::render_stats_frame(f, &stats, 0, false).2.is_some();
+        })
+        .unwrap();
+        assert!(overflow, "a short stats frame must report a scroll bar");
+        // A tall frame → it all fits → no bar.
+        let mut fits = true;
+        crate::tui::headless_render(120, 80, |f| {
+            fits = UI::render_stats_frame(f, &stats, 0, false).2.is_some();
+        })
+        .unwrap();
+        assert!(!fits, "a tall stats frame fits → no scroll bar");
     }
 
     #[test]
@@ -7894,7 +7995,7 @@ mod tests {
         };
         let mut clicks = Vec::new();
         let out = crate::tui::headless_render(120, 30, |f| {
-            let (_, _chips, c, _menu) = UI::render_rename(f, &view);
+            let (_, _chips, c, _menu, _) = UI::render_rename(f, &view);
             clicks = c;
         })
         .unwrap();
@@ -7954,7 +8055,7 @@ mod tests {
         };
         let mut menu = Vec::new();
         let out = crate::tui::headless_render(120, 30, |f| {
-            let (_, _chips, _links, m) = UI::render_rename(f, &view);
+            let (_, _chips, _links, m, _) = UI::render_rename(f, &view);
             menu = m;
         })
         .unwrap();
