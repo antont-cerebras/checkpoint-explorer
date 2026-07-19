@@ -401,7 +401,7 @@ fn y_roundtrips() {
         vec!["--tensor", t, "--heatmap"],
         vec!["--health"],          // the health-check popup over the tree
         vec!["--health-findings"], // …with the per-finding detail expanded
-        vec!["--stats"],           // the checkpoint-stats popup over the tree
+        vec!["--stats"],           // the full-screen checkpoint-stats view
         vec!["--stats-shards"],    // …with the per-shard breakdown expanded
     ] {
         assert_y_roundtrip(FIXTURE, &extra);
@@ -624,7 +624,7 @@ mod hdf5 {
             vec!["--tensor", &dp, "--heatmap"],
             vec!["--health"],          // the health-check popup over the tree
             vec!["--health-findings"], // …with the per-finding detail expanded
-            vec!["--stats"],           // the checkpoint-stats popup over the tree
+            vec!["--stats"],           // the full-screen checkpoint-stats view
             vec!["--stats-shards"],    // …with the per-shard breakdown expanded
         ];
         for extra in cases {

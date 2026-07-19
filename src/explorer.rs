@@ -263,11 +263,11 @@ pub struct OpenRequest {
     /// Like `health`, but with the per-finding detail expanded (`--health-findings`,
     /// the popup's `f` toggle). Round-trips through `y`.
     pub health_findings: bool,
-    /// Open straight into the checkpoint-stats popup on the tree (`--stats`, the
-    /// `s` key). Part of `y`'s round-trip: the popup's `y` copies this command.
+    /// Open straight into the full-screen checkpoint-stats view (`--stats`, the
+    /// `s` key). Part of `y`'s round-trip: the view's `y` copies this command.
     pub stats: bool,
     /// Like `stats`, but with the on-disk per-shard breakdown expanded
-    /// (`--stats-shards`, the popup's `f` toggle). Round-trips through `y`.
+    /// (`--stats-shards`, the view's `f` toggle). Round-trips through `y`.
     pub stats_shards: bool,
     /// Render the view once and exit without interactive navigation.
     pub exit_after: bool,
@@ -548,6 +548,15 @@ enum Screen {
     /// what was typed.
     Rename {
         pairs: Vec<(String, String)>,
+    },
+    /// The full-screen **checkpoint stats** view (opened with `s` or `--stats`):
+    /// a scrollable report (sizes, params, dtype mix, layers, experts, per-layer
+    /// graphs) with the on-disk per-shard breakdown foldable via `f`. Carries the
+    /// fold state + scroll so stepping away and back restores it; the reopen
+    /// command round-trips it as `--stats` / `--stats-shards`.
+    Stats {
+        shards_expanded: bool,
+        scroll: usize,
     },
 }
 
@@ -2591,6 +2600,196 @@ impl Mode for DetailMode {
     }
 }
 
+/// The full-screen checkpoint-stats view ([`Screen::Stats`]) as a [`Mode`]: a
+/// scrollable report (sizes, params, dtype mix, layers, experts, per-layer graphs)
+/// with the on-disk per-shard breakdown foldable via `f`. The stats are computed
+/// once and cached on the [`Explorer`]; `scroll` / `shards_expanded` round-trip
+/// through history and the `--stats` reopen command.
+struct StatsMode {
+    shards_expanded: bool,
+    scroll: usize,
+    /// The last render's maximum scroll (render is `&self`), so the key / wheel
+    /// handlers can clamp downward scrolling to the content.
+    scroll_max: std::cell::Cell<usize>,
+    overlay: Option<Overlay>,
+}
+
+impl StatsMode {
+    fn new(shards_expanded: bool, scroll: usize) -> Self {
+        Self {
+            shards_expanded,
+            scroll,
+            scroll_max: std::cell::Cell::new(0),
+            overlay: None,
+        }
+    }
+
+    /// The cached stats (computed in `on_enter`).
+    fn stats(&self, ex: &Explorer) -> crate::stats::CheckpointStats {
+        ex.checkpoint_stats_cache
+            .borrow()
+            .clone()
+            .expect("on_enter computes and caches the stats")
+    }
+
+    /// Whether there's a per-shard on-disk breakdown to fold (more than one shard).
+    fn has_fold(&self, ex: &Explorer) -> bool {
+        ex.checkpoint_stats_cache
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.disk.as_ref())
+            .is_some_and(|d| d.shards.len() > 1)
+    }
+}
+
+impl Mode for StatsMode {
+    fn spec(&self) -> ModeSpec {
+        ModeSpec {
+            id: HelpCtx::Stats,
+            ctrlc_quits_immediately: true,
+        }
+    }
+
+    fn overlay(&self) -> Option<&Overlay> {
+        self.overlay.as_ref()
+    }
+    fn dismiss_overlay(&mut self) -> bool {
+        self.overlay.take().is_some()
+    }
+
+    fn on_enter(
+        &mut self,
+        ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+    ) -> Result<Outcome> {
+        // Reuse the stats computed on a previous open (an O(tensors) header-only
+        // pass over an immutable checkpoint), else compute + cache them now.
+        if ex.checkpoint_stats_cache.borrow().is_none() {
+            let s = crate::stats::CheckpointStats::compute(
+                &ex.tensors,
+                ex.config.as_ref(),
+                ex.disk_usage(),
+            );
+            *ex.checkpoint_stats_cache.borrow_mut() = Some(s);
+        }
+        Ok(Outcome::Stay)
+    }
+
+    fn pre_draw(&mut self, _ex: &mut Explorer, _term: &mut crate::tui::LiveTerminal) {
+        self.scroll = self.scroll.min(self.scroll_max.get());
+    }
+
+    fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
+        let stats = self.stats(ex);
+        let max = ex.render_stats_screen(f, &stats, self.scroll, self.shards_expanded);
+        self.scroll_max.set(max);
+        if let Some((what, _)) = &ex.copied_flash {
+            UI::render_copied_flash(f, what);
+        }
+    }
+
+    fn open_palette(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+    ) -> PaletteResult {
+        let stats = self.stats(ex);
+        let entries = available_stats_commands(self.has_fold(ex));
+        let (scroll, shards_expanded) = (self.scroll, self.shards_expanded);
+        let chosen = ex.run_palette(term, entries, HelpCtx::Stats, |s, f| {
+            s.render_stats_screen(f, &stats, scroll, shards_expanded);
+        });
+        match chosen {
+            Some(StatsCmd::CopyCommand) => PaletteResult::CopyCommand,
+            Some(cmd) => PaletteResult::SynthKey(stats_cmd_key(cmd)),
+            None => PaletteResult::Handled,
+        }
+    }
+
+    fn handle_key(
+        &mut self,
+        ex: &mut Explorer,
+        term: &mut crate::tui::LiveTerminal,
+        key: KeyEvent,
+    ) -> Result<Outcome> {
+        match key.code {
+            // Fold / expand the on-disk per-shard breakdown (a no-op without one).
+            KeyCode::Char('f') => {
+                if self.has_fold(ex) {
+                    self.shards_expanded = !self.shards_expanded;
+                }
+            }
+            // Copy the report as plain text, matching the current fold state.
+            KeyCode::Char('r') => {
+                let report = self.stats(ex).render(self.shards_expanded);
+                copy_to_clipboard(&report);
+                ex.copied_flash = Some((
+                    "copied the report to the clipboard".to_string(),
+                    std::time::Instant::now(),
+                ));
+            }
+            // Copy the whole screen's text at the live terminal size.
+            KeyCode::Char('c') => {
+                let (w, h) = term
+                    .size()
+                    .map(|s| (s.width, s.height))
+                    .unwrap_or((120, 40));
+                let stats = self.stats(ex);
+                let (scroll, shards_expanded) = (self.scroll, self.shards_expanded);
+                if let Ok(text) = crate::tui::headless_render(w, h, |f| {
+                    UI::render_stats_frame(f, &stats, scroll, shards_expanded);
+                }) {
+                    copy_to_clipboard(&text);
+                }
+                ex.copied_flash = Some((
+                    "copied the screen to the clipboard".to_string(),
+                    std::time::Instant::now(),
+                ));
+            }
+            KeyCode::Char('l') => self.overlay = Some(Overlay::Legend(Legend::Stats)),
+            KeyCode::Char('q') => return Ok(Outcome::Leave(Nav::Quit)),
+            KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::Down => self.scroll = (self.scroll + 1).min(self.scroll_max.get()),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(SCROLL_PAGE),
+            KeyCode::PageDown => {
+                self.scroll = (self.scroll + SCROLL_PAGE).min(self.scroll_max.get())
+            }
+            KeyCode::Home => self.scroll = 0,
+            KeyCode::End => self.scroll = self.scroll_max.get(),
+            KeyCode::Esc | KeyCode::Backspace => return Ok(Outcome::Leave(Nav::Back)),
+            KeyCode::Char('\\') => return Ok(Outcome::Leave(Nav::Forward)),
+            _ => {}
+        }
+        Ok(Outcome::Stay)
+    }
+
+    fn handle_mouse(
+        &mut self,
+        _ex: &mut Explorer,
+        _term: &mut crate::tui::LiveTerminal,
+        m: MouseEvent,
+    ) -> MouseOutcome {
+        match m.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll = self.scroll.saturating_sub(WHEEL_STEP);
+                MouseOutcome::Redraw
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll = (self.scroll + WHEEL_STEP).min(self.scroll_max.get());
+                MouseOutcome::Redraw
+            }
+            _ => MouseOutcome::Ignored,
+        }
+    }
+
+    fn residual(&self) -> Screen {
+        Screen::Stats {
+            shards_expanded: self.shards_expanded,
+            scroll: self.scroll,
+        }
+    }
+}
+
 /// The tensor data view ([`Screen::Data`]) as a [`Mode`] — the heatmap / numeric
 /// grid. Like the detail screen it runs the exact-stats scan on a worker thread
 /// (`tick_background`/`Bg::Poll`, paused while input flows). `slice`/`slices`/
@@ -3101,6 +3300,18 @@ enum RenameCmd {
     Quit,
 }
 
+/// A command the **checkpoint stats** view palette lists. Like [`DetailCmd`],
+/// each maps to the key that already runs it. See [`STATS_COMMANDS`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StatsCmd {
+    FoldShards,
+    CopyReport,
+    CopyScreen,
+    CopyCommand,
+    Legend,
+    Quit,
+}
+
 /// A command the **data view** (heatmap / numeric grid) palette lists. Like
 /// [`DetailCmd`], each maps to the key that already runs it. See [`DATA_COMMANDS`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -3222,6 +3433,29 @@ const DATA_COMMANDS: &[(DataCmd, &str, &str, char)] = &[
     ),
 ];
 
+/// The checkpoint-stats view's command registry (palette order). `FoldShards`
+/// is filtered out when there's no per-shard breakdown to fold (see
+/// [`available_stats_commands`]); every shown key appears in the footer, enforced
+/// by `every_static_mode_footer_shows_its_command_keys`.
+const STATS_COMMANDS: &[(StatsCmd, &str, &str, char)] = &[
+    (
+        StatsCmd::FoldShards,
+        "View",
+        "Fold / expand the per-shard breakdown",
+        'f',
+    ),
+    (StatsCmd::Legend, "View", "Legend", 'l'),
+    (StatsCmd::CopyReport, "Copy", "Report text", 'r'),
+    (StatsCmd::CopyScreen, "Copy", "Screen text", 'c'),
+    (
+        StatsCmd::CopyCommand,
+        "Copy",
+        "Command to reopen this view",
+        'y',
+    ),
+    (StatsCmd::Quit, "App", "Quit", 'q'),
+];
+
 /// The rename editor's command registry (palette order). The `char` is a *sentinel*
 /// naming the real **Ctrl** trigger — Ctrl keys so every character stays typeable in
 /// the name fields, mirroring the non-editing modes' bare letters (`^R` apply, `^S`
@@ -3265,6 +3499,7 @@ type FileCmdEntry = PaletteRow<FileCmd>;
 type LayoutCmdEntry = PaletteRow<LayoutCmd>;
 type DetailCmdEntry = PaletteRow<DetailCmd>;
 type DataCmdEntry = PaletteRow<DataCmd>;
+type StatsCmdEntry = PaletteRow<StatsCmd>;
 type RenameCmdEntry = PaletteRow<RenameCmd>;
 
 /// The display label for a palette/footer key: `Tab` for the `\t` sentinel
@@ -3441,6 +3676,29 @@ fn available_data_commands(overridable: bool) -> Vec<DataCmdEntry> {
 /// key handlers run it.
 fn data_cmd_key(cmd: DataCmd) -> KeyEvent {
     let key = DATA_COMMANDS
+        .iter()
+        .find(|(c, ..)| *c == cmd)
+        .map_or('\0', |(_, _, _, key)| *key);
+    KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)
+}
+
+/// The stats-view commands available now: the per-shard fold only when there's a
+/// breakdown to fold (more than one shard on disk).
+fn available_stats_commands(has_fold: bool) -> Vec<StatsCmdEntry> {
+    STATS_COMMANDS
+        .iter()
+        .copied()
+        .filter(|(cmd, _, _, _)| match cmd {
+            StatsCmd::FoldShards => has_fold,
+            _ => true,
+        })
+        .collect()
+}
+
+/// The key a chosen [`StatsCmd`] maps to — synthesized so the stats mode's key
+/// handlers run it.
+fn stats_cmd_key(cmd: StatsCmd) -> KeyEvent {
+    let key = STATS_COMMANDS
         .iter()
         .find(|(c, ..)| *c == cmd)
         .map_or('\0', |(_, _, _, key)| *key);
@@ -4902,14 +5160,23 @@ impl Explorer {
                     1,
                 )
             });
-            // `--stats`: composite the checkpoint-stats popup over the tree. The
-            // on-disk footprint is a live, machine-specific measurement (block
-            // size / ZFS), so it's left out of this deterministic headless render
-            // (`--plain`, `--emit-command`) — the interactive popup and its `r`
-            // report show it.
-            let stats = want_stats_popup.then(|| {
-                crate::stats::CheckpointStats::compute(&self.tensors, self.config.as_ref(), None)
-            });
+            // `--stats`: render the full-screen stats view (not composited over the
+            // tree — it's a first-class screen now). The on-disk footprint is a
+            // live, machine-specific measurement (block size / ZFS), so it's left
+            // out of this deterministic headless render — the interactive mode and
+            // its `r` report show it.
+            if want_stats_popup {
+                let stats = crate::stats::CheckpointStats::compute(
+                    &self.tensors,
+                    self.config.as_ref(),
+                    None,
+                );
+                let text = crate::tui::headless_render(120, 40, |f| {
+                    UI::render_stats_frame(f, &stats, 0, want_stats_shards);
+                })?;
+                println!("{text}");
+                return Ok(());
+            }
             let text = crate::tui::headless_render(120, 40, |f| {
                 self.render_tree_frame(f, false); // headless: no scroll bar
                 if want_legend {
@@ -4926,9 +5193,6 @@ impl Explorer {
                         0,
                         want_health_findings,
                     );
-                }
-                if let Some(stats) = &stats {
-                    UI::render_stats(f, stats, None, 0, want_stats_shards);
                 }
             })?;
             println!("{text}");
@@ -5002,6 +5266,16 @@ impl Explorer {
                 self.command_for_data(&t, *repr, *slice)
             }
             Screen::Rename { pairs } => self.command_for_rename(pairs),
+            Screen::Stats {
+                shards_expanded, ..
+            } => {
+                let flag = if *shards_expanded {
+                    "--stats-shards"
+                } else {
+                    "--stats"
+                };
+                format!("{} {flag}", self.command_for_tree())
+            }
         }
     }
 
@@ -5280,19 +5554,23 @@ impl Explorer {
             self.load_all_files()?;
         }
 
-        // `--health` / `--stats`: float the requested popup over the tree before
-        // handing off to the navigator (dismissing it drops into the normal tree).
+        // `--health`: float the report popup over the tree before handing off to
+        // the navigator (dismissing it drops into the normal tree).
         if want_health {
             self.ensure_full_load()?;
             let mut term = self.terminal.take().expect("interactive loop owns it");
             self.show_check_report(&mut term, want_health_findings);
             self.terminal = Some(term);
         }
+        // `--stats` / `--stats-shards`: open straight into the full-screen stats
+        // mode (Esc / `⌫` drops back to the tree).
         if want_stats_popup {
             self.ensure_full_load()?;
-            let mut term = self.terminal.take().expect("interactive loop owns it");
-            self.show_stats(&mut term, want_stats_shards);
-            self.terminal = Some(term);
+            history.push(Screen::Stats {
+                shards_expanded: want_stats_shards,
+                scroll: 0,
+            });
+            cursor = history.len() - 1;
         }
         // `--files`: open the file browser on top of the tree, so `Tab`/Backspace
         // drop back to it. Pushed last so it wins even alongside `--tensor`. The
@@ -5350,9 +5628,11 @@ impl Explorer {
             // that on returning to the tree we can land back on it.
             let screen_tensor = match &history[cursor] {
                 Screen::Detail { tensor, .. } | Screen::Data { tensor, .. } => Some(tensor.clone()),
-                Screen::Tree | Screen::Files | Screen::Layout { .. } | Screen::Rename { .. } => {
-                    None
-                }
+                Screen::Tree
+                | Screen::Files
+                | Screen::Layout { .. }
+                | Screen::Rename { .. }
+                | Screen::Stats { .. } => None,
             };
 
             let nav = match history[cursor].clone() {
@@ -5392,6 +5672,17 @@ impl Explorer {
                     // Re-record the screen with where the user left it (slice /
                     // representation), so back/forward returns there faithfully.
                     let mut mode = DataMode::new(tensor, repr, slice, Interaction::Interactive);
+                    let nav = self.run_mode(&mut mode)?;
+                    history[cursor] = mode.residual();
+                    nav
+                }
+                Screen::Stats {
+                    shards_expanded,
+                    scroll,
+                } => {
+                    // Record the fold state / scroll where the user left them, so
+                    // back/forward (and the `--stats` reopen command) restore it.
+                    let mut mode = StatsMode::new(shards_expanded, scroll);
                     let nav = self.run_mode(&mut mode)?;
                     history[cursor] = mode.residual();
                     nav
@@ -5929,6 +6220,25 @@ impl Explorer {
         let badges = self.screen_badges(HelpCtx::Detail);
         UI::render_badge_bar(frame, &badges, self.hovered_badge.get());
         self.render_shortcut_hover(frame);
+    }
+
+    /// Render the full-screen checkpoint-stats view (chrome + scrollable body +
+    /// footer via [`UI::render_stats_frame`]), record its clickable regions, and
+    /// draw the access badge on the reserved bottom row — the stats analogue of
+    /// [`Self::render_detail_frame`]. Returns the maximum valid scroll offset so
+    /// the mode can clamp its own.
+    fn render_stats_screen(
+        &self,
+        frame: &mut ratatui::Frame,
+        stats: &crate::stats::CheckpointStats,
+        scroll: usize,
+        shards_expanded: bool,
+    ) -> usize {
+        let (max, regions) = UI::render_stats_frame(frame, stats, scroll, shards_expanded);
+        *self.clickable.borrow_mut() = regions;
+        let badges = self.screen_badges(HelpCtx::Stats);
+        UI::render_badge_bar(frame, &badges, self.hovered_badge.get());
+        max
     }
 
     /// Render a tensor's detail screen to plain text via an in-memory Ratatui
@@ -6470,7 +6780,12 @@ impl Explorer {
             Cmd::CopyScreen => self.copy_tree_screen(),
             Cmd::CopyPath => self.copy_selected_path(),
             Cmd::CopyName => self.copy_selected_name(),
-            Cmd::Stats => self.show_stats(term, false),
+            Cmd::Stats => {
+                return Some(Nav::Open(Screen::Stats {
+                    shards_expanded: false,
+                    scroll: 0,
+                }));
+            }
             Cmd::Health => self.show_check_report(term, false),
             Cmd::Legend => self.show_legend(term, Legend::Tree, None),
             Cmd::CopyTree => self.copy_menu(term),
@@ -7986,9 +8301,14 @@ impl Explorer {
                         Interaction::OneShot,
                     ))?;
                 }
-                // The tree renders itself; the file browser, layout map and rename
-                // editor are interactive-only (a `--files`/`--layout --exit` falls back).
-                Screen::Tree | Screen::Files | Screen::Layout { .. } | Screen::Rename { .. } => {}
+                // The tree renders itself; the file browser, layout map, rename
+                // editor and stats view are interactive-only (a `--files` / `--layout`
+                // / `--stats` with `--exit` falls back to the headless render).
+                Screen::Tree
+                | Screen::Files
+                | Screen::Layout { .. }
+                | Screen::Rename { .. }
+                | Screen::Stats { .. } => {}
             }
             return Ok(None);
         }
@@ -9275,164 +9595,6 @@ impl Explorer {
         paths.sort_unstable();
         paths.dedup();
         crate::stats::DiskUsage::from_local(&paths)
-    }
-
-    /// Float the overall-checkpoint stats popup over the tree (the `s` key).
-    /// It's read-only: `f` (or a click on the row) folds/unfolds the on-disk
-    /// per-shard breakdown, `r` copies the report, `c` the whole screen, `y` the
-    /// CLI command that reopens it (`--stats` / `--stats-shards`), `Esc` or a
-    /// click elsewhere dismisses, Ctrl-C quits; the body scrolls (↑/↓, PgUp/PgDn,
-    /// Home/End, wheel) when it's taller than the popup, and mouse motion keeps
-    /// the hover bubbles behind it live. `shards_expanded` is the initial fold
-    /// state (`--stats-shards`).
-    fn show_stats(&self, term: &mut crate::tui::LiveTerminal, mut shards_expanded: bool) {
-        // Reuse the stats computed on a previous open — an O(tensors) pass over an
-        // immutable checkpoint, so it's computed once and cached. The `borrow()`
-        // is released on its own line (not held across `compute`, which
-        // `borrow_mut`s to store the result).
-        let cached = self.checkpoint_stats_cache.borrow().clone();
-        let stats = cached.unwrap_or_else(|| {
-            let s = crate::stats::CheckpointStats::compute(
-                &self.tensors,
-                self.config.as_ref(),
-                self.disk_usage(),
-            );
-            *self.checkpoint_stats_cache.borrow_mut() = Some(s.clone());
-            s
-        });
-
-        // What was just copied (and when), so the footer can flash it briefly.
-        let mut copied_at: Option<(std::time::Instant, &'static str)> = None;
-        // A non-Latin key (wrong keyboard layout) shows a hint, as on other screens.
-        let mut layout_hint: Option<char> = None;
-        let mut scroll = 0usize;
-        let mut scroll_max;
-
-        loop {
-            let copied = copied_at
-                .filter(|(t, _)| t.elapsed() < COPY_FLASH)
-                .map(|(_, what)| what);
-            let hint = layout_hint;
-            let max_cell = std::cell::Cell::new(0usize);
-            if term
-                .draw(|f| {
-                    self.render_tree_frame(f, true);
-                    let (max, regions) =
-                        UI::render_stats(f, &stats, copied, scroll, shards_expanded);
-                    max_cell.set(max);
-                    // The popup owns the clickable map while it's up (the fold
-                    // toggle), overriding the tree's chips behind it.
-                    *self.clickable.borrow_mut() = regions;
-                    if let Some(c) = hint {
-                        UI::render_notice(f, &layout_hint_msg(c));
-                    }
-                })
-                .is_err()
-            {
-                break;
-            }
-            // Clamp to what actually fit (the popup / terminal size can change).
-            scroll_max = max_cell.get();
-            scroll = scroll.min(scroll_max);
-
-            // While the copy flash is up, wake to clear it when it expires; else
-            // block until the next event.
-            let event = if copied.is_some() {
-                let left =
-                    COPY_FLASH.saturating_sub(copied_at.map_or(COPY_FLASH, |(t, _)| t.elapsed()));
-                if event::poll(left).unwrap_or(false) {
-                    event::read().ok()
-                } else {
-                    copied_at = None; // flash expired — redraw without it
-                    continue;
-                }
-            } else {
-                event::read().ok()
-            };
-
-            layout_hint = None;
-            match event {
-                Some(Event::Key(key)) => {
-                    if is_ctrl_c(&key) {
-                        quit_immediately();
-                    }
-                    let now = std::time::Instant::now();
-                    match key.code {
-                        // `y` copies the command that reopens this popup, in its
-                        // current fold state.
-                        KeyCode::Char('y') => {
-                            let flag = if shards_expanded {
-                                "--stats-shards"
-                            } else {
-                                "--stats"
-                            };
-                            let cmd = format!("{} {flag}", self.command_for_tree());
-                            if copy_to_clipboard(&cmd) {
-                                copied_at = Some((now, "command"));
-                            }
-                        }
-                        // `c` copies the whole screen — the tree with this popup
-                        // composited on top, at the live terminal size.
-                        KeyCode::Char('c') => {
-                            let (w, h) = term
-                                .size()
-                                .map(|s| (s.width, s.height))
-                                .unwrap_or((120, 40));
-                            let screen = crate::tui::headless_render(w, h, |f| {
-                                self.render_tree_frame(f, false);
-                                UI::render_stats(f, &stats, None, scroll, shards_expanded);
-                            });
-                            if let Ok(text) = screen
-                                && copy_to_clipboard(&text)
-                            {
-                                copied_at = Some((now, "screen"));
-                            }
-                        }
-                        // `r` copies just the stats as plain text (matching the
-                        // current fold state).
-                        KeyCode::Char('r') => {
-                            if copy_to_clipboard(&stats.render(shards_expanded)) {
-                                copied_at = Some((now, "report"));
-                            }
-                        }
-                        // `f` folds / unfolds the on-disk per-shard breakdown.
-                        KeyCode::Char('f') => shards_expanded = !shards_expanded,
-                        // Scroll the body when it's taller than the popup.
-                        KeyCode::Up => scroll = scroll.saturating_sub(1),
-                        KeyCode::Down => scroll = (scroll + 1).min(scroll_max),
-                        KeyCode::PageUp => scroll = scroll.saturating_sub(SCROLL_PAGE),
-                        KeyCode::PageDown => scroll = (scroll + SCROLL_PAGE).min(scroll_max),
-                        KeyCode::Home => scroll = 0,
-                        KeyCode::End => scroll = scroll_max,
-                        KeyCode::Esc => break,
-                        _ => layout_hint = wrong_layout_char(&key),
-                    }
-                }
-                // A click on the fold toggle folds/unfolds; a click anywhere else
-                // dismisses (the popup convention).
-                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Down(_)) => {
-                    if crate::ui::region_hit(&self.clickable.borrow(), m.column, m.row).is_some() {
-                        shards_expanded = !shards_expanded;
-                    } else {
-                        break;
-                    }
-                }
-                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::ScrollUp) => {
-                    scroll = scroll.saturating_sub(WHEEL_STEP)
-                }
-                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::ScrollDown) => {
-                    scroll = (scroll + WHEEL_STEP).min(scroll_max)
-                }
-                // Motion refreshes the hover bubbles behind the popup.
-                Some(Event::Mouse(m)) if matches!(m.kind, MouseEventKind::Moved) => {
-                    if let Ok(sz) = term.size() {
-                        self.update_hovers(HelpCtx::Tree, sz.width, sz.height, m.column, m.row);
-                    }
-                }
-                Some(_) => {}
-                None => break,
-            }
-        }
     }
 
     /// Run the value-tier scan on a worker thread, animating the popup (spinner +
@@ -10902,6 +11064,15 @@ mod tests {
                 .map(|&(_, g, _, c)| (g, c))
                 .collect::<Vec<_>>(),
             data_chips,
+        );
+        // Stats footer rendered with the per-shard fold available, so `f` shows too.
+        check(
+            "stats",
+            &STATS_COMMANDS
+                .iter()
+                .map(|&(_, g, _, c)| (g, c))
+                .collect::<Vec<_>>(),
+            crate::ui::stats_hint_lines(true, false, 200).1,
         );
     }
 

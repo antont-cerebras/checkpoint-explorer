@@ -2,43 +2,42 @@
 source: tests/cli.rs
 expression: "plain(&[\"--stats\"])"
 ---
-Checkpoint Explorer - [FIXTURE] (1/1)                                                                 [×]
+ Checkpoint stats                                                                                                    [×]
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-▾ [FIXTURE] (▦╭ Checkpoint stats ────────────────────────────────────────────────────────────────────────╮
-  ▸ 🔧 Metadat│ Overview                                                                                 │
-  · lm_head.we│   Parameters   988                                                                       │
-  ▾ model (▦ 2│   Size         1.2 KiB on disk · 2.0 KiB logical (1.65× smaller)                         │
-    · embed_to│                                                                                          │
-    ▸ layers (│ ▤ Files  ×1                                                                              │
-    · norm.wei│   Largest      2.0 KiB   [FIXTURE]                                                       │
-    · scale.i8│   Smallest     2.0 KiB   [FIXTURE]                                                       │
-              │   Average      2.0 KiB                                                                   │
-              │   Median       2.0 KiB                                                                   │
-              │                                                                                          │
-              │ ▦ Tensors  ×23                                                                           │
-              │   Largest      192 B     model.layers.2.block_sparse_moe.experts.down_proj.weight.qscale │
-              │   Smallest     8 B       model.scale.i8                                                  │
-              │   Average      91 B                                                                      │
-              │   Median       64 B                                                                      │
-              │                                                                                          │
-              │ ≡ Layers  ×3                                                                             │
-              │   Params       298 each · 896 total                                                      │
-              │   Size         637 B each · 1.9 KiB total                                                │
-              │                                                                                          │
-              │ ◆ Experts  ×6 per layer                                                                  │
-              │   Storage      fused (stacked tensors) · gate+up fused                                   │
-              │   Params       45 each · 816 total                                                       │
-              │   Size         90 B each · 1.6 KiB total                                                 │
-              │   down_proj    400 B each · 1.2 KiB total                                                │
-              │   gate_up_proj 144 B each · 432 B total                                                  │
-              │                                                                                          │
-              │ By dtype                                                                                 │
-              │   F16    928 B  8 tensors                                                                │
-              │   U16    904 B  7 tensors                                                                │
-              │   I32    192 B  3 tensors                                                                │
-              │   F32     64 B  4 tensors                                                                │
-↑/↓ navigate ·│   I8       8 B  1 tensor                                                                 │mmands
-E/C all · / se│ c copy screen · r copy report · y copy command · Esc dismiss                             │me
-y copy command╰──────────────────────────────────────────────────────────────────────────────────────────╯
- ▪ [FIXTURE]
-                                                                                                              read-only
+Overview
+  Parameters   988
+  Size         1.2 KiB on disk · 2.0 KiB logical (1.65× smaller)
+
+▤ Files  ×1
+  Largest      2.0 KiB   [FIXTURE]
+  Smallest     2.0 KiB   [FIXTURE]
+  Average      2.0 KiB
+  Median       2.0 KiB
+
+▦ Tensors  ×23
+  Largest      192 B     model.layers.2.block_sparse_moe.experts.down_proj.weight.qscale
+  Smallest     8 B       model.scale.i8
+  Average      91 B
+  Median       64 B
+
+≡ Layers  ×3
+  Params       298 each · 896 total
+  Size         637 B each · 1.9 KiB total
+
+◆ Experts  ×6 per layer
+  Storage      fused (stacked tensors) · gate+up fused
+  Params       45 each · 816 total
+  Size         90 B each · 1.6 KiB total
+  down_proj    400 B each · 1.2 KiB total
+  gate_up_proj 144 B each · 432 B total
+
+By dtype
+  F16    928 B  8 tensors
+  U16    904 B  7 tensors
+  I32    192 B  3 tensors
+  F32     64 B  4 tensors
+  I8       8 B  1 tensor
+
+
+
+↑/↓ scroll · PgUp/PgDn page · r copy report · c copy screen · y copy command · l legend · ⌫ back · q quit

@@ -131,12 +131,13 @@ pub enum HelpCtx {
     Detail,
     Data,
     Rename,
+    Stats,
 }
 
 /// A one-line help description for a footer shortcut `key` on screen `ctx`, shown
 /// as a bubble when the mouse hovers the chip. `None` for keys with no help.
 pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
-    use HelpCtx::{Data, Detail, Files, Layout, Rename, Tree};
+    use HelpCtx::{Data, Detail, Files, Layout, Rename, Stats, Tree};
     use KeyCode::{Backspace, Char, Down, Left, PageDown, PageUp, Right, Tab, Up};
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     let help = match (ctx, key.code) {
@@ -217,6 +218,13 @@ pub fn shortcut_help(key: KeyEvent, ctx: HelpCtx) -> Option<&'static str> {
         (Rename, Char('l') | Char('\u{c}')) => "Show the legend for the rename editor's symbols.",
         (Rename, Char('\u{1b}')) => "Go back to the previous view.",
         (Rename, Char('\u{3}')) => "Quit the explorer.",
+        // Checkpoint stats (full-screen).
+        (Stats, Char(' ') | Char(':')) => "Open the command palette — search and run any command.",
+        (Stats, Up | Down) => "Scroll the report up / down one line.",
+        (Stats, PageUp | PageDown) => "Scroll the report by one screenful.",
+        (Stats, Char('f')) => "Fold / expand the per-shard on-disk breakdown.",
+        (Stats, Char('r')) => "Copy the stats report as plain text.",
+        (Stats, Char('q')) => "Quit the explorer.",
         // Common to every screen.
         (_, Char('l')) => "Show the legend for this screen's symbols and keys.",
         (_, Char('c')) => "Copy the whole screen's text to the clipboard.",
@@ -596,6 +604,7 @@ pub enum Legend {
     Heatmap,
     Values,
     Rename,
+    Stats,
 }
 
 /// A floating pop-up the detail screen can show *over* its live frame — drawn as
@@ -3193,16 +3202,16 @@ impl UI {
     /// The overall-checkpoint stats popup (the `s` key on the tree). Returns the
     /// max scroll offset, like [`Self::render_check_report`], so the caller can
     /// clamp its scroll state to what actually fit.
-    pub fn render_stats(
-        frame: &mut Frame,
+    /// Build the checkpoint-stats report as styled body lines, plus the body-line
+    /// index of the on-disk per-shard fold toggle (for click hit-testing) when a
+    /// breakdown is present. Shared by the full-screen stats mode and headless
+    /// `--stats`, so both render identically.
+    fn stats_body_lines(
         s: &crate::stats::CheckpointStats,
-        copied: Option<&'static str>,
-        scroll: usize,
         shards_expanded: bool,
-    ) -> (usize, Vec<(Rect, KeyEvent)>) {
+    ) -> (Vec<Line<'static>>, Option<usize>) {
         use crate::stats::ExpertStorage;
-        let bg = palette::PANEL_BG;
-        let sty = |t: String, style: Style| Span::styled(t, style.bg(bg));
+        let sty = |t: String, style: Style| Span::styled(t, style);
         let plain = |t: String| sty(t, Style::default());
         let dim = |t: String| sty(t, Style::default().fg(palette::DIM));
 
@@ -3463,21 +3472,129 @@ impl UI {
             }
         }
 
-        // The fold toggle (when present) is the popup's one clickable body row.
-        let clickable: Vec<(usize, KeyEvent)> = fold_line
-            .map(|i| (i, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)))
-            .into_iter()
-            .collect();
-        // The `f` fold hint goes in the footer (only when there's a breakdown).
-        let fold = fold_line.map(|_| shards_expanded);
-        render_scroll_popup(
+        (lines, fold_line)
+    }
+
+    /// Render the full-screen checkpoint-stats view: a title header, the scrollable
+    /// report body (with an overflow indicator), and the bottom-pinned command
+    /// footer. Returns the maximum valid scroll offset (so the mode can clamp its
+    /// own) and the clickable regions — the on-disk fold toggle, the footer chips,
+    /// and the top-right `[×]`. Used by the interactive [`StatsMode`] and headless
+    /// `--stats`, so the two stay byte-identical.
+    pub fn render_stats_frame(
+        frame: &mut Frame,
+        s: &crate::stats::CheckpointStats,
+        scroll: usize,
+        shards_expanded: bool,
+    ) -> (usize, Vec<(Rect, KeyEvent)>) {
+        let area = frame.area();
+        let (width, height) = (area.width, area.height);
+
+        let (body, fold_line) = Self::stats_body_lines(s, shards_expanded);
+        let (footer, chips) = stats_hint_lines(fold_line.is_some(), shards_expanded, width);
+        let footer_len = footer.len() as u16;
+
+        // Header: a title and a full-width rule — the shared view-header look.
+        let header = vec![
+            Line::from(Span::styled(
+                " Checkpoint stats",
+                Style::default()
+                    .fg(palette::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "─".repeat(width as usize),
+                Style::default().fg(palette::DIM),
+            )),
+        ];
+        let header_len = header.len() as u16;
+        Paragraph::new(header).render(
+            Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: header_len,
+            },
+            frame.buffer_mut(),
+        );
+
+        // Footer pinned above the bottom row, which the caller reserves for the
+        // access badge (drawn after this, like the detail / data views).
+        let footer_top = height.saturating_sub(footer_len + 1);
+        Paragraph::new(footer).render(
+            Rect {
+                x: 0,
+                y: footer_top,
+                width,
+                height: footer_len,
+            },
+            frame.buffer_mut(),
+        );
+
+        // Body window between header and footer; when it overflows, reserve one
+        // row just above the footer for the scroll indicator.
+        let avail = footer_top.saturating_sub(header_len) as usize;
+        let total = body.len();
+        let overflow = total > avail;
+        let visible = if overflow {
+            avail.saturating_sub(1)
+        } else {
+            avail
+        };
+        let max_scroll = total.saturating_sub(visible);
+        let scroll = scroll.min(max_scroll);
+        // Clone only the visible window (not the whole body) so scrolling a large
+        // report stays O(screen), not O(content).
+        let window: Vec<Line> = body.iter().skip(scroll).take(visible).cloned().collect();
+        Paragraph::new(window).render(
+            Rect {
+                x: 0,
+                y: header_len,
+                width,
+                height: visible as u16,
+            },
+            frame.buffer_mut(),
+        );
+        if overflow {
+            let indicator = format!(
+                "↑↓ PgUp/PgDn scroll · {}–{} of {total}",
+                scroll + 1,
+                scroll + visible
+            );
+            Paragraph::new(Line::from(dim_span(indicator))).render(
+                Rect {
+                    x: 0,
+                    y: header_len + visible as u16,
+                    width,
+                    height: 1,
+                },
+                frame.buffer_mut(),
+            );
+        }
+
+        // Clickable regions: the fold toggle (when visible in the scrolled window),
+        // the footer chips, and the top-right `[×]` (→ step back, like `⌫`).
+        let mut regions: Vec<(Rect, KeyEvent)> = Vec::new();
+        if let Some(i) = fold_line
+            && i >= scroll
+            && i < scroll + visible
+        {
+            regions.push((
+                Rect {
+                    x: 0,
+                    y: header_len + (i - scroll) as u16,
+                    width,
+                    height: 1,
+                },
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+            ));
+        }
+        regions.extend(chip_regions(&chips, footer_top));
+        regions.extend(close_button(
             frame,
-            "Checkpoint stats",
-            &lines,
-            stats_footer_line(copied, fold, bg),
-            scroll,
-            &clickable,
-        )
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        ));
+        (max_scroll, regions)
     }
 
     /// Borderless band shown when a chosen export is too big for the terminal
@@ -3916,47 +4033,53 @@ fn check_footer_line(state: &CheckPopup, fold: Option<bool>, bg: Color) -> Line<
 }
 
 /// Footer for the stats popup: a "✓ copied …" flash, or the key hints.
-fn stats_footer_line(copied: Option<&'static str>, fold: Option<bool>, bg: Color) -> Line<'static> {
-    if let Some(what) = copied {
-        return Line::from(Span::styled(
-            format!("✓ copied {what} to the clipboard"),
-            Style::default().fg(palette::SUCCESS).bg(bg),
+/// The full-screen stats view's footer hint chips — the same borderless,
+/// clickable, hover-aware footer every other view has. `can_fold` shows the
+/// per-shard `f` toggle only when there's a breakdown; `shards_expanded` picks
+/// its label. Every command key in [`STATS_COMMANDS`] appears here (enforced by
+/// `every_static_mode_footer_shows_its_command_keys`).
+pub(crate) fn stats_hint_lines(
+    can_fold: bool,
+    shards_expanded: bool,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<ChipHit>) {
+    use KeyCode::{Backspace, Down, PageDown, PageUp, Up};
+    let plain = KeyModifiers::NONE;
+    let mut items: Vec<(Vec<Seg>, &str)> = vec![
+        (
+            vec![
+                Seg::Key("↑", KeyEvent::new(Up, plain)),
+                Seg::Sep("/"),
+                Seg::Key("↓", KeyEvent::new(Down, plain)),
+            ],
+            "scroll",
+        ),
+        (
+            vec![
+                Seg::Key("PgUp", KeyEvent::new(PageUp, plain)),
+                Seg::Sep("/"),
+                Seg::Key("PgDn", KeyEvent::new(PageDown, plain)),
+            ],
+            "page",
+        ),
+    ];
+    if can_fold {
+        items.push((
+            vec![Seg::Key("f", hint_key('f'))],
+            if shards_expanded {
+                "fold shards"
+            } else {
+                "expand shards"
+            },
         ));
     }
-    let key = |k: &str| {
-        Span::styled(
-            k.to_string(),
-            Style::default()
-                .fg(palette::KEY)
-                .add_modifier(Modifier::BOLD)
-                .bg(bg),
-        )
-    };
-    // Descriptions in the default foreground and only the " · " separators dimmed,
-    // matching the tree view's footer (the other footers follow its style).
-    let dim = |s: &str| Span::styled(s.to_string(), Style::default().fg(palette::DIM).bg(bg));
-    let label = |s: &str| Span::styled(s.to_string(), Style::default().bg(bg));
-    let mut items: Vec<(&str, &str)> = Vec::new();
-    // The per-shard fold key, when there's a breakdown to fold — a footer hint
-    // (not inline) so it matches the other keys and stays visible either way.
-    match fold {
-        Some(true) => items.push(("f", " fold shards")),
-        Some(false) => items.push(("f", " expand shards")),
-        None => {}
-    }
-    items.push(("c", " copy screen"));
-    items.push(("r", " copy report"));
-    items.push(("y", " copy command"));
-    items.push(("Esc", " dismiss"));
-    let mut spans = Vec::new();
-    for (i, (k, lbl)) in items.iter().enumerate() {
-        if i > 0 {
-            spans.push(dim(" · "));
-        }
-        spans.push(key(k));
-        spans.push(label(lbl));
-    }
-    Line::from(spans)
+    items.push((vec![Seg::Key("r", hint_key('r'))], "copy report"));
+    items.push((vec![Seg::Key("c", hint_key('c'))], "copy screen"));
+    items.push((vec![Seg::Key("y", hint_key('y'))], "copy command"));
+    items.push((vec![Seg::Key("l", hint_key('l'))], "legend"));
+    items.push((vec![Seg::Key("⌫", KeyEvent::new(Backspace, plain))], "back"));
+    items.push((vec![Seg::Key("q", hint_key('q'))], "quit"));
+    wrap_hint_items(items, width)
 }
 
 /// A centred, content-sized pop-up over the frame: a rounded [`Block`] (accent
@@ -4483,6 +4606,7 @@ fn legend_title(legend: Legend) -> &'static str {
         Legend::Heatmap => "Legend — heatmap",
         Legend::Values => "Legend — numeric values",
         Legend::Rename => "Legend — rename tensors in place",
+        Legend::Stats => "Legend — checkpoint stats",
     }
 }
 
@@ -4708,6 +4832,39 @@ fn legend_band_lines(legend: Legend) -> Vec<Line<'static>> {
             lines.push(Line::from(dim_span(
                 "  Space/: palette · Tab complete · ↑↓ fields · ↵ next field · ←→ caret · ^N add · ^D remove · ^R apply · ^S copy screen · ^Y copy cmd · ^A apply cmd",
             )));
+        }
+        Legend::Stats => {
+            let rows = [
+                (
+                    Some(palette::ACCENT),
+                    crate::stats::GLYPH_FILES,
+                    "Files — one row per shard / file on disk",
+                ),
+                (
+                    Some(palette::ACCENT),
+                    crate::stats::GLYPH_TENSORS,
+                    "Tensors — every stored array in the checkpoint",
+                ),
+                (
+                    Some(palette::ACCENT),
+                    crate::stats::GLYPH_LAYERS,
+                    "Layers — the repeated transformer-block stack",
+                ),
+                (
+                    Some(palette::ACCENT),
+                    crate::stats::GLYPH_EXPERTS,
+                    "Experts — MoE expert tensors, split by projection (down / gate / up)",
+                ),
+                (
+                    None,
+                    "each · total",
+                    "a per-layer (or per-expert) average beside the whole-checkpoint total",
+                ),
+            ];
+            let col = legend_desc_col(&rows, 0);
+            for (color, sym, desc) in rows {
+                lines.push(legend_row_line(color, sym, desc, col));
+            }
         }
     }
 
@@ -7274,7 +7431,7 @@ mod tests {
 
         // Expanded: *every* shard is listed — the saver and the untouched one.
         let expanded = crate::tui::headless_render(100, 50, |f| {
-            UI::render_stats(f, &stats, None, 0, true);
+            UI::render_stats_frame(f, &stats, 0, true);
         })
         .unwrap();
         assert!(expanded.contains("On disk (filesystem)"), "{expanded}");
@@ -7289,7 +7446,7 @@ mod tests {
 
         // Folded (default): the shard list collapses to a single toggle line.
         let folded = crate::tui::headless_render(100, 50, |f| {
-            UI::render_stats(f, &stats, None, 0, false);
+            UI::render_stats_frame(f, &stats, 0, false);
         })
         .unwrap();
         assert!(folded.contains("per-shard breakdown"), "{folded}");
