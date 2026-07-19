@@ -18,6 +18,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::filter::NameFilter;
+use crate::remote::{S3Meta, S3Object};
 use crate::sample::{HistBins, HistogramDiff, ValueDiff};
 use crate::tree::{MetadataInfo, TensorInfo};
 use crate::utils::{format_parameters, format_shape, format_size};
@@ -841,6 +842,9 @@ pub struct DiffReport {
     pub new_bytes: usize,
     pub old_params: usize,
     pub new_params: usize,
+    /// The S3 object-metadata diff, set only for an s3-vs-s3 comparison (attached
+    /// after [`compare_with`], which has no S3 data). `None` otherwise.
+    pub s3: Option<S3Diff>,
 }
 
 impl DiffReport {
@@ -853,6 +857,8 @@ impl DiffReport {
             || !self.meta_removed.is_empty()
             || !self.meta_added.is_empty()
             || !self.meta_changed.is_empty()
+            // S3 material changes count; timestamp-only deltas never do.
+            || self.s3.as_ref().is_some_and(S3Diff::has_material_changes)
     }
 
     /// Render the report as plain text: a `---`/`+++` header naming the two sides,
@@ -1095,7 +1101,232 @@ impl DiffReport {
             };
             let _ = writeln!(s, "\nmetadata: not compared ({reason})");
         }
+
+        // S3 object metadata (s3-vs-s3 only).
+        if let Some(s3) = &self.s3 {
+            let _ = writeln!(
+                s,
+                "\nS3 objects: -{} +{} ~{} ({} unchanged)",
+                s3.removed.len(),
+                s3.added.len(),
+                s3.changed.len(),
+                s3.unchanged,
+            );
+            for key in &s3.removed {
+                let _ = writeln!(s, "{}", paint(&format!("  - {key}"), opts.color, RED));
+            }
+            for key in &s3.added {
+                let _ = writeln!(s, "{}", paint(&format!("  + {key}"), opts.color, GREEN));
+            }
+            for c in &s3.changed {
+                let _ = writeln!(s, "  ~ {}  ({})", c.key, c.fields.join(", "));
+            }
+            // Timestamp-only deltas are informational — never a difference.
+            for i in &s3.info_only {
+                let _ = writeln!(
+                    s,
+                    "{}",
+                    paint(
+                        &format!("  info: {} differs only in {}", i.key, i.fields.join(", ")),
+                        opts.color,
+                        DIM
+                    )
+                );
+            }
+            for w in &s3.warnings {
+                let _ = writeln!(s, "{}", paint(&format!("  note: {w}"), opts.color, DIM));
+            }
+        }
         s
+    }
+}
+
+// ── S3 object metadata diff (s3-vs-s3 only) ─────────────────────────────────
+
+/// An S3 object present in both checkpoints (matched by prefix-relative key) that
+/// differs in one or more **material** fields (never a timestamp — those are info).
+pub struct S3ObjectChange {
+    pub key: String,
+    /// Which material fields differ: any of `size`, `etag`, `checksum`, `tags`, `meta`.
+    pub fields: Vec<&'static str>,
+}
+
+/// An object whose only differences are timestamp-like (last-modified, or a
+/// timestamp-valued tag / metadata entry) — reported as info, never a difference.
+pub struct S3InfoChange {
+    pub key: String,
+    pub fields: Vec<&'static str>,
+}
+
+/// The S3-object-metadata difference between two `s3://` checkpoints.
+pub struct S3Diff {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub changed: Vec<S3ObjectChange>,
+    pub unchanged: usize,
+    /// Objects differing only in timestamp-like fields — informational.
+    pub info_only: Vec<S3InfoChange>,
+    /// Warnings from either side (e.g. tags denied), each prefixed with its side.
+    pub warnings: Vec<String>,
+}
+
+impl S3Diff {
+    /// Material changes only — timestamp-only deltas never count (never affect the
+    /// exit code).
+    pub fn has_material_changes(&self) -> bool {
+        !self.added.is_empty() || !self.removed.is_empty() || !self.changed.is_empty()
+    }
+}
+
+/// Whether a tag / user-metadata entry is timestamp-like — so a difference in it is
+/// treated as information, not a real change. True when the key names a time (common
+/// substrings) or the value parses as an ISO-8601 / RFC3339 datetime or a unix epoch.
+pub fn is_timestamp_like(key: &str, value: &str) -> bool {
+    const PATS: &[&str] = &[
+        "time",
+        "date",
+        "timestamp",
+        "modified",
+        "created",
+        "updated",
+        "mtime",
+        "ctime",
+    ];
+    let k = key.to_ascii_lowercase();
+    if PATS.iter().any(|p| k.contains(p)) {
+        return true;
+    }
+    let b = value.as_bytes();
+    // ISO-8601 / RFC3339: `YYYY-MM-DD` then `T`/space then `HH:MM`.
+    let iso = b.len() >= 16
+        && b[..10].iter().enumerate().all(|(i, &c)| {
+            if i == 4 || i == 7 {
+                c == b'-'
+            } else {
+                c.is_ascii_digit()
+            }
+        })
+        && (b[10] == b'T' || b[10] == b' ')
+        && b[11].is_ascii_digit()
+        && b[13] == b':';
+    // Unix epoch seconds (10) or milliseconds (13).
+    let epoch = (value.len() == 10 || value.len() == 13) && b.iter().all(u8::is_ascii_digit);
+    iso || epoch
+}
+
+/// The material vs timestamp-only split of two objects' tag/metadata maps: `true`
+/// when the non-timestamp entries differ (material), and `true` when a timestamp-like
+/// entry differs (info). A `None` map (couldn't be read) is skipped — not a change.
+fn map_differs(
+    old: Option<&BTreeMap<String, String>>,
+    new: Option<&BTreeMap<String, String>>,
+) -> (bool, bool) {
+    let (Some(o), Some(n)) = (old, new) else {
+        return (false, false); // one side unreadable → can't compare
+    };
+    let (mut material, mut info) = (false, false);
+    for key in o.keys().chain(n.keys()) {
+        let (ov, nv) = (o.get(key), n.get(key));
+        if ov == nv {
+            continue;
+        }
+        // Timestamp-like on either side's value (or by key name) → info, else material.
+        if is_timestamp_like(key, ov.map_or("", |s| s))
+            || is_timestamp_like(key, nv.map_or("", |s| s))
+        {
+            info = true;
+        } else {
+            material = true;
+        }
+    }
+    (material, info)
+}
+
+/// Compare two `s3://` checkpoints' object metadata, matching objects by their
+/// prefix-relative key. Timestamps (last-modified, timestamp-like tags/metadata) are
+/// bucketed as info and never counted as a difference.
+pub fn compare_s3(old: &S3Meta, new: &S3Meta) -> S3Diff {
+    let index = |m: &S3Meta| -> BTreeMap<String, S3Object> {
+        m.objects
+            .iter()
+            .map(|o| (o.key.clone(), o.clone()))
+            .collect()
+    };
+    let (om, nm) = (index(old), index(new));
+
+    let removed: Vec<String> = om
+        .keys()
+        .filter(|k| !nm.contains_key(*k))
+        .cloned()
+        .collect();
+    let added: Vec<String> = nm
+        .keys()
+        .filter(|k| !om.contains_key(*k))
+        .cloned()
+        .collect();
+
+    let mut changed = Vec::new();
+    let mut info_only = Vec::new();
+    let mut unchanged = 0usize;
+    for (key, o) in &om {
+        let Some(n) = nm.get(key) else { continue };
+        let mut material: Vec<&'static str> = Vec::new();
+        let mut info: Vec<&'static str> = Vec::new();
+        if o.size != n.size {
+            material.push("size");
+        }
+        if o.etag != n.etag {
+            material.push("etag");
+        }
+        if o.checksum != n.checksum {
+            material.push("checksum");
+        }
+        let (tag_mat, tag_info) = map_differs(o.tags.as_ref(), n.tags.as_ref());
+        if tag_mat {
+            material.push("tags");
+        }
+        if tag_info {
+            info.push("tags");
+        }
+        let (meta_mat, meta_info) = map_differs(Some(&o.user_meta), Some(&n.user_meta));
+        if meta_mat {
+            material.push("meta");
+        }
+        if meta_info {
+            info.push("meta");
+        }
+        if o.last_modified != n.last_modified {
+            info.push("last-modified");
+        }
+        if !material.is_empty() {
+            changed.push(S3ObjectChange {
+                key: key.clone(),
+                fields: material,
+            });
+        } else if !info.is_empty() {
+            info_only.push(S3InfoChange {
+                key: key.clone(),
+                fields: info,
+            });
+        } else {
+            unchanged += 1;
+        }
+    }
+
+    let mut warnings: Vec<String> = old
+        .warnings
+        .iter()
+        .map(|w| format!("old: {w}"))
+        .chain(new.warnings.iter().map(|w| format!("new: {w}")))
+        .collect();
+    warnings.dedup();
+    S3Diff {
+        added,
+        removed,
+        changed,
+        unchanged,
+        info_only,
+        warnings,
     }
 }
 
@@ -1177,6 +1408,7 @@ pub fn compare_with(
         new_bytes: new.total_bytes,
         old_params: old.total_params,
         new_params: new.total_params,
+        s3: None, // attached by the caller for an s3-vs-s3 diff
     }
 }
 
@@ -1673,6 +1905,143 @@ mod tests {
         // A pattern that matches nothing counts zero.
         let miss = NameMap::from_pairs([("^nope$".to_string(), "x".to_string())]).unwrap();
         assert_eq!(miss.match_count(names), 0);
+    }
+
+    fn s3obj(
+        key: &str,
+        etag: &str,
+        size: u64,
+        tags: &[(&str, &str)],
+        meta: &[(&str, &str)],
+        last_modified: &str,
+    ) -> S3Object {
+        let to_map = |kv: &[(&str, &str)]| {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        S3Object {
+            key: key.into(),
+            size,
+            etag: etag.into(),
+            checksum: None,
+            last_modified: last_modified.into(),
+            user_meta: to_map(meta),
+            tags: Some(to_map(tags)),
+        }
+    }
+
+    fn empty_summary() -> CheckpointSummary {
+        CheckpointSummary::from_loaded(&[], &[])
+    }
+
+    #[test]
+    fn is_timestamp_like_flags_time_keys_and_datetime_values() {
+        // Key-name signals.
+        assert!(is_timestamp_like("created_at", "prod"));
+        assert!(is_timestamp_like("LastModified", ""));
+        assert!(is_timestamp_like("mtime", "x"));
+        // Value signals: ISO-8601 and unix epoch.
+        assert!(is_timestamp_like("run", "2026-01-02T03:04:05Z"));
+        assert!(is_timestamp_like("built", "1700000000"));
+        // Non-timestamps.
+        assert!(!is_timestamp_like("env", "prod"));
+        assert!(!is_timestamp_like("version", "3"));
+    }
+
+    #[test]
+    fn compare_s3_splits_material_from_added_removed_unchanged() {
+        let old = S3Meta {
+            objects: vec![
+                s3obj("a", "e1", 10, &[("env", "prod")], &[("run", "1")], "t1"),
+                s3obj("gone", "e0", 5, &[], &[], "t"),
+                s3obj("same", "eq", 7, &[("k", "v")], &[], "t"),
+            ],
+            warnings: vec![],
+        };
+        let new = S3Meta {
+            objects: vec![
+                // etag changed (material) + last-modified changed (info) → changed(etag).
+                s3obj("a", "e2", 10, &[("env", "prod")], &[("run", "1")], "t2"),
+                s3obj("added", "e9", 1, &[], &[], "t"),
+                s3obj("same", "eq", 7, &[("k", "v")], &[], "t"),
+            ],
+            warnings: vec!["tags unavailable".into()],
+        };
+        let d = compare_s3(&old, &new);
+        assert_eq!(d.removed, vec!["gone".to_string()]);
+        assert_eq!(d.added, vec!["added".to_string()]);
+        assert_eq!(d.changed.len(), 1);
+        assert_eq!(d.changed[0].key, "a");
+        assert!(d.changed[0].fields.contains(&"etag"));
+        assert_eq!(d.unchanged, 1);
+        assert!(d.has_material_changes());
+        // compare_s3 prefixes each warning with its side.
+        assert_eq!(d.warnings, vec!["new: tags unavailable".to_string()]);
+    }
+
+    #[test]
+    fn compare_s3_timestamp_only_delta_is_info_not_a_difference() {
+        let old = S3Meta {
+            objects: vec![s3obj(
+                "a",
+                "eq",
+                10,
+                &[("created", "2026-01-01T00:00:00Z")],
+                &[],
+                "2026-01-01T00:00:00Z",
+            )],
+            warnings: vec![],
+        };
+        // Same content/etag/size; only last-modified and a timestamp-valued tag differ.
+        let new = S3Meta {
+            objects: vec![s3obj(
+                "a",
+                "eq",
+                10,
+                &[("created", "2026-09-09T00:00:00Z")],
+                &[],
+                "2026-09-09T00:00:00Z",
+            )],
+            warnings: vec![],
+        };
+        let d = compare_s3(&old, &new);
+        assert!(
+            d.changed.is_empty(),
+            "timestamp-only delta must not be material"
+        );
+        assert_eq!(d.info_only.len(), 1);
+        assert!(!d.has_material_changes());
+        // A report carrying only this S3 delta reports no differences (exit 0).
+        let mut report = compare(&empty_summary(), &empty_summary());
+        report.s3 = Some(d);
+        assert!(!report.has_differences());
+    }
+
+    #[test]
+    fn render_shows_s3_section_and_permission_warning() {
+        let old = S3Meta {
+            objects: vec![s3obj("shard0", "e1", 10, &[], &[], "t")],
+            warnings: vec![],
+        };
+        let new = S3Meta {
+            objects: vec![s3obj("shard0", "e2", 10, &[], &[], "t")],
+            warnings: vec!["tags unavailable (needs s3:GetObjectTagging): AccessDenied".into()],
+        };
+        let mut report = compare(&empty_summary(), &empty_summary());
+        report.s3 = Some(compare_s3(&old, &new));
+        let opts = DiffOpts {
+            color: false,
+            metadata: true,
+            group: true,
+            values: false,
+            histogram: false,
+            filtered: false,
+        };
+        let out = report.render("s3://old", "s3://new", opts);
+        assert!(out.contains("S3 objects: -0 +0 ~1"), "{out}");
+        assert!(out.contains("~ shard0  (etag)"), "{out}");
+        assert!(out.contains("note: new: tags unavailable"), "{out}");
     }
 
     fn sig(dtype: &str, shape: &[usize]) -> TensorSig {

@@ -18,7 +18,7 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::progress::LoadProgress;
 use crate::sftp::RemoteSession;
@@ -44,6 +44,36 @@ pub struct RemoteCheckpoint {
     pub metadata: Vec<MetadataInfo>,
     pub disk: Option<DiskUsage>,
     pub health: Vec<crate::health::HealthReport>,
+    /// The underlying S3 objects' metadata — `Some` only for an `s3://` source
+    /// (fetched best-effort by the remote script); `None` for a local/SFTP read.
+    pub s3: Option<S3Meta>,
+}
+
+/// One S3 object under a checkpoint's prefix, with the metadata `diff` compares.
+/// Fetched best-effort by the remote dump script via boto3 (the remote's own AWS
+/// credentials — nothing S3 happens locally).
+#[derive(Debug, Clone)]
+pub struct S3Object {
+    /// Key relative to the checkpoint prefix, so two prefixes line up by shard.
+    pub key: String,
+    pub size: u64,
+    pub etag: String,
+    /// `(algorithm, value)` when the object stored an additional checksum.
+    pub checksum: Option<(String, String)>,
+    pub last_modified: String,
+    /// User-defined `x-amz-meta-*` metadata.
+    pub user_meta: BTreeMap<String, String>,
+    /// Object tags, or `None` when they couldn't be read (permission) — distinct
+    /// from `Some(empty)` meaning "read, no tags".
+    pub tags: Option<BTreeMap<String, String>>,
+}
+
+/// The S3 objects under an `s3://` checkpoint's prefix, plus any warnings raised
+/// while fetching them (e.g. tags denied). `Some` only for an `s3://` source.
+#[derive(Debug, Clone, Default)]
+pub struct S3Meta {
+    pub objects: Vec<S3Object>,
+    pub warnings: Vec<String>,
 }
 
 /// Line prefix the remote script tags its JSON with, so we can pick it out of any
@@ -106,7 +136,9 @@ impl RemoteRead {
         eprintln!("checkpoint-explorer: reading tensor metadata over ssh …");
         let bars = crate::progress::Bars::start(vec![src.to_string()]);
         let progress = bars.progress(0);
-        let out = self.read(&session, src, &password, progress.as_deref());
+        // Interactive browse doesn't use S3 object metadata (that's a `diff`-only
+        // comparison), so skip the extra per-object HEADs here.
+        let out = self.read(&session, src, &password, progress.as_deref(), false);
         bars.finish(0, out.is_ok());
         bars.join();
         let rc = out?;
@@ -149,16 +181,20 @@ impl RemoteRead {
         src: &str,
         password: &Option<String>,
         progress: Option<&LoadProgress>,
+        want_s3: bool,
     ) -> Result<RemoteCheckpoint> {
         if src.starts_with("s3://") {
             // An s3:// cstorch checkpoint isn't a local filesystem path, so there's
-            // no block allocation to measure, and it has no HF index to check.
-            let (tensors, metadata) = self.read_cstorch(session, src, progress)?;
+            // no block allocation to measure, and it has no HF index to check. The
+            // S3 object metadata (an extra HEAD per object) is fetched only when the
+            // caller wants it (`diff`) — a plain browse skips that cost.
+            let (tensors, metadata, s3) = self.read_cstorch(session, src, progress, want_s3)?;
             Ok(RemoteCheckpoint {
                 tensors,
                 metadata,
                 disk: None,
                 health: Vec::new(),
+                s3: want_s3.then_some(s3),
             })
         } else {
             self.read_dir(session, src, password, progress)
@@ -297,6 +333,7 @@ impl RemoteRead {
             metadata,
             disk,
             health,
+            s3: None, // a safetensors dir/file has no S3 object metadata
         })
     }
 
@@ -320,20 +357,28 @@ impl RemoteRead {
         session: &RemoteSession,
         src: &str,
         progress: Option<&LoadProgress>,
-    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
-        let script = dump_script(src);
+        want_s3: bool,
+    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>, S3Meta)> {
+        let script = dump_script(src, want_s3);
         let command = format!("source {}/bin/activate && python3 -", self.venv);
         // Feed the streamed `PROG:done/total` lines into the load bar as they land.
         let out = session.exec_capture(&command, &script, |line| {
-            if let Some((d, t)) = line
-                .strip_prefix(PROGRESS_TAG)
-                .and_then(|rest| rest.split_once('/'))
-                && let (Ok(done), Ok(total)) = (d.trim().parse(), t.trim().parse())
-                && let Some(p) = progress
-            {
-                p.set_total(total);
-                p.set_done(done);
-                p.set_unit(crate::progress::Unit::Tensors);
+            // `PROG:done/total[/unit]` — the optional unit switches the bar's label
+            // for the second (S3-metadata) phase; absent ⇒ tensors (back-compat).
+            if let Some(rest) = line.strip_prefix(PROGRESS_TAG) {
+                let mut parts = rest.splitn(3, '/');
+                if let (Some(d), Some(t)) = (parts.next(), parts.next())
+                    && let (Ok(done), Ok(total)) = (d.trim().parse(), t.trim().parse())
+                    && let Some(p) = progress
+                {
+                    let unit = match parts.next().map(str::trim) {
+                        Some("s3") => crate::progress::Unit::S3Objects,
+                        _ => crate::progress::Unit::Tensors,
+                    };
+                    p.set_total(total);
+                    p.set_done(done);
+                    p.set_unit(unit);
+                }
             }
         })?;
         let json = out
@@ -360,18 +405,20 @@ impl RemoteRead {
 /// **Read-only:** the script only *loads* (lazily) and writes its output to
 /// stdout — it never opens a file for writing, calls `cstorch.save`/`torch.save`,
 /// or otherwise mutates the checkpoint. The remote checkpoint is never modified.
-fn dump_script(src: &str) -> String {
+fn dump_script(src: &str, want_s3: bool) -> String {
     let src_lit = serde_json::to_string(src).unwrap_or_else(|_| "\"\"".into());
     const TEMPLATE: &str = r#"
 import sys, json
 SRC = __URI__
+WANT_S3 = __WANT_S3__
 S = "__SENTINEL__"
 P = "__PROGRESS__"
 def emit(obj):
     sys.stdout.write(S + json.dumps(obj) + "\n")
     sys.stdout.flush()
-def prog(done, total):
-    sys.stdout.write("%s%d/%d\n" % (P, done, total))
+def prog(done, total, unit=None):
+    tail = ("/" + unit) if unit else ""
+    sys.stdout.write("%s%d/%d%s\n" % (P, done, total, tail))
     sys.stdout.flush()
 try:
     import cerebras.pytorch as cstorch
@@ -395,10 +442,66 @@ for i, name in enumerate(keys):
         pass
     if (i + 1) % step == 0 or i + 1 == total:
         prog(i + 1, total)
-emit({"tensors": tensors, "metadata": []})
+# S3 object metadata (best-effort, read-only): list the objects under the prefix
+# and HEAD each for size/etag/checksum/last-modified/user-metadata; tags need a
+# separate (often ungranted) permission, so they're tried per object and a single
+# warning is emitted if denied. Any failure degrades to fewer objects + a warning.
+s3_objects = []
+s3_warnings = []
+if WANT_S3:
+    try:
+        import boto3
+        from urllib.parse import urlparse
+        u = urlparse(SRC)
+        bucket, prefix = u.netloc, u.path.lstrip("/")
+        cli = boto3.client("s3")
+        keys, tok = [], None
+        while True:
+            kw = {"Bucket": bucket, "Prefix": prefix}
+            if tok: kw["ContinuationToken"] = tok
+            resp = cli.list_objects_v2(**kw)
+            keys.extend(it["Key"] for it in resp.get("Contents", []))
+            if resp.get("IsTruncated"): tok = resp.get("NextContinuationToken")
+            else: break
+        # Second progress phase: HEADing each object is the slow part, so drive the
+        # bar off it (relabelled "S3 objects") instead of sitting at 100% tensors.
+        nkeys = len(keys)
+        s3_step = max(1, nkeys // 100)
+        prog(0, nkeys, "s3")
+        tags_denied = False
+        for i, k in enumerate(keys):
+            if i % s3_step == 0:
+                prog(i, nkeys, "s3")
+            try:
+                h = cli.head_object(Bucket=bucket, Key=k, ChecksumMode="ENABLED")
+            except Exception as e:
+                s3_warnings.append("head_object failed for %s: %r" % (k, e)); continue
+            rel = k[len(prefix):].lstrip("/") if k.startswith(prefix) else k
+            lm = h.get("LastModified")
+            obj = {"key": rel, "size": int(h.get("ContentLength", 0)),
+                   "etag": str(h.get("ETag", "")).strip('"'),
+                   "last_modified": lm.isoformat() if lm else "",
+                   "metadata": {mk: str(mv) for mk, mv in (h.get("Metadata") or {}).items()}}
+            for algo in ("CRC32", "CRC32C", "SHA1", "SHA256"):
+                cv = h.get("Checksum" + algo)
+                if cv:
+                    obj["checksum"] = [algo.lower(), str(cv)]; break
+            try:
+                tg = cli.get_object_tagging(Bucket=bucket, Key=k)
+                obj["tags"] = {t["Key"]: t["Value"] for t in tg.get("TagSet", [])}
+            except Exception as e:
+                if not tags_denied:
+                    s3_warnings.append("tags unavailable (needs s3:GetObjectTagging): %r" % (e,))
+                    tags_denied = True
+            s3_objects.append(obj)
+        prog(nkeys, nkeys, "s3")
+    except Exception as e:
+        s3_warnings.append("s3 metadata unavailable: %r" % (e,))
+emit({"tensors": tensors, "metadata": [], "s3_objects": s3_objects, "s3_warnings": s3_warnings})
 "#;
     TEMPLATE
         .replace("__URI__", &src_lit)
+        .replace("__WANT_S3__", if want_s3 { "True" } else { "False" })
         .replace("__SENTINEL__", SENTINEL)
         .replace("__PROGRESS__", PROGRESS_TAG)
 }
@@ -407,7 +510,10 @@ emit({"tensors": tensors, "metadata": []})
 /// [`TensorInfo`]s + [`MetadataInfo`], stamping each tensor with `source_path`
 /// (already remote-marked; see [`RemoteRead::source_path`]) so display, the `y`
 /// command, and the data-view "local-only" guard all behave.
-fn parse_dump(json: &str, source_path: &str) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+fn parse_dump(
+    json: &str,
+    source_path: &str,
+) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>, S3Meta)> {
     let v: serde_json::Value =
         serde_json::from_str(json).context("parsing the remote metadata JSON")?;
     if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
@@ -475,7 +581,68 @@ fn parse_dump(json: &str, source_path: &str) -> Result<(Vec<TensorInfo>, Vec<Met
                 .collect()
         })
         .unwrap_or_default();
-    Ok((tensors, metadata))
+    let s3 = parse_s3_meta(&v);
+    Ok((tensors, metadata, s3))
+}
+
+/// Parse the remote script's optional `s3_objects` / `s3_warnings` fields into
+/// [`S3Meta`]. Missing / malformed fields degrade to empty (never an error) — the
+/// tensor dump is what matters; S3 metadata is best-effort.
+fn parse_s3_meta(v: &serde_json::Value) -> S3Meta {
+    let str_map = |val: Option<&serde_json::Value>| -> BTreeMap<String, String> {
+        val.and_then(|m| m.as_object())
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let objects = v
+        .get("s3_objects")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|o| {
+                    let key = o.get("key").and_then(|x| x.as_str())?.to_string();
+                    let checksum = o
+                        .get("checksum")
+                        .and_then(|c| c.as_array())
+                        .and_then(|c| Some((c.first()?.as_str()?, c.get(1)?.as_str()?)))
+                        .map(|(a, b)| (a.to_string(), b.to_string()));
+                    Some(S3Object {
+                        key,
+                        size: o.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
+                        etag: o
+                            .get("etag")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        checksum,
+                        last_modified: o
+                            .get("last_modified")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        user_meta: str_map(o.get("metadata")),
+                        // `tags` absent in the JSON ⇒ couldn't be read (None);
+                        // present (even empty) ⇒ read successfully.
+                        tags: o.get("tags").map(|t| str_map(Some(t))),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let warnings = v
+        .get("s3_warnings")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|w| w.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    S3Meta { objects, warnings }
 }
 
 /// Map a torch dtype string (`torch.float16`) to the display name used elsewhere
@@ -531,10 +698,43 @@ mod tests {
 
     #[test]
     fn cstorch_script_embeds_source_safely() {
-        let s = dump_script("s3://b/k");
+        let s = dump_script("s3://b/k", false);
         assert!(s.contains("SRC = \"s3://b/k\""));
         assert!(s.contains("import cerebras.pytorch"));
         assert!(s.contains(SENTINEL));
+    }
+
+    #[test]
+    fn cstorch_script_fetches_s3_metadata_only_when_wanted() {
+        // Not wanted (interactive browse / check) → no boto3 work.
+        let off = dump_script("s3://b/ckpt", false);
+        assert!(off.contains("WANT_S3 = False"), "{off}");
+
+        let s = dump_script("s3://b/ckpt", true);
+        assert!(s.contains("WANT_S3 = True"), "{s}");
+        // Fetches object metadata via boto3, read-only calls only.
+        assert!(s.contains("boto3.client(\"s3\")"));
+        assert!(s.contains("list_objects_v2"));
+        assert!(s.contains("head_object"));
+        assert!(s.contains("ChecksumMode=\"ENABLED\""));
+        assert!(s.contains("get_object_tagging"));
+        assert!(s.contains("s3_objects"));
+        assert!(s.contains("s3_warnings"));
+        // Reports S3 progress as a second phase (so the bar doesn't sit at 100%).
+        assert!(s.contains("\"s3\""));
+        // Read-only: never writes / uploads / deletes / puts tags.
+        for forbidden in [
+            "put_object",
+            "upload",
+            "delete_object",
+            "put_object_tagging",
+            "copy_object",
+        ] {
+            assert!(
+                !s.contains(forbidden),
+                "script must stay read-only: {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -542,13 +742,43 @@ mod tests {
         let json = r#"{"tensors":[
             {"name":"model.embed_tokens.weight","dtype":"BF16","shape":[151936,2048],"itemsize":2}
         ],"metadata":[{"name":"format","value":"pt","value_type":"string"}]}"#;
-        let (t, m) = parse_dump(json, "lab@host:/opt/models/ckpt").unwrap();
+        let (t, m, s3) = parse_dump(json, "lab@host:/opt/models/ckpt").unwrap();
         assert_eq!(t[0].dtype, "BF16");
         assert_eq!(t[0].shape, vec![151936, 2048]);
         assert_eq!(t[0].source_path, "lab@host:/opt/models/ckpt");
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].name, "format");
         assert_eq!(m[0].value, "pt");
+        // No `s3_objects` in the JSON → empty (this path is for safetensors dumps).
+        assert!(s3.objects.is_empty() && s3.warnings.is_empty());
+    }
+
+    #[test]
+    fn parses_s3_objects_and_warnings() {
+        let json = r#"{"tensors":[
+            {"name":"w","dtype":"F16","shape":[4],"itemsize":2}
+        ],"metadata":[],"s3_objects":[
+            {"key":"shard0.dat","size":1024,"etag":"abc","last_modified":"2026-01-02T03:04:05+00:00",
+             "checksum":["sha256","deadbeef"],"metadata":{"run":"42"},"tags":{"env":"prod"}},
+            {"key":"shard1.dat","size":2048,"etag":"def","last_modified":"2026-01-02T03:04:06+00:00"}
+        ],"s3_warnings":["tags unavailable (needs s3:GetObjectTagging): AccessDenied"]}"#;
+        let (_t, _m, s3) = parse_dump(json, "s3://b/ckpt").unwrap();
+        assert_eq!(s3.objects.len(), 2);
+        let o0 = &s3.objects[0];
+        assert_eq!(o0.key, "shard0.dat");
+        assert_eq!(o0.size, 1024);
+        assert_eq!(o0.checksum, Some(("sha256".into(), "deadbeef".into())));
+        assert_eq!(o0.user_meta.get("run").map(String::as_str), Some("42"));
+        assert_eq!(
+            o0.tags
+                .as_ref()
+                .and_then(|t| t.get("env"))
+                .map(String::as_str),
+            Some("prod")
+        );
+        // Second object had no `tags` key → None (couldn't be read), distinct from empty.
+        assert!(s3.objects[1].tags.is_none());
+        assert_eq!(s3.warnings.len(), 1);
     }
 
     #[test]
@@ -575,7 +805,7 @@ mod tests {
             {"name":"a.weight","dtype":"torch.float16","shape":[6,4],"itemsize":2},
             {"name":"b","dtype":"torch.int32","shape":[5],"itemsize":4}
         ],"metadata":[]}"#;
-        let (t, _m) = parse_dump(json, "s3://bucket/ckpt").unwrap();
+        let (t, _m, _s3) = parse_dump(json, "s3://bucket/ckpt").unwrap();
         assert_eq!(t.len(), 2);
         assert_eq!(t[0].dtype, "F16");
         assert_eq!(t[0].shape, vec![6, 4]);
