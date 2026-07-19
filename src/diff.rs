@@ -1117,6 +1117,21 @@ impl DiffReport {
             // objects stored one; tags only when readable.
             let sc = &s3.scope;
             let m = sc.matched;
+            // ETag confidence: a single-part ETag is a full MD5 content hash; a
+            // multipart one is a part-layout-dependent composite (not a content hash).
+            let etag = if m == 0 {
+                "ETag".to_string()
+            } else if sc.etag_multipart == m {
+                "ETag (multipart composite)".to_string()
+            } else if sc.etag_multipart == 0 {
+                "ETag (single-part MD5)".to_string()
+            } else {
+                format!(
+                    "ETag ({} multipart, {} single-part)",
+                    sc.etag_multipart,
+                    m - sc.etag_multipart
+                )
+            };
             let checksum = if sc.checksum_both == m && m > 0 {
                 "checksum".to_string()
             } else {
@@ -1136,31 +1151,100 @@ impl DiffReport {
                 s,
                 "{}",
                 paint(
-                    &format!("  checked per object: ETag, size, {checksum}, {umeta}, {tags}"),
+                    &format!("  checked per object: {etag}, size, {checksum}, {umeta}, {tags}"),
                     opts.color,
                     DIM
                 )
             );
-            for key in &s3.removed {
-                let _ = writeln!(s, "{}", paint(&format!("  - {key}"), opts.color, RED));
+            // How much "unchanged" is worth when no checksum backs it: with a
+            // single-part ETag it's a real content hash; with multipart it confirms
+            // sameness only when the part layout also matches.
+            if sc.checksum_both < m && m > 0 {
+                let note = if sc.etag_multipart == 0 {
+                    "no stored checksums — single-part ETags are full MD5 content hashes, so matching ETag + size means identical content"
+                } else {
+                    "no stored checksums — equality rests on the ETag; a multipart ETag matches only when content AND part layout match (upload with S3 checksums for a definitive compare)"
+                };
+                let _ = writeln!(s, "{}", paint(&format!("  note: {note}"), opts.color, DIM));
             }
-            for key in &s3.added {
-                let _ = writeln!(s, "{}", paint(&format!("  + {key}"), opts.color, GREEN));
-            }
-            for c in &s3.changed {
-                let _ = writeln!(s, "  ~ {}  ({})", c.key, c.fields.join(", "));
-            }
-            // Timestamp-only deltas are informational — never a difference.
-            for i in &s3.info_only {
+            // Collapse a set of object keys into index-templated lines with counts
+            // (e.g. `model.layers.{0-61}.….weight  (×62)`), like the tensor lists —
+            // or one line per key under `--full`. Keeps a 934-object list readable.
+            let collapse = |keys: &[&str]| -> Vec<(String, usize)> {
+                if opts.group {
+                    name_schema(keys)
+                } else {
+                    keys.iter().map(|k| ((*k).to_string(), 1)).collect()
+                }
+            };
+            let count = |n: usize| {
+                if n > 1 {
+                    format!("  (×{n})")
+                } else {
+                    String::new()
+                }
+            };
+            let removed: Vec<&str> = s3.removed.iter().map(String::as_str).collect();
+            for (tmpl, n) in collapse(&removed) {
                 let _ = writeln!(
                     s,
                     "{}",
-                    paint(
-                        &format!("  info: {} differs only in {}", i.key, i.fields.join(", ")),
-                        opts.color,
-                        DIM
-                    )
+                    paint(&format!("  - {tmpl}{}", count(n)), opts.color, RED)
                 );
+            }
+            let added: Vec<&str> = s3.added.iter().map(String::as_str).collect();
+            for (tmpl, n) in collapse(&added) {
+                let _ = writeln!(
+                    s,
+                    "{}",
+                    paint(&format!("  + {tmpl}{}", count(n)), opts.color, GREEN)
+                );
+            }
+            // Group material changes by which fields differ, then collapse the keys
+            // within each group.
+            let mut by_fields: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+            for c in &s3.changed {
+                by_fields
+                    .entry(c.fields.join(", "))
+                    .or_default()
+                    .push(&c.key);
+            }
+            for (fields, keys) in &by_fields {
+                for (tmpl, n) in collapse(keys) {
+                    let _ = writeln!(s, "  ~ {tmpl}{}  ({fields})", count(n));
+                }
+            }
+            // Timestamp-only deltas are informational — never a difference. Summarise
+            // them by field-set (a per-object list of "differs only in last-modified"
+            // is pure noise); `--full` lists each.
+            if opts.group {
+                let mut info: BTreeMap<String, usize> = BTreeMap::new();
+                for i in &s3.info_only {
+                    *info.entry(i.fields.join(", ")).or_default() += 1;
+                }
+                for (fields, n) in &info {
+                    let _ = writeln!(
+                        s,
+                        "{}",
+                        paint(
+                            &format!("  info: {n} object(s) differ only in {fields}"),
+                            opts.color,
+                            DIM
+                        )
+                    );
+                }
+            } else {
+                for i in &s3.info_only {
+                    let _ = writeln!(
+                        s,
+                        "{}",
+                        paint(
+                            &format!("  info: {} differs only in {}", i.key, i.fields.join(", ")),
+                            opts.color,
+                            DIM
+                        )
+                    );
+                }
             }
             for w in &s3.warnings {
                 let _ = writeln!(s, "{}", paint(&format!("  note: {w}"), opts.color, DIM));
@@ -1197,11 +1281,24 @@ pub struct S3Scope {
     pub matched: usize,
     /// …of which had an additional checksum on **both** sides (so it was compared).
     pub checksum_both: usize,
+    /// …whose ETag is a multipart composite (`<md5>-<parts>`) rather than a plain
+    /// single-part MD5 — determines how much a matching ETag proves (see the report's
+    /// confidence note).
+    pub etag_multipart: usize,
     /// …of which carried any user metadata on either side.
     pub user_meta_any: usize,
     /// Whether tags were readable on both sides for every matched object (else they
     /// were skipped — see `warnings`).
     pub tags_compared: bool,
+}
+
+/// Whether an S3 ETag is a **multipart** upload's composite tag (`<hex>-<parts>`)
+/// rather than a single-part object's plain MD5. A multipart ETag isn't a content
+/// hash — it depends on the part size — so a matching one implies identical content
+/// only when the part layout also matches.
+pub fn is_multipart_etag(etag: &str) -> bool {
+    etag.rsplit_once('-')
+        .is_some_and(|(_, parts)| !parts.is_empty() && parts.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The S3-object-metadata difference between two `s3://` checkpoints.
@@ -1328,6 +1425,9 @@ pub fn compare_s3(old: &S3Meta, new: &S3Meta) -> S3Diff {
         scope.matched += 1;
         if o.checksum.is_some() && n.checksum.is_some() {
             scope.checksum_both += 1;
+        }
+        if is_multipart_etag(&o.etag) {
+            scope.etag_multipart += 1;
         }
         if !o.user_meta.is_empty() || !n.user_meta.is_empty() {
             scope.user_meta_any += 1;
@@ -2049,6 +2149,7 @@ mod tests {
         // Scope reflects what was comparable across the 2 matched objects.
         assert_eq!(d.scope.matched, 2);
         assert_eq!(d.scope.checksum_both, 0); // none stored a checksum
+        assert_eq!(d.scope.etag_multipart, 0); // "e1"/"eq" are single-part
         assert!(d.scope.tags_compared); // tags Some on both sides
         // compare_s3 prefixes each warning with its side.
         assert_eq!(d.warnings, vec!["new: tags unavailable".to_string()]);
@@ -2093,19 +2194,28 @@ mod tests {
     }
 
     #[test]
-    fn render_shows_s3_section_scope_and_permission_warning() {
-        // Tags denied on both sides ⇒ objects carry `tags: None` + a warning.
+    fn is_multipart_etag_detects_the_part_suffix() {
+        assert!(is_multipart_etag("d41d8cd98f00b204e9800998ecf8427e-64"));
+        assert!(is_multipart_etag("abc-1"));
+        assert!(!is_multipart_etag("d41d8cd98f00b204e9800998ecf8427e")); // plain MD5
+        assert!(!is_multipart_etag("abc-")); // no part count
+        assert!(!is_multipart_etag("abc-def")); // suffix not digits
+    }
+
+    #[test]
+    fn render_shows_s3_scope_etag_confidence_and_warning() {
+        // Multipart ETags, tags denied on both sides (objects carry `tags: None`).
         let denied = |key: &str, etag: &str| {
             let mut o = s3obj(key, etag, 10, &[], &[], "t");
             o.tags = None;
             o
         };
         let old = S3Meta {
-            objects: vec![denied("shard0", "e1")],
+            objects: vec![denied("shard0", "aaa-64")],
             warnings: vec!["tags unavailable (needs s3:GetObjectTagging): AccessDenied".into()],
         };
         let new = S3Meta {
-            objects: vec![denied("shard0", "e2")],
+            objects: vec![denied("shard0", "bbb-64")],
             warnings: vec!["tags unavailable (needs s3:GetObjectTagging): AccessDenied".into()],
         };
         let mut report = compare(&empty_summary(), &empty_summary());
@@ -2120,12 +2230,99 @@ mod tests {
         };
         let out = report.render("s3://old", "s3://new", opts);
         assert!(out.contains("S3 objects: -0 +0 ~1"), "{out}");
-        // The scope line spells out what was actually checked.
-        assert!(out.contains("checked per object: ETag, size"), "{out}");
+        // The scope line names the ETag type + coverage of the other fields.
+        assert!(
+            out.contains("checked per object: ETag (multipart composite), size"),
+            "{out}"
+        );
         assert!(out.contains("checksum (0/1 stored)"), "{out}");
         assert!(out.contains("tags (unavailable — not compared)"), "{out}");
+        // No checksums + multipart ETag → the part-layout caveat note.
+        assert!(
+            out.contains("note: no stored checksums — equality rests on the ETag"),
+            "{out}"
+        );
         assert!(out.contains("~ shard0  (etag)"), "{out}");
         assert!(out.contains("note: old: tags unavailable"), "{out}");
+    }
+
+    #[test]
+    fn render_single_part_etag_note_calls_it_a_content_hash() {
+        // Single-part ETags (plain MD5) + no checksums → the "content hash" note.
+        let old = S3Meta {
+            objects: vec![s3obj("shard0", "md5aaa", 10, &[], &[], "t")],
+            warnings: vec![],
+        };
+        let new = S3Meta {
+            objects: vec![s3obj("shard0", "md5aaa", 10, &[], &[], "t")],
+            warnings: vec![],
+        };
+        let mut report = compare(&empty_summary(), &empty_summary());
+        report.s3 = Some(compare_s3(&old, &new));
+        let opts = DiffOpts {
+            color: false,
+            metadata: true,
+            group: true,
+            values: false,
+            histogram: false,
+            filtered: false,
+        };
+        let out = report.render("s3://old", "s3://new", opts);
+        assert!(out.contains("ETag (single-part MD5)"), "{out}");
+        assert!(
+            out.contains("single-part ETags are full MD5 content hashes"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn render_compresses_timestamp_only_info_to_one_line() {
+        // Many objects, all identical except last-modified → one summary line, not N.
+        let mk = |lm: &str| S3Meta {
+            objects: (0..50)
+                .map(|i| {
+                    s3obj(
+                        &format!("model.layers.{i}.self_attn.o_proj.weight"),
+                        "eq",
+                        10,
+                        &[],
+                        &[],
+                        lm,
+                    )
+                })
+                .collect(),
+            warnings: vec![],
+        };
+        let old = mk("2026-01-01T00:00:00Z");
+        let new = mk("2026-02-02T00:00:00Z");
+        let mut report = compare(&empty_summary(), &empty_summary());
+        report.s3 = Some(compare_s3(&old, &new));
+        let opts = DiffOpts {
+            color: false,
+            metadata: true,
+            group: true,
+            values: false,
+            histogram: false,
+            filtered: false,
+        };
+        let out = report.render("s3://old", "s3://new", opts);
+        assert!(
+            out.contains("info: 50 object(s) differ only in last-modified"),
+            "{out}"
+        );
+        // Collapsed — not one line per object.
+        assert_eq!(out.matches("differ only in").count(), 1, "{out}");
+
+        // …but `--full` lists each object.
+        let full = report.render(
+            "s3://old",
+            "s3://new",
+            DiffOpts {
+                group: false,
+                ..opts
+            },
+        );
+        assert_eq!(full.matches("differs only in").count(), 50, "{full}");
     }
 
     fn sig(dtype: &str, shape: &[usize]) -> TensorSig {

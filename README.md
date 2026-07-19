@@ -215,7 +215,11 @@ local credentials are needed — though **tags** need the `s3:GetObjectTagging`
 permission on that role, and if it's missing the diff notes it and carries on
 (best-effort). **Timestamps are informational only**: a different last-modified — or
 a timestamp-valued tag/metadata entry — is shown but never counts as a difference
-(so it never flips the exit code).
+(so it never flips the exit code). A **scope line** spells out exactly what was
+checked and how much it's worth: ETag (flagged as a single-part MD5 content hash vs
+a multipart composite that only matches when the part layout does), how many objects
+carried a stored checksum / user metadata, and whether tags were compared — so
+"N unchanged" is never ambiguous.
 
 ### Open a tensor directly
 Jump straight to a tensor's preview on startup instead of navigating the tree —
