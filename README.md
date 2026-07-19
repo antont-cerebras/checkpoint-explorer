@@ -207,6 +207,16 @@ dirs — each with its own colour progress spinner and elapsed timer. The passwo
 is entered once and reused for the second connection, so you're still prompted only
 once.)
 
+When **both** sides are `s3://`, the diff also compares the underlying **S3 objects'
+metadata** — checksum / ETag, size, object tags, and user metadata — matched by
+each object's prefix-relative key. This uses the remote host's own AWS access (the
+same access that reads the checkpoint; nothing S3 happens locally), so no extra
+local credentials are needed — though **tags** need the `s3:GetObjectTagging`
+permission on that role, and if it's missing the diff notes it and carries on
+(best-effort). **Timestamps are informational only**: a different last-modified — or
+a timestamp-valued tag/metadata entry — is shown but never counts as a difference
+(so it never flips the exit code).
+
 ### Open a tensor directly
 Jump straight to a tensor's preview on startup instead of navigating the tree —
 handy for scripting or revisiting a known tensor:

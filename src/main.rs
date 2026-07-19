@@ -479,6 +479,11 @@ enum Command {
     /// tensors (by name, dtype, shape) and metadata (by name, value) that were
     /// added, removed, or changed. Tensor data/values are not compared.
     ///
+    /// For an s3-vs-s3 diff (both sides `s3://` with `--ssh-read`), the underlying
+    /// S3 objects' metadata is compared too — checksum/ETag, size, tags, and user
+    /// metadata (best-effort, using the remote host's own AWS access); timestamps
+    /// (last-modified and timestamp-valued tags/metadata) are shown as info only.
+    ///
     /// Exit status follows `diff`: 0 = structurally identical, 1 = differences
     /// found, 2 = trouble (a path couldn't be read).
     Diff {
@@ -862,7 +867,7 @@ fn run_check(
             let bars = progress::Bars::start(vec![src.clone()]);
             let progress = bars.progress(0);
             let out = r
-                .read(&session, &src, &password, progress.as_deref())
+                .read(&session, &src, &password, progress.as_deref(), false)
                 .with_context(|| format!("reading {src}"));
             bars.finish(0, out.is_ok());
             bars.join();
@@ -1252,6 +1257,9 @@ fn truncate_tail(s: &str, max: usize) -> String {
 
 /// The tensors + metadata read from one checkpoint (local or remote).
 type Loaded = (Vec<TensorInfo>, Vec<MetadataInfo>);
+/// One diff side: its loaded structure plus, for an `s3://` source, the underlying
+/// S3 objects' metadata (`None` for a local / SFTP source).
+type SideLoad = (Loaded, Option<crate::remote::S3Meta>);
 
 #[allow(clippy::too_many_arguments)] // a CLI entry point; each arg is a distinct flag
 fn run_diff(
@@ -1267,7 +1275,7 @@ fn run_diff(
     jobs: usize,
     remote: Option<&crate::remote::RemoteRead>,
 ) -> i32 {
-    let load_local = |path: &Path| -> Result<Loaded> {
+    let load_local = |path: &Path| -> Result<SideLoad> {
         let (files, _index_specs) =
             collect_safetensors_files(std::slice::from_ref(&path.to_path_buf()), recursive, true)?;
         if files.is_empty() {
@@ -1276,7 +1284,7 @@ fn run_diff(
         // `diff` compares structure only — the config sidecar isn't needed here.
         let (tensors, metadata, _config, _disk, _health) =
             Explorer::gather_checkpoint(&files, None)?;
-        Ok((tensors, metadata))
+        Ok(((tensors, metadata), None)) // local sources have no S3 object metadata
     };
 
     let (old_str, new_str) = (old.to_string_lossy(), new.to_string_lossy());
@@ -1284,8 +1292,8 @@ fn run_diff(
     // (ssh2 sessions aren't Sync, so a session per thread). The password is entered
     // once and reused for the second session, so it's still one prompt; agent/key
     // auth needs none. A spinner line animates for each read. Local: sequential.
-    let loaded: Result<(Loaded, Loaded)> = match remote {
-        Some(r) => (|| -> Result<(Loaded, Loaded)> {
+    let loaded: Result<(SideLoad, SideLoad)> = match remote {
+        Some(r) => (|| -> Result<(SideLoad, SideLoad)> {
             // Open both sessions up front so the one password prompt happens here,
             // before the spinner. Opening is silent, so nothing is printed until
             // we're actually connected — then announce the read (not before, when
@@ -1296,14 +1304,16 @@ fn run_diff(
             eprintln!("checkpoint-explorer diff: reading tensor metadata over ssh …");
             let bars = progress::Bars::start(vec![old_str.to_string(), new_str.to_string()]);
             let read =
-                |session: &crate::sftp::RemoteSession, src: &str, i: usize| -> Result<Loaded> {
+                |session: &crate::sftp::RemoteSession, src: &str, i: usize| -> Result<SideLoad> {
                     let progress = bars.progress(i);
                     let out = r
-                        .read(session, src, &password, progress.as_deref())
+                        // `diff` compares S3 object metadata for s3-vs-s3 → fetch it.
+                        .read(session, src, &password, progress.as_deref(), true)
                         .with_context(|| format!("reading {src}"));
                     bars.finish(i, out.is_ok());
-                    // `diff` compares structure, not the on-disk footprint or health.
-                    out.map(|rc| (rc.tensors, rc.metadata))
+                    // `diff` compares structure + (for s3://) S3 object metadata, not
+                    // the on-disk footprint or health.
+                    out.map(|rc| ((rc.tensors, rc.metadata), rc.s3))
                 };
             let (ra, rb) = std::thread::scope(|s| {
                 let (oref, nref): (&str, &str) = (&old_str, &new_str);
@@ -1323,7 +1333,7 @@ fn run_diff(
             ))
         })(),
     };
-    let ((old_t, old_m), (new_t, new_m)) = match loaded {
+    let (((old_t, old_m), old_s3), ((new_t, new_m), new_s3)) = match loaded {
         Ok(v) => v,
         Err(e) => {
             eprintln!("checkpoint-explorer diff: {e:#}");
@@ -1401,7 +1411,7 @@ fn run_diff(
     // Scope the diff to the selected subset (no-op when no filter was given).
     filter.apply(&mut old_sum, &mut new_sum);
 
-    let report = if opts.values || opts.histogram {
+    let mut report = if opts.values || opts.histogram {
         use rayon::prelude::*;
         // Read each common same-shape tensor and compare values and/or distribution.
         // The old side is keyed by its *post-rename* name (the same names `common`
@@ -1498,6 +1508,20 @@ fn run_diff(
                 );
             }
         }
+    }
+    // S3 object metadata is compared only when BOTH sides are `s3://` (only then do
+    // both carry it). last-modified / timestamp-like deltas are informational and
+    // never affect the exit code (see `diff::compare_s3`).
+    match (&old_s3, &new_s3) {
+        (Some(o), Some(n)) => {
+            let count = o.objects.len().max(n.objects.len());
+            eprintln!("checkpoint-explorer diff: compared {count} S3 object(s)' metadata");
+            report.s3 = Some(diff::compare_s3(o, n));
+        }
+        (Some(_), None) | (None, Some(_)) => eprintln!(
+            "checkpoint-explorer diff: S3 object metadata compared only for s3-vs-s3 (one side isn't s3://)"
+        ),
+        (None, None) => {}
     }
     print!("{}", report.render(&old_label, &new_label, opts));
     i32::from(report.has_differences())
