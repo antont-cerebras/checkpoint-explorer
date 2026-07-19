@@ -1112,6 +1112,35 @@ impl DiffReport {
                 s3.changed.len(),
                 s3.unchanged,
             );
+            // Spell out exactly what was compared per object, so "N unchanged" isn't
+            // ambiguous: ETag + size always carry a signal; checksums only when the
+            // objects stored one; tags only when readable.
+            let sc = &s3.scope;
+            let m = sc.matched;
+            let checksum = if sc.checksum_both == m && m > 0 {
+                "checksum".to_string()
+            } else {
+                format!("checksum ({}/{m} stored)", sc.checksum_both)
+            };
+            let umeta = if sc.user_meta_any > 0 {
+                format!("user metadata ({}/{m})", sc.user_meta_any)
+            } else {
+                "user metadata (none set)".to_string()
+            };
+            let tags = if sc.tags_compared {
+                "tags"
+            } else {
+                "tags (unavailable — not compared)"
+            };
+            let _ = writeln!(
+                s,
+                "{}",
+                paint(
+                    &format!("  checked per object: ETag, size, {checksum}, {umeta}, {tags}"),
+                    opts.color,
+                    DIM
+                )
+            );
             for key in &s3.removed {
                 let _ = writeln!(s, "{}", paint(&format!("  - {key}"), opts.color, RED));
             }
@@ -1158,6 +1187,23 @@ pub struct S3InfoChange {
     pub fields: Vec<&'static str>,
 }
 
+/// What was actually checked across the objects present on both sides — so the
+/// report can spell out which fields carried a real signal (ETag/size always do;
+/// checksums only when stored; tags only when readable), rather than leaving
+/// "N unchanged" ambiguous.
+#[derive(Default)]
+pub struct S3Scope {
+    /// Objects present on both sides (the ones actually compared field-by-field).
+    pub matched: usize,
+    /// …of which had an additional checksum on **both** sides (so it was compared).
+    pub checksum_both: usize,
+    /// …of which carried any user metadata on either side.
+    pub user_meta_any: usize,
+    /// Whether tags were readable on both sides for every matched object (else they
+    /// were skipped — see `warnings`).
+    pub tags_compared: bool,
+}
+
 /// The S3-object-metadata difference between two `s3://` checkpoints.
 pub struct S3Diff {
     pub added: Vec<String>,
@@ -1166,6 +1212,8 @@ pub struct S3Diff {
     pub unchanged: usize,
     /// Objects differing only in timestamp-like fields — informational.
     pub info_only: Vec<S3InfoChange>,
+    /// What was compared across matched objects (for the report's scope line).
+    pub scope: S3Scope,
     /// Warnings from either side (e.g. tags denied), each prefixed with its side.
     pub warnings: Vec<String>,
 }
@@ -1268,8 +1316,25 @@ pub fn compare_s3(old: &S3Meta, new: &S3Meta) -> S3Diff {
     let mut changed = Vec::new();
     let mut info_only = Vec::new();
     let mut unchanged = 0usize;
+    let mut scope = S3Scope {
+        tags_compared: true, // until a matched object proves tags weren't readable
+        ..Default::default()
+    };
     for (key, o) in &om {
         let Some(n) = nm.get(key) else { continue };
+        // Tally what was actually comparable across matched objects (for the scope
+        // line): ETag/size always; checksum only when both stored one; tags only
+        // when readable on both sides.
+        scope.matched += 1;
+        if o.checksum.is_some() && n.checksum.is_some() {
+            scope.checksum_both += 1;
+        }
+        if !o.user_meta.is_empty() || !n.user_meta.is_empty() {
+            scope.user_meta_any += 1;
+        }
+        if o.tags.is_none() || n.tags.is_none() {
+            scope.tags_compared = false;
+        }
         let mut material: Vec<&'static str> = Vec::new();
         let mut info: Vec<&'static str> = Vec::new();
         if o.size != n.size {
@@ -1320,12 +1385,17 @@ pub fn compare_s3(old: &S3Meta, new: &S3Meta) -> S3Diff {
         .chain(new.warnings.iter().map(|w| format!("new: {w}")))
         .collect();
     warnings.dedup();
+    // No matched objects → tags weren't "compared" (nothing to compare).
+    if scope.matched == 0 {
+        scope.tags_compared = false;
+    }
     S3Diff {
         added,
         removed,
         changed,
         unchanged,
         info_only,
+        scope,
         warnings,
     }
 }
@@ -1976,6 +2046,10 @@ mod tests {
         assert!(d.changed[0].fields.contains(&"etag"));
         assert_eq!(d.unchanged, 1);
         assert!(d.has_material_changes());
+        // Scope reflects what was comparable across the 2 matched objects.
+        assert_eq!(d.scope.matched, 2);
+        assert_eq!(d.scope.checksum_both, 0); // none stored a checksum
+        assert!(d.scope.tags_compared); // tags Some on both sides
         // compare_s3 prefixes each warning with its side.
         assert_eq!(d.warnings, vec!["new: tags unavailable".to_string()]);
     }
@@ -2019,13 +2093,19 @@ mod tests {
     }
 
     #[test]
-    fn render_shows_s3_section_and_permission_warning() {
+    fn render_shows_s3_section_scope_and_permission_warning() {
+        // Tags denied on both sides ⇒ objects carry `tags: None` + a warning.
+        let denied = |key: &str, etag: &str| {
+            let mut o = s3obj(key, etag, 10, &[], &[], "t");
+            o.tags = None;
+            o
+        };
         let old = S3Meta {
-            objects: vec![s3obj("shard0", "e1", 10, &[], &[], "t")],
-            warnings: vec![],
+            objects: vec![denied("shard0", "e1")],
+            warnings: vec!["tags unavailable (needs s3:GetObjectTagging): AccessDenied".into()],
         };
         let new = S3Meta {
-            objects: vec![s3obj("shard0", "e2", 10, &[], &[], "t")],
+            objects: vec![denied("shard0", "e2")],
             warnings: vec!["tags unavailable (needs s3:GetObjectTagging): AccessDenied".into()],
         };
         let mut report = compare(&empty_summary(), &empty_summary());
@@ -2040,8 +2120,12 @@ mod tests {
         };
         let out = report.render("s3://old", "s3://new", opts);
         assert!(out.contains("S3 objects: -0 +0 ~1"), "{out}");
+        // The scope line spells out what was actually checked.
+        assert!(out.contains("checked per object: ETag, size"), "{out}");
+        assert!(out.contains("checksum (0/1 stored)"), "{out}");
+        assert!(out.contains("tags (unavailable — not compared)"), "{out}");
         assert!(out.contains("~ shard0  (etag)"), "{out}");
-        assert!(out.contains("note: new: tags unavailable"), "{out}");
+        assert!(out.contains("note: old: tags unavailable"), "{out}");
     }
 
     fn sig(dtype: &str, shape: &[usize]) -> TensorSig {
