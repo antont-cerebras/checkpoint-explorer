@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::check::{expert_index, split_layer_index};
+use crate::check::{expert_index, proj_category, split_layer_index};
 use crate::tree::{Storage, TensorInfo};
 
 /// Section glyphs, matching the tree view's (`▦` tensors, `≡` layers) so the
@@ -67,6 +67,15 @@ impl ExpertStorage {
     }
 }
 
+/// One expert projection category (`down_proj` / `gate_proj` / `up_proj` /
+/// `gate_up_proj`) aggregated across every expert and layer.
+#[derive(Debug, Clone)]
+pub struct ExpertCategory {
+    pub name: String,
+    /// Total logical bytes in this projection across all experts.
+    pub bytes: usize,
+}
+
 /// MoE expert structure — present only when the checkpoint has experts.
 #[derive(Debug, Clone)]
 pub struct ExpertStats {
@@ -83,6 +92,8 @@ pub struct ExpertStats {
     /// Layers that carry experts — the divisor (with `per_layer`) for a single
     /// expert's average.
     pub layers: usize,
+    /// Per-projection breakdown (down/gate/up/gate_up), in that canonical order.
+    pub by_category: Vec<ExpertCategory>,
 }
 
 impl ExpertStats {
@@ -441,6 +452,14 @@ impl CheckpointStats {
                     each_total(format_size(x.bytes_each()), format_size(x.bytes)),
                 ));
             }
+            // Per-projection split (down/gate/up), each with its per-layer footprint.
+            for c in &x.by_category {
+                let per_layer = c.bytes / x.layers.max(1);
+                out.push(row(
+                    &c.name,
+                    each_total(format_size(per_layer), format_size(c.bytes)),
+                ));
+            }
         }
 
         // By dtype.
@@ -599,10 +618,13 @@ fn expert_stats(
             .unwrap_or(0),
     };
 
-    // Layers carrying experts, and the expert totals.
+    // Layers carrying experts, the expert totals, and the per-projection split.
     let mut layers = BTreeSet::new();
     let mut params = 0;
     let mut bytes = 0;
+    // Logical bytes per projection, emitted below in a fixed canonical order
+    // (independent of tensor iteration order).
+    let mut cat_bytes: HashMap<&'static str, usize> = HashMap::new();
     for t in tensors {
         if is_expert(&t.name) {
             params += t.num_elements;
@@ -610,8 +632,20 @@ fn expert_stats(
             if let Some((_, idx, _)) = split_layer_index(&t.name) {
                 layers.insert(idx);
             }
+            if let Some(cat) = proj_category(&t.name) {
+                *cat_bytes.entry(cat).or_default() += t.size_bytes;
+            }
         }
     }
+    let by_category = ["down_proj", "gate_proj", "up_proj", "gate_up_proj"]
+        .into_iter()
+        .filter_map(|name| {
+            cat_bytes.get(name).map(|&bytes| ExpertCategory {
+                name: name.to_string(),
+                bytes,
+            })
+        })
+        .collect();
 
     let gate_up_fused = tensors
         .iter()
@@ -624,6 +658,7 @@ fn expert_stats(
         params,
         bytes,
         layers: layers.len().max(1),
+        by_category,
     })
 }
 
@@ -746,6 +781,35 @@ mod tests {
         assert_eq!(x.params, 80); // 8 experts × 10
         assert_eq!(x.params_each(), 10);
         assert!(!x.gate_up_fused);
+    }
+
+    #[test]
+    fn experts_split_by_projection_category() {
+        let mut tensors = vec![ti("model.embed_tokens.weight", "F32", &[100], 4)];
+        // 2 layers × 3 experts, each with down/gate/up projections of distinct sizes.
+        for layer in 0..2 {
+            for e in 0..3 {
+                for (proj, elems) in [("down_proj", 10), ("gate_proj", 20), ("up_proj", 20)] {
+                    tensors.push(ti(
+                        &format!("model.layers.{layer}.mlp.experts.{e}.{proj}.weight"),
+                        "F32",
+                        &[elems],
+                        4,
+                    ));
+                }
+            }
+        }
+        let x = CheckpointStats::compute(&tensors, None, None)
+            .experts
+            .unwrap();
+        // Canonical order down/gate/up; gate_up absent here.
+        let cats: Vec<&str> = x.by_category.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(cats, ["down_proj", "gate_proj", "up_proj"]);
+        let down = &x.by_category[0];
+        assert_eq!(down.bytes, 6 * 10 * 4); // 6 tensors (2 layers × 3 experts), 240 B total
+        assert_eq!(down.bytes / x.layers.max(1), 120); // per layer (2 layers)
+        let gate = &x.by_category[1];
+        assert_eq!(gate.bytes, 6 * 20 * 4); // 480 B total
     }
 
     #[test]

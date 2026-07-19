@@ -918,6 +918,20 @@ pub(crate) fn expert_index(name: &str) -> Option<usize> {
     parts.get(pos + 1)?.parse().ok()
 }
 
+/// The projection category of an MoE expert tensor — the `.`-segment ending in
+/// `_proj` (`down_proj` / `gate_proj` / `up_proj` / `gate_up_proj`), normalising the
+/// double-underscore fusion `gate_proj__up_proj` to `gate_up_proj`. `None` when no
+/// segment names a projection (e.g. a per-expert bias/scale with no `_proj` part).
+pub(crate) fn proj_category(name: &str) -> Option<&'static str> {
+    name.split('.').find_map(|seg| match seg {
+        "down_proj" => Some("down_proj"),
+        "gate_proj" => Some("gate_proj"),
+        "up_proj" => Some("up_proj"),
+        "gate_up_proj" | "gate_proj__up_proj" => Some("gate_up_proj"),
+        _ => None,
+    })
+}
+
 /// The number of experts (max expert index + 1) seen across the checkpoint.
 fn detected_expert_count(tensors: &[TensorInfo]) -> Option<usize> {
     tensors
@@ -1429,6 +1443,33 @@ mod tests {
             Some(("model.layers".into(), 5, "mlp.down_proj.weight".into()))
         );
         assert_eq!(split_layer_index("lm_head.weight"), None);
+    }
+
+    #[test]
+    fn proj_category_names_the_projection_segment() {
+        assert_eq!(
+            proj_category("model.layers.0.mlp.experts.3.down_proj.weight"),
+            Some("down_proj")
+        );
+        assert_eq!(
+            proj_category("model.layers.0.mlp.experts.3.gate_proj.weight"),
+            Some("gate_proj")
+        );
+        assert_eq!(
+            proj_category("model.layers.0.mlp.experts.3.up_proj.weight"),
+            Some("up_proj")
+        );
+        // Both fusion spellings normalise to gate_up_proj.
+        assert_eq!(
+            proj_category("model.layers.0.mlp.experts.gate_up_proj.weight"),
+            Some("gate_up_proj")
+        );
+        assert_eq!(
+            proj_category("model.layers.0.mlp.experts.3.gate_proj__up_proj.weight"),
+            Some("gate_up_proj")
+        );
+        // No projection segment (a bias/scale) → None.
+        assert_eq!(proj_category("model.layers.0.self_attn.q_proj.bias"), None);
     }
 
     #[test]

@@ -3374,6 +3374,13 @@ impl UI {
                     each_total(x.bytes_each(), x.bytes, format_size),
                 ));
             }
+            // Per-projection split (down/gate/up), each with its per-layer footprint.
+            for c in &x.by_category {
+                lines.push(row(
+                    &c.name,
+                    each_total(c.bytes / x.layers.max(1), c.bytes, format_size),
+                ));
+            }
         }
 
         // ── dtype mix ─────────────────────────────────────────────────────────
