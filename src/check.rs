@@ -932,6 +932,55 @@ pub(crate) fn proj_category(name: &str) -> Option<&'static str> {
     })
 }
 
+/// The broad structural role of a tensor within a transformer layer, for the
+/// per-layer composition chart. Attention vs the feed-forward / MoE-expert block
+/// vs everything else (norms, router bias, rotary tables, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TensorRole {
+    Attention,
+    Ffn,
+    Other,
+}
+
+/// Classify a layer suffix (the 3rd element of [`split_layer_index`]) by role.
+/// Attention is checked first; none of its markers are substrings of the FFN ones
+/// (`o_proj` never appears inside `down_proj` / `up_proj` / `gate_up_proj`), so the
+/// ordering is unambiguous.
+pub(crate) fn classify_role(suffix: &str) -> TensorRole {
+    let s = suffix.to_ascii_lowercase();
+    // An exact dot-delimited segment (so the short `wq`/`w1` forms don't match by
+    // accident inside a longer word).
+    let seg = |name: &str| s.split('.').any(|p| p == name);
+    let attention = s.contains("attn")
+        || s.contains("q_proj")
+        || s.contains("k_proj")
+        || s.contains("v_proj")
+        || s.contains("o_proj")
+        || s.contains("qkv")
+        || seg("wq")
+        || seg("wk")
+        || seg("wv")
+        || seg("wo");
+    if attention {
+        return TensorRole::Attention;
+    }
+    let ffn = s.contains("experts")
+        || s.contains("mlp")
+        || s.contains("feed_forward")
+        || s.contains("ffn")
+        || s.contains("gate_proj")
+        || s.contains("up_proj")
+        || s.contains("down_proj")
+        || s.contains("gate_up_proj")
+        || seg("w1")
+        || seg("w2")
+        || seg("w3");
+    if ffn {
+        return TensorRole::Ffn;
+    }
+    TensorRole::Other
+}
+
 /// The number of experts (max expert index + 1) seen across the checkpoint.
 fn detected_expert_count(tensors: &[TensorInfo]) -> Option<usize> {
     tensors
@@ -1470,6 +1519,20 @@ mod tests {
         );
         // No projection segment (a bias/scale) → None.
         assert_eq!(proj_category("model.layers.0.self_attn.q_proj.bias"), None);
+    }
+
+    #[test]
+    fn classify_role_splits_attention_ffn_other() {
+        use TensorRole::{Attention, Ffn, Other};
+        assert_eq!(classify_role("self_attn.q_proj.weight"), Attention);
+        assert_eq!(classify_role("self_attn.o_proj.weight"), Attention);
+        assert_eq!(classify_role("attn.wo.weight"), Attention); // short form
+        assert_eq!(classify_role("mlp.experts.3.down_proj.weight"), Ffn);
+        assert_eq!(classify_role("mlp.gate_up_proj.weight"), Ffn);
+        assert_eq!(classify_role("feed_forward.w2.weight"), Ffn);
+        // Norms and the like are "other" — and `o_proj`/`attention` don't leak in.
+        assert_eq!(classify_role("input_layernorm.weight"), Other);
+        assert_eq!(classify_role("post_attention_layernorm.weight"), Other);
     }
 
     #[test]

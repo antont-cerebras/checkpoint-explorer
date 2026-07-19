@@ -20,11 +20,13 @@ subcommands for comparing and health-checking checkpoints.
   whole-tensor [**statistics**](#statistics) (min/max, mean, std, % zeros,
   NaN/Inf) — computed by streaming the tensor in bounded blocks, so it works on
   **multi-GB** tensors without loading them into RAM.
-- 📊 **The whole checkpoint at a glance.** Press `s` for a
-  [**stats popup**](#checkpoint-statistics-s): total params / size, the largest /
+- 📊 **The whole checkpoint at a glance.** Press `s` for the full-screen
+  [**stats view**](#checkpoint-statistics-s): total params / size, the largest /
   smallest / typical tensor, the dtype mix, and the per-layer and
-  per-**MoE-expert** breakdown — including whether experts are stored fused or
-  unfused. Header-only, so it's instant even on a many-shard model — plus the
+  per-**MoE-expert** breakdown — experts split by projection (down / gate / up),
+  and whether they're stored fused or unfused — plus **per-layer ASCII graphs**
+  (size / params / tensor-count sparklines and an attention-vs-FFN composition
+  chart). Header-only, so it's instant even on a many-shard model — plus the
   *true* on-disk footprint from the filesystem (`st_blocks`), so **ZFS/btrfs
   compression and sparse holes** show up, local or over SSH.
 - 🧩 **Quantized weights, decoded.** [Reinterpret packed dtypes](#dtype-override)
@@ -240,8 +242,8 @@ without `--tensor` is reported as ambiguous.
 | `--legend` | Overlay the opened screen's legend (the `l` key); most useful with `--plain` |
 | `--health` | Open straight into the health-check popup on the tree (the `h` key) |
 | `--health-findings` | Like `--health`, but with the per-finding detail expanded (the popup's `f` toggle) |
-| `--stats` | Open straight into the checkpoint-stats popup on the tree (the `s` key) |
-| `--stats-shards` | Like `--stats`, but with the on-disk per-shard breakdown expanded (the popup's `f` toggle) |
+| `--stats` | Open straight into the full-screen checkpoint-stats view (the `s` key) |
+| `--stats-shards` | Like `--stats`, but with the on-disk per-shard breakdown expanded (the view's `f` toggle) |
 | `--files` | Open straight into the [file browser](#file-browser-tab) — the checkpoint's directory tree (the `Tab` toggle) |
 | `--layout <PATH>` | Open straight into the [safetensors layout map](#safetensors-layout-map) for `PATH` (`Enter` on a `.safetensors` in the file browser) |
 | `--rename` | Open straight into the [rename editor](#renaming-tensors-in-place-convert---map) (local safetensors only; the `R` key) |
@@ -320,7 +322,7 @@ what it does (handy while you're still learning the keys).
 | `f` | Copy the selected row's File path (tensor file, or a group/root's file or directory) |
 | `n` | Copy the selected tensor's Name to the clipboard |
 | `y` | Show and copy the CLI command that reopens this exact screen — file, tensor (or metadata entry), dtype/shape overrides, view, layout, zebra, base, slice (works on every screen) |
-| `s` | **Detail screen:** compute the tensor's statistics on demand · **Tree:** float the [checkpoint-stats popup](#checkpoint-statistics-s) — per-file / per-tensor sizes, params, the dtype mix, and the per-layer / per-expert breakdown; `f` folds/unfolds the on-disk per-shard list, `r` copies the report, `c` the screen, `y` the reopen command (`--stats`) |
+| `s` | **Detail screen:** compute the tensor's statistics on demand · **Tree:** open the full-screen [checkpoint-stats view](#checkpoint-statistics-s) — per-file / per-tensor sizes, params, the dtype mix, the per-layer / per-expert breakdown, and per-layer graphs; `f` folds/unfolds the on-disk per-shard list, `r` copies the report, `c` the screen, `l` the legend, `y` the reopen command (`--stats`), `Esc` / `⌫` back |
 | `h` | **Detail screen:** show the value histogram · **Tree:** run the health checks and float the report in a popup — `f` folds/unfolds the per-finding detail (folded by default), `v` runs the value-tier data scan (progress bar; `Esc` cancels), `r` copies the report, `c` the screen, `y` the reopen command (`--health`); same checks as the [`check`](#checking-checkpoints-check) subcommand (auto-suggested when an index/file mismatch is detected) |
 | `r` | Repack the current HDF5 checkpoint into a new file (HDF5 only) |
 | `R` | Open the [rename editor](#renaming-tensors-in-place-convert---map) (local safetensors only): a full-screen mode to rename tensors in place with autocomplete + a live before→after diff preview. Capital `R` — deliberately harder to hit than a plain letter, since it edits files in place |
@@ -563,7 +565,8 @@ read correctly but shown transposed (their dimensions reversed).
 
 The per-tensor stats above answer "what's *in* this tensor?"; press `s` on the
 **tree** for the complementary question — "what *is* this checkpoint?" — as a
-popup summarising the whole model at a glance:
+full-screen view summarising the whole model at a glance (it scrolls with
+↑/↓ · PgUp/PgDn · Home/End; `l` shows the legend, `Esc` / `⌫` steps back):
 
 - **Overview** — the architecture (`model_type` from `config.json`, when
   present), total parameters, and total size (on-disk vs. logical, with the
@@ -577,7 +580,14 @@ popup summarising the whole model at a glance:
 - **Experts (MoE)** — for mixture-of-experts checkpoints: experts per layer,
   whether they're stored **fused** (stacked into one tensor per projection) or
   **unfused** (a tensor per expert) — and whether gate & up are fused — plus the
-  parameters / bytes in a single expert, the same way layers are broken down.
+  parameters / bytes in a single expert, and a **per-projection split** (down /
+  gate / up, or the fused gate-up) with each projection's per-layer and total size.
+- **Per-layer profile** — ASCII graphs across the transformer stack: min-anchored
+  **sparklines** of size / parameters / tensor-count per layer (so an outlier or a
+  dense-then-MoE split stands out at a glance), and a stacked **composition chart**
+  splitting each layer into attention vs FFN/experts vs other. Long stacks are
+  bucketed to fit; the glyphs are distinct (not colour-only) so the copied report
+  reads the same in a plain terminal.
 - **By dtype** — the dtype mix, each with its tensor count and byte share, so a
   quantized / mixed-precision checkpoint shows exactly how much is in each type.
 - **On disk (filesystem)** — the *true* footprint from the OS (`st_blocks`),
@@ -945,7 +955,7 @@ fail it under `--strict`.
 The checks are also available **interactively**: press `h` in the tree browser
 (or launch with `--health`) to float the report in a popup. Each check shows a
 pass/warn/fail row with its counts; the per-finding detail is **folded by
-default** — `f` (or a click on the toggle, like the stats popup's per-shard
+default** — `f` (or a click on the toggle, like the stats view's per-shard
 fold) unfolds the full list, and `--health-findings` opens it expanded. There,
 `v` runs the value-tier data scan (progress bar; `Esc` cancels), `r` copies the
 report, `c` copies the tree screen, and `y` copies the CLI command that reopens

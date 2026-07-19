@@ -1,0 +1,43 @@
+---
+source: tests/cli.rs
+expression: "run_plain(FIXTURE_MOE, &[\"--stats\"])"
+---
+ Checkpoint stats                                                                                                    [×]
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Overview
+  Parameters   4.9K
+  Size         9.8 KiB
+
+▤ Files  ×1 safetensors
+  Largest      9.8 KiB   [FIXTURE]
+  Smallest     9.8 KiB   [FIXTURE]
+  Average      9.8 KiB
+  Median       9.8 KiB
+
+▦ Tensors  ×99
+  Largest      512 B     model.embed_tokens.weight
+  Smallest     32 B      model.layers.0.input_layernorm.weight
+  Average      101 B
+  Median       96 B
+
+≡ Layers  ×8
+  Params       544 each · 4.4K total
+  Size         1.1 KiB each · 8.8 KiB total
+
+◆ Experts  ×2 per layer
+  Storage      unfused (per-expert tensors)
+  Params       144 each · 2.3K total
+  Size         288 B each · 4.5 KiB total
+  down_proj    192 B each · 1.5 KiB total
+  gate_proj    192 B each · 1.5 KiB total
+  up_proj      192 B each · 1.5 KiB total
+
+Per-layer profile
+  Size/layer     ▁▂▃▄▅▆▇█  896 B–1.3 KiB
+  Params/layer   ▁▂▃▄▅▆▇█  432–656
+  Tensors/layer  uniform · 12 each
+  Composition    █████████████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░
+                 █ 43% attention   ▓ 51% ffn/experts   ░ 6% other
+
+↑↓ PgUp/PgDn scroll · 1–35 of 39
+↑/↓ scroll · PgUp/PgDn page · r copy report · c copy screen · y copy command · l legend · ⌫ back · q quit

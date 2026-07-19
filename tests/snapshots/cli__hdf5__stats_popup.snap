@@ -31,13 +31,13 @@ Overview
   down_proj    400 B each · 1.2 KiB total
   gate_up_proj 144 B each · 432 B total
 
+Per-layer profile
+  Size/layer     █▁▁  624 B–664 B
+  Params/layer   █▁▁  292–312
+  Tensors/layer  █▁▁  6–7
+  Composition    ████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░
+                 █ 10% attention   ▓ 85% ffn/experts   ░ 5% other
+
 By dtype
-  F16    928 B  8 tensors
-  U16    904 B  7 tensors
-  I32    192 B  3 tensors
-  F32     64 B  4 tensors
-  I8       8 B  1 tensor
-
-
-
+↑↓ PgUp/PgDn scroll · 1–35 of 40
 ↑/↓ scroll · PgUp/PgDn page · r copy report · c copy screen · y copy command · l legend · ⌫ back · q quit

@@ -24,6 +24,13 @@ Overview
   Params       80 each · 80 total
   Size         168 B each · 168 B total
 
+Per-layer profile
+  Size/layer     uniform · 168 B each
+  Params/layer   uniform · 80 each
+  Tensors/layer  uniform · 3 each
+  Composition    ████████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░
+                 █ 19% attention   ▓ 71% ffn/experts   ░ 10% other
+
 By dtype
   U16     120 B  1 tensor
   F16      48 B  1 tensor
@@ -31,13 +38,6 @@ By dtype
   F32      32 B  2 tensors
   I32      32 B  1 tensor
   U8        8 B  1 tensor
-
-
-
-
-
-
-
 
 
 ↑/↓ scroll · PgUp/PgDn page · r copy report · c copy screen · y copy command · l legend · ⌫ back · q quit

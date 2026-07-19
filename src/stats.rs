@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::check::{expert_index, proj_category, split_layer_index};
+use crate::check::{TensorRole, classify_role, expert_index, proj_category, split_layer_index};
 use crate::tree::{Storage, TensorInfo};
 
 /// Section glyphs, matching the tree view's (`▦` tensors, `≡` layers) so the
@@ -18,6 +18,112 @@ pub(crate) const GLYPH_FILES: &str = "▤";
 pub(crate) const GLYPH_TENSORS: &str = "▦";
 pub(crate) const GLYPH_LAYERS: &str = "≡";
 pub(crate) const GLYPH_EXPERTS: &str = "◆";
+
+// ── Per-layer graph geometry + math ─────────────────────────────────────────
+// Pure functions (no ratatui) so the plain report and the styled view agree and
+// are unit-testable without a `Frame`.
+
+/// Caps the number of chart columns. A pure function of the layer count (not the
+/// terminal width), so headless `--stats` snapshots are stable everywhere; models
+/// with ≤ `GRAPH_W` layers render one column per layer, larger stacks are bucketed.
+pub(crate) const GRAPH_W: usize = 72;
+/// Width of the single 100%-stacked composition bar.
+pub(crate) const BAR_W: usize = 40;
+/// The eight block-eighths for the scalar sparklines, low → high.
+pub(crate) const SPARK_BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// Composition segment glyphs (attention / ffn-experts / other) — distinct
+/// characters, not just colour, so the monochrome `--stats` / `r` report is legible.
+pub(crate) const SHADES: [char; 3] = ['█', '▓', '░'];
+
+/// Number of chart cells for a series of length `n`, capped at `width`.
+fn cell_count(n: usize, width: usize) -> usize {
+    n.min(width).max(1)
+}
+
+/// The half-open layer range `[start, end)` feeding chart cell `c`. Integer math;
+/// with `c < cells ≤ n` the range is always non-empty.
+fn bucket_bounds(n: usize, cells: usize, c: usize) -> (usize, usize) {
+    (c * n / cells, (c + 1) * n / cells)
+}
+
+/// Bucket a series to `≤ width` cells, averaging each bucket.
+pub(crate) fn bucket_means(values: &[usize], width: usize) -> Vec<f64> {
+    let n = values.len();
+    let cells = cell_count(n, width);
+    (0..cells)
+        .map(|c| {
+            let (s, e) = bucket_bounds(n, cells, c);
+            values[s..e].iter().sum::<usize>() as f64 / (e - s) as f64
+        })
+        .collect()
+}
+
+/// Sparkline glyph indices (`0..=7`) for `values` at `width`, plus the raw
+/// min / max (the true per-layer extremes, for the range label). Min-anchored so
+/// small variation is visible; all-equal → every cell at mid (index 3, no div-by-0).
+pub(crate) fn spark_levels(values: &[usize], width: usize) -> (Vec<usize>, usize, usize) {
+    let lo = values.iter().copied().min().unwrap_or(0);
+    let hi = values.iter().copied().max().unwrap_or(0);
+    let (flo, fhi) = (lo as f64, hi as f64);
+    let levels = bucket_means(values, width)
+        .iter()
+        .map(|&x| {
+            if fhi <= flo {
+                3
+            } else {
+                ((x - flo) / (fhi - flo) * 7.0).round().clamp(0.0, 7.0) as usize
+            }
+        })
+        .collect();
+    (levels, lo, hi)
+}
+
+/// The sparkline string for `values` at `width`.
+pub(crate) fn spark_string(values: &[usize], width: usize) -> String {
+    spark_levels(values, width)
+        .0
+        .iter()
+        .map(|&l| SPARK_BLOCKS[l])
+        .collect()
+}
+
+/// Split `parts` (attn, ffn, other) into row counts summing to exactly `height`
+/// (largest-remainder), or `[0, 0, 0]` for an all-zero column.
+pub(crate) fn alloc_rows(parts: [usize; 3], height: usize) -> [usize; 3] {
+    let total: usize = parts.iter().sum();
+    if total == 0 {
+        return [0, 0, 0];
+    }
+    let raw = parts.map(|p| p as f64 / total as f64 * height as f64);
+    let mut out = raw.map(|r| r.floor() as usize);
+    let mut leftover = height - out.iter().sum::<usize>();
+    // Hand the leftover rows to the largest fractional parts (ties → lowest index).
+    let mut order = [0usize, 1, 2];
+    order.sort_by(|&i, &j| {
+        let (fi, fj) = (raw[i] - raw[i].floor(), raw[j] - raw[j].floor());
+        fj.partial_cmp(&fi)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(i.cmp(&j))
+    });
+    for &i in &order {
+        if leftover == 0 {
+            break;
+        }
+        out[i] += 1;
+        leftover -= 1;
+    }
+    out
+}
+
+/// A 100%-stacked composition bar: `width` cells split `[attn, ffn, other]` by
+/// share (largest-remainder), each cell the matching [`SHADES`] glyph.
+pub(crate) fn composition_bar(totals: [usize; 3], width: usize) -> String {
+    alloc_rows(totals, width)
+        .iter()
+        .zip(SHADES)
+        .flat_map(|(&n, ch)| std::iter::repeat_n(ch, n))
+        .collect()
+}
 
 /// One named tensor with its logical size — for the largest / smallest rows.
 #[derive(Debug, Clone)]
@@ -45,6 +151,73 @@ impl LayerStats {
     /// Average bytes in a single layer.
     pub fn bytes_each(&self) -> usize {
         self.bytes / self.count.max(1)
+    }
+}
+
+/// One layer's aggregate, with a byte-composition split for the stacked chart.
+/// (The layer index is the row's position in [`PerLayerStats::rows`].)
+#[derive(Debug, Clone, Default)]
+pub struct LayerRow {
+    /// Tensor count in this layer.
+    pub tensors: usize,
+    /// Total parameters in this layer.
+    pub params: usize,
+    /// Total logical bytes in this layer.
+    pub bytes: usize,
+    pub attn_bytes: usize,
+    /// MLP + expert bytes.
+    pub ffn_bytes: usize,
+    pub other_bytes: usize,
+}
+
+/// The per-layer series behind the stats graphs. Present only when a canonical
+/// layer family exists (`None` for a dense checkpoint with no indexed stack).
+#[derive(Debug, Clone)]
+pub struct PerLayerStats {
+    /// One row per index `0..count`, in order (so index ↔ position always align).
+    pub rows: Vec<LayerRow>,
+}
+
+impl PerLayerStats {
+    pub fn bytes_series(&self) -> Vec<usize> {
+        self.rows.iter().map(|r| r.bytes).collect()
+    }
+    pub fn params_series(&self) -> Vec<usize> {
+        self.rows.iter().map(|r| r.params).collect()
+    }
+    pub fn tensor_series(&self) -> Vec<usize> {
+        self.rows.iter().map(|r| r.tensors).collect()
+    }
+
+    /// Total `[attention, ffn/experts, other]` bytes across every layer.
+    pub fn composition_totals(&self) -> [usize; 3] {
+        self.rows.iter().fold([0; 3], |[a, f, o], r| {
+            [a + r.attn_bytes, f + r.ffn_bytes, o + r.other_bytes]
+        })
+    }
+
+    /// Aggregate the per-layer series over the canonical layer family — the same
+    /// family [`LayerStats`] uses, so the graphs line up with `Layers ×N`.
+    fn compute(tensors: &[TensorInfo]) -> Option<PerLayerStats> {
+        let (prefix, count) = canonical_family(tensors)?;
+        let mut rows: Vec<LayerRow> = vec![LayerRow::default(); count];
+        for t in tensors {
+            if let Some((p, idx, suffix)) = split_layer_index(&t.name)
+                && p == prefix
+                && idx < count
+            {
+                let r = &mut rows[idx];
+                r.tensors += 1;
+                r.params += t.num_elements;
+                r.bytes += t.size_bytes;
+                match classify_role(&suffix) {
+                    TensorRole::Attention => r.attn_bytes += t.size_bytes,
+                    TensorRole::Ffn => r.ffn_bytes += t.size_bytes,
+                    TensorRole::Other => r.other_bytes += t.size_bytes,
+                }
+            }
+        }
+        Some(PerLayerStats { rows })
     }
 }
 
@@ -226,6 +399,9 @@ pub struct CheckpointStats {
     /// dtypes, largest share first.
     pub dtypes: Vec<DtypeStat>,
     pub layers: Option<LayerStats>,
+    /// Per-layer series (tensor count / params / bytes / composition) for the
+    /// stats graphs — `Some` whenever `layers` is.
+    pub per_layer: Option<PerLayerStats>,
     pub experts: Option<ExpertStats>,
     /// `config.json`'s `model_type`, when a config was found.
     pub model_type: Option<String>,
@@ -330,6 +506,7 @@ impl CheckpointStats {
             median_bytes,
             dtypes,
             layers: layer_stats(tensors),
+            per_layer: PerLayerStats::compute(tensors),
             experts: expert_stats(tensors, config),
             model_type: config.and_then(|c| c.model_type.clone()),
             disk,
@@ -462,6 +639,61 @@ impl CheckpointStats {
             }
         }
 
+        // Per-layer profile: a per-metric sparkline when it varies across the
+        // stack, else a plain "uniform" note (a flat sparkline says nothing); plus
+        // a single composition bar for the whole stack.
+        if let Some(pl) = &self.per_layer {
+            const LBL: usize = 13;
+            out.push(String::new());
+            out.push("Per-layer profile".into());
+            let metric = |label: &str, vals: &[usize], fmt: fn(usize) -> String| -> String {
+                let (lo, hi) = (
+                    vals.iter().copied().min().unwrap_or(0),
+                    vals.iter().copied().max().unwrap_or(0),
+                );
+                if lo == hi {
+                    format!("  {label:<LBL$}  uniform · {} each", fmt(lo))
+                } else {
+                    format!(
+                        "  {label:<LBL$}  {}  {}–{}",
+                        spark_string(vals, GRAPH_W),
+                        fmt(lo),
+                        fmt(hi)
+                    )
+                }
+            };
+            out.push(metric("Size/layer", &pl.bytes_series(), format_size));
+            out.push(metric(
+                "Params/layer",
+                &pl.params_series(),
+                format_parameters,
+            ));
+            out.push(metric("Tensors/layer", &pl.tensor_series(), |n| {
+                n.to_string()
+            }));
+            // Composition: one 100%-stacked bar over the whole stack, with shares.
+            let comp = pl.composition_totals();
+            let total: usize = comp.iter().sum();
+            if total > 0 {
+                let pct = |x: usize| (x * 100 + total / 2) / total;
+                out.push(format!(
+                    "  {:<LBL$}  {}",
+                    "Composition",
+                    composition_bar(comp, BAR_W)
+                ));
+                out.push(format!(
+                    "  {:<LBL$}  {} {}% attention · {} {}% ffn/experts · {} {}% other",
+                    "",
+                    SHADES[0],
+                    pct(comp[0]),
+                    SHADES[1],
+                    pct(comp[1]),
+                    SHADES[2],
+                    pct(comp[2]),
+                ));
+            }
+        }
+
         // By dtype.
         if !self.dtypes.is_empty() {
             out.push(String::new());
@@ -545,9 +777,11 @@ pub(crate) fn ratio_phrase(apparent: u64, allocated: u64) -> String {
     }
 }
 
-/// Aggregate the repeated layer stack. Mirrors `check`'s family selection:
-/// prefer the conventional `…layers` prefix, else the largest indexed family.
-fn layer_stats(tensors: &[TensorInfo]) -> Option<LayerStats> {
+/// The canonical layer family: its prefix and layer count (highest index + 1).
+/// Mirrors `check`'s selection — prefer the conventional `…layers` prefix, else
+/// the largest indexed family. Shared by [`layer_stats`] and
+/// [`PerLayerStats::compute`] so the summary and the per-layer series can't drift.
+fn canonical_family(tensors: &[TensorInfo]) -> Option<(String, usize)> {
     let mut fam: HashMap<String, BTreeSet<usize>> = HashMap::new();
     for t in tensors {
         if let Some((prefix, idx, _)) = split_layer_index(&t.name) {
@@ -558,9 +792,13 @@ fn layer_stats(tensors: &[TensorInfo]) -> Option<LayerStats> {
         .iter()
         .find(|(p, _)| p.rsplit('.').next() == Some("layers"))
         .or_else(|| fam.iter().max_by_key(|(_, idxs)| idxs.len()))?;
-    let prefix = chosen.0.clone();
     let count = chosen.1.iter().next_back().map(|&m| m + 1)?;
+    Some((chosen.0.clone(), count))
+}
 
+/// Aggregate the repeated layer stack over the canonical family.
+fn layer_stats(tensors: &[TensorInfo]) -> Option<LayerStats> {
+    let (prefix, count) = canonical_family(tensors)?;
     let mut params = 0;
     let mut bytes = 0;
     for t in tensors {
@@ -810,6 +1048,85 @@ mod tests {
         assert_eq!(down.bytes / x.layers.max(1), 120); // per layer (2 layers)
         let gate = &x.by_category[1];
         assert_eq!(gate.bytes, 6 * 20 * 4); // 480 B total
+    }
+
+    #[test]
+    fn spark_levels_are_min_anchored() {
+        // Distinct values map min → 0, max → 7 across the range.
+        let (levels, lo, hi) = spark_levels(&[10, 20, 30], GRAPH_W);
+        assert_eq!((lo, hi), (10, 30));
+        assert_eq!(levels.first(), Some(&0));
+        assert_eq!(levels.last(), Some(&7));
+        // All-equal → every cell at mid (index 3), no divide-by-zero.
+        let (flat, lo, hi) = spark_levels(&[5, 5, 5], GRAPH_W);
+        assert_eq!((lo, hi), (5, 5));
+        assert!(flat.iter().all(|&l| l == 3));
+    }
+
+    #[test]
+    fn bucketing_fits_the_width_cap() {
+        // Fewer layers than the cap → one cell per layer.
+        assert_eq!(bucket_means(&[1, 2, 3, 4], GRAPH_W).len(), 4);
+        // More layers than the width → bucketed to the width, averaging each bucket.
+        let vals: Vec<usize> = (0..100).collect();
+        let means = bucket_means(&vals, 10);
+        assert_eq!(means.len(), 10);
+        assert!((means[0] - 4.5).abs() < 1e-9); // mean of 0..=9
+    }
+
+    #[test]
+    fn alloc_rows_sums_to_height_by_largest_remainder() {
+        assert_eq!(alloc_rows([1, 1, 1], 6), [2, 2, 2]);
+        // Leftover row goes to the largest fractional part (ties → lowest index):
+        // 1:1:0 of height 3 → raw 1.5/1.5/0 → floors 1/1/0, +1 → index 0.
+        assert_eq!(alloc_rows([1, 1, 0], 3), [2, 1, 0]);
+        assert_eq!(alloc_rows([0, 0, 0], 6), [0, 0, 0]); // empty column
+        for parts in [[3, 1, 0], [7, 2, 1], [1, 0, 5]] {
+            assert_eq!(alloc_rows(parts, 6).iter().sum::<usize>(), 6);
+        }
+    }
+
+    #[test]
+    fn per_layer_series_aligns_with_layer_count() {
+        let mut tensors = vec![ti("model.embed_tokens.weight", "F32", &[100], 4)];
+        for layer in 0..4 {
+            tensors.push(ti(
+                &format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                "F32",
+                &[10],
+                4,
+            ));
+            tensors.push(ti(
+                &format!("model.layers.{layer}.mlp.down_proj.weight"),
+                "F32",
+                &[20],
+                4,
+            ));
+            tensors.push(ti(
+                &format!("model.layers.{layer}.input_layernorm.weight"),
+                "F32",
+                &[2],
+                4,
+            ));
+        }
+        let s = CheckpointStats::compute(&tensors, None, None);
+        let pl = s.per_layer.unwrap();
+        assert_eq!(pl.rows.len(), s.layers.unwrap().count); // 4, aligned
+        let row = &pl.rows[0];
+        assert_eq!(row.tensors, 3);
+        assert_eq!(row.attn_bytes, 10 * 4); // q_proj
+        assert_eq!(row.ffn_bytes, 20 * 4); // down_proj
+        assert_eq!(row.other_bytes, 2 * 4); // layernorm
+    }
+
+    #[test]
+    fn dense_checkpoint_has_no_per_layer() {
+        let tensors = vec![ti("lm_head.weight", "F32", &[10], 4)];
+        assert!(
+            CheckpointStats::compute(&tensors, None, None)
+                .per_layer
+                .is_none()
+        );
     }
 
     #[test]
