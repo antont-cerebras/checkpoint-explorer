@@ -680,15 +680,19 @@ impl CheckpointStats {
                     )
                 }
             };
+            // A blank line between each graph so they read as separate charts.
             out.push(metric("Size/layer", &pl.bytes_series(), format_size));
+            out.push(String::new());
             out.push(metric(
                 "Params/layer",
                 &pl.params_series(),
                 format_parameters,
             ));
+            out.push(String::new());
             out.push(metric("Tensors/layer", &pl.tensor_series(), |n| {
                 n.to_string()
             }));
+            out.push(String::new());
             // Composition: a swatch + % key on the "Composition" line, and the
             // 100%-stacked bar just below it (indented under, so the pure-glyph bar
             // isn't mistaken for part of the key).
@@ -703,9 +707,12 @@ impl CheckpointStats {
                         format!("{p}%")
                     }
                 };
+                // Bar and key on one line (bar first) — a separate key row directly
+                // above the bar reads as one stacked block.
                 out.push(format!(
-                    "  {:<LBL$}  {} attention {} · {} ffn/experts {} · {} other {}",
+                    "  {:<LBL$}  {}   {} attention {} · {} ffn/experts {} · {} other {}",
                     "Composition",
+                    composition_bar(comp, BAR_W),
                     SHADES[0],
                     pct(comp[0]),
                     SHADES[1],
@@ -713,7 +720,6 @@ impl CheckpointStats {
                     SHADES[2],
                     pct(comp[2]),
                 ));
-                out.push(format!("  {:<LBL$}  {}", "", composition_bar(comp, BAR_W)));
             }
         }
 

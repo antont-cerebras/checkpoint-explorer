@@ -33,11 +33,11 @@ Overview
 
 Per-layer profile
   Size/layer     █▁▁  624 B–664 B
-  Params/layer   █▁▁  292–312
-  Tensors/layer  █▁▁  6–7
-  Composition    █ attention 10% · ▓ ffn/experts 85% · ░ other 5%
-                 ████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░
 
-By dtype
-↑↓ PgUp/PgDn scroll · 1–35 of 40
+  Params/layer   █▁▁  292–312
+
+  Tensors/layer  █▁▁  6–7
+
+  Composition    ████▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░   █ attention 10% · ▓ ffn/experts 85% · ░ other 5%
+↑↓ PgUp/PgDn scroll · 1–35 of 42
 ↑/↓ scroll · PgUp/PgDn page · r copy report · c copy screen · y copy command · l legend · ⌫ back · q quit
