@@ -182,6 +182,7 @@ dependencies = [
  "regex",
  "rpassword",
  "safetensors",
+ "serde",
  "serde_json",
  "similar",
  "ssh2",

@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 // `Raw`/`Compressed` are only constructed by the HDF5 reader; without that
 // feature they are still matched in the UI but never built.
 #[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Storage {
     /// Compression is not tracked for this format (e.g. safetensors / GGUF).
     Unknown,
@@ -18,7 +18,7 @@ pub enum Storage {
 /// Where a tensor's data sits within its file, by format.
 // `Chunked` is only constructed by the HDF5 reader.
 #[cfg_attr(not(feature = "hdf5"), allow(dead_code))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Layout {
     /// Layout not tracked.
     None,
@@ -33,7 +33,7 @@ pub enum Layout {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TensorInfo {
     pub name: String,
     pub dtype: String,
@@ -60,7 +60,7 @@ impl TensorInfo {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MetadataInfo {
     pub name: String,
     pub value: String,
@@ -635,6 +635,38 @@ fn insert_metadata(nodes: &mut Vec<TreeNode>, parent: &[&str], meta: MetadataInf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tensor_info_round_trips_through_json() {
+        // The central model serializes to JSON and back unchanged — the backbone
+        // invariant of the "read once into one serializable datatype" design.
+        let t = TensorInfo {
+            name: "model.layers.0.mlp.down_proj.weight".into(),
+            dtype: "BF16".into(),
+            shape: vec![4096, 11008],
+            size_bytes: 4096 * 11008 * 2,
+            num_elements: 4096 * 11008,
+            storage: Storage::Compressed {
+                codec: "lz4".into(),
+                stored_bytes: 123,
+            },
+            source_path: "/ckpt/model-00001.safetensors".into(),
+            layout: Layout::ByteRange { start: 0, end: 90177536 },
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let back: TensorInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, t.name);
+        assert_eq!(back.shape, t.shape);
+        assert_eq!(back.on_disk_size(), 123);
+        assert!(matches!(back.layout, Layout::ByteRange { start: 0, end: 90177536 }));
+        let m = MetadataInfo {
+            name: "format".into(),
+            value: "pt".into(),
+            value_type: "string".into(),
+        };
+        let m2: MetadataInfo = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(m2.value, "pt");
+    }
 
     fn tensor(name: &str) -> TensorInfo {
         TensorInfo {

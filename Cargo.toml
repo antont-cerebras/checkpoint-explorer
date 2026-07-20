@@ -16,6 +16,10 @@ crossterm = "0.28"
 # rename (`convert --map`) rewrites a safetensors header without reshuffling its
 # entries (a `BTreeMap` would sort them), and index.json round-trips unchanged.
 serde_json = { version = "1.0", features = ["preserve_order"] }
+# The central checkpoint model + reports serialize to JSON (and other formats)
+# via derive — the backbone of the "read once into one serializable datatype"
+# architecture.
+serde = { version = "1.0", features = ["derive"] }
 glob = "0.3"
 fuzzy-matcher = "0.3"
 # Terminal width for output formatting (diff/progress) without pulling the full
