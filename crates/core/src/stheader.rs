@@ -21,7 +21,10 @@ pub fn header_len(raw: u64, source: &str) -> Result<usize> {
 /// Parse a safetensors header (the JSON blob after the 8-byte length) into
 /// tensors + metadata. `source` is the tensors' `source_path` (a local path or a
 /// remote marker). Every non-`__metadata__` entry describes a tensor.
-pub fn parse_header(header_buf: &[u8], source: &str) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
+pub fn parse_header(
+    header_buf: &[u8],
+    source: &str,
+) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
     let mut tensors: Vec<TensorInfo> = Vec::new();
     let mut metadata: Vec<MetadataInfo> = Vec::new();
     let source_path = source.to_string();

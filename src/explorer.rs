@@ -4632,8 +4632,7 @@ impl Explorer {
         let mut len_buf = [0u8; 8];
         file.read_exact(&mut len_buf)
             .with_context(|| format!("Failed to read header length: {}", file_path.display()))?;
-        let header_len =
-            crate::stheader::header_len(u64::from_le_bytes(len_buf), &source_path)?;
+        let header_len = crate::stheader::header_len(u64::from_le_bytes(len_buf), &source_path)?;
         let mut header_buf = vec![0u8; header_len];
         file.read_exact(&mut header_buf)
             .with_context(|| format!("Failed to read header: {}", file_path.display()))?;

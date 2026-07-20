@@ -38,6 +38,10 @@ impl Segment {
     pub fn len(&self) -> u64 {
         self.end.saturating_sub(self.start)
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.end <= self.start
+    }
 }
 
 /// The parsed layout of a safetensors file: its total size, the header size, and

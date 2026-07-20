@@ -14,13 +14,13 @@ use crate::tree::{Storage, TensorInfo};
 
 /// Section glyphs, matching the tree view's (`▦` tensors, `≡` layers) so the
 /// popup reads like the rest of the UI rather than a flat table.
-pub(crate) const GLYPH_FILES: &str = "▤";
-pub(crate) const GLYPH_TENSORS: &str = "▦";
-pub(crate) const GLYPH_LAYERS: &str = "≡";
-pub(crate) const GLYPH_EXPERTS: &str = "◆";
+pub const GLYPH_FILES: &str = "▤";
+pub const GLYPH_TENSORS: &str = "▦";
+pub const GLYPH_LAYERS: &str = "≡";
+pub const GLYPH_EXPERTS: &str = "◆";
 /// The S3-objects section glyph (a cloud) — the `s3://` cstorch source's
 /// underlying object store.
-pub(crate) const GLYPH_S3: &str = "☁";
+pub const GLYPH_S3: &str = "☁";
 
 // ── Per-layer graph geometry + math ─────────────────────────────────────────
 // Pure functions (no ratatui) so the plain report and the styled view agree and
@@ -29,14 +29,14 @@ pub(crate) const GLYPH_S3: &str = "☁";
 /// Caps the number of chart columns. A pure function of the layer count (not the
 /// terminal width), so headless `--stats` snapshots are stable everywhere; models
 /// with ≤ `GRAPH_W` layers render one column per layer, larger stacks are bucketed.
-pub(crate) const GRAPH_W: usize = 72;
+pub const GRAPH_W: usize = 72;
 /// Width of the single 100%-stacked composition bar.
-pub(crate) const BAR_W: usize = 40;
+pub const BAR_W: usize = 40;
 /// The eight block-eighths for the scalar sparklines, low → high.
 pub(crate) const SPARK_BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// Composition segment glyphs (attention / ffn-experts / other) — distinct
 /// characters, not just colour, so the monochrome `--stats` / `r` report is legible.
-pub(crate) const SHADES: [char; 3] = ['█', '▓', '░'];
+pub const SHADES: [char; 3] = ['█', '▓', '░'];
 
 /// Number of chart cells for a series of length `n`, capped at `width`.
 fn cell_count(n: usize, width: usize) -> usize {
@@ -82,7 +82,7 @@ pub(crate) fn spark_levels(values: &[usize], width: usize) -> (Vec<usize>, usize
 }
 
 /// The sparkline string for `values` at `width`.
-pub(crate) fn spark_string(values: &[usize], width: usize) -> String {
+pub fn spark_string(values: &[usize], width: usize) -> String {
     spark_levels(values, width)
         .0
         .iter()
@@ -122,7 +122,7 @@ pub(crate) fn alloc_rows(parts: [usize; 3], height: usize) -> [usize; 3] {
 /// non-zero component at least one cell — a thin sliver — so a tiny attention or
 /// "other" share stays visible instead of rounding away. The sliver is borrowed
 /// from the widest segment (so the cells still sum to `width`).
-pub(crate) fn composition_cells(totals: [usize; 3], width: usize) -> [usize; 3] {
+pub fn composition_cells(totals: [usize; 3], width: usize) -> [usize; 3] {
     let mut cells = alloc_rows(totals, width);
     for i in 0..3 {
         if totals[i] > 0
@@ -933,13 +933,13 @@ impl CheckpointStats {
 /// ~1%, so files the filesystem left untouched (and trivial block-rounding
 /// differences) don't clutter the per-shard list; only real savings are worth a
 /// row.
-pub(crate) fn has_saving(apparent: u64, allocated: u64) -> bool {
+pub fn has_saving(apparent: u64, allocated: u64) -> bool {
     allocated < apparent && (apparent - allocated).saturating_mul(100) >= apparent
 }
 
 /// "N.N× smaller" when the filesystem shrank the file, else "no filesystem
 /// saving" — describing `allocated` relative to `apparent`.
-pub(crate) fn ratio_phrase(apparent: u64, allocated: u64) -> String {
+pub fn ratio_phrase(apparent: u64, allocated: u64) -> String {
     if allocated == 0 || allocated >= apparent {
         "no filesystem saving".to_string()
     } else {
@@ -950,7 +950,7 @@ pub(crate) fn ratio_phrase(apparent: u64, allocated: u64) -> String {
 /// The S3 section's "Checksums" value: stored-checksum coverage by algorithm
 /// (e.g. "126 with SHA256"), or a note that none were stored (so object equality
 /// would rest on the ETag alone). Shared by the plain + styled reports.
-pub(crate) fn s3_checksums_phrase(s3: &S3Stats) -> String {
+pub fn s3_checksums_phrase(s3: &S3Stats) -> String {
     let by_algo = s3.checksums();
     if by_algo.is_empty() {
         "none stored".to_string()
@@ -965,7 +965,7 @@ pub(crate) fn s3_checksums_phrase(s3: &S3Stats) -> String {
 
 /// The S3 section's "Tags" value: how many objects carried tags, whether any were
 /// denied by permission (`s3:GetObjectTagging`), or that none were tagged.
-pub(crate) fn s3_tags_phrase(s3: &S3Stats) -> String {
+pub fn s3_tags_phrase(s3: &S3Stats) -> String {
     let tagged = s3
         .objects
         .iter()
@@ -987,7 +987,7 @@ pub(crate) fn s3_tags_phrase(s3: &S3Stats) -> String {
 
 /// The S3 section's "Modified" value: a single date when all objects share one,
 /// else the "earliest – latest" span; `None` when no object reported a date.
-pub(crate) fn s3_modified_phrase(s3: &S3Stats) -> Option<String> {
+pub fn s3_modified_phrase(s3: &S3Stats) -> Option<String> {
     s3.modified_range().map(|(lo, hi)| {
         if lo == hi {
             lo
@@ -1001,7 +1001,7 @@ pub(crate) fn s3_modified_phrase(s3: &S3Stats) -> Option<String> {
 /// per-object breakdown, shared by the plain + styled reports. Hashes are shown in
 /// full (not abbreviated) — they're the whole point of the row, and the report
 /// scrolls / the `r` copy carries them verbatim.
-pub(crate) fn s3_object_detail(o: &S3ObjectStat) -> String {
+pub fn s3_object_detail(o: &S3ObjectStat) -> String {
     use crate::utils::format_size;
     let mut parts = vec![format!("{:>9}", format_size(o.size as usize))];
     if !o.etag.is_empty() {

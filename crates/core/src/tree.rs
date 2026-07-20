@@ -651,14 +651,23 @@ mod tests {
                 stored_bytes: 123,
             },
             source_path: "/ckpt/model-00001.safetensors".into(),
-            layout: Layout::ByteRange { start: 0, end: 90177536 },
+            layout: Layout::ByteRange {
+                start: 0,
+                end: 90177536,
+            },
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: TensorInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, t.name);
         assert_eq!(back.shape, t.shape);
         assert_eq!(back.on_disk_size(), 123);
-        assert!(matches!(back.layout, Layout::ByteRange { start: 0, end: 90177536 }));
+        assert!(matches!(
+            back.layout,
+            Layout::ByteRange {
+                start: 0,
+                end: 90177536
+            }
+        ));
         let m = MetadataInfo {
             name: "format".into(),
             value: "pt".into(),

@@ -604,7 +604,7 @@ pub fn sample_tensor(
 /// `reader`'s real stored shape, so any reshape with a matching element count is
 /// a valid row-major reinterpretation.
 #[allow(clippy::too_many_arguments)] // distinct sampling parameters
-pub(crate) fn sample_tensor_with(
+pub fn sample_tensor_with(
     reader: &dyn TensorReader,
     t: &TensorInfo,
     shape: &[usize],
@@ -1186,7 +1186,7 @@ fn stats_tile_shape(shape: &[usize], chunk: &[usize], budget: usize) -> Vec<usiz
 /// [`decode`] / [`decode_view`] expect. The sampling preview and the statistics
 /// scan are written once against this trait, so supporting a new format (e.g.
 /// remote/S3 shards) is just another implementation.
-pub(crate) trait TensorReader {
+pub trait TensorReader {
     /// The stored shape.
     fn shape(&self) -> &[usize];
 
@@ -1233,7 +1233,7 @@ pub(crate) trait TensorReader {
 }
 
 /// Open the right [`TensorReader`] for a tensor, dispatching by file extension.
-pub(crate) fn open_reader(t: &TensorInfo) -> Result<Box<dyn TensorReader>, String> {
+pub fn open_reader(t: &TensorInfo) -> Result<Box<dyn TensorReader>, String> {
     // Remote sources (`--ssh-read`: `s3://…` or scp-style `host:/path`) are
     // metadata-only: their metadata was read on the remote, but the data views
     // (heatmap/values/stats) read locally via mmap, so there are no bytes here.
@@ -1510,7 +1510,7 @@ impl DiffAcc {
 /// stored dtypes may differ (so it measures requantization drift, e.g. F16 → BF16,
 /// or compares the unpacked 3-bit fields). Streams matching row-blocks via
 /// [`TensorReader::read_region`], so memory stays bounded regardless of size.
-pub(crate) fn compare_values(
+pub fn compare_values(
     a: &TensorInfo,
     a_schema: Option<&PackingSchema>,
     b: &TensorInfo,
@@ -1609,7 +1609,7 @@ impl HistogramDiff {
 /// shared layout (spanning the combined value range) and return the per-bin
 /// counts. `bins` requests a bucket count (else the defaults). Reuses the
 /// statistics + histogram scans, so it honours `unpacked` etc.
-pub(crate) fn histogram_diff(
+pub fn histogram_diff(
     a: &TensorInfo,
     a_schema: Option<&PackingSchema>,
     b: &TensorInfo,

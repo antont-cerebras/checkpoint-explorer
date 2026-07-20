@@ -7160,6 +7160,74 @@ fn fmt_hist_edge(x: f64) -> String {
 mod tests {
     use super::*;
 
+    // The styled check-popup fold render (`render_check_report`) is exercised
+    // here in the bin, since the frontend-free core can't depend on ratatui. The
+    // core `check` module keeps the data-level checks.
+    #[test]
+    fn check_popup_folds_findings_like_the_stats_popup() {
+        use crate::check::{CheckReport, CheckResult, Finding};
+        let findings: Vec<Finding> = (0..250)
+            .map(|i| Finding::error(Some(format!("tensor-{i:04}")), "bad byte range".into()))
+            .collect();
+        let report = CheckReport {
+            label: "x".into(),
+            n_files: 1,
+            n_tensors: 250,
+            params: 1,
+            values: false,
+            results: vec![CheckResult::done(
+                "id",
+                "Byte-range integrity",
+                "n",
+                findings,
+            )],
+        };
+        let render = |expanded| {
+            crate::tui::headless_render(200, 400, |f| {
+                UI::render_check_report(
+                    f,
+                    &report,
+                    CheckPopup::Idle {
+                        copied: None,
+                        can_scan: false,
+                    },
+                    0,
+                    expanded,
+                );
+            })
+            .unwrap()
+        };
+
+        let folded = render(false);
+        assert!(
+            folded.contains("250 findings"),
+            "fold toggle shows the count"
+        );
+        assert!(
+            folded.contains("expand findings"),
+            "footer hints `f` to expand:\n{folded}"
+        );
+        assert!(
+            folded.contains("    ▸ 250 findings"),
+            "toggle indented under the check title:\n{folded}"
+        );
+        assert!(
+            !folded.contains("tensor-0000"),
+            "findings hidden when folded"
+        );
+
+        let expanded = render(true);
+        assert!(expanded.contains("tensor-0000"), "first finding shown");
+        assert!(
+            expanded.contains("tensor-0249"),
+            "last finding shown too (no cap)"
+        );
+        assert!(
+            expanded.contains("fold findings"),
+            "footer offers folding back:\n{expanded}"
+        );
+    }
+
     /// Drop CSI escape sequences (`\x1b[…<letter>`) so a colored string can be
     /// compared against its plain text.
     fn strip_ansi_codes(s: &str) -> String {

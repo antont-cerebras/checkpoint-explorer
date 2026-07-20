@@ -1,34 +1,16 @@
-mod check;
-mod codec;
-mod config;
+// The frontend-free core modules live in `checkpoint-explorer-core`. Re-export
+// them at the crate root so the (still bin-side) `explorer`/`ui` keep resolving
+// their `crate::tree::…` / `crate::stats::…` paths unchanged during the refactor.
+pub use checkpoint_explorer_core::{
+    check, codec, config, diff, filetree, filter, gguf, health, npy, progress, remote, rename, s3,
+    safelayout, sample, sftp, stats, stheader, tree, utils,
+};
 #[cfg(feature = "hdf5")]
-mod convert;
-mod diff;
+pub use checkpoint_explorer_core::{convert, hdf5, hdf5_lz4, hdf5_zstd};
+
 mod explorer;
-mod filetree;
-mod filter;
-mod gguf;
-#[cfg(feature = "hdf5")]
-mod hdf5;
-#[cfg(feature = "hdf5")]
-mod hdf5_lz4;
-#[cfg(feature = "hdf5")]
-mod hdf5_zstd;
-mod health;
-mod npy;
-mod progress;
-mod remote;
-mod rename;
-mod s3;
-mod safelayout;
-mod sample;
-mod sftp;
-mod stats;
-mod stheader;
-mod tree;
 mod tui;
 mod ui;
-mod utils;
 
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
@@ -38,6 +20,21 @@ use std::path::{Path, PathBuf};
 
 use crate::explorer::{DataLayout, Explorer, OpenRequest, OpenView};
 use crate::tree::{MetadataInfo, TensorInfo};
+
+/// `check --format` — the CLI's output-format choice. Lives here (not in the
+/// frontend-free core) so `clap` doesn't leak into `core`; `run_check` dispatches
+/// on it to the core report's `render` / `to_json` / `to_sarif`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Format {
+    /// Human-readable report (default).
+    #[default]
+    Text,
+    /// A structured JSON report: per-check status, findings, and the overall
+    /// exit code — for scripts / agents / CI.
+    Json,
+    /// SARIF 2.1.0 — for GitHub code scanning / static-analysis tooling.
+    Sarif,
+}
 
 /// Worked examples shown at the end of `--help` (not the terse `-h`), grouped by
 /// the most useful things you can do. Written to read cleanly for both people
@@ -450,7 +447,7 @@ enum Command {
         /// Destination file to create (repack mode only; omit when using `--map`).
         output: Option<PathBuf>,
         /// Compression codec for the output (repack mode).
-        #[arg(short, long, value_enum, default_value_t = codec::Codec::default())]
+        #[arg(short, long, default_value_t = codec::Codec::default())]
         codec: codec::Codec,
         /// Compression level (gzip 0–9, zstd 1–22; ignored for lz4/none).
         /// Defaults to a sensible level for the codec (repack mode).
@@ -626,8 +623,8 @@ enum Command {
         jobs: Option<usize>,
         /// Output format: text (default), json (a structured report for scripts /
         /// agents / CI), or sarif (SARIF 2.1.0 for GitHub code scanning).
-        #[arg(long, value_enum, default_value_t = check::Format::default(), value_name = "FORMAT")]
-        format: check::Format,
+        #[arg(long, value_enum, default_value_t = Format::default(), value_name = "FORMAT")]
+        format: Format,
         /// Never colorize the output (also off when stdout isn't a terminal, or
         /// when NO_COLOR is set).
         #[arg(long = "no-color")]
@@ -839,7 +836,7 @@ fn run_check(
     strict: bool,
     name: &[String],
     jobs: usize,
-    format: check::Format,
+    format: Format,
     no_color: bool,
     remote: Option<&crate::remote::RemoteRead>,
 ) -> i32 {
@@ -939,12 +936,12 @@ fn run_check(
         Err(code) => return code,
     };
     match format {
-        check::Format::Text => print!("{}", report.render(color_enabled(no_color))),
-        check::Format::Json => println!(
+        Format::Text => print!("{}", report.render(color_enabled(no_color))),
+        Format::Json => println!(
             "{}",
             serde_json::to_string_pretty(&report.to_json(strict)).unwrap_or_default()
         ),
-        check::Format::Sarif => println!(
+        Format::Sarif => println!(
             "{}",
             serde_json::to_string_pretty(&report.to_sarif()).unwrap_or_default()
         ),

@@ -164,6 +164,7 @@ version = "0.2.1"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
+ "checkpoint-explorer-core",
  "clap",
  "colored_json",
  "crossterm",
@@ -189,6 +190,30 @@ dependencies = [
  "terminal_size",
  "unicode-width 0.2.0",
  "yansi",
+ "zip",
+ "zstd",
+]
+
+[[package]]
+name = "checkpoint-explorer-core"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "glob",
+ "half",
+ "hdf5-metno",
+ "hdf5-metno-sys",
+ "lz4_flex",
+ "memmap2",
+ "ndarray",
+ "rayon",
+ "regex",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "similar",
+ "ssh2",
+ "terminal_size",
  "zip",
  "zstd",
 ]

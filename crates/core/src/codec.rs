@@ -2,8 +2,9 @@
 //! own (ungated) module so the CLI argument can use it even in a build without
 //! the `hdf5` feature; the actual repack lives in [`crate::convert`].
 
-/// A codec for re-compressing HDF5 datasets.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, clap::ValueEnum)]
+/// A codec for re-compressing HDF5 datasets. Frontend-free: the CLI parses it via
+/// [`std::str::FromStr`] (see the bin), so no `clap` dependency leaks into core.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Codec {
     /// gzip / DEFLATE — built into libhdf5, entropy-coded (~3.5× on 4-bit
     /// weights), but slower.
@@ -15,8 +16,28 @@ pub enum Codec {
     /// 4-bit weights (no entropy coding).
     Lz4,
     /// No compression.
-    #[value(name = "none", aliases = ["store", "uncompressed"])]
     Uncompressed,
+}
+
+impl std::fmt::Display for Codec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl std::str::FromStr for Codec {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "gzip" => Ok(Codec::Gzip),
+            "zstd" => Ok(Codec::Zstd),
+            "lz4" => Ok(Codec::Lz4),
+            "none" | "store" | "uncompressed" => Ok(Codec::Uncompressed),
+            other => Err(format!(
+                "unknown codec '{other}' (expected gzip, zstd, lz4, or none)"
+            )),
+        }
+    }
 }
 
 // Most accessors are only exercised by the `hdf5`-gated repack paths; in a

@@ -19,19 +19,6 @@ use crate::utils::{format_parameters, format_shape, format_size};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// `check --format`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-pub enum Format {
-    /// Human-readable report (default).
-    #[default]
-    Text,
-    /// A structured JSON report: per-check status, findings, and the overall
-    /// exit code — for scripts / agents / CI.
-    Json,
-    /// SARIF 2.1.0 — for GitHub code scanning / static-analysis tooling.
-    Sarif,
-}
-
 /// How serious a finding is. `Error` always fails the run; `Warning` fails only
 /// under `--strict`. Ordered so `Error > Warning` for sorting/severity.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -50,7 +37,7 @@ pub struct Finding {
 }
 
 impl Finding {
-    fn error(subject: Option<String>, message: String) -> Self {
+    pub fn error(subject: Option<String>, message: String) -> Self {
         Finding {
             severity: Severity::Error,
             subject,
@@ -102,7 +89,7 @@ impl CheckResult {
             summary: None,
         }
     }
-    fn done(
+    pub fn done(
         id: &'static str,
         title: &'static str,
         note: &'static str,
@@ -444,12 +431,12 @@ fn sarif_location(subject: &str) -> serde_json::Value {
 }
 
 /// A scan duration for the report, in the progress bar's `12.3s` style.
-pub(crate) fn fmt_elapsed(d: std::time::Duration) -> String {
+pub fn fmt_elapsed(d: std::time::Duration) -> String {
     format!("{:.1}s", d.as_secs_f64())
 }
 
 /// "1 error, 2 warnings" (omitting a zero side, keeping at least one).
-pub(crate) fn count_phrase(errors: usize, warnings: usize) -> String {
+pub fn count_phrase(errors: usize, warnings: usize) -> String {
     let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
     match (errors, warnings) {
         (0, w) => plural(w, "warning"),
@@ -1409,74 +1396,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn popup_folds_findings_like_the_stats_popup() {
-        let findings: Vec<Finding> = (0..250)
-            .map(|i| Finding::error(Some(format!("tensor-{i:04}")), "bad byte range".into()))
-            .collect();
-        let report = CheckReport {
-            label: "x".into(),
-            n_files: 1,
-            n_tensors: 250,
-            params: 1,
-            values: false,
-            results: vec![CheckResult::done(
-                "id",
-                "Byte-range integrity",
-                "n",
-                findings,
-            )],
-        };
-        let render = |expanded| {
-            crate::tui::headless_render(200, 400, |f| {
-                crate::ui::UI::render_check_report(
-                    f,
-                    &report,
-                    crate::ui::CheckPopup::Idle {
-                        copied: None,
-                        can_scan: false,
-                    },
-                    0,
-                    expanded,
-                );
-            })
-            .unwrap()
-        };
-
-        // Folded (default): findings hidden behind a toggle line.
-        let folded = render(false);
-        assert!(
-            folded.contains("250 findings"),
-            "fold toggle shows the count"
-        );
-        // The `f` hint lives in the footer, consistent with the other popups.
-        assert!(
-            folded.contains("expand findings"),
-            "footer hints `f` to expand:\n{folded}"
-        );
-        // Indented under the check title's first letter (4 spaces), not the deeper
-        // finding indent, so the toggle reads as the check's collapsed detail.
-        assert!(
-            folded.contains("    ▸ 250 findings"),
-            "toggle indented under the check title:\n{folded}"
-        );
-        assert!(
-            !folded.contains("tensor-0000"),
-            "findings hidden when folded"
-        );
-
-        // Expanded: the full list (nothing capped), plus a fold-back hint.
-        let expanded = render(true);
-        assert!(expanded.contains("tensor-0000"), "first finding shown");
-        assert!(
-            expanded.contains("tensor-0249"),
-            "last finding shown too (no cap)"
-        );
-        assert!(
-            expanded.contains("fold findings"),
-            "footer offers folding back:\n{expanded}"
-        );
-    }
+    // NOTE: the styled-popup fold test (`render_check_report`) lives in the bin's
+    // `ui` module now — it renders via ratatui, which the frontend-free core
+    // doesn't depend on. See `src/ui.rs` tests.
 
     #[test]
     fn fmt_indices_collapses_runs() {

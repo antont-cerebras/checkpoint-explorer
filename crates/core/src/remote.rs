@@ -100,7 +100,7 @@ type ShardParse = (usize, Vec<TensorInfo>, Vec<MetadataInfo>);
 /// available locally. The scp test (a `:` before any `/`, with a non-empty host to
 /// its left) matches how `scp` itself distinguishes a remote target from a local
 /// path, so local absolute/relative paths are never misread as remote.
-pub(crate) fn is_remote_source(source_path: &str) -> bool {
+pub fn is_remote_source(source_path: &str) -> bool {
     if source_path.starts_with("s3://") {
         return true;
     }

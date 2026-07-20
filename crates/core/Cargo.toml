@@ -1,0 +1,43 @@
+[package]
+name = "checkpoint-explorer-core"
+version = "0.2.1"
+edition = "2024"
+repository = "https://github.com/antont-cerebras/checkpoint-explorer"
+license = "MIT"
+description = "Frontend-free core of checkpoint-explorer: the serializable checkpoint model, readers (local + SSH/S3), derived views, and reports."
+
+[dependencies]
+anyhow = "1.0"
+# `preserve_order` keeps object keys in insertion order, so the in-place tensor
+# rename rewrites a safetensors header without reshuffling its entries.
+serde_json = { version = "1.0", features = ["preserve_order"] }
+serde = { version = "1.0", features = ["derive"] }
+glob = "0.3"
+# Zero-copy reads (mmap) + parallel scans for whole-tensor statistics / value scan.
+memmap2 = "0.9"
+rayon = "1"
+# Read NumPy `.npz` archives (a ZIP of `.npy` entries), pure-Rust deflate.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Pure-Rust SSH/SFTP for `--ssh-read`; vendored OpenSSL so the build is
+# self-contained.
+ssh2 = { version = "0.9.6", features = ["vendored-openssl"] }
+# Read the SSH password from the tty when key/agent auth isn't available.
+rpassword = "7.5.4"
+# Text diffing for the `diff` metadata line-diff.
+similar = "2.7"
+# `diff --map` rename rules (regex → replacement).
+regex = "1"
+# Terminal width for output formatting without the crossterm terminal layer.
+terminal_size = "0.4"
+
+# Optional: read/repack Cerebras-style HDF5 checkpoints (see the bin's `hdf5`
+# feature, which turns this on).
+hdf5-metno = { version = "0.12", optional = true, features = ["static", "zlib", "f16"] }
+ndarray = { version = "0.17", optional = true }
+hdf5-metno-sys = { version = "0.11", optional = true }
+lz4_flex = { version = "0.11", optional = true, default-features = false, features = ["safe-decode"] }
+half = { version = "2", optional = true }
+zstd = { version = "0.13", optional = true }
+
+[features]
+hdf5 = ["dep:hdf5-metno", "dep:ndarray", "dep:hdf5-metno-sys", "dep:lz4_flex", "dep:half", "dep:zstd"]
