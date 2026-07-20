@@ -8095,15 +8095,26 @@ impl Explorer {
         }
     }
 
-    /// Copy the selected row's path to the clipboard (OSC 52): a tensor's file,
-    /// or for a group/root the single file it lives in, else the directory its
-    /// files share (so copying the root yields the file or the checkpoint dir).
+    /// Copy the selected row's path to the clipboard (OSC 52) — see
+    /// [`Self::selected_copy_path`] for what each row yields.
     fn copy_selected_path(&mut self) {
-        let Some((node, _)) = self.flattened_tree.get(self.selected_idx) else {
-            return;
-        };
-        let path = match node {
+        if let Some(path) = self.selected_copy_path() {
+            copy_to_clipboard(&path);
+            self.flash_copied("the source path");
+        }
+    }
+
+    /// The path `f` copies for the current selection: a tensor's own file; for the
+    /// **root** row (the whole checkpoint) its **directory** — never an arbitrary
+    /// shard, even when only one file is loaded; for a non-root group the single
+    /// file it lives in, else the directory its files share.
+    fn selected_copy_path(&self) -> Option<String> {
+        let (node, depth) = self.flattened_tree.get(self.selected_idx)?;
+        match node {
             TreeNode::Tensor { info, .. } => Some(info.source_path.clone()),
+            // The root (depth 0) is the whole checkpoint → its directory/prefix, so
+            // `f` never yields one shard (e.g. `…/model-00016-of-00016.safetensors`).
+            TreeNode::Group { .. } if *depth == 0 => Some(self.checkpoint_dir()),
             // Reuse the cached per-selection walk (see `selected_source_files`) so
             // `f` on a big group doesn't re-traverse the whole subtree.
             TreeNode::Group { .. } => {
@@ -8115,10 +8126,17 @@ impl Explorer {
                 }
             }
             TreeNode::Metadata { .. } => None,
-        };
-        if let Some(path) = path {
-            copy_to_clipboard(&path);
-            self.flash_copied("the source path");
+        }
+    }
+
+    /// The checkpoint's directory / prefix — what `f` copies for the root row: the
+    /// local browse directory, the remote SFTP directory (scp-style `host:/dir`, so
+    /// it's usable with `scp`/`rsync`), or the `s3://` prefix.
+    fn checkpoint_dir(&self) -> String {
+        match &self.remote_browse {
+            Some(RemoteBrowse::S3(uri)) => uri.clone(),
+            Some(RemoteBrowse::Sftp(dir)) => format!("{}:{dir}", self.remote_host_label()),
+            None => self.browse_root.to_string_lossy().into_owned(),
         }
     }
 
@@ -11176,6 +11194,41 @@ mod tests {
             PathBuf::from(".")
         );
         assert_eq!(browse_root_of(&[]), PathBuf::from("."));
+    }
+
+    #[test]
+    fn checkpoint_dir_is_the_directory_not_a_shard() {
+        // `f` on the tree root copies the checkpoint directory — even when only one
+        // shard is loaded, it must not yield that shard's file path.
+        let e = Explorer::new(
+            vec![PathBuf::from(
+                "/cb/home/antont/ws/Qwen3-Coder-30B-A3B/model-00016-of-00016.safetensors",
+            )],
+            Vec::new(),
+            None,
+            false,
+        );
+        assert_eq!(e.checkpoint_dir(), "/cb/home/antont/ws/Qwen3-Coder-30B-A3B");
+
+        // Remote SFTP: scp-style `host:/dir` (usable with scp/rsync).
+        let mut e = Explorer::new(
+            vec![PathBuf::from("/opt/models/ckpt")],
+            Vec::new(),
+            None,
+            false,
+        );
+        e.set_remote_read("net004".into(), "~/venv".into());
+        assert_eq!(e.checkpoint_dir(), "net004:/opt/models/ckpt");
+
+        // Remote s3: the prefix URI is already the "directory".
+        let mut e = Explorer::new(
+            vec![PathBuf::from("s3://bucket/ckpt")],
+            Vec::new(),
+            None,
+            false,
+        );
+        e.set_remote_read("host".into(), "~/venv".into());
+        assert_eq!(e.checkpoint_dir(), "s3://bucket/ckpt");
     }
 
     #[test]
