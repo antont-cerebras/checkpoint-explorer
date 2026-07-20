@@ -14,6 +14,7 @@ pub mod filetree;
 pub mod filter;
 pub mod gguf;
 pub mod health;
+pub mod model;
 pub mod npy;
 pub mod progress;
 pub mod remote;

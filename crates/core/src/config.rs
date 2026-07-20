@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 /// The architecture fields we validate against the tensors. All optional — a
 /// config that omits a field simply skips that check.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelConfig {
     pub model_type: Option<String>,
     pub num_hidden_layers: Option<u64>,

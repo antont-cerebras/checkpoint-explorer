@@ -332,7 +332,7 @@ pub struct FileStats {
 /// filesystem actually allocated. `allocated < apparent` means the filesystem
 /// (e.g. ZFS/btrfs transparent compression, or sparse-file holes) is squeezing
 /// it — a saving invisible to the logical byte counts above.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShardDisk {
     /// The shard's basename, for display.
     pub name: String,
@@ -346,7 +346,7 @@ pub struct ShardDisk {
 /// footprint, gathered from the OS `stat` (`st_blocks`) rather than the logical
 /// byte counts. `None` when it can't be measured (remote `s3://`, a failed stat,
 /// or a non-Unix host).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiskUsage {
     pub shards: Vec<ShardDisk>,
     pub total_apparent: u64,

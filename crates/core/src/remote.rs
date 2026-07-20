@@ -52,7 +52,7 @@ pub struct RemoteCheckpoint {
 /// One S3 object under a checkpoint's prefix, with the metadata `diff` compares.
 /// Fetched best-effort by the remote dump script via boto3 (the remote's own AWS
 /// credentials — nothing S3 happens locally).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct S3Object {
     /// Key relative to the checkpoint prefix, so two prefixes line up by shard.
     pub key: String,
@@ -70,7 +70,7 @@ pub struct S3Object {
 
 /// The S3 objects under an `s3://` checkpoint's prefix, plus any warnings raised
 /// while fetching them (e.g. tags denied). `Some` only for an `s3://` source.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct S3Meta {
     pub objects: Vec<S3Object>,
     pub warnings: Vec<String>,

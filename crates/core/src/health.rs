@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::tree::TensorInfo;
 
 /// The result of comparing an index against the files on disk.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HealthReport {
     /// The index file that was checked.
     pub index_path: String,
