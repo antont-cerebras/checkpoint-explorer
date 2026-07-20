@@ -7,7 +7,7 @@
 //! from the shapes and dtypes already in memory, so the popup is instant even on
 //! multi-GB checkpoints.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::check::{TensorRole, classify_role, expert_index, proj_category, split_layer_index};
 use crate::tree::{Storage, TensorInfo};
@@ -18,6 +18,9 @@ pub(crate) const GLYPH_FILES: &str = "▤";
 pub(crate) const GLYPH_TENSORS: &str = "▦";
 pub(crate) const GLYPH_LAYERS: &str = "≡";
 pub(crate) const GLYPH_EXPERTS: &str = "◆";
+/// The S3-objects section glyph (a cloud) — the `s3://` cstorch source's
+/// underlying object store.
+pub(crate) const GLYPH_S3: &str = "☁";
 
 // ── Per-layer graph geometry + math ─────────────────────────────────────────
 // Pure functions (no ratatui) so the plain report and the styled view agree and
@@ -396,6 +399,95 @@ pub fn shard_name(path: &str) -> String {
     path.rsplit(['/', ':']).next().unwrap_or(path).to_string()
 }
 
+/// One S3 object of an `s3://` cstorch checkpoint, for the stats report's S3
+/// section — the fields worth surfacing about the underlying object store. Built
+/// from the remote read's `S3Meta` at the explorer boundary (like [`ShardDisk`]),
+/// so this module stays free of a remote/network dependency.
+#[derive(Debug, Clone)]
+pub struct S3ObjectStat {
+    /// Key relative to the checkpoint prefix (the shard-ish name).
+    pub key: String,
+    pub size: u64,
+    pub etag: String,
+    /// `(algorithm, value)` when the object stored an additional checksum.
+    pub checksum: Option<(String, String)>,
+    pub last_modified: String,
+    /// Number of object tags, or `None` when they couldn't be read (permission).
+    pub tags: Option<usize>,
+    /// Number of user (`x-amz-meta-*`) metadata entries.
+    pub user_meta: usize,
+}
+
+/// The underlying S3 objects of an `s3://` cstorch checkpoint (the stats report's
+/// S3 section): the per-object rows plus any warnings the remote raised while
+/// reading them (e.g. tags denied). The summary figures are derived on demand so
+/// the styled and plain reports agree. `None` for a local / SFTP checkpoint.
+#[derive(Debug, Clone, Default)]
+pub struct S3Stats {
+    pub objects: Vec<S3ObjectStat>,
+    pub warnings: Vec<String>,
+}
+
+impl S3Stats {
+    pub fn count(&self) -> usize {
+        self.objects.len()
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.objects.iter().map(|o| o.size).sum()
+    }
+
+    /// Objects that reported an ETag.
+    pub fn etags(&self) -> usize {
+        self.objects.iter().filter(|o| !o.etag.is_empty()).count()
+    }
+
+    /// Stored-checksum coverage as `(algorithm, count)`, most common first — e.g.
+    /// `[("SHA256", 126)]`. Empty when no object stored an extra checksum.
+    pub fn checksums(&self) -> Vec<(String, usize)> {
+        let mut by_algo: BTreeMap<String, usize> = BTreeMap::new();
+        for o in &self.objects {
+            if let Some((algo, _)) = &o.checksum {
+                *by_algo.entry(algo.to_uppercase()).or_default() += 1;
+            }
+        }
+        let mut v: Vec<(String, usize)> = by_algo.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    }
+
+    /// Objects whose tags were readable (`Some`), and whether *any* object's tags
+    /// were denied (`s3:GetObjectTagging` refused) — so the report can say
+    /// "N read" vs "unavailable (permission)".
+    pub fn tags_read(&self) -> usize {
+        self.objects.iter().filter(|o| o.tags.is_some()).count()
+    }
+
+    pub fn any_tags_denied(&self) -> bool {
+        self.objects.iter().any(|o| o.tags.is_none())
+    }
+
+    /// Objects carrying any user (`x-amz-meta-*`) metadata.
+    pub fn with_user_meta(&self) -> usize {
+        self.objects.iter().filter(|o| o.user_meta > 0).count()
+    }
+
+    /// The span of object last-modified dates (ISO-8601, so lexicographic min/max
+    /// is chronological) as `(earliest, latest)` date parts — `None` if unknown.
+    pub fn modified_range(&self) -> Option<(String, String)> {
+        let date = |s: &str| s.split('T').next().unwrap_or(s).to_string();
+        let dates: Vec<String> = self
+            .objects
+            .iter()
+            .filter(|o| !o.last_modified.is_empty())
+            .map(|o| date(&o.last_modified))
+            .collect();
+        let lo = dates.iter().min()?.clone();
+        let hi = dates.iter().max()?.clone();
+        Some((lo, hi))
+    }
+}
+
 /// Everything the `s` popup shows, computed once when the popup opens.
 #[derive(Debug, Clone)]
 pub struct CheckpointStats {
@@ -425,6 +517,10 @@ pub struct CheckpointStats {
     pub model_type: Option<String>,
     /// True on-disk footprint from the filesystem, when measurable.
     pub disk: Option<DiskUsage>,
+    /// The underlying S3 objects — `Some` only for an `s3://` cstorch source (set
+    /// via [`Self::with_s3`]); mutually exclusive with `disk` (an s3 source has no
+    /// local filesystem), so both share the report's one foldable breakdown.
+    pub s3: Option<S3Stats>,
 }
 
 impl CheckpointStats {
@@ -528,7 +624,15 @@ impl CheckpointStats {
             experts: expert_stats(tensors, config),
             model_type: config.and_then(|c| c.model_type.clone()),
             disk,
+            s3: None,
         }
+    }
+
+    /// Attach the underlying S3 objects (an `s3://` cstorch source only) — kept out
+    /// of [`Self::compute`] so its many local/test call sites don't churn.
+    pub fn with_s3(mut self, s3: Option<S3Stats>) -> Self {
+        self.s3 = s3;
+        self
     }
 
     /// A plain-text rendering of the stats — what the popup's `r` copies. Mirrors
@@ -739,6 +843,43 @@ impl CheckpointStats {
             }
         }
 
+        // S3 objects (an `s3://` cstorch source) — summary + a per-object list
+        // folded away by default (shared with the on-disk fold; the two never
+        // coexist). Mirrors the styled `stats_body_lines` S3 section.
+        if let Some(s3) = self.s3.as_ref().filter(|s| !s.objects.is_empty()) {
+            out.push(String::new());
+            out.push(format!("{GLYPH_S3} S3 objects  ×{}", s3.count()));
+            out.push(row("Total", format_size(s3.total_bytes() as usize)));
+            out.push(row("Checksums", s3_checksums_phrase(s3)));
+            out.push(row(
+                "ETags",
+                format!("{} of {} present", s3.etags(), s3.count()),
+            ));
+            out.push(row("Tags", s3_tags_phrase(s3)));
+            if let Some(m) = s3_modified_phrase(s3) {
+                out.push(row("Modified", m));
+            }
+            let umeta = s3.with_user_meta();
+            if umeta > 0 {
+                out.push(row(
+                    "User meta",
+                    format!("{umeta} object{}", if umeta == 1 { "" } else { "s" }),
+                ));
+            }
+            if shards_expanded {
+                out.push(format!("  ▾ per-object breakdown ({})", s3.count()));
+                let kw = s3.objects.iter().map(|o| o.key.len()).max().unwrap_or(0);
+                for o in &s3.objects {
+                    out.push(format!("    {:<kw$}  {}", o.key, s3_object_detail(o)));
+                }
+            } else {
+                out.push(format!("  ▸ per-object breakdown ({})", s3.count()));
+            }
+            for w in &s3.warnings {
+                out.push(format!("  ⚠ {w}"));
+            }
+        }
+
         // On disk (filesystem allocation) — the true footprint, ZFS/sparse-aware.
         if let Some(d) = &self.disk {
             out.push(String::new());
@@ -804,6 +945,72 @@ pub(crate) fn ratio_phrase(apparent: u64, allocated: u64) -> String {
     } else {
         format!("{:.2}× smaller", apparent as f64 / allocated as f64)
     }
+}
+
+/// The S3 section's "Checksums" value: stored-checksum coverage by algorithm
+/// (e.g. "126 with SHA256"), or a note that none were stored (so object equality
+/// would rest on the ETag alone). Shared by the plain + styled reports.
+pub(crate) fn s3_checksums_phrase(s3: &S3Stats) -> String {
+    let by_algo = s3.checksums();
+    if by_algo.is_empty() {
+        "none stored".to_string()
+    } else {
+        by_algo
+            .iter()
+            .map(|(a, n)| format!("{n} with {a}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The S3 section's "Tags" value: how many objects carried tags, whether any were
+/// denied by permission (`s3:GetObjectTagging`), or that none were tagged.
+pub(crate) fn s3_tags_phrase(s3: &S3Stats) -> String {
+    let tagged = s3
+        .objects
+        .iter()
+        .filter(|o| o.tags.is_some_and(|n| n > 0))
+        .count();
+    if s3.any_tags_denied() {
+        let denied = s3.count() - s3.tags_read();
+        if tagged > 0 {
+            format!("{tagged} tagged · {denied} unavailable (permission)")
+        } else {
+            "unavailable (permission)".to_string()
+        }
+    } else if tagged > 0 {
+        format!("{tagged} of {} tagged", s3.count())
+    } else {
+        "none".to_string()
+    }
+}
+
+/// The S3 section's "Modified" value: a single date when all objects share one,
+/// else the "earliest – latest" span; `None` when no object reported a date.
+pub(crate) fn s3_modified_phrase(s3: &S3Stats) -> Option<String> {
+    s3.modified_range().map(|(lo, hi)| {
+        if lo == hi {
+            lo
+        } else {
+            format!("{lo} – {hi}")
+        }
+    })
+}
+
+/// One S3 object's detail tail (size + full ETag + full checksum) for the
+/// per-object breakdown, shared by the plain + styled reports. Hashes are shown in
+/// full (not abbreviated) — they're the whole point of the row, and the report
+/// scrolls / the `r` copy carries them verbatim.
+pub(crate) fn s3_object_detail(o: &S3ObjectStat) -> String {
+    use crate::utils::format_size;
+    let mut parts = vec![format!("{:>9}", format_size(o.size as usize))];
+    if !o.etag.is_empty() {
+        parts.push(format!("etag {}", o.etag));
+    }
+    if let Some((algo, val)) = &o.checksum {
+        parts.push(format!("{} {}", algo.to_lowercase(), val));
+    }
+    parts.join("  ")
 }
 
 /// The canonical layer family: its prefix and layer count (highest index + 1).
@@ -1323,6 +1530,76 @@ mod tests {
         assert!(
             !expanded.contains("shards with no filesystem saving"),
             "report:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn report_s3_section_summarizes_and_folds_objects() {
+        let obj = |key: &str, size: u64, checksum: Option<(&str, &str)>, tags: Option<usize>| {
+            S3ObjectStat {
+                key: key.into(),
+                size,
+                etag: "abcdef0123456789abcdef0123456789".into(),
+                checksum: checksum.map(|(a, v)| (a.into(), v.into())),
+                last_modified: "2026-07-19T00:00:00+00:00".into(),
+                tags,
+                user_meta: 0,
+            }
+        };
+        let s3 = S3Stats {
+            objects: vec![
+                obj(
+                    "model-00000.safetensors",
+                    100,
+                    Some(("SHA256", "9f8e7d6c5b4a")),
+                    Some(1),
+                ),
+                obj(
+                    "model-00001.safetensors",
+                    200,
+                    Some(("SHA256", "1122334455aa")),
+                    None,
+                ),
+            ],
+            warnings: vec!["tags unavailable (needs s3:GetObjectTagging)".into()],
+        };
+        let tensors = vec![ti("w", "F32", &[10], 4)];
+        let stats = CheckpointStats::compute(&tensors, None, None).with_s3(Some(s3));
+
+        // Folded: the summary (count, total, checksum coverage, tags note) + a fold
+        // line, but no per-object rows; warnings surface.
+        let folded = stats.render(false);
+        assert!(folded.contains("S3 objects  ×2"), "report:\n{folded}");
+        assert!(folded.contains("2 with SHA256"), "report:\n{folded}");
+        assert!(folded.contains("2 of 2 present"), "etags:\n{folded}");
+        assert!(
+            folded.contains("unavailable (permission)"),
+            "tags:\n{folded}"
+        );
+        assert!(
+            folded.contains("▸ per-object breakdown (2)"),
+            "fold:\n{folded}"
+        );
+        assert!(
+            !folded.contains("model-00000.safetensors"),
+            "folded:\n{folded}"
+        );
+        assert!(folded.contains("s3:GetObjectTagging"), "warning:\n{folded}");
+
+        // Unfolded: every object listed, with its full (un-abbreviated) etag +
+        // checksum — the row's whole point, and copied verbatim by `r`.
+        let expanded = stats.render(true);
+        assert!(
+            expanded.contains("model-00000.safetensors"),
+            "expanded:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("sha256 9f8e7d6c5b4a"),
+            "checksum:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("etag abcdef0123456789abcdef0123456789"),
+            "etag:\n{expanded}"
         );
     }
 

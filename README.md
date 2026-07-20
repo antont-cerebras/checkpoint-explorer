@@ -626,16 +626,28 @@ full-screen view summarising the whole model at a glance (it scrolls with
   usage. The per-shard list is **folded by default** to a one-line summary
   (`N of M smaller`); press `f`, or click the row, to expand it to **every**
   shard's apparent → allocated size. For `--ssh-read` dirs it's measured by a single
-  read-only `stat` on the remote host (SFTP carries no block count); it's omitted
-  for `s3://` and in the deterministic `--plain` render (a live measurement isn't
-  reproducible).
+  read-only `stat -L` on the remote host (SFTP carries no block count) — the same
+  symlink-following size resolution the file browser uses, so a symlinked shard
+  shows its real target footprint, not the link stub. It's omitted for `s3://` and
+  in the deterministic `--plain` render (a live measurement isn't reproducible).
+- **☁ S3 objects** — for an `s3://` cstorch source (`--ssh-read`), the underlying
+  object store's metadata: object count and total size, **stored-checksum coverage**
+  by algorithm (e.g. `126 with SHA256`, or "none stored" when equality would rest on
+  the ETag), how many objects reported an **ETag**, **tag** coverage (or
+  "unavailable (permission)" when `s3:GetObjectTagging` is denied), the
+  **last-modified** span, and any user (`x-amz-meta-*`) metadata. The per-object list
+  (each object's size + full ETag / checksum) is **folded by default**; press
+  `f`, or click the row, to expand it. Fetched read-only over SSH with the tensor
+  metadata (a `HEAD` per object), so it needs no local AWS credentials. This
+  replaces the on-disk section for an s3 source (there's no local filesystem).
 
 It's derived from the metadata already in memory (shapes and dtypes, no data
 read), so it's instant even on a multi-GB, multi-shard checkpoint. The body
 scrolls (`↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End`, wheel) when it's taller than the
-popup; `f` folds/unfolds the per-shard list, `r` copies the report as plain text,
-`c` copies the screen, `y` copies the command that reopens it (`--stats`, or
-`--stats-shards` when the list is expanded), and `Esc` or a click dismisses.
+popup; `f` folds/unfolds the per-shard (or S3 per-object) list, `r` copies the
+report as plain text, `c` copies the screen, `y` copies the command that reopens
+it (`--stats`, or `--stats-shards` when the list is expanded), and `Esc` or a
+click dismisses.
 
 #### Dtype override
 

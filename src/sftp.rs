@@ -50,6 +50,18 @@ pub struct ShardListing {
 /// a remote directory (see [`RemoteSession::walk_dir`]).
 pub type DirListing = Vec<(String, u64, bool)>;
 
+/// A remote path's canonical filesystem metadata, with symlinks **followed** —
+/// the value type of [`RemoteSession::stat_paths`], the single source of truth for
+/// remote "file-like" sizes.
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteStat {
+    /// Apparent size (`st_size`) of the target, in bytes.
+    pub apparent: u64,
+    /// On-disk allocation (`st_blocks × block-size`) of the target, in bytes.
+    pub allocated: u64,
+    pub is_dir: bool,
+}
+
 /// An authenticated SSH session. Constructed once per host, then reused for every
 /// read (SFTP for safetensors dirs, an exec channel for the cstorch dump), so a
 /// checkpoint — or two, for `diff` — costs one authentication / one password
@@ -241,23 +253,27 @@ impl RemoteSession {
         // the target's (a symlinked dir stays a size-0 leaf — never descended).
         if !links.is_empty() {
             let paths: Vec<String> = links.iter().map(|(_, _, p)| p.clone()).collect();
-            let resolved = self.resolve_links(&paths);
+            let resolved = self.stat_paths(&paths);
             for (dir, idx, full) in &links {
-                if let Some((is_dir, size)) = resolved.get(full)
+                if let Some(st) = resolved.get(full)
                     && let Some(rows) = map.get_mut(dir)
                 {
-                    rows[*idx].1 = if *is_dir { 0 } else { *size };
+                    rows[*idx].1 = if st.is_dir { 0 } else { st.apparent };
                 }
             }
         }
         Ok(map)
     }
 
-    /// Follow `paths` (symlinks) in one `stat -L` over an SSH exec channel,
-    /// returning `full-path → (is_dir, followed size)` for each that resolved.
-    /// Best-effort: broken links / a non-GNU `stat` just leave entries absent (the
-    /// caller keeps the `lstat` fallback), so this never fails the browse.
-    fn resolve_links(&self, paths: &[String]) -> HashMap<String, (bool, u64)> {
+    /// **The single source of truth for remote "file-like" sizes** — the file
+    /// browser, the layout map, and the stats on-disk section all resolve a path's
+    /// size through here, so they can't disagree. Stats `paths` in one `stat -L`
+    /// exec with symlinks **followed**, so a linked shard reports its *target's*
+    /// size and block allocation (never the ~50 B link stub), returning
+    /// `path → RemoteStat`. Best-effort: a path that can't be resolved (broken
+    /// link, no GNU `stat`) is simply absent, and the exit status is ignored so one
+    /// bad path doesn't drop the rest.
+    pub fn stat_paths(&self, paths: &[String]) -> HashMap<String, RemoteStat> {
         let mut out = HashMap::new();
         if paths.is_empty() {
             return out;
@@ -266,17 +282,13 @@ impl RemoteSession {
             .iter()
             .map(|p| format!(" {}", shell_single_quote(p)))
             .collect();
-        // `-L` follows the link; `%s` target size, `%F` target type, `%n` the path
-        // as given (tab-separated so a spaced type like "regular file" is one field).
-        let command = format!("stat -L -c '%s\t%F\t%n' --{args}");
-        // Ignore the exit status (a broken link makes it non-zero) — the good lines
-        // are already delivered to the callback.
+        // `-L` follows links; `%s` size · `%b` blocks · `%B` block-size · `%F` type
+        // · `%n` the path as given (tab-separated so a spaced type like "regular
+        // file" stays one field, and a path with spaces is the whole last field).
+        let command = format!("stat -L -c '%s\t%b\t%B\t%F\t%n' --{args}");
         let _ = self.exec_capture(&command, "", |line| {
-            let mut it = line.splitn(3, '\t');
-            if let (Some(sz), Some(kind), Some(name)) = (it.next(), it.next(), it.next())
-                && let Ok(sz) = sz.trim().parse::<u64>()
-            {
-                out.insert(name.to_string(), (kind == "directory", sz));
+            if let Some((name, st)) = parse_stat_line(line) {
+                out.insert(name, st);
             }
         });
         out
@@ -290,36 +302,23 @@ impl RemoteSession {
         read_header_sized(&sftp, path)
     }
 
-    /// The on-disk footprint of each path via a single read-only `stat` syscall
-    /// over an SSH exec channel — SFTP carries no block-allocation field, so this
-    /// is the only way to see remote **ZFS/btrfs compression or sparse holes**.
-    /// Returns `(path, apparent, allocated)` per line: `allocated = st_blocks ×
-    /// block-size`, `apparent = st_size`. Uses GNU coreutils `stat`; the caller
-    /// treats any error (missing `stat`, non-GNU, a vanished file) as "unknown".
+    /// The on-disk footprint of each path — `(path, apparent, allocated)` — for the
+    /// stats "on disk" section, showing remote **ZFS/btrfs compression or sparse
+    /// holes** (SFTP carries no block count). Derived from [`Self::stat_paths`],
+    /// the one source of truth for remote file sizes, so it **follows symlinks**:
+    /// a linked shard reports its target's real footprint, agreeing with the file
+    /// browser and layout map (rather than the ~50 B link stub). Paths that don't
+    /// resolve are omitted (treated as "unknown"), preserving the input order.
     pub fn allocated_sizes(&self, paths: &[String]) -> Result<Vec<(String, u64, u64)>> {
-        if paths.is_empty() {
-            return Ok(Vec::new());
-        }
-        // `%b` blocks · `%B` bytes-per-block · `%s` apparent size · `%n` the path.
-        let args: String = paths
+        let stats = self.stat_paths(paths);
+        Ok(paths
             .iter()
-            .map(|p| format!(" {}", shell_single_quote(p)))
-            .collect();
-        let command = format!("stat -c '%b %B %s %n' --{args}");
-        let mut rows = Vec::new();
-        self.exec_capture(&command, "", |line| {
-            // "<blocks> <blocksize> <size> <path…>" — the path (`%n`) is last and
-            // may contain spaces, so only the first three fields are numbers.
-            let mut it = line.trim().splitn(4, ' ');
-            if let (Some(b), Some(bs), Some(sz), Some(name)) =
-                (it.next(), it.next(), it.next(), it.next())
-                && let (Ok(b), Ok(bs), Ok(sz)) =
-                    (b.parse::<u64>(), bs.parse::<u64>(), sz.parse::<u64>())
-            {
-                rows.push((name.to_string(), sz, b * bs));
-            }
-        })?;
-        Ok(rows)
+            .filter_map(|p| {
+                stats
+                    .get(p)
+                    .map(|st| (p.clone(), st.apparent, st.allocated))
+            })
+            .collect())
     }
 
     /// Claim shards from the shared `next` counter and read+parse each header over
@@ -670,6 +669,26 @@ fn read_header(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<u8>> {
     Ok(header)
 }
 
+/// Parse one `stat -L -c '%s\t%b\t%B\t%F\t%n'` line into `(path, RemoteStat)`:
+/// size · blocks · block-size · type · path. The path (`%n`) is the whole last
+/// field, so a path containing spaces (or the type's own space, "regular file")
+/// survives. Pure, so the format is unit-tested without a live SFTP server.
+fn parse_stat_line(line: &str) -> Option<(String, RemoteStat)> {
+    let mut it = line.splitn(5, '\t');
+    let (s, b, bs, kind, name) = (it.next()?, it.next()?, it.next()?, it.next()?, it.next()?);
+    let apparent = s.trim().parse::<u64>().ok()?;
+    let blocks = b.trim().parse::<u64>().ok()?;
+    let block_size = bs.trim().parse::<u64>().ok()?;
+    Some((
+        name.to_string(),
+        RemoteStat {
+            apparent,
+            allocated: blocks * block_size,
+            is_dir: kind == "directory",
+        },
+    ))
+}
+
 /// Like [`read_header`], but also returns the file's total size (from a `stat`
 /// on the open handle) — the layout map needs it to size the trailing data gap.
 fn read_header_sized(sftp: &ssh2::Sftp, path: &str) -> Result<(u64, Vec<u8>)> {
@@ -701,6 +720,37 @@ fn read_all(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_stat_line_reads_followed_size_and_allocation() {
+        // size · blocks · block-size · type · path — a followed (`-L`) regular file.
+        let (name, st) = parse_stat_line(
+            "6127900160\t11968752\t512\tregular file\t/ckpt/model-00000.safetensors",
+        )
+        .unwrap();
+        assert_eq!(name, "/ckpt/model-00000.safetensors");
+        assert_eq!(st.apparent, 6_127_900_160);
+        assert_eq!(st.allocated, 11_968_752 * 512); // st_blocks × block-size
+        assert!(!st.is_dir);
+
+        // A directory target (a followed symlink-to-dir).
+        assert!(
+            parse_stat_line("4096\t8\t512\tdirectory\t/d")
+                .unwrap()
+                .1
+                .is_dir
+        );
+        // The path (last field) keeps embedded spaces intact.
+        assert_eq!(
+            parse_stat_line("1\t1\t512\tregular file\t/a b/c d.safetensors")
+                .unwrap()
+                .0,
+            "/a b/c d.safetensors"
+        );
+        // Garbage / short lines are ignored, not panics.
+        assert!(parse_stat_line("nope").is_none());
+        assert!(parse_stat_line("x\ty\tz\tregular file\t/p").is_none());
+    }
 
     #[test]
     fn parses_targets() {
