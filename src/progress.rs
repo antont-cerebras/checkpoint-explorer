@@ -200,9 +200,7 @@ fn spawn(
     // Fit labels to the terminal width so a line (mark + path + bar + timer) can't
     // wrap and break the fixed-height redraw. Truncate in the *middle* so both
     // ends — the `s3://`/`host:` prefix and the checkpoint tail — stay visible.
-    let cols = crossterm::terminal::size()
-        .map(|(c, _)| c as usize)
-        .unwrap_or(80);
+    let cols = crate::utils::term_width(80);
     // "  ⠋ <label>  [bar]  123/456  12.3s"
     let budget = cols.saturating_sub(BAR_COLS + 30).max(20);
     let labels: Vec<String> = labels.iter().map(|l| truncate_middle(l, budget)).collect();

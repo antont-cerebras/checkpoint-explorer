@@ -18,6 +18,9 @@ crossterm = "0.28"
 serde_json = { version = "1.0", features = ["preserve_order"] }
 glob = "0.3"
 fuzzy-matcher = "0.3"
+# Terminal width for output formatting (diff/progress) without pulling the full
+# crossterm terminal layer into the core — a tiny, dependency-light ioctl wrapper.
+terminal_size = "0.4"
 # Zero-copy reads (mmap) + parallel scans for whole-tensor statistics.
 memmap2 = "0.9"
 rayon = "1"

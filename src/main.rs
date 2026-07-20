@@ -24,6 +24,7 @@ mod safelayout;
 mod sample;
 mod sftp;
 mod stats;
+mod stheader;
 mod tree;
 mod tui;
 mod ui;

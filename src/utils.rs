@@ -40,6 +40,16 @@ pub fn parse_size(s: &str) -> Result<usize, String> {
         .map_err(|_| format!("invalid size '{s}' (use e.g. 64M, 256M, 1G)"))
 }
 
+/// Terminal width in columns, or `fallback` when not attached to a tty — the
+/// core's frontend-free replacement for `crossterm::terminal::size()`, so output
+/// formatters (diff, progress bars) can fit the terminal without depending on the
+/// full crossterm terminal layer.
+pub fn term_width(fallback: usize) -> usize {
+    terminal_size::terminal_size()
+        .map(|(w, _)| w.0 as usize)
+        .unwrap_or(fallback)
+}
+
 pub fn format_shape(shape: &[usize]) -> String {
     format!(
         "({})",

@@ -5,8 +5,8 @@
 //!
 //! - a **safetensors directory/file** is read over SFTP — open each shard, read
 //!   just its header (8-byte length + JSON; SFTP fetches only the bytes we ask
-//!   for, never the multi-GB body) and parse with the local safetensors parser
-//!   ([`Explorer::parse_safetensors_header`]).
+//!   for, never the multi-GB body) and parse with the shared safetensors parser
+//!   ([`crate::stheader::parse_header`]).
 //! - an **`s3://…` cstorch checkpoint** is read by running the lazy cstorch dump
 //!   script over an SSH *exec* channel ([`RemoteSession::exec_capture`]); the
 //!   caller ([`crate::remote`]) builds the script and parses the result.
@@ -26,7 +26,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use ssh2::{CheckResult, KnownHostFileKind, Session};
 
-use crate::explorer::Explorer;
 use crate::tree::{MetadataInfo, TensorInfo};
 
 /// What one pass over a remote directory (one `readdir`, one index read) yields:
@@ -345,7 +344,7 @@ impl RemoteSession {
                 break;
             }
             let header = read_header(&sftp, &files[idx])?;
-            let (ts, ms) = Explorer::parse_safetensors_header(&header, &displays[idx])?;
+            let (ts, ms) = crate::stheader::parse_header(&header, &displays[idx])?;
             out.push((idx, ts, ms));
             if let Some(p) = progress {
                 p.advance();
@@ -662,7 +661,7 @@ fn read_header(sftp: &ssh2::Sftp, path: &str) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 8];
     f.read_exact(&mut len_buf)
         .with_context(|| format!("reading header length of {path}"))?;
-    let n = Explorer::safetensors_header_len(u64::from_le_bytes(len_buf), path)?;
+    let n = crate::stheader::header_len(u64::from_le_bytes(len_buf), path)?;
     let mut header = vec![0u8; n];
     f.read_exact(&mut header)
         .with_context(|| format!("reading header of {path}"))?;
@@ -701,7 +700,7 @@ fn read_header_sized(sftp: &ssh2::Sftp, path: &str) -> Result<(u64, Vec<u8>)> {
     let mut len_buf = [0u8; 8];
     f.read_exact(&mut len_buf)
         .with_context(|| format!("reading header length of {path}"))?;
-    let n = Explorer::safetensors_header_len(u64::from_le_bytes(len_buf), path)?;
+    let n = crate::stheader::header_len(u64::from_le_bytes(len_buf), path)?;
     let mut header = vec![0u8; n];
     f.read_exact(&mut header)
         .with_context(|| format!("reading header of {path}"))?;

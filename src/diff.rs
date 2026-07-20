@@ -1825,11 +1825,7 @@ const MAX_META_DIFF_LINES: usize = 20;
 /// that pretty-JSON leaves as a single escaped string). Uses the terminal width
 /// when attached, else a sane default; leaves room for the indent.
 fn meta_line_width() -> usize {
-    crossterm::terminal::size()
-        .map(|(cols, _)| cols as usize)
-        .unwrap_or(120)
-        .saturating_sub(6)
-        .max(40)
+    crate::utils::term_width(120).saturating_sub(6).max(40)
 }
 
 /// Window two long, differing lines each to `max` columns around where they first
