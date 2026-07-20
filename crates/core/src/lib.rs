@@ -17,6 +17,7 @@ pub mod health;
 pub mod model;
 pub mod npy;
 pub mod progress;
+pub mod readers;
 pub mod remote;
 pub mod rename;
 pub mod s3;
