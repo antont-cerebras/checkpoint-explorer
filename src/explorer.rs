@@ -350,6 +350,27 @@ type CheckpointParts = (
 
 /// The bottom status bar's text: `(icon, primary line, secondary line)`.
 type StatusBar = (&'static str, String, String);
+
+/// What the current selection shows and copies, produced together by
+/// [`Explorer::describe_selection`] — the single source of truth for the status
+/// bar and the `f` copy, so the path shown and the path copied can't diverge.
+struct SelectionView {
+    /// The status bar `(glyph, primary, secondary)`.
+    status: StatusBar,
+    /// The path `f` copies (`None` for metadata / an empty selection). Always a
+    /// substring of `status.1` for a group, so the two agree.
+    copy_path: Option<String>,
+}
+
+impl SelectionView {
+    /// The empty selection (nothing highlighted / an empty group).
+    fn empty() -> Self {
+        SelectionView {
+            status: ("", String::new(), String::new()),
+            copy_path: None,
+        }
+    }
+}
 /// The selected node's distinct source files, cached with its key — the
 /// selection index, tree length, and search mode (see
 /// [`Explorer::selected_source_files`]).
@@ -8047,85 +8068,115 @@ impl Explorer {
 
     /// The bottom status bar for the current selection. The group case reuses the
     /// cached [`Self::selected_source_files`] walk, so it's cheap every frame.
+    /// The status bar for the current selection — its display half of
+    /// [`Self::describe_selection`], the single source both it and the `f` copy
+    /// derive from (so the path shown and the path copied can never disagree).
     fn status_bar(&self) -> StatusBar {
+        self.describe_selection().status
+    }
+
+    /// Copy the selected row's path to the clipboard (OSC 52) — the copy half of
+    /// [`Self::describe_selection`], so `f` copies exactly the path the status bar
+    /// shows.
+    fn copy_selected_path(&mut self) {
+        if let Some(path) = self.describe_selection().copy_path {
+            copy_to_clipboard(&path);
+            self.flash_copied("the source path");
+        }
+    }
+
+    /// **The one place** that turns the current selection into what the UI shows
+    /// and copies for it — the status-bar `(glyph, primary, secondary)` *and* the
+    /// path `f` copies — computed together from a single analysis of the selected
+    /// row, so the two can never drift apart (the class of "the status bar shows
+    /// one path but `f` copies another" bug is made impossible by construction).
+    ///
+    /// Per row: a **tensor** → its own file; the **root** (the whole checkpoint) →
+    /// its directory/prefix, never an arbitrary shard, even when one file is
+    /// loaded; a non-root **group** → its single file, else the directory its files
+    /// share (or a "stored across N files" span when they don't); **metadata** →
+    /// no path.
+    fn describe_selection(&self) -> SelectionView {
         let tree = if self.search_mode {
             &self.filtered_tree
         } else {
             &self.flattened_tree
         };
-        let Some((node, _)) = tree.get(self.selected_idx) else {
-            return ("", String::new(), String::new());
+        let Some((node, depth)) = tree.get(self.selected_idx) else {
+            return SelectionView::empty();
         };
-
         match node {
             // The full name on the first line (the tree row often abbreviates it —
             // last segment or a compacted path), the source file on the second.
             // `n` copies the name, `f` the file.
-            TreeNode::Tensor { info, .. } => ("▪", info.name.clone(), info.source_path.clone()),
+            TreeNode::Tensor { info, .. } => SelectionView {
+                status: ("▪", info.name.clone(), info.source_path.clone()),
+                copy_path: Some(info.source_path.clone()),
+            },
+            // The root (depth 0) is the whole checkpoint → its directory/prefix (so
+            // `f` and the status bar both show the dir, never one shard like
+            // `…/model-00016-of-00016.safetensors`). A file-count prefix adds
+            // context, but the directory shown IS the directory copied.
+            TreeNode::Group { .. } if *depth == 0 => {
+                let dir = self.checkpoint_dir();
+                let n = self.selected_source_files().len();
+                let primary = if n > 1 {
+                    format!("{n} files in {dir}")
+                } else {
+                    dir.clone()
+                };
+                SelectionView {
+                    status: ("▸", primary, String::new()),
+                    copy_path: Some(dir),
+                }
+            }
+            // A non-root group: the file it lives in, else the directory its files
+            // share. The `primary` string always contains `copy_path`, so the shown
+            // and copied paths agree. (Cached per-selection walk — see
+            // `selected_source_files` — so `f` on a big group doesn't re-traverse.)
             TreeNode::Group { .. } => {
                 let files = self.selected_source_files();
                 match files.len() {
-                    0 => ("", String::new(), String::new()),
-                    1 => (
-                        "▪",
-                        files.into_iter().next().unwrap_or_default(),
-                        String::new(),
-                    ),
-                    // When the files share a directory, show that instead of a long
-                    // list — most checkpoints live in one folder.
-                    n => {
-                        let primary = match common_dir(&files) {
-                            Some(dir) => format!("{n} files in {dir}"),
-                            None => {
-                                let first = file_name(files.iter().next().unwrap());
-                                let last = file_name(files.iter().next_back().unwrap());
-                                format!("stored across {n} files: {first} … {last}")
-                            }
-                        };
-                        ("▸", primary, String::new())
+                    0 => SelectionView::empty(),
+                    1 => {
+                        let file = files.into_iter().next().unwrap_or_default();
+                        SelectionView {
+                            status: ("▪", file.clone(), String::new()),
+                            copy_path: Some(file),
+                        }
                     }
+                    // Files sharing a directory show + copy that directory; files
+                    // that don't show a span and copy the first (nothing shared).
+                    n => match common_dir(&files) {
+                        Some(dir) => SelectionView {
+                            status: ("▸", format!("{n} files in {dir}"), String::new()),
+                            copy_path: Some(dir),
+                        },
+                        None => {
+                            let first = files.iter().next().cloned().unwrap_or_default();
+                            let first_name = file_name(&first);
+                            let last_name = file_name(files.iter().next_back().unwrap());
+                            SelectionView {
+                                status: (
+                                    "▸",
+                                    format!("stored across {n} files: {first_name} … {last_name}"),
+                                    String::new(),
+                                ),
+                                copy_path: Some(first),
+                            }
+                        }
+                    },
                 }
             }
             // The full metadata path on the first line (the tree row shows only
             // the short `…__metadata__` label); the value preview on the second.
             TreeNode::Metadata { info } => {
                 let value = info.value.split_whitespace().collect::<Vec<_>>().join(" ");
-                ("†", info.name.clone(), value)
-            }
-        }
-    }
-
-    /// Copy the selected row's path to the clipboard (OSC 52) — see
-    /// [`Self::selected_copy_path`] for what each row yields.
-    fn copy_selected_path(&mut self) {
-        if let Some(path) = self.selected_copy_path() {
-            copy_to_clipboard(&path);
-            self.flash_copied("the source path");
-        }
-    }
-
-    /// The path `f` copies for the current selection: a tensor's own file; for the
-    /// **root** row (the whole checkpoint) its **directory** — never an arbitrary
-    /// shard, even when only one file is loaded; for a non-root group the single
-    /// file it lives in, else the directory its files share.
-    fn selected_copy_path(&self) -> Option<String> {
-        let (node, depth) = self.flattened_tree.get(self.selected_idx)?;
-        match node {
-            TreeNode::Tensor { info, .. } => Some(info.source_path.clone()),
-            // The root (depth 0) is the whole checkpoint → its directory/prefix, so
-            // `f` never yields one shard (e.g. `…/model-00016-of-00016.safetensors`).
-            TreeNode::Group { .. } if *depth == 0 => Some(self.checkpoint_dir()),
-            // Reuse the cached per-selection walk (see `selected_source_files`) so
-            // `f` on a big group doesn't re-traverse the whole subtree.
-            TreeNode::Group { .. } => {
-                let files = self.selected_source_files();
-                match files.len() {
-                    0 => None,
-                    1 => files.into_iter().next(),
-                    _ => common_dir(&files).or_else(|| files.into_iter().next()),
+                SelectionView {
+                    status: ("†", info.name.clone(), value),
+                    copy_path: None,
                 }
             }
-            TreeNode::Metadata { .. } => None,
         }
     }
 
@@ -11229,6 +11280,67 @@ mod tests {
         );
         e.set_remote_read("host".into(), "~/venv".into());
         assert_eq!(e.checkpoint_dir(), "s3://bucket/ckpt");
+    }
+
+    #[test]
+    fn status_bar_and_copy_path_share_one_source_for_the_root() {
+        use crate::tree::{Layout, Storage, TensorInfo};
+        let ti = |name: &str, shard: &str| TensorInfo {
+            name: name.into(),
+            dtype: "F32".into(),
+            shape: vec![2],
+            size_bytes: 8,
+            num_elements: 2,
+            storage: Storage::Unknown,
+            source_path: format!("/ckpt/{shard}"),
+            layout: Layout::None,
+        };
+
+        // A single-shard open: the root's status bar and `f` copy must BOTH show
+        // the checkpoint directory, never the shard (the reported bug).
+        let mut e = Explorer::new(
+            vec![PathBuf::from("/ckpt/model-00016-of-00016.safetensors")],
+            Vec::new(),
+            None,
+            false,
+        );
+        e.tensors = vec![ti("lm_head.weight", "model-00016-of-00016.safetensors")];
+        e.build_tree();
+        e.selected_idx = 0; // the root row
+        let view = e.describe_selection();
+        assert_eq!(view.copy_path.as_deref(), Some("/ckpt"));
+        assert_eq!(view.status.1, "/ckpt"); // status bar shows the dir, not the shard
+        assert!(
+            !view.status.1.contains(".safetensors"),
+            "status: {:?}",
+            view.status
+        );
+
+        // A two-shard directory open: still the directory, with a count prefix —
+        // and the copied dir is a substring of what the status bar shows (they come
+        // from the one `describe_selection`, so they can't disagree).
+        let mut e = Explorer::new(
+            vec![
+                PathBuf::from("/ckpt/model-00001-of-00002.safetensors"),
+                PathBuf::from("/ckpt/model-00002-of-00002.safetensors"),
+            ],
+            Vec::new(),
+            None,
+            false,
+        );
+        e.tensors = vec![
+            ti(
+                "model.embed_tokens.weight",
+                "model-00001-of-00002.safetensors",
+            ),
+            ti("lm_head.weight", "model-00002-of-00002.safetensors"),
+        ];
+        e.build_tree();
+        e.selected_idx = 0;
+        let view = e.describe_selection();
+        assert_eq!(view.copy_path.as_deref(), Some("/ckpt"));
+        assert_eq!(view.status.1, "2 files in /ckpt");
+        assert!(view.status.1.contains(view.copy_path.as_deref().unwrap()));
     }
 
     #[test]
