@@ -2621,13 +2621,17 @@ impl StatsMode {
             .expect("on_enter computes and caches the stats")
     }
 
-    /// Whether there's a per-shard on-disk breakdown to fold (more than one shard).
+    /// Whether the report has a foldable breakdown for `f` / a click to toggle: a
+    /// multi-shard on-disk section, or the S3 per-object list (an s3 source has no
+    /// on-disk section, so the two never coexist and share the one fold state).
     fn has_fold(&self, ex: &Explorer) -> bool {
-        ex.checkpoint_stats_cache
-            .borrow()
-            .as_ref()
-            .and_then(|s| s.disk.as_ref())
-            .is_some_and(|d| d.shards.len() > 1)
+        let cache = ex.checkpoint_stats_cache.borrow();
+        let Some(s) = cache.as_ref() else {
+            return false;
+        };
+        let on_disk = s.disk.as_ref().is_some_and(|d| d.shards.len() > 1);
+        let s3 = s.s3.as_ref().is_some_and(|x| !x.objects.is_empty());
+        on_disk || s3
     }
 }
 
@@ -2658,7 +2662,8 @@ impl Mode for StatsMode {
                 &ex.tensors,
                 ex.config.as_ref(),
                 ex.disk_usage(),
-            );
+            )
+            .with_s3(ex.s3_stats());
             *ex.checkpoint_stats_cache.borrow_mut() = Some(s);
         }
         Ok(Outcome::Stay)
@@ -3722,6 +3727,10 @@ pub struct Explorer {
     /// When set (`--ssh-read`), remote `s3://…` sources have their metadata read
     /// over SSH via cstorch on the remote, instead of directly (metadata-only).
     remote_read: Option<crate::remote::RemoteRead>,
+    /// The underlying S3 objects' metadata, fetched up front for an `s3://` source
+    /// (checksums/ETags/tags/sizes) and shown in the stats report's S3 section.
+    /// `None` for a local / SFTP checkpoint.
+    s3_meta: Option<crate::remote::S3Meta>,
     /// The remote source kind for the file browser (`None` locally). Set alongside
     /// [`Self::remote_read`] from the raw `--ssh-read` source; gates
     /// [`Self::file_view_available`] and selects the browse backend.
@@ -3918,6 +3927,7 @@ impl Explorer {
             metadata: Vec::new(),
             config: None,
             remote_read: None,
+            s3_meta: None,
             remote_browse: None,
             remote_session: RefCell::new(None),
             remote_password: RefCell::new(None),
@@ -4396,13 +4406,16 @@ impl Explorer {
         let mut config: Option<crate::config::ModelConfig> = None;
         let mut disk_shards: Vec<crate::stats::ShardDisk> = Vec::new();
         let mut health: Vec<crate::health::HealthReport> = Vec::new();
+        let mut s3_meta: Option<crate::remote::S3Meta> = None;
         for file_path in &self.files {
             let as_str = file_path.to_string_lossy().into_owned();
             let bars = crate::progress::Bars::start(vec![as_str.clone()]);
             let progress = bars.progress(0);
-            // Interactive browse doesn't use S3 object metadata (that's `diff`-only).
+            // Fetch the S3 object metadata up front for an `s3://` source (checksums
+            // /ETags/tags — a HEAD per object), so the stats report's S3 section is
+            // ready; `want_s3` is a no-op for an SFTP source.
             let pw = self.remote_password.borrow().clone();
-            let out = r.read(&session, &as_str, &pw, progress.as_deref(), false);
+            let out = r.read(&session, &as_str, &pw, progress.as_deref(), true);
             bars.finish(0, out.is_ok());
             bars.join();
             let rc = out?;
@@ -4412,11 +4425,15 @@ impl Explorer {
                 disk_shards.extend(d.shards);
             }
             health.extend(rc.health);
+            if let Some(s3) = rc.s3 {
+                s3_meta = Some(s3); // one `s3://` source per run
+            }
             if config.is_none() {
                 config = r.read_config(&session, &as_str);
             }
         }
         *self.remote_session.borrow_mut() = Some(session);
+        self.s3_meta = s3_meta;
         Ok((
             tensors,
             metadata,
@@ -5311,7 +5328,8 @@ impl Explorer {
                     &self.tensors,
                     self.config.as_ref(),
                     None,
-                );
+                )
+                .with_s3(self.s3_stats());
                 let text = crate::tui::headless_render(120, 40, |f| {
                     UI::render_stats_frame(f, &stats, 0, want_stats_shards);
                 })?;
@@ -9941,6 +9959,31 @@ impl Explorer {
     /// The checkpoint's true on-disk footprint for the stats popup. Remote reads
     /// captured it at load time (the session is gone now); local checkpoints are
     /// statted here — cheap, and it picks up any change since load.
+    /// The S3 objects for the stats report's S3 section — converting the remote
+    /// read's [`crate::remote::S3Meta`] into the stats module's own
+    /// [`crate::stats::S3Stats`] (so `stats` stays free of a remote dependency).
+    /// `None` for a local / SFTP checkpoint.
+    fn s3_stats(&self) -> Option<crate::stats::S3Stats> {
+        let meta = self.s3_meta.as_ref()?;
+        let objects = meta
+            .objects
+            .iter()
+            .map(|o| crate::stats::S3ObjectStat {
+                key: o.key.clone(),
+                size: o.size,
+                etag: o.etag.clone(),
+                checksum: o.checksum.clone(),
+                last_modified: o.last_modified.clone(),
+                tags: o.tags.as_ref().map(|t| t.len()),
+                user_meta: o.user_meta.len(),
+            })
+            .collect();
+        Some(crate::stats::S3Stats {
+            objects,
+            warnings: meta.warnings.clone(),
+        })
+    }
+
     fn disk_usage(&self) -> Option<crate::stats::DiskUsage> {
         if self.remote_read.is_some() {
             return self.remote_disk.clone();

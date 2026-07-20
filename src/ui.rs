@@ -3513,6 +3513,69 @@ impl UI {
             }
         }
 
+        // ── S3 objects (an `s3://` cstorch source) ─────────────────────────────
+        // Summary + a per-object breakdown folded away by default. Shares the one
+        // `fold_line` with the on-disk section — an s3 source has no local
+        // filesystem, so the two never both appear.
+        if let Some(s3) = s.s3.as_ref().filter(|x| !x.objects.is_empty()) {
+            lines.push(Line::from(sty(String::new(), Style::default())));
+            lines.push(section(
+                crate::stats::GLYPH_S3,
+                "S3 objects",
+                format!("×{}", s3.count()),
+                "",
+            ));
+            lines.push(row(
+                "Total",
+                vec![plain(format_size(s3.total_bytes() as usize))],
+            ));
+            lines.push(row(
+                "Checksums",
+                vec![plain(crate::stats::s3_checksums_phrase(s3))],
+            ));
+            lines.push(row(
+                "ETags",
+                vec![plain(format!("{} of {} present", s3.etags(), s3.count()))],
+            ));
+            lines.push(row("Tags", vec![plain(crate::stats::s3_tags_phrase(s3))]));
+            if let Some(m) = crate::stats::s3_modified_phrase(s3) {
+                lines.push(row("Modified", vec![plain(m)]));
+            }
+            let umeta = s3.with_user_meta();
+            if umeta > 0 {
+                lines.push(row(
+                    "User meta",
+                    vec![plain(format!(
+                        "{umeta} object{}",
+                        if umeta == 1 { "" } else { "s" }
+                    ))],
+                ));
+            }
+            // A click on this line or `f` toggles the per-object list.
+            let arrow = if shards_expanded { "▾" } else { "▸" };
+            fold_line = Some(lines.len());
+            lines.push(Line::from(vec![
+                sty(format!("  {arrow} "), Style::default().fg(palette::ACCENT)),
+                plain("per-object breakdown".into()),
+                dim(format!("  ({})", s3.count())),
+            ]));
+            if shards_expanded {
+                let kw = s3.objects.iter().map(|o| o.key.len()).max().unwrap_or(0);
+                for o in &s3.objects {
+                    lines.push(Line::from(vec![
+                        sty(
+                            format!("    {:<kw$}  ", o.key),
+                            Style::default().fg(palette::META),
+                        ),
+                        plain(crate::stats::s3_object_detail(o)),
+                    ]));
+                }
+            }
+            for w in &s3.warnings {
+                lines.push(Line::from(dim(format!("  ⚠ {w}"))));
+            }
+        }
+
         // ── On disk (filesystem allocation) ────────────────────────────────────
         if let Some(d) = &s.disk {
             lines.push(Line::from(sty(String::new(), Style::default())));
@@ -7533,6 +7596,65 @@ mod tests {
         assert_eq!(NumBase::Hex.digits(8), 2);
         assert_eq!(NumBase::Hex.digits(4), 1);
         assert_eq!(NumBase::Octal.digits(8), 3);
+    }
+
+    #[test]
+    fn stats_popup_renders_s3_section() {
+        use crate::stats::{CheckpointStats, S3ObjectStat, S3Stats};
+        use crate::tree::{Layout, Storage, TensorInfo};
+        let tensors = vec![TensorInfo {
+            name: "w".into(),
+            dtype: "F32".into(),
+            shape: vec![4],
+            size_bytes: 16,
+            num_elements: 4,
+            storage: Storage::Unknown,
+            source_path: "s3://bucket/ckpt".into(),
+            layout: Layout::None,
+        }];
+        let s3 = S3Stats {
+            objects: vec![
+                S3ObjectStat {
+                    key: "model-00000.safetensors".into(),
+                    size: 100,
+                    etag: "abcdef0123456789".into(),
+                    checksum: Some(("SHA256".into(), "9f8e7d6c5b4a3210".into())),
+                    last_modified: "2026-07-19T00:00:00+00:00".into(),
+                    tags: Some(1),
+                    user_meta: 1,
+                },
+                S3ObjectStat {
+                    key: "model-00001.safetensors".into(),
+                    size: 200,
+                    etag: "112233445566".into(),
+                    checksum: Some(("SHA256".into(), "aabbccddeeff".into())),
+                    last_modified: "2026-07-18T00:00:00+00:00".into(),
+                    tags: Some(0),
+                    user_meta: 0,
+                },
+            ],
+            warnings: Vec::new(),
+        };
+        let stats = CheckpointStats::compute(&tensors, None, None).with_s3(Some(s3));
+
+        // Expanded: the S3 summary + every object row (abbreviated etag/checksum).
+        let expanded = crate::tui::headless_render(100, 50, |f| {
+            UI::render_stats_frame(f, &stats, 0, true);
+        })
+        .unwrap();
+        assert!(expanded.contains("S3 objects"), "{expanded}");
+        assert!(expanded.contains("2 with SHA256"), "{expanded}");
+        assert!(expanded.contains("2026-07-18 – 2026-07-19"), "{expanded}");
+        assert!(expanded.contains("model-00000.safetensors"), "{expanded}");
+        assert!(expanded.contains("sha256 9f8e7d6c5b4a3210"), "{expanded}");
+
+        // Folded (default): the per-object list collapses to a single toggle line.
+        let folded = crate::tui::headless_render(100, 50, |f| {
+            UI::render_stats_frame(f, &stats, 0, false);
+        })
+        .unwrap();
+        assert!(folded.contains("per-object breakdown"), "{folded}");
+        assert!(!folded.contains("model-00000.safetensors"), "{folded}");
     }
 
     #[test]
