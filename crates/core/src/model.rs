@@ -104,6 +104,11 @@ impl FsNode {
 /// (size, content kind, link target) live in the tagged [`FsNode`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileEntry {
+    /// The filesystem kind + kind-specific data (size / content kind / link target).
+    /// Declared **first** so its internally-tagged `"type"` key leads the JSON
+    /// object for every entry, ahead of the common path/name/… fields.
+    #[serde(flatten)]
+    pub node: FsNode,
     /// Path relative to the checkpoint root (POSIX `/`-separated).
     pub rel_path: String,
     /// The final path component (the display name).
@@ -114,9 +119,6 @@ pub struct FileEntry {
     pub mode: Option<u32>,
     /// Modification time (seconds since the epoch), when known.
     pub mtime: Option<i64>,
-    /// The filesystem kind + kind-specific data (size / content kind / link target).
-    #[serde(flatten)]
-    pub node: FsNode,
 }
 
 impl FileEntry {
