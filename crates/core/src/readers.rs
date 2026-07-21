@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::filetree::FileKind;
-use crate::model::{Checkpoint, FileEntry, IndexEntry, ShardHeader, Source};
+use crate::model::{Checkpoint, FileEntry, FsNode, IndexEntry, ShardHeader, Source};
 use crate::tree::{Layout, MetadataInfo, Storage, TensorInfo};
 
 /// Read a local checkpoint (a directory, a single file, or several files) fully
@@ -111,29 +111,40 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<FileEntry>) {
         };
         // A real directory descends; a symlinked directory stays a leaf.
         let descendable = is_dir && !is_symlink;
-        let symlink_target = if is_symlink {
-            std::fs::read_link(&path)
-                .ok()
-                .map(|t| t.to_string_lossy().into_owned())
-        } else {
-            None
-        };
         let rel_path = path
             .strip_prefix(root)
             .unwrap_or(&path)
             .to_string_lossy()
             .into_owned();
+        // Classify into the tagged fs-node: a symlink (with its followed sizes),
+        // a real directory, or a regular file.
+        let node = if is_symlink {
+            let target = std::fs::read_link(&path)
+                .ok()
+                .map(|t| t.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            FsNode::Symlink {
+                target,
+                apparent,
+                allocated,
+                kind: FileKind::of(&name),
+            }
+        } else if descendable {
+            FsNode::Directory
+        } else {
+            FsNode::File {
+                apparent,
+                allocated,
+                kind: FileKind::of(&name),
+            }
+        };
         out.push(FileEntry {
             rel_path,
             name: name.clone(),
             depth,
-            apparent,
-            allocated,
-            is_dir: descendable,
-            kind: FileKind::of(&name),
-            symlink_target,
             mode,
             mtime,
+            node,
         });
         if descendable {
             walk(root, &path, depth + 1, out);
@@ -445,7 +456,7 @@ mod tests {
         assert!(
             cp.files
                 .iter()
-                .any(|f| f.name == "model.safetensors" && f.apparent > 0)
+                .any(|f| f.name == "model.safetensors" && f.apparent() > 0)
         );
         assert!(cp.files.iter().any(|f| f.name == "config.json"));
         // Sidecar config + index parsed in the same pass.
@@ -461,6 +472,53 @@ mod tests {
         // The whole model serializes.
         let json = serde_json::to_string(&cp).unwrap();
         assert!(json.contains("\"model_type\":\"llama\""));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The walk classifies each entry into the tagged [`FsNode`]: a regular file,
+    /// a real directory, and a symlink (carrying its raw target + followed size).
+    #[cfg(unix)]
+    #[test]
+    fn walk_tags_files_dirs_and_symlinks() {
+        use crate::model::FsNode;
+        let dir = std::env::temp_dir().join("ce_readers_fsnode_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        write_st(&dir.join("model.safetensors"));
+        // An HF-cache-style symlink to the real shard.
+        std::os::unix::fs::symlink(dir.join("model.safetensors"), dir.join("link.safetensors"))
+            .unwrap();
+
+        let cp = read_local(&[dir.join("model.safetensors")]).unwrap();
+        let node = |name: &str| {
+            cp.files
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.node.clone())
+        };
+
+        // Regular shard → File, with a nonzero size and the Checkpoint content kind.
+        assert!(matches!(
+            node("model.safetensors"),
+            Some(FsNode::File { kind: FileKind::Checkpoint, apparent, .. }) if apparent > 0
+        ));
+        // Subdirectory → Directory (no size fields at all).
+        assert!(matches!(node("sub"), Some(FsNode::Directory)));
+        // Symlink → Symlink, carrying its raw target and the *followed* size/kind.
+        match node("link.safetensors") {
+            Some(FsNode::Symlink {
+                target,
+                apparent,
+                kind,
+                ..
+            }) => {
+                assert!(target.ends_with("model.safetensors"), "target: {target}");
+                assert!(apparent > 0, "followed size");
+                assert_eq!(kind, FileKind::Checkpoint);
+            }
+            other => panic!("expected a symlink fs-node, got {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

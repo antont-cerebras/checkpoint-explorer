@@ -29,12 +29,79 @@ pub enum Source {
     S3 { uri: String },
 }
 
+/// The filesystem kind of a [`FileEntry`], as a **tagged sum type**: a regular
+/// **file**, a **directory**, or a **symlink** each carry exactly the fields that
+/// make sense for them — instead of the old flat struct with an `is_dir` flag plus
+/// an optional `symlink_target`, where illegal states (a directory with a symlink
+/// target, a symlink with `is_dir`) were representable. Serialized
+/// internally-tagged: `{"type":"file","apparent":…,"allocated":…,"kind":…}`,
+/// `{"type":"directory"}`, `{"type":"symlink","target":…,"apparent":…,…}`.
+///
+/// Sizes are **symlink-followed** (the single-source-of-truth invariant):
+/// `apparent` is `st_size` of the target, `allocated` its on-disk block allocation
+/// (0 when unknown — e.g. over SFTP without a `stat -L`, or for an s3 object).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FsNode {
+    /// A regular file — its own apparent/allocated size and content [`FileKind`].
+    File {
+        apparent: u64,
+        allocated: u64,
+        kind: FileKind,
+    },
+    /// A real, descendable directory. (A symlink *to* a directory is a
+    /// [`FsNode::Symlink`], kept as a leaf so the walk can't cycle.)
+    Directory,
+    /// A symbolic link: `target` is the raw link text; the size/kind are the
+    /// **followed** target's (0 / a broken-link fallback when it can't be statted).
+    Symlink {
+        target: String,
+        apparent: u64,
+        allocated: u64,
+        kind: FileKind,
+    },
+}
+
+impl FsNode {
+    /// Whether this is a real, descendable directory.
+    pub fn is_dir(&self) -> bool {
+        matches!(self, FsNode::Directory)
+    }
+    /// Apparent size in bytes (0 for a directory).
+    pub fn apparent(&self) -> u64 {
+        match self {
+            FsNode::File { apparent, .. } | FsNode::Symlink { apparent, .. } => *apparent,
+            FsNode::Directory => 0,
+        }
+    }
+    /// On-disk allocation in bytes (0 for a directory / when unknown).
+    pub fn allocated(&self) -> u64 {
+        match self {
+            FsNode::File { allocated, .. } | FsNode::Symlink { allocated, .. } => *allocated,
+            FsNode::Directory => 0,
+        }
+    }
+    /// The content classification, for a file or a symlink's target.
+    pub fn file_kind(&self) -> Option<FileKind> {
+        match self {
+            FsNode::File { kind, .. } | FsNode::Symlink { kind, .. } => Some(*kind),
+            FsNode::Directory => None,
+        }
+    }
+    /// The raw link text when this is a symlink, else `None`.
+    pub fn symlink_target(&self) -> Option<&str> {
+        match self {
+            FsNode::Symlink { target, .. } => Some(target),
+            _ => None,
+        }
+    }
+}
+
 /// One entry in the checkpoint's directory tree — the unified filesystem metadata
 /// that used to be scattered across `filetree::FileNode`, `stats::ShardDisk`,
-/// `sftp::RemoteStat`, and `remote::S3Object`. Sizes are **symlink-followed**
-/// (the single-source-of-truth invariant): `apparent` is `st_size` of the target,
-/// `allocated` its on-disk block allocation (0 when unknown, e.g. over SFTP
-/// without a `stat -L`, or for an s3 object).
+/// `sftp::RemoteStat`, and `remote::S3Object`. The path/name/depth/permissions/
+/// mtime are common to every entry; the filesystem kind and its kind-specific data
+/// (size, content kind, link target) live in the tagged [`FsNode`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileEntry {
     /// Path relative to the checkpoint root (POSIX `/`-separated).
@@ -43,18 +110,36 @@ pub struct FileEntry {
     pub name: String,
     /// Depth below the root (0 = a top-level entry).
     pub depth: usize,
-    /// Apparent size in bytes (`st_size`, symlink target). 0 for a directory.
-    pub apparent: u64,
-    /// On-disk allocation in bytes (`st_blocks × block-size`), or 0 when unknown.
-    pub allocated: u64,
-    pub is_dir: bool,
-    pub kind: FileKind,
-    /// The link target when this entry is a symlink (kept for display), else None.
-    pub symlink_target: Option<String>,
     /// Unix mode bits, when known (local reads).
     pub mode: Option<u32>,
     /// Modification time (seconds since the epoch), when known.
     pub mtime: Option<i64>,
+    /// The filesystem kind + kind-specific data (size / content kind / link target).
+    #[serde(flatten)]
+    pub node: FsNode,
+}
+
+impl FileEntry {
+    /// Whether this entry is a real, descendable directory.
+    pub fn is_dir(&self) -> bool {
+        self.node.is_dir()
+    }
+    /// Apparent (symlink-followed) size in bytes.
+    pub fn apparent(&self) -> u64 {
+        self.node.apparent()
+    }
+    /// On-disk allocation in bytes.
+    pub fn allocated(&self) -> u64 {
+        self.node.allocated()
+    }
+    /// The content classification (file / symlink target), else `None` for a dir.
+    pub fn file_kind(&self) -> Option<FileKind> {
+        self.node.file_kind()
+    }
+    /// The raw symlink target text, when this entry is a symlink.
+    pub fn symlink_target(&self) -> Option<&str> {
+        self.node.symlink_target()
+    }
 }
 
 /// One safetensors file's parsed header — the tensors it stores and its
@@ -134,11 +219,11 @@ impl Checkpoint {
         let shards: Vec<ShardDisk> = self
             .files
             .iter()
-            .filter(|f| !f.is_dir && f.kind == FileKind::Checkpoint)
+            .filter(|f| f.file_kind() == Some(FileKind::Checkpoint))
             .map(|f| ShardDisk {
                 name: f.name.clone(),
-                apparent: f.apparent,
-                allocated: f.allocated,
+                apparent: f.apparent(),
+                allocated: f.allocated(),
             })
             .collect();
         DiskUsage::from_shards(shards)
@@ -161,13 +246,16 @@ mod tests {
                 rel_path: "model-00001-of-00002.safetensors".into(),
                 name: "model-00001-of-00002.safetensors".into(),
                 depth: 0,
-                apparent: 4_000_000_000,
-                allocated: 4_000_000_000,
-                is_dir: false,
-                kind: FileKind::Checkpoint,
-                symlink_target: Some("/blobs/abc".into()),
                 mode: Some(0o644),
                 mtime: Some(1_700_000_000),
+                // An HF-cache-style symlink into a blob store: the followed target
+                // sizes drive disk usage.
+                node: FsNode::Symlink {
+                    target: "/blobs/abc".into(),
+                    apparent: 4_000_000_000,
+                    allocated: 4_000_000_000,
+                    kind: FileKind::Checkpoint,
+                },
             }],
             shards: vec![ShardHeader {
                 path: "net004:/opt/ckpt/model-00001-of-00002.safetensors".into(),
@@ -226,6 +314,9 @@ mod tests {
         // config + index + symlink target survive the round-trip.
         assert_eq!(back.config.unwrap().num_hidden_layers, Some(48));
         assert_eq!(back.index[0].weight_map.len(), 1);
-        assert_eq!(back.files[0].symlink_target.as_deref(), Some("/blobs/abc"));
+        // The tagged fs-node round-trips: a symlink with its followed target.
+        assert_eq!(back.files[0].symlink_target(), Some("/blobs/abc"));
+        assert!(matches!(back.files[0].node, FsNode::Symlink { .. }));
+        assert_eq!(back.files[0].file_kind(), Some(FileKind::Checkpoint));
     }
 }

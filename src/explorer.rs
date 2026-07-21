@@ -4459,13 +4459,13 @@ impl Explorer {
                 rel_path: d.name.clone(),
                 name: d.name.clone(),
                 depth: 0,
-                apparent: d.apparent,
-                allocated: d.allocated,
-                is_dir: false,
-                kind: crate::filetree::FileKind::of(&d.name),
-                symlink_target: None,
                 mode: None,
                 mtime: None,
+                node: crate::model::FsNode::File {
+                    apparent: d.apparent,
+                    allocated: d.allocated,
+                    kind: crate::filetree::FileKind::of(&d.name),
+                },
             })
             .collect();
         let cp = crate::model::Checkpoint {
@@ -6962,8 +6962,8 @@ impl Explorer {
                             .or_default()
                             .push(crate::filetree::DirEntry {
                                 name: fe.name.clone(),
-                                size: fe.apparent,
-                                is_dir: fe.is_dir,
+                                size: fe.apparent(),
+                                is_dir: fe.is_dir(),
                             });
                     }
                     let list = move |p: &Path| listing.get(p).cloned().unwrap_or_default();
