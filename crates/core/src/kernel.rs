@@ -60,10 +60,12 @@ pub struct ViewModel {
 }
 
 /// The tensor-tree browser state — the tree itself, its flattened/filtered rows,
-/// and the selection/scroll/search. Owned by the kernel (this is the state the
-/// interactive tree screen drives and renders from); the operations currently
-/// live on the frontend and mutate these fields directly, and will move onto this
-/// type as the migration continues.
+/// and the selection/scroll/search. Kernel-owned, with its navigation + fold
+/// operations as methods on this type (`move_selection`, `move_to_*`,
+/// `toggle_group_at`, `set_all_expanded`, `reveal`, `reflatten`) — the tree
+/// screen's command surface. A frontend drives those methods and renders the
+/// resulting fields; the search-filter refresh stays on the frontend only because
+/// it needs the tensor list (which the [`Session`] owns).
 #[derive(Default)]
 pub struct TreeState {
     /// The grouped tree (a single root node summarising the checkpoint).
@@ -82,6 +84,148 @@ pub struct TreeState {
     pub search_cursor: usize,
     /// Whether search input is active.
     pub search_mode: bool,
+}
+
+impl TreeState {
+    /// The currently visible rows: the search results while searching, else the
+    /// fold-aware flattened tree. The one selector every navigation op reads.
+    pub fn visible(&self) -> &[(TreeNode, usize)] {
+        if self.search_mode {
+            &self.filtered
+        } else {
+            &self.flattened
+        }
+    }
+
+    /// Rebuild the flattened rows from the (possibly re-folded) tree. The pure
+    /// half of a re-flatten; the search-filtered rows refresh separately (they
+    /// need the tensor list) only when the query changes.
+    pub fn reflatten(&mut self) {
+        self.flattened = TreeBuilder::flatten_tree(&self.tree);
+    }
+
+    /// Expand/collapse the group at flattened index `idx` in place and re-flatten.
+    /// Toggles the tree directly rather than cloning it first — that full
+    /// deep-clone made every expand/collapse lag on a big checkpoint.
+    pub fn toggle_group_at(&mut self, idx: usize) {
+        TreeBuilder::toggle_node_by_index(idx, &mut self.tree);
+        self.reflatten();
+    }
+
+    /// Expand or collapse every group, then reset the cursor to the top since the
+    /// visible rows change wholesale.
+    pub fn set_all_expanded(&mut self, expanded: bool) {
+        TreeBuilder::set_all_expanded(&mut self.tree, expanded);
+        self.reflatten();
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    /// Move the cursor by `delta` rows within the visible list, clamped.
+    pub fn move_selection(&mut self, delta: i32) {
+        let n = self.visible().len();
+        if n == 0 {
+            return;
+        }
+        self.selected = if delta < 0 {
+            self.selected.saturating_sub((-delta) as usize)
+        } else {
+            (self.selected + delta as usize).min(n - 1)
+        };
+    }
+
+    /// Move the cursor to the parent group of the selected row (the nearest
+    /// preceding row at a shallower depth). No-op at the top level.
+    pub fn move_to_parent(&mut self) {
+        let Some(&(_, depth)) = self.visible().get(self.selected) else {
+            return;
+        };
+        if depth == 0 {
+            return;
+        }
+        let parent = (0..self.selected)
+            .rev()
+            .find(|&i| self.visible()[i].1 < depth);
+        if let Some(p) = parent {
+            self.selected = p;
+        }
+    }
+
+    /// Move the cursor to the next/previous sibling: the nearest row at the same
+    /// depth before a shallower row (i.e. without leaving the parent).
+    pub fn move_to_sibling(&mut self, forward: bool) {
+        let Some(&(_, depth)) = self.visible().get(self.selected) else {
+            return;
+        };
+        let indices: Vec<usize> = if forward {
+            (self.selected + 1..self.visible().len()).collect()
+        } else {
+            (0..self.selected).rev().collect()
+        };
+        for i in indices {
+            let d = self.visible()[i].1;
+            if d < depth {
+                break; // left the parent: no sibling in this direction
+            }
+            if d == depth {
+                self.selected = i;
+                break;
+            }
+            // d > depth: a descendant, keep scanning
+        }
+    }
+
+    /// Enter the selected group: expand it if collapsed, then move the cursor to
+    /// its first child. No-op for leaf rows or empty groups (and in search mode,
+    /// where the list is flat).
+    pub fn move_to_first_child(&mut self) {
+        if self.search_mode {
+            return;
+        }
+        let (expanded, has_children, depth) = match self.flattened.get(self.selected) {
+            Some((
+                TreeNode::Group {
+                    expanded, children, ..
+                },
+                depth,
+            )) => (*expanded, !children.is_empty(), *depth),
+            _ => return,
+        };
+        if !has_children {
+            return;
+        }
+        if !expanded {
+            self.toggle_group_at(self.selected);
+        }
+        // The first child is the next row, one level deeper.
+        if let Some((_, child_depth)) = self.flattened.get(self.selected + 1)
+            && *child_depth == depth + 1
+        {
+            self.selected += 1;
+        }
+    }
+
+    /// Move the cursor onto the leaf named `name`, expanding any collapsed groups
+    /// so it's visible. Fast path when the row is already on screen (returning to
+    /// an expanded tree — the common case): just move the cursor, no rebuild. In
+    /// search mode the list is flat, so an absent name leaves the cursor put.
+    pub fn reveal(&mut self, name: &str) {
+        if let Some(idx) = self
+            .visible()
+            .iter()
+            .position(|(node, _)| node.name() == name)
+        {
+            self.selected = idx;
+            return;
+        }
+        if !self.search_mode {
+            TreeBuilder::expand_to_tensor(&mut self.tree, name);
+            self.reflatten();
+            if let Some(idx) = self.flattened.iter().position(|(n, _)| n.name() == name) {
+                self.selected = idx;
+            }
+        }
+    }
 }
 
 /// The file-browser state — the directory tree (built from the model / a remote
@@ -524,5 +668,48 @@ mod tests {
         // And round-trips.
         let back: ViewModel = serde_json::from_str(&json).unwrap();
         assert_eq!(back.screen, Screen::Files);
+    }
+
+    #[test]
+    fn tree_state_ops_navigate_fold_and_reveal() {
+        let ti = |name: &str| TensorInfo {
+            name: name.into(),
+            dtype: "F32".into(),
+            shape: vec![2, 2],
+            size_bytes: 16,
+            num_elements: 4,
+            storage: Storage::Unknown,
+            source_path: "/x.safetensors".into(),
+            layout: Layout::ByteRange { start: 0, end: 16 },
+        };
+        // Two nested groups (blk.0.{a,b}, blk.1.{a,b}).
+        let tensors = vec![ti("blk.0.a"), ti("blk.0.b"), ti("blk.1.a"), ti("blk.1.b")];
+        let mut ts = TreeState {
+            tree: TreeBuilder::build_tree(&tensors),
+            ..Default::default()
+        };
+        ts.reflatten();
+
+        // Expand everything; selection clamps to the visible range.
+        ts.set_all_expanded(true);
+        let n = ts.visible().len();
+        assert!(n > 0);
+        ts.move_selection(1000);
+        assert_eq!(ts.selected, n - 1);
+        ts.move_selection(-1000);
+        assert_eq!(ts.selected, 0);
+
+        // Reveal an already-visible leaf: the cursor just moves onto it.
+        ts.reveal("blk.1.b");
+        assert_eq!(ts.visible()[ts.selected].0.name(), "blk.1.b");
+
+        // Collapse-all resets the cursor and hides the leaves; reveal re-expands
+        // to the target and grows the visible list.
+        ts.set_all_expanded(false);
+        assert_eq!(ts.selected, 0);
+        let collapsed = ts.visible().len();
+        ts.reveal("blk.1.b");
+        assert!(ts.visible().len() > collapsed);
+        assert_eq!(ts.visible()[ts.selected].0.name(), "blk.1.b");
     }
 }
