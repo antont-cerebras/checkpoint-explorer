@@ -63,7 +63,6 @@
           <tr><th>File</th><td class="dim src">{info.source_path}</td></tr>
         </tbody>
       </table>
-      <p class="dim hint">Press <b>m</b> heatmap · <b>v</b> values · <b>h</b> histogram · <b>s</b> statistics — or click a tab above. These read the tensor's bytes on demand.</p>
     {:else if tab === 'heatmap'}
       <Heatmap name={tensor} />
     {:else if tab === 'values'}
@@ -118,9 +117,5 @@
   }
   .src {
     word-break: break-all;
-  }
-  .hint {
-    font-size: 12px;
-    max-width: 620px;
   }
 </style>
