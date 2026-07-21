@@ -1,0 +1,23 @@
+---
+source: tests/cli.rs
+expression: "export(&[\"--print-view\", \"--name\", \"*.mlp.*\"])"
+---
+{
+  "screen": "tree",
+  "root": "[FIXTURE]",
+  "rows": [
+    {
+      "depth": 0,
+      "label": "[FIXTURE]",
+      "is_group": true
+    },
+    {
+      "depth": 1,
+      "label": "model.layers.0.mlp.down_proj.weight",
+      "is_group": false
+    }
+  ],
+  "selected": 0,
+  "status": "[FIXTURE]",
+  "search": null
+}

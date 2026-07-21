@@ -5695,6 +5695,18 @@ impl Explorer {
         emit_stdout(&out)
     }
 
+    /// Load the checkpoint and print the tensor-tree screen's serializable
+    /// [`ViewModel`](crate::kernel::ViewModel) as JSON, then return — `--print-view`.
+    /// This is the kernel's frontend-agnostic output contract exercised headlessly:
+    /// exactly what a web server or MCP tool would serve for the tree screen,
+    /// projected from the same live `tree_state` the interactive TUI renders.
+    pub fn print_view(&mut self, filter: &crate::filter::NameFilter) -> Result<()> {
+        self.load_quiet()?;
+        self.apply_name_filter(filter);
+        let vm = crate::kernel::ViewModel::from_tree(&self.root_label(), &self.tree_state);
+        emit_stdout(&serde_json::to_string_pretty(&vm)?)
+    }
+
     /// Drop the tensors and metadata whose names don't pass `filter`, then rebuild
     /// the tree — scoping a `--print-tree` / `--print-tensors` export to a subset.
     /// A no-op when the filter is inactive.

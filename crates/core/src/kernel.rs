@@ -1,18 +1,20 @@
-//! The **kernel**: a frontend-agnostic session over a cached
-//! [`crate::model::Checkpoint`]. It owns the browser state (which screen, the
-//! selection, the search query), derives + caches the views (tensor tree, file
-//! tree) and reports (stats) from the model, and exposes:
+//! The **kernel**: the frontend-agnostic core over a cached
+//! [`crate::model::Checkpoint`]. No terminal, no disk — everything comes from the
+//! model the readers already cached, so it's trivially unit-testable and the same
+//! kernel backs the interactive terminal, a headless web server, or an MCP tool.
+//! It has three parts:
 //!
-//! - **command methods** — `select_next`/`select_prev`/`toggle`/`search`/… —
-//!   that mutate the state, and
-//! - a **query** — [`Session::view`] returning a serializable [`ViewModel`] of
-//!   what's on screen (rows, selection, status).
-//!
-//! No terminal, no disk: it's driven by method calls and observed through the
-//! `ViewModel`, so it's trivially unit-testable and the same session can back the
-//! interactive terminal, a headless web server, or an MCP tool. The kernel reads
-//! nothing from disk — everything comes from the model the readers already
-//! cached.
+//! - [`Session`] — the single owner of the checkpoint's **canonical data**
+//!   (deduped + natural-sorted tensors, metadata, config, parameter count) and
+//!   its cached reports (stats). A frontend loads the tree from it and asks it for
+//!   reports.
+//! - the **view-state + command surface** — [`TreeState`] / [`FileState`] /
+//!   [`DataViewState`], the browser state a frontend owns and persists across
+//!   loads, with the navigation/fold operations as methods (`move_selection`,
+//!   `toggle_group_at`, `reveal`, …) the frontend drives.
+//! - the **output contract** — [`ViewModel`], a serializable snapshot projected
+//!   from the live view-state ([`ViewModel::from_tree`] / [`ViewModel::from_files`])
+//!   that a TUI renders, a web server sends as JSON, or an MCP tool returns.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -403,12 +405,6 @@ pub struct Session {
     config: Option<ModelConfig>,
     /// Total element count across the canonical tensors (parameter count).
     total_parameters: usize,
-    /// The tensor tree flattened to visible rows, derived once from the tensors
-    /// (no disk); search filters it on the fly.
-    flat: Vec<(TreeNode, usize)>,
-    screen: Screen,
-    selected: usize,
-    search: String,
     /// Cached stats report (computed on first request).
     stats: Option<CheckpointStats>,
 }
@@ -442,18 +438,23 @@ impl Session {
     ) -> Self {
         let tensors = Self::canonical_tensors(tensors);
         let total_parameters = tensors.iter().map(|t| t.num_elements).sum();
-        let flat = Self::flatten(&tensors, &metadata);
         Session {
             model,
             tensors,
             metadata,
             config,
             total_parameters,
-            flat,
-            screen: Screen::Tree,
-            selected: 0,
-            search: String::new(),
             stats: None,
+        }
+    }
+
+    /// Build the initial tensor tree (fold-aware) from the canonical data — the
+    /// starting point a frontend loads into its [`TreeState`]. No disk.
+    pub fn build_tree(&self) -> Vec<TreeNode> {
+        if self.metadata.is_empty() {
+            TreeBuilder::build_tree(&self.tensors)
+        } else {
+            TreeBuilder::build_tree_mixed(&self.tensors, &self.metadata)
         }
     }
 
@@ -469,24 +470,14 @@ impl Session {
         tensors
     }
 
-    /// Build + flatten the tensor tree from the given tensors/metadata.
-    fn flatten(tensors: &[TensorInfo], metadata: &[MetadataInfo]) -> Vec<(TreeNode, usize)> {
-        let tree = if metadata.is_empty() {
-            TreeBuilder::build_tree(tensors)
-        } else {
-            TreeBuilder::build_tree_mixed(tensors, metadata)
-        };
-        TreeBuilder::flatten_tree(&tree)
-    }
-
     /// Drop the tensors and metadata whose names don't pass `keep`, recompute the
-    /// parameter count, rebuild the flattened tree, and invalidate the cached
-    /// stats — backs the `--print-tree`/`--print-tensors` name-filter subset.
+    /// parameter count, and invalidate the cached stats — backs the
+    /// `--print-tree`/`--print-tensors` name-filter subset. The frontend rebuilds
+    /// its tree afterwards.
     pub fn retain_named<F: FnMut(&str) -> bool>(&mut self, mut keep: F) {
         self.tensors.retain(|t| keep(&t.name));
         self.metadata.retain(|m| keep(&m.name));
         self.total_parameters = self.tensors.iter().map(|t| t.num_elements).sum();
-        self.flat = Self::flatten(&self.tensors, &self.metadata);
         self.stats = None;
     }
 
@@ -534,97 +525,66 @@ impl Session {
         let disk = self.model.as_ref().and_then(|m| m.disk_usage());
         self.stats_with_disk(disk)
     }
+}
 
-    // ── Command methods (input) ──────────────────────────────────────────────
-
-    /// Switch screen (tree ⇆ files); resets the selection.
-    pub fn show(&mut self, screen: Screen) {
-        self.screen = screen;
-        self.selected = 0;
-    }
-
-    /// Move the selection by `delta` rows, clamped to the visible range.
-    pub fn move_selection(&mut self, delta: isize) {
-        let n = self.rows_len();
-        if n == 0 {
-            self.selected = 0;
-            return;
-        }
-        let cur = self.selected as isize;
-        self.selected = cur.saturating_add(delta).clamp(0, n as isize - 1) as usize;
-    }
-
-    pub fn select_next(&mut self) {
-        self.move_selection(1);
-    }
-    pub fn select_prev(&mut self) {
-        self.move_selection(-1);
-    }
-
-    /// Set the fuzzy search query (tree screen); empty clears it.
-    pub fn search(&mut self, query: &str) {
-        self.search = query.to_string();
-        self.selected = 0;
-    }
-
-    // ── Query (output) ───────────────────────────────────────────────────────
-
-    /// The number of currently visible rows (search-filtered on the tree screen).
-    fn rows_len(&self) -> usize {
-        match self.screen {
-            Screen::Tree => self.tree_rows().count(),
-            Screen::Files => self.model.as_ref().map_or(0, |m| m.files.len()),
-        }
-    }
-
-    /// The tree rows matching the active search (all rows when the query is empty).
-    fn tree_rows(&self) -> impl Iterator<Item = &(TreeNode, usize)> {
-        let q = self.search.to_ascii_lowercase();
-        self.flat
+impl ViewModel {
+    /// Project the tensor-tree screen into a serializable snapshot: the visible
+    /// (fold-aware, search-filtered) rows, the selection, and the search query,
+    /// straight from the frontend's live [`TreeState`]. Pure — the kernel's output
+    /// contract that a TUI renders, a web server sends as JSON, or an MCP tool
+    /// returns.
+    pub fn from_tree(root: &str, tree: &TreeState) -> Self {
+        let rows: Vec<Row> = tree
+            .visible()
             .iter()
-            .filter(move |(node, _)| q.is_empty() || node.name().to_ascii_lowercase().contains(&q))
-    }
-
-    /// A serializable snapshot of the current screen — the kernel's sole output.
-    pub fn view(&self) -> ViewModel {
-        let rows: Vec<Row> = match self.screen {
-            Screen::Tree => self
-                .tree_rows()
-                .map(|(node, depth)| Row {
-                    depth: *depth,
-                    label: node.name().to_string(),
-                    is_group: matches!(node, TreeNode::Group { .. }),
-                })
-                .collect(),
-            Screen::Files => self
-                .model
-                .as_ref()
-                .map(|m| m.files.as_slice())
-                .unwrap_or_default()
-                .iter()
-                .map(|f| Row {
-                    depth: f.depth,
-                    label: f.name.clone(),
-                    is_group: f.is_dir,
-                })
-                .collect(),
-        };
-        let selected = self.selected.min(rows.len().saturating_sub(1));
+            .map(|(node, depth)| Row {
+                depth: *depth,
+                label: node.name().to_string(),
+                is_group: matches!(node, TreeNode::Group { .. }),
+            })
+            .collect();
+        let selected = tree.selected.min(rows.len().saturating_sub(1));
         let status = rows
             .get(selected)
             .map(|r| r.label.clone())
             .unwrap_or_default();
         ViewModel {
-            screen: self.screen,
-            root: self
-                .model
-                .as_ref()
-                .map(|m| m.root.clone())
-                .unwrap_or_default(),
+            screen: Screen::Tree,
+            root: root.to_string(),
             rows,
             selected,
             status,
-            search: (!self.search.is_empty()).then(|| self.search.clone()),
+            search: tree
+                .search_mode
+                .then(|| tree.search_query.clone())
+                .filter(|q| !q.is_empty()),
+        }
+    }
+
+    /// Project the file-browser screen into a serializable snapshot from the
+    /// frontend's live [`FileState`].
+    pub fn from_files(root: &str, files: &FileState) -> Self {
+        let rows: Vec<Row> = files
+            .rows
+            .iter()
+            .map(|r| Row {
+                depth: r.depth,
+                label: r.name.clone(),
+                is_group: r.is_dir,
+            })
+            .collect();
+        let selected = files.selected.min(rows.len().saturating_sub(1));
+        let status = rows
+            .get(selected)
+            .map(|r| r.label.clone())
+            .unwrap_or_default();
+        ViewModel {
+            screen: Screen::Files,
+            root: root.to_string(),
+            rows,
+            selected,
+            status,
+            search: None,
         }
     }
 }
@@ -696,45 +656,60 @@ mod tests {
     }
 
     #[test]
-    fn drives_by_methods_and_yields_a_serializable_viewmodel() {
+    fn session_owns_data_and_viewmodel_projects_the_live_state() {
         let mut s = Session::from_model(model());
-        // Tree screen: rows derived from the model, no disk.
-        let v = s.view();
-        assert_eq!(v.screen, Screen::Tree);
-        assert_eq!(v.root, "/ckpt");
-        assert!(!v.rows.is_empty());
-        assert_eq!(v.selected, 0);
-
-        // Navigation clamps.
-        s.select_prev();
-        assert_eq!(s.view().selected, 0);
-        s.select_next();
-        assert_eq!(s.view().selected, 1);
-
-        // Search filters the rows.
-        s.search("embed");
-        let v = s.view();
-        assert!(
-            v.rows
-                .iter()
-                .all(|r| r.label.to_lowercase().contains("embed"))
-        );
-        assert_eq!(v.search.as_deref(), Some("embed"));
-        s.search("");
-
-        // Switch to the file screen (from the cached model's file list).
-        s.show(Screen::Files);
-        let v = s.view();
-        assert_eq!(v.screen, Screen::Files);
-        assert!(v.rows.iter().any(|r| r.label == "config.json"));
-
-        // Stats derived + cached from the model.
+        // The session owns the canonical data + reports (no disk).
+        assert_eq!(s.tensors().len(), 2);
         assert_eq!(s.stats().n_tensors, 2);
 
-        // The whole ViewModel serializes (the frontends' output contract).
-        let json = serde_json::to_string(&s.view()).unwrap();
+        // A frontend loads the session's tree into its own TreeState and drives it.
+        let mut tree = TreeState {
+            tree: s.build_tree(),
+            ..Default::default()
+        };
+        tree.reflatten();
+        tree.set_all_expanded(true);
+
+        // The ViewModel is a projection of that live view-state.
+        let vm = ViewModel::from_tree(s.model().unwrap().root.as_str(), &tree);
+        assert_eq!(vm.screen, Screen::Tree);
+        assert_eq!(vm.root, "/ckpt");
+        assert!(!vm.rows.is_empty());
+        assert_eq!(vm.selected, 0);
+        assert!(vm.search.is_none());
+
+        // Search state flows through the projection.
+        tree.search_mode = true;
+        tree.search_query = "q".into();
+        tree.filtered = tree.flattened.iter().take(1).cloned().collect();
+        let vm = ViewModel::from_tree("/ckpt", &tree);
+        assert_eq!(vm.search.as_deref(), Some("q"));
+        assert_eq!(vm.rows.len(), 1);
+        // An empty query projects no search even in search mode.
+        tree.search_query.clear();
+        assert!(ViewModel::from_tree("/ckpt", &tree).search.is_none());
+
+        // The file screen projects from a FileState the same way.
+        let files = FileState {
+            rows: vec![crate::filetree::FileRow {
+                depth: 0,
+                name: "config.json".into(),
+                path: "/ckpt/config.json".into(),
+                size: 20,
+                is_dir: false,
+                expanded: false,
+                files: 0,
+                kind: crate::filetree::FileKind::Json,
+            }],
+            ..Default::default()
+        };
+        let fvm = ViewModel::from_files("/ckpt", &files);
+        assert_eq!(fvm.screen, Screen::Files);
+        assert_eq!(fvm.rows[0].label, "config.json");
+
+        // The ViewModel serializes (the frontends' output contract) and round-trips.
+        let json = serde_json::to_string(&fvm).unwrap();
         assert!(json.contains("\"screen\":\"files\""), "{json}");
-        // And round-trips.
         let back: ViewModel = serde_json::from_str(&json).unwrap();
         assert_eq!(back.screen, Screen::Files);
     }

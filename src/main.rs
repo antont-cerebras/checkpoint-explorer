@@ -392,6 +392,15 @@ struct ExploreArgs {
     print_model: bool,
 
     #[arg(
+        long = "print-view",
+        conflicts_with = "print_tree",
+        conflicts_with = "print_tensors",
+        conflicts_with = "print_model",
+        help = "Print the tensor-tree screen's ViewModel (visible rows, selection, search) as JSON and exit — the kernel's frontend-agnostic output contract a web/MCP frontend would serve"
+    )]
+    print_view: bool,
+
+    #[arg(
         long,
         value_enum,
         default_value_t = explorer::TreeFormat::default(),
@@ -1911,6 +1920,10 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         } else {
             explorer.print_tensors(args.format, detail, &filter)
         };
+    }
+    if args.print_view {
+        let filter = filter::NameFilter::parse(&args.name)?;
+        return explorer.print_view(&filter);
     }
 
     if args.emit_command {

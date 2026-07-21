@@ -322,6 +322,21 @@ fn print_tensors_name_exclude() {
     settings().bind(|| insta::assert_snapshot!(export(&["--print-tensors", "--name", "!*.mlp.*"])));
 }
 
+/// `--print-view` dumps the tensor-tree screen's `ViewModel` as JSON — the
+/// kernel's frontend-agnostic output contract, projected from the same live tree
+/// state the TUI renders. Deterministic (row labels/depths only), so snapshotted.
+#[test]
+fn print_view_emits_viewmodel_json() {
+    settings().bind(|| insta::assert_snapshot!(export(&["--print-view"])));
+}
+
+/// The `--name` filter scopes the `ViewModel` rows too (same path as the other
+/// exports).
+#[test]
+fn print_view_name_filter() {
+    settings().bind(|| insta::assert_snapshot!(export(&["--print-view", "--name", "*.mlp.*"])));
+}
+
 #[test]
 fn check_healthy_fixture() {
     ensure_fixture();
