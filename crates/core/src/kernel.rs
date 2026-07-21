@@ -279,7 +279,7 @@ impl FileState {
         let Some((is_dir, expanded, depth)) = self
             .rows
             .get(self.selected)
-            .map(|r| (r.is_dir, r.expanded, r.depth))
+            .map(|r| (r.is_dir(), r.expanded(), r.depth))
         else {
             return;
         };
@@ -300,7 +300,10 @@ impl FileState {
 
     /// `→`: expand the selected directory if it's collapsed (a no-op otherwise).
     pub fn expand_or_child(&mut self) {
-        let Some((is_dir, expanded)) = self.rows.get(self.selected).map(|r| (r.is_dir, r.expanded))
+        let Some((is_dir, expanded)) = self
+            .rows
+            .get(self.selected)
+            .map(|r| (r.is_dir(), r.expanded()))
         else {
             return;
         };
@@ -570,7 +573,7 @@ impl ViewModel {
             .map(|r| Row {
                 depth: r.depth,
                 label: r.name.clone(),
-                is_group: r.is_dir,
+                is_group: r.is_dir(),
             })
             .collect();
         let selected = files.selected.min(rows.len().saturating_sub(1));
@@ -696,10 +699,9 @@ mod tests {
                 name: "config.json".into(),
                 path: "/ckpt/config.json".into(),
                 size: 20,
-                is_dir: false,
-                expanded: false,
-                files: 0,
-                kind: crate::filetree::FileKind::Json,
+                kind: crate::filetree::FileRowKind::File {
+                    kind: crate::filetree::FileKind::Json,
+                },
             }],
             ..Default::default()
         };

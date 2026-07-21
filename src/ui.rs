@@ -5931,45 +5931,48 @@ fn band_rows(map: &crate::safelayout::LayoutMap, body_rows: usize) -> Vec<usize>
 /// coloured by kind, and its dim size. `selected` draws the whole row in the
 /// selection colours (via [`tree_span`], shared with the tensor tree).
 fn file_row_line(row: &crate::filetree::FileRow, selected: bool) -> Line<'static> {
-    use crate::filetree::FileKind;
+    use crate::filetree::{FileKind, FileRowKind};
     let indent = "  ".repeat(row.depth);
     let mut s: Vec<Span> = vec![tree_span(selected, Color::Reset, indent)];
-    if row.is_dir {
-        let arrow = if row.expanded { "▾" } else { "▸" };
-        s.push(tree_span(selected, palette::ACCENT, arrow));
-        s.push(tree_span(selected, Color::Reset, " "));
-        s.push(tree_span(
-            selected,
-            palette::ACCENT,
-            format!("{}/", row.name),
-        ));
-        let files = row.files;
-        s.push(tree_span(
-            selected,
-            palette::DIM,
-            format!(
-                "  {} · {files} {}",
-                format_size(row.size as usize),
-                if files == 1 { "file" } else { "files" }
-            ),
-        ));
-    } else {
-        // A checkpoint gets the tensor glyph (it opens into the tree) and the amber
-        // dtype accent; JSON/text/other stay quiet, so the openable ones stand out.
-        let (marker, name_color) = match row.kind {
-            FileKind::Checkpoint => ("▦", palette::DTYPE),
-            FileKind::Json => ("{}", palette::META),
-            FileKind::Text => ("·", Color::Reset),
-            FileKind::Other => ("·", palette::DIM),
-        };
-        s.push(tree_span(selected, palette::DIM, marker));
-        s.push(tree_span(selected, Color::Reset, " "));
-        s.push(tree_span(selected, name_color, row.name.clone()));
-        s.push(tree_span(
-            selected,
-            palette::DIM,
-            format!("  {}", format_size(row.size as usize)),
-        ));
+    match row.kind {
+        FileRowKind::Dir { expanded, files } => {
+            let arrow = if expanded { "▾" } else { "▸" };
+            s.push(tree_span(selected, palette::ACCENT, arrow));
+            s.push(tree_span(selected, Color::Reset, " "));
+            s.push(tree_span(
+                selected,
+                palette::ACCENT,
+                format!("{}/", row.name),
+            ));
+            s.push(tree_span(
+                selected,
+                palette::DIM,
+                format!(
+                    "  {} · {files} {}",
+                    format_size(row.size as usize),
+                    if files == 1 { "file" } else { "files" }
+                ),
+            ));
+        }
+        FileRowKind::File { kind } => {
+            // A checkpoint gets the tensor glyph (it opens into the tree) and the
+            // amber dtype accent; JSON/text/other stay quiet, so the openable ones
+            // stand out.
+            let (marker, name_color) = match kind {
+                FileKind::Checkpoint => ("▦", palette::DTYPE),
+                FileKind::Json => ("{}", palette::META),
+                FileKind::Text => ("·", Color::Reset),
+                FileKind::Other => ("·", palette::DIM),
+            };
+            s.push(tree_span(selected, palette::DIM, marker));
+            s.push(tree_span(selected, Color::Reset, " "));
+            s.push(tree_span(selected, name_color, row.name.clone()));
+            s.push(tree_span(
+                selected,
+                palette::DIM,
+                format!("  {}", format_size(row.size as usize)),
+            ));
+        }
     }
     Line::from(s)
 }
@@ -7178,37 +7181,35 @@ mod tests {
 
     #[test]
     fn file_browser_shows_dirs_files_and_footer() {
-        use crate::filetree::{FileKind, FileRow};
+        use crate::filetree::{FileKind, FileRow, FileRowKind};
         let rows = vec![
             FileRow {
                 depth: 0,
                 name: "ckpt".into(),
                 path: "/ckpt".into(),
                 size: 100,
-                is_dir: true,
-                expanded: true,
-                files: 2,
-                kind: FileKind::Other,
+                kind: FileRowKind::Dir {
+                    expanded: true,
+                    files: 2,
+                },
             },
             FileRow {
                 depth: 1,
                 name: "model.safetensors".into(),
                 path: "/ckpt/model.safetensors".into(),
                 size: 90,
-                is_dir: false,
-                expanded: false,
-                files: 0,
-                kind: FileKind::Checkpoint,
+                kind: FileRowKind::File {
+                    kind: FileKind::Checkpoint,
+                },
             },
             FileRow {
                 depth: 1,
                 name: "config.json".into(),
                 path: "/ckpt/config.json".into(),
                 size: 10,
-                is_dir: false,
-                expanded: false,
-                files: 0,
-                kind: FileKind::Json,
+                kind: FileRowKind::File {
+                    kind: FileKind::Json,
+                },
             },
         ];
         let badges = status_badges(AccessBadge::ReadOnly, None, false);

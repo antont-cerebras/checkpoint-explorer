@@ -78,19 +78,26 @@ impl FileNode {
     }
 }
 
-/// One directory entry from a listing backend (local `std::fs`, remote SFTP, …).
-/// The backend is responsible for skipping dotfiles and for the two invariants the
-/// browser relies on:
-/// - `size` is the entry's **readable content size** — symlinks are *followed*, so
-///   a linked shard reports its target's size (what opening it yields, and what
-///   the layout map reads), never the link-path length. `0` for a directory.
-/// - `is_dir` is whether it's a **descendable** directory. A symlink to a
-///   directory must be `false` (a leaf) so the recursive walk can't cycle.
-#[derive(Debug, Clone)]
-pub struct DirEntry {
-    pub name: String,
-    pub size: u64,
-    pub is_dir: bool,
+/// One entry in a directory listing from any backend (local `std::fs`, remote
+/// SFTP, or synthetic S3 keys) — the **shared** interchange type every backend
+/// produces and [`build_from`] consumes, so there's one filesystem-entry sum type
+/// rather than a `(name, size, is_dir)` bag per backend. A `File` carries its
+/// **readable content size** (symlinks are *followed*, so a linked shard reports
+/// its target's size — what opening it yields); a symlink *to a directory* is
+/// represented as a `File` leaf (size 0) so the recursive walk can't cycle. Only a
+/// real, descendable directory is `Directory`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirEntry {
+    File { name: String, size: u64 },
+    Directory { name: String },
+}
+
+impl DirEntry {
+    pub fn name(&self) -> &str {
+        match self {
+            DirEntry::File { name, .. } | DirEntry::Directory { name } => name,
+        }
+    }
 }
 
 /// Build the file tree rooted at `root` from the **local filesystem**, recursively
@@ -147,18 +154,18 @@ pub fn build_from_keys(root_label: &str, objects: &[(String, u64)]) -> FileNode 
         for comp in dirs {
             let child = cur.join(comp);
             if dir_seen.insert(child.clone()) {
-                listing.entry(cur.clone()).or_default().push(DirEntry {
-                    name: (*comp).to_string(),
-                    size: 0,
-                    is_dir: true,
-                });
+                listing
+                    .entry(cur.clone())
+                    .or_default()
+                    .push(DirEntry::Directory {
+                        name: (*comp).to_string(),
+                    });
             }
             cur = child;
         }
-        listing.entry(cur).or_default().push(DirEntry {
+        listing.entry(cur).or_default().push(DirEntry::File {
             name: (*leaf).to_string(),
             size: *size,
-            is_dir: false,
         });
     }
     let list = move |p: &Path| listing.get(p).cloned().unwrap_or_default();
@@ -186,12 +193,16 @@ fn local_list(dir: &Path) -> Vec<DirEntry> {
             // link falls back to its own (lstat) metadata.
             let is_symlink = entry.file_type().ok().is_some_and(|t| t.is_symlink());
             let meta = std::fs::metadata(entry.path()).or_else(|_| entry.metadata());
-            let (is_dir, size) = match meta {
-                Ok(m) if m.is_dir() => (!is_symlink, 0),
-                Ok(m) => (false, m.len()),
-                Err(_) => (false, 0),
-            };
-            out.push(DirEntry { name, size, is_dir });
+            out.push(match meta {
+                // A real directory descends; a symlinked directory is a File leaf.
+                Ok(m) if m.is_dir() && !is_symlink => DirEntry::Directory { name },
+                Ok(m) if m.is_dir() => DirEntry::File { name, size: 0 },
+                Ok(m) => DirEntry::File {
+                    name,
+                    size: m.len(),
+                },
+                Err(_) => DirEntry::File { name, size: 0 },
+            });
         }
     }
     out
@@ -214,27 +225,31 @@ fn build_dir(
     let mut dirs: Vec<FileNode> = Vec::new();
     let mut files: Vec<FileNode> = Vec::new();
     for entry in list(dir) {
-        let path = dir.join(&entry.name);
-        if entry.is_dir && depth_left > 0 {
-            dirs.push(build_dir(list, &path, entry.name, depth_left - 1));
-        } else if entry.is_dir {
-            // Depth limit reached: represent as an empty (unexpanded) dir.
-            dirs.push(FileNode::Dir {
-                name: entry.name,
-                path,
-                children: Vec::new(),
-                expanded: false,
-                size: 0,
-                files: 0,
-            });
-        } else {
-            let kind = FileKind::of(&entry.name);
-            files.push(FileNode::File {
-                name: entry.name,
-                path,
-                size: entry.size,
-                kind,
-            });
+        let path = dir.join(entry.name());
+        match entry {
+            DirEntry::Directory { name } if depth_left > 0 => {
+                dirs.push(build_dir(list, &path, name, depth_left - 1));
+            }
+            DirEntry::Directory { name } => {
+                // Depth limit reached: represent as an empty (unexpanded) dir.
+                dirs.push(FileNode::Dir {
+                    name,
+                    path,
+                    children: Vec::new(),
+                    expanded: false,
+                    size: 0,
+                    files: 0,
+                });
+            }
+            DirEntry::File { name, size } => {
+                let kind = FileKind::of(&name);
+                files.push(FileNode::File {
+                    name,
+                    path,
+                    size,
+                    kind,
+                });
+            }
         }
     }
     let by_name =
@@ -265,18 +280,48 @@ fn build_dir(
 
 /// One visible row of the flattened file tree — the data a row needs to render
 /// and to act on (`Enter`), so the browser never re-walks the tree per frame.
+/// The dir-vs-file split is a tagged [`FileRowKind`] (no `is_dir` bool + dummy
+/// `expanded`/`files`/`kind` fields that only some rows use).
 #[derive(Debug, Clone)]
 pub struct FileRow {
     pub depth: usize,
     pub name: String,
     pub path: PathBuf,
     pub size: u64,
-    pub is_dir: bool,
-    pub expanded: bool,
-    /// Number of files under a directory (0 for a file row).
-    pub files: usize,
-    /// A file's kind (`Checkpoint` for a dir row — unused there).
-    pub kind: FileKind,
+    pub kind: FileRowKind,
+}
+
+/// A flattened row is either a directory (with its fold state + child count) or a
+/// file (with its content kind) — the two carry disjoint data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileRowKind {
+    Dir { expanded: bool, files: usize },
+    File { kind: FileKind },
+}
+
+impl FileRow {
+    /// Whether this row is a directory.
+    pub fn is_dir(&self) -> bool {
+        matches!(self.kind, FileRowKind::Dir { .. })
+    }
+    /// Whether this (directory) row is expanded — `false` for a file row.
+    pub fn expanded(&self) -> bool {
+        matches!(self.kind, FileRowKind::Dir { expanded: true, .. })
+    }
+    /// Child-file count for a directory row (0 for a file row).
+    pub fn files(&self) -> usize {
+        match self.kind {
+            FileRowKind::Dir { files, .. } => files,
+            FileRowKind::File { .. } => 0,
+        }
+    }
+    /// The content classification for a file row, else `None` for a directory.
+    pub fn file_kind(&self) -> Option<FileKind> {
+        match self.kind {
+            FileRowKind::File { kind } => Some(kind),
+            FileRowKind::Dir { .. } => None,
+        }
+    }
 }
 
 /// Flatten the tree into the visible rows (a collapsed directory hides its
@@ -302,10 +347,10 @@ fn flatten_node(node: &FileNode, depth: usize, out: &mut Vec<FileRow>) {
                 name: name.clone(),
                 path: path.clone(),
                 size: *size,
-                is_dir: true,
-                expanded: *expanded,
-                files: *files,
-                kind: FileKind::Other,
+                kind: FileRowKind::Dir {
+                    expanded: *expanded,
+                    files: *files,
+                },
             });
             if *expanded {
                 for child in children {
@@ -323,10 +368,7 @@ fn flatten_node(node: &FileNode, depth: usize, out: &mut Vec<FileRow>) {
             name: name.clone(),
             path: path.clone(),
             size: *size,
-            is_dir: false,
-            expanded: false,
-            files: 0,
-            kind: *kind,
+            kind: FileRowKind::File { kind: *kind },
         }),
     }
 }
@@ -446,38 +488,28 @@ mod tests {
         let list = |dir: &Path| -> Vec<DirEntry> {
             match dir.to_str().unwrap() {
                 "/ckpt" => vec![
-                    DirEntry {
+                    DirEntry::File {
                         name: "model.safetensors".into(),
                         size: 100,
-                        is_dir: false,
                     },
-                    DirEntry {
-                        name: "sub".into(),
-                        size: 0,
-                        is_dir: true,
-                    },
-                    DirEntry {
+                    DirEntry::Directory { name: "sub".into() },
+                    DirEntry::File {
                         name: "config.json".into(),
                         size: 2,
-                        is_dir: false,
                     },
                 ],
                 "/ckpt/sub" => vec![
-                    DirEntry {
+                    DirEntry::File {
                         name: "extra.json".into(),
                         size: 8,
-                        is_dir: false,
                     },
-                    DirEntry {
+                    DirEntry::Directory {
                         name: "deep".into(),
-                        size: 0,
-                        is_dir: true,
                     },
                 ],
-                "/ckpt/sub/deep" => vec![DirEntry {
+                "/ckpt/sub/deep" => vec![DirEntry::File {
                     name: "leaf.bin".into(),
                     size: 4,
-                    is_dir: false,
                 }],
                 _ => Vec::new(),
             }

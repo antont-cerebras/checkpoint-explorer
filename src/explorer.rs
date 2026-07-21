@@ -882,7 +882,7 @@ impl Mode for FilesMode {
                     if let Some(fr) = ex.file_state.rows.get(idx).cloned() {
                         // A click on a directory's ▸/▾ twisty (column `2*depth`)
                         // toggles it on a single click.
-                        let on_arrow = fr.is_dir && col == 2 * fr.depth as u16;
+                        let on_arrow = fr.is_dir() && col == 2 * fr.depth as u16;
                         ex.file_state.selected = idx;
                         if on_arrow {
                             self.last_click = None;
@@ -6957,14 +6957,17 @@ impl Explorer {
                             .parent()
                             .map(Path::to_path_buf)
                             .unwrap_or_else(|| root.clone());
-                        listing
-                            .entry(parent)
-                            .or_default()
-                            .push(crate::filetree::DirEntry {
+                        let entry = if fe.is_dir() {
+                            crate::filetree::DirEntry::Directory {
+                                name: fe.name.clone(),
+                            }
+                        } else {
+                            crate::filetree::DirEntry::File {
                                 name: fe.name.clone(),
                                 size: fe.apparent(),
-                                is_dir: fe.is_dir(),
-                            });
+                            }
+                        };
+                        listing.entry(parent).or_default().push(entry);
                     }
                     let list = move |p: &Path| listing.get(p).cloned().unwrap_or_default();
                     Ok(crate::filetree::build_from(&list, root, 8))
@@ -6979,29 +6982,13 @@ impl Explorer {
                 let listing = self
                     .with_remote_session(|s| s.walk_dir(dir, 8))
                     .map_err(|e| format!("{e:#}"))?;
+                // `walk_dir` already yields the shared `filetree::DirEntry`, so the
+                // listing feeds `build_from` directly — no per-entry conversion.
                 let list = |p: &Path| -> Vec<crate::filetree::DirEntry> {
                     listing
                         .get(p.to_string_lossy().as_ref())
                         .cloned()
                         .unwrap_or_default()
-                        .into_iter()
-                        .map(|e| match e {
-                            crate::sftp::RemoteDirEntry::File { name, size } => {
-                                crate::filetree::DirEntry {
-                                    name,
-                                    size,
-                                    is_dir: false,
-                                }
-                            }
-                            crate::sftp::RemoteDirEntry::Directory { name } => {
-                                crate::filetree::DirEntry {
-                                    name,
-                                    size: 0,
-                                    is_dir: true,
-                                }
-                            }
-                        })
-                        .collect()
                 };
                 Ok(crate::filetree::build_from(&list, Path::new(dir), 8))
             }
@@ -7096,10 +7083,13 @@ impl Explorer {
     fn activate_file_selection(&mut self) -> Option<Nav> {
         use crate::filetree::FileKind;
         let row = self.file_state.rows.get(self.file_state.selected)?.clone();
-        if row.is_dir {
+        if row.is_dir() {
             self.file_state.toggle_dir(self.file_state.selected);
             return None;
         }
+        // Past the directory guard the row is a file; project its content kind
+        // (the `Other` fallback is unreachable — a dir would have returned above).
+        let kind = row.file_kind().unwrap_or(FileKind::Other);
         // s3-native browse is a read-only object listing: `Enter` on an object
         // shows an info pop-up (full key + size); there's no per-object layout map
         // or preview (cstorch objects aren't per-file safetensors).
@@ -7133,14 +7123,14 @@ impl Explorer {
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
-        if row.kind == FileKind::Checkpoint && is_safetensors {
+        if kind == FileKind::Checkpoint && is_safetensors {
             return Some(Nav::Open(Screen::Layout {
                 path: row.path.to_string_lossy().into_owned(),
                 selected: 0,
                 scroll: 0,
             }));
         }
-        match row.kind {
+        match kind {
             // A non-safetensors checkpoint that's the one we're exploring drops
             // back to its tensor tree (no per-file layout map for those formats).
             FileKind::Checkpoint if self.is_loaded_checkpoint(&row.path) => {
@@ -7161,7 +7151,7 @@ impl Explorer {
                 });
             }
             FileKind::Json | FileKind::Text => {
-                self.with_terminal(|s, t| s.preview_sidecar(t, &row.path, &row.name, row.kind));
+                self.with_terminal(|s, t| s.preview_sidecar(t, &row.path, &row.name, kind));
             }
             FileKind::Other => {
                 let body = vec![
@@ -7483,7 +7473,7 @@ impl Explorer {
             .iter()
             .map(|r| {
                 let indent = "  ".repeat(r.depth);
-                let name = if r.is_dir {
+                let name = if r.is_dir() {
                     format!("{}/", r.name)
                 } else {
                     r.name.clone()

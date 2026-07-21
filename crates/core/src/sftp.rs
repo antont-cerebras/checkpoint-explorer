@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use ssh2::{CheckResult, KnownHostFileKind, Session};
 
+use crate::filetree::DirEntry;
 use crate::tree::{MetadataInfo, TensorInfo};
 
 /// What one pass over a remote directory (one `readdir`, one index read) yields:
@@ -45,18 +46,10 @@ pub struct ShardListing {
     pub actual: BTreeSet<String>,
 }
 
-/// One entry in a remote directory listing: a file (with its size) or a
-/// subdirectory — a 2-case sum instead of a `(name, size, is_dir)` tuple whose
-/// bool gated the size.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RemoteDirEntry {
-    File { name: String, size: u64 },
-    Directory { name: String },
-}
-
-/// One directory's entries — the file browser's view of a remote directory
-/// (see [`RemoteSession::walk_dir`]).
-pub type DirListing = Vec<RemoteDirEntry>;
+/// One directory's entries — the file browser's view of a remote directory (see
+/// [`RemoteSession::walk_dir`]). Uses the shared [`crate::filetree::DirEntry`] sum
+/// type, so the remote listing and the local walk feed the browser the same shape.
+pub type DirListing = Vec<DirEntry>;
 
 /// A remote path's canonical filesystem metadata, with symlinks **followed** —
 /// the value type of [`RemoteSession::stat_paths`], the single source of truth for
@@ -258,7 +251,7 @@ impl RemoteSession {
                     continue;
                 }
             };
-            let mut rows: Vec<RemoteDirEntry> = Vec::new();
+            let mut rows: Vec<DirEntry> = Vec::new();
             for (p, st) in entries {
                 let name = match p.file_name().and_then(|n| n.to_str()) {
                     Some(n) if !n.starts_with('.') => n.to_string(),
@@ -273,7 +266,7 @@ impl RemoteSession {
                     links.push((dir.clone(), rows.len(), full));
                     // Pushed as a File leaf with a fallback size; the follow-up
                     // `stat -L` below replaces the size with the target's.
-                    rows.push(RemoteDirEntry::File {
+                    rows.push(DirEntry::File {
                         name,
                         size: st.size.unwrap_or(0),
                     });
@@ -283,9 +276,9 @@ impl RemoteSession {
                         stack.push((full, depth + 1));
                     }
                     rows.push(if is_dir {
-                        RemoteDirEntry::Directory { name }
+                        DirEntry::Directory { name }
                     } else {
-                        RemoteDirEntry::File {
+                        DirEntry::File {
                             name,
                             size: st.size.unwrap_or(0),
                         }
@@ -302,7 +295,7 @@ impl RemoteSession {
             for (dir, idx, full) in &links {
                 if let Some(st) = resolved.get(full)
                     && let Some(rows) = map.get_mut(dir)
-                    && let Some(RemoteDirEntry::File { size, .. }) = rows.get_mut(*idx)
+                    && let Some(DirEntry::File { size, .. }) = rows.get_mut(*idx)
                 {
                     // A symlinked dir stays a size-0 leaf (never descended).
                     *size = if st.is_dir() { 0 } else { st.apparent() };
