@@ -777,10 +777,10 @@ impl Mode for FilesMode {
         // persists across `Tab` toggles). Local walks the filesystem; a remote
         // source lists over SFTP / s3 — a listing failure floats an error and
         // drops back rather than showing an empty browser.
-        if ex.file_tree.is_none() {
+        if ex.file_state.tree.is_none() {
             match ex.build_browse_tree() {
                 Ok(tree) => {
-                    ex.file_tree = Some(tree);
+                    ex.file_state.tree = Some(tree);
                     ex.rebuild_file_rows();
                 }
                 Err(e) => {
@@ -799,13 +799,13 @@ impl Mode for FilesMode {
 
     fn pre_draw(&mut self, ex: &mut Explorer, term: &mut crate::tui::LiveTerminal) {
         if let Ok(sz) = term.size() {
-            if ex.file_selected != self.last_sel {
+            if ex.file_state.selected != self.last_sel {
                 ex.update_files_scroll(sz.width, sz.height);
-                self.last_sel = ex.file_selected;
+                self.last_sel = ex.file_state.selected;
             }
             let body = UI::files_visible_rows(sz.width, sz.height);
-            let total = ex.file_flattened.len();
-            ex.file_scroll = ex.file_scroll.min(total.saturating_sub(body));
+            let total = ex.file_state.rows.len();
+            ex.file_state.scroll = ex.file_state.scroll.min(total.saturating_sub(body));
         }
     }
 
@@ -832,7 +832,7 @@ impl Mode for FilesMode {
         term: &mut crate::tui::LiveTerminal,
         key: KeyEvent,
     ) -> Result<Outcome> {
-        let total = ex.file_flattened.len();
+        let total = ex.file_state.rows.len();
         match key.code {
             // Every lettered command dispatches through the registry (like the tree),
             // so key and palette entry can't drift.
@@ -867,8 +867,8 @@ impl Mode for FilesMode {
                     (ex.file_page_rows() * ex.held_step(KeyCode::PageDown, accel_step_page)) as i32;
                 ex.move_file_selection(step);
             }
-            KeyCode::Home => ex.file_selected = 0,
-            KeyCode::End => ex.file_selected = total.saturating_sub(1),
+            KeyCode::Home => ex.file_state.selected = 0,
+            KeyCode::End => ex.file_state.selected = total.saturating_sub(1),
             KeyCode::Left => ex.file_collapse_or_parent(),
             KeyCode::Right => ex.file_expand_or_child(),
             KeyCode::Enter => {
@@ -897,12 +897,12 @@ impl Mode for FilesMode {
                 let body_top = UI::files_header_rows(sz.width) as u16;
                 let body_bottom = sz.height.saturating_sub(FILES_FOOTER_ROWS as u16);
                 if row >= body_top && row < body_bottom {
-                    let idx = ex.file_scroll + (row - body_top) as usize;
-                    if let Some(fr) = ex.file_flattened.get(idx).cloned() {
+                    let idx = ex.file_state.scroll + (row - body_top) as usize;
+                    if let Some(fr) = ex.file_state.rows.get(idx).cloned() {
                         // A click on a directory's ▸/▾ twisty (column `2*depth`)
                         // toggles it on a single click.
                         let on_arrow = fr.is_dir && col == 2 * fr.depth as u16;
-                        ex.file_selected = idx;
+                        ex.file_state.selected = idx;
                         if on_arrow {
                             self.last_click = None;
                             ex.activate_file_selection();
@@ -925,11 +925,11 @@ impl Mode for FilesMode {
                 MouseOutcome::Redraw
             }
             MouseEventKind::ScrollDown => {
-                ex.file_scroll = ex.file_scroll.saturating_add(WHEEL_STEP);
+                ex.file_state.scroll = ex.file_state.scroll.saturating_add(WHEEL_STEP);
                 MouseOutcome::Redraw
             }
             MouseEventKind::ScrollUp => {
-                ex.file_scroll = ex.file_scroll.saturating_sub(WHEEL_STEP);
+                ex.file_state.scroll = ex.file_state.scroll.saturating_sub(WHEEL_STEP);
                 MouseOutcome::Redraw
             }
             _ => MouseOutcome::Ignored,
@@ -937,7 +937,7 @@ impl Mode for FilesMode {
     }
 
     fn set_scroll(&mut self, ex: &mut Explorer, offset: usize) {
-        ex.file_scroll = offset;
+        ex.file_state.scroll = offset;
     }
 
     fn residual(&self) -> Screen {
@@ -3922,20 +3922,9 @@ pub struct Explorer {
     /// The directory the file browser (`Tab`) lists — the checkpoint's own
     /// directory (the common parent of its shards). Fixed for the session.
     browse_root: PathBuf,
-    /// The file browser's directory tree, built lazily the first time the file
-    /// view opens (so a session that never uses it never stats the directory),
-    /// then kept — with its per-directory fold state — across `Tab` toggles.
-    file_tree: Option<crate::filetree::FileNode>,
-    /// The file tree flattened to visible rows — the file-view analogue of
-    /// [`Self::flattened_tree`], cached so the browsing loop and renderer never
-    /// re-walk the tree per frame (which would slow the input drain enough to lag
-    /// the wheel and break held-key acceleration). Rebuilt only when the fold
-    /// state changes (a directory toggles) via [`Self::rebuild_file_rows`].
-    file_flattened: Vec<crate::filetree::FileRow>,
-    /// The file browser's selected row and viewport scroll, mirroring the tensor
-    /// tree's [`Self::selected_idx`] / [`Self::scroll_offset`].
-    file_selected: usize,
-    file_scroll: usize,
+    /// The file-browser state (directory tree + flattened rows + selection/scroll)
+    /// — kernel-owned, built lazily on first `Tab` and driven by the file screen.
+    file_state: crate::kernel::FileState,
 }
 
 impl Explorer {
@@ -4001,10 +3990,7 @@ impl Explorer {
             writable: Cell::new(None),
             cached_group_files: RefCell::new(None),
             browse_root,
-            file_tree: None,
-            file_flattened: Vec::new(),
-            file_selected: 0,
-            file_scroll: 0,
+            file_state: crate::kernel::FileState::default(),
         }
     }
 
@@ -5038,8 +5024,9 @@ impl Explorer {
         // The file browser (`--files`): build the directory rows, then render its
         // frame headlessly — so `--plain` covers this screen like the others.
         if want_files && self.file_view_available() {
-            if self.file_tree.is_none() {
-                self.file_tree = Some(self.build_browse_tree().map_err(|e| anyhow::anyhow!(e))?);
+            if self.file_state.tree.is_none() {
+                self.file_state.tree =
+                    Some(self.build_browse_tree().map_err(|e| anyhow::anyhow!(e))?);
                 self.rebuild_file_rows();
             }
             let text = crate::tui::headless_render(120, 40, |f| self.render_files_frame(f, false))?;
@@ -6991,13 +6978,14 @@ impl Explorer {
     /// directory fold), clamping the selection into the new row count — the
     /// file-view analogue of the tensor tree's flatten-on-change.
     fn rebuild_file_rows(&mut self) {
-        self.file_flattened = self
-            .file_tree
+        self.file_state.rows = self
+            .file_state
+            .tree
             .as_ref()
             .map(crate::filetree::flatten)
             .unwrap_or_default();
-        let n = self.file_flattened.len();
-        self.file_selected = self.file_selected.min(n.saturating_sub(1));
+        let n = self.file_state.rows.len();
+        self.file_state.selected = self.file_state.selected.min(n.saturating_sub(1));
     }
 
     /// The header path shown atop the file browser: the local browse root, the
@@ -7101,9 +7089,9 @@ impl Explorer {
         let regions = UI::render_files(
             frame,
             &root,
-            &self.file_flattened,
-            self.file_selected,
-            self.file_scroll,
+            &self.file_state.rows,
+            self.file_state.selected,
+            self.file_state.scroll,
             flash,
             interactive,
             &badges,
@@ -7118,8 +7106,8 @@ impl Explorer {
                 UI::files_scrollbar(
                     area.width,
                     area.height,
-                    self.file_flattened.len(),
-                    self.file_scroll,
+                    self.file_state.rows.len(),
+                    self.file_state.scroll,
                 )
             })
             .flatten();
@@ -7132,14 +7120,14 @@ impl Explorer {
     }
 
     fn move_file_selection(&mut self, delta: i32) {
-        let len = self.file_flattened.len();
+        let len = self.file_state.rows.len();
         if len == 0 {
             return;
         }
-        self.file_selected = if delta < 0 {
-            self.file_selected.saturating_sub((-delta) as usize)
+        self.file_state.selected = if delta < 0 {
+            self.file_state.selected.saturating_sub((-delta) as usize)
         } else {
-            (self.file_selected + delta as usize).min(len - 1)
+            (self.file_state.selected + delta as usize).min(len - 1)
         };
     }
 
@@ -7147,58 +7135,60 @@ impl Explorer {
     /// [`Self::update_tree_scroll`].
     fn update_files_scroll(&mut self, width: u16, height: u16) {
         let body = UI::files_visible_rows(width, height);
-        let sel = self.file_selected;
-        self.file_scroll = if sel >= self.file_scroll + body {
+        let sel = self.file_state.selected;
+        self.file_state.scroll = if sel >= self.file_state.scroll + body {
             sel.saturating_sub(body - 1)
-        } else if sel < self.file_scroll {
+        } else if sel < self.file_state.scroll {
             sel
         } else {
-            self.file_scroll
+            self.file_state.scroll
         };
     }
 
     /// `←`: collapse the selected directory if it's open, else jump to its parent.
     fn file_collapse_or_parent(&mut self) {
         let Some((is_dir, expanded, depth)) = self
-            .file_flattened
-            .get(self.file_selected)
+            .file_state
+            .rows
+            .get(self.file_state.selected)
             .map(|r| (r.is_dir, r.expanded, r.depth))
         else {
             return;
         };
         if is_dir && expanded {
-            self.toggle_file_dir(self.file_selected);
+            self.toggle_file_dir(self.file_state.selected);
             return;
         }
         if depth == 0 {
             return;
         }
-        if let Some(parent) = (0..self.file_selected)
+        if let Some(parent) = (0..self.file_state.selected)
             .rev()
-            .find(|&i| self.file_flattened[i].depth < depth)
+            .find(|&i| self.file_state.rows[i].depth < depth)
         {
-            self.file_selected = parent;
+            self.file_state.selected = parent;
         }
     }
 
     /// `→`: expand the selected directory if it's collapsed (a no-op otherwise).
     fn file_expand_or_child(&mut self) {
         let Some((is_dir, expanded)) = self
-            .file_flattened
-            .get(self.file_selected)
+            .file_state
+            .rows
+            .get(self.file_state.selected)
             .map(|r| (r.is_dir, r.expanded))
         else {
             return;
         };
         if is_dir && !expanded {
-            self.toggle_file_dir(self.file_selected);
+            self.toggle_file_dir(self.file_state.selected);
         }
     }
 
     /// Toggle the fold of the directory at flattened index `idx` and refresh the
     /// cached rows so the collapsed / expanded subtree shows immediately.
     fn toggle_file_dir(&mut self, idx: usize) {
-        if let Some(tree) = self.file_tree.as_mut() {
+        if let Some(tree) = self.file_state.tree.as_mut() {
             crate::filetree::toggle_by_index(tree, idx);
         }
         self.rebuild_file_rows();
@@ -7224,9 +7214,9 @@ impl Explorer {
     /// Returns `Some(Nav)` only when it leaves the file view.
     fn activate_file_selection(&mut self) -> Option<Nav> {
         use crate::filetree::FileKind;
-        let row = self.file_flattened.get(self.file_selected)?.clone();
+        let row = self.file_state.rows.get(self.file_state.selected)?.clone();
         if row.is_dir {
-            self.toggle_file_dir(self.file_selected);
+            self.toggle_file_dir(self.file_state.selected);
             return None;
         }
         // s3-native browse is a read-only object listing: `Enter` on an object
@@ -7594,8 +7584,9 @@ impl Explorer {
     /// Copy the selected file row's path (`f`).
     fn copy_file_path(&mut self) {
         let path = self
-            .file_flattened
-            .get(self.file_selected)
+            .file_state
+            .rows
+            .get(self.file_state.selected)
             .map(|r| r.path.to_string_lossy().into_owned());
         if let Some(path) = path {
             copy_to_clipboard(&path);
@@ -7606,7 +7597,8 @@ impl Explorer {
     /// Copy the file browser's visible listing as plain text (`c`).
     fn copy_files_screen(&mut self) {
         let text = self
-            .file_flattened
+            .file_state
+            .rows
             .iter()
             .map(|r| {
                 let indent = "  ".repeat(r.depth);

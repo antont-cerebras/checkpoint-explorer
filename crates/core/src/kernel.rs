@@ -78,6 +78,17 @@ pub struct TreeState {
     pub search_mode: bool,
 }
 
+/// The file-browser state — the directory tree (built from the model / a remote
+/// listing), its flattened visible rows, and the selection/scroll. Kernel-owned,
+/// like [`TreeState`].
+#[derive(Default)]
+pub struct FileState {
+    pub tree: Option<crate::filetree::FileNode>,
+    pub rows: Vec<crate::filetree::FileRow>,
+    pub selected: usize,
+    pub scroll: usize,
+}
+
 /// A frontend-agnostic browsing session over a cached checkpoint.
 pub struct Session {
     model: Checkpoint,
