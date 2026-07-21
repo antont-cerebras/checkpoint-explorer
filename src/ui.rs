@@ -3417,7 +3417,7 @@ impl UI {
         // Summary + a per-object breakdown folded away by default. Shares the one
         // `fold_line` with the on-disk section — an s3 source has no local
         // filesystem, so the two never both appear.
-        if let Some(s3) = s.s3.as_ref().filter(|x| !x.objects.is_empty()) {
+        if let Some(s3) = s.s3().filter(|x| !x.objects.is_empty()) {
             lines.push(Line::from(sty(String::new(), Style::default())));
             lines.push(section(
                 crate::stats::GLYPH_S3,
@@ -3477,7 +3477,7 @@ impl UI {
         }
 
         // ── On disk (filesystem allocation) ────────────────────────────────────
-        if let Some(d) = &s.disk {
+        if let Some(d) = s.disk() {
             lines.push(Line::from(sty(String::new(), Style::default())));
             lines.push(header("On disk (filesystem)"));
             lines.push(row(

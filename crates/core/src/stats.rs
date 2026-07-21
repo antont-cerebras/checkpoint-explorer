@@ -515,12 +515,21 @@ pub struct CheckpointStats {
     pub experts: Option<ExpertStats>,
     /// `config.json`'s `model_type`, when a config was found.
     pub model_type: Option<String>,
-    /// True on-disk footprint from the filesystem, when measurable.
-    pub disk: Option<DiskUsage>,
-    /// The underlying S3 objects — `Some` only for an `s3://` cstorch source (set
-    /// via [`Self::with_s3`]); mutually exclusive with `disk` (an s3 source has no
-    /// local filesystem), so both share the report's one foldable breakdown.
-    pub s3: Option<S3Stats>,
+    /// The checkpoint's storage footprint — a local/SFTP filesystem measurement or
+    /// the s3:// object listing, but **never both** (an s3 source has no local
+    /// filesystem). One tagged optional instead of two mutually-exclusive
+    /// `Option`s; the report shows whichever is present in its one foldable
+    /// breakdown. `None` when neither could be measured.
+    pub footprint: Option<StorageFootprint>,
+}
+
+/// Where a checkpoint's bytes live — the two are mutually exclusive by source.
+#[derive(Debug, Clone, serde::Serialize)]
+pub enum StorageFootprint {
+    /// Local / SFTP filesystem footprint (symlink-followed sizes).
+    Disk(DiskUsage),
+    /// The `s3://` object listing (a cstorch source).
+    S3(S3Stats),
 }
 
 impl CheckpointStats {
@@ -623,16 +632,34 @@ impl CheckpointStats {
             per_layer: PerLayerStats::compute(tensors),
             experts: expert_stats(tensors, config),
             model_type: config.and_then(|c| c.model_type.clone()),
-            disk,
-            s3: None,
+            footprint: disk.map(StorageFootprint::Disk),
         }
     }
 
     /// Attach the underlying S3 objects (an `s3://` cstorch source only) — kept out
-    /// of [`Self::compute`] so its many local/test call sites don't churn.
+    /// of [`Self::compute`] so its many local/test call sites don't churn. Sets the
+    /// S3 footprint; a `None` leaves any disk footprint from `compute` intact.
     pub fn with_s3(mut self, s3: Option<S3Stats>) -> Self {
-        self.s3 = s3;
+        if let Some(s3) = s3 {
+            self.footprint = Some(StorageFootprint::S3(s3));
+        }
         self
+    }
+
+    /// The on-disk (local/SFTP) footprint, if this checkpoint has one.
+    pub fn disk(&self) -> Option<&DiskUsage> {
+        match &self.footprint {
+            Some(StorageFootprint::Disk(d)) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// The S3 object footprint, if this is an `s3://` source.
+    pub fn s3(&self) -> Option<&S3Stats> {
+        match &self.footprint {
+            Some(StorageFootprint::S3(s)) => Some(s),
+            _ => None,
+        }
     }
 
     /// A plain-text rendering of the stats — what the popup's `r` copies. Mirrors
@@ -846,7 +873,7 @@ impl CheckpointStats {
         // S3 objects (an `s3://` cstorch source) — summary + a per-object list
         // folded away by default (shared with the on-disk fold; the two never
         // coexist). Mirrors the styled `stats_body_lines` S3 section.
-        if let Some(s3) = self.s3.as_ref().filter(|s| !s.objects.is_empty()) {
+        if let Some(s3) = self.s3().filter(|s| !s.objects.is_empty()) {
             out.push(String::new());
             out.push(format!("{GLYPH_S3} S3 objects  ×{}", s3.count()));
             out.push(row("Total", format_size(s3.total_bytes() as usize)));
@@ -881,7 +908,7 @@ impl CheckpointStats {
         }
 
         // On disk (filesystem allocation) — the true footprint, ZFS/sparse-aware.
-        if let Some(d) = &self.disk {
+        if let Some(d) = self.disk() {
             out.push(String::new());
             out.push("On disk (filesystem)".into());
             out.push(row(

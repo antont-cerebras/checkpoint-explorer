@@ -2648,8 +2648,8 @@ impl StatsMode {
         let Some(s) = cache.as_ref() else {
             return false;
         };
-        let on_disk = s.disk.as_ref().is_some_and(|d| d.shards.len() > 1);
-        let s3 = s.s3.as_ref().is_some_and(|x| !x.objects.is_empty());
+        let on_disk = s.disk().is_some_and(|d| d.shards.len() > 1);
+        let s3 = s.s3().is_some_and(|x| !x.objects.is_empty());
         on_disk || s3
     }
 }
