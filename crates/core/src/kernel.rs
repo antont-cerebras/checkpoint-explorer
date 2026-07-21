@@ -15,12 +15,13 @@
 //! cached.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::config::ModelConfig;
 use crate::model::Checkpoint;
 use crate::sample::ViewDtype;
 use crate::stats::CheckpointStats;
-use crate::tree::{TreeBuilder, TreeNode};
+use crate::tree::{MetadataInfo, TensorInfo, TreeBuilder, TreeNode, natural_sort_key};
 use crate::viewstate::{DataLayout, NumBase, StripeMode};
 
 /// Which screen the session is showing.
@@ -166,9 +167,30 @@ impl Default for DataViewState {
 }
 
 /// A frontend-agnostic browsing session over a cached checkpoint.
+///
+/// The session is the single owner of the checkpoint's **canonical** primary
+/// data — the tensors deduplicated by name (first shard wins) and natural-sorted,
+/// the metadata, and the config — so a frontend never keeps its own copy that can
+/// drift. For a local checkpoint it's built from the serializable
+/// [`Checkpoint`] model ([`Session::from_model`]); a remote (`--ssh-read`) read
+/// that hasn't produced a model yet supplies the parts directly
+/// ([`Session::from_parts`]).
 pub struct Session {
-    model: Checkpoint,
-    /// The tensor tree flattened to visible rows, derived once from the model
+    /// The serializable model — `Some` for a local read; `None` for a remote read
+    /// whose model isn't assembled yet (its tensors/metadata still populate the
+    /// canonical fields below).
+    model: Option<Checkpoint>,
+    /// Canonical tensor list: deduplicated by name (first occurrence in shard
+    /// order wins) then natural-sorted. The one primary tensor list every view /
+    /// report / status line reads.
+    tensors: Vec<TensorInfo>,
+    /// The metadata entries, in model / shard order.
+    metadata: Vec<MetadataInfo>,
+    /// The checkpoint's `config.json`, when present.
+    config: Option<ModelConfig>,
+    /// Total element count across the canonical tensors (parameter count).
+    total_parameters: usize,
+    /// The tensor tree flattened to visible rows, derived once from the tensors
     /// (no disk); search filters it on the fly.
     flat: Vec<(TreeNode, usize)>,
     screen: Screen,
@@ -179,18 +201,41 @@ pub struct Session {
 }
 
 impl Session {
-    /// Open a session over an already-read checkpoint model.
-    pub fn new(model: Checkpoint) -> Self {
+    /// Open a session over an already-read checkpoint model (local reads).
+    pub fn from_model(model: Checkpoint) -> Self {
         let tensors = model.tensors_vec();
         let metadata = model.metadata_vec();
-        let tree = if metadata.is_empty() {
-            TreeBuilder::build_tree(&tensors)
-        } else {
-            TreeBuilder::build_tree_mixed(&tensors, &metadata)
-        };
-        let flat = TreeBuilder::flatten_tree(&tree);
+        let config = model.config.clone();
+        Self::assemble(Some(model), tensors, metadata, config)
+    }
+
+    /// Open a session from raw parts — a remote read whose serializable model
+    /// isn't assembled yet. Canonicalises the tensors exactly as [`from_model`].
+    pub fn from_parts(
+        tensors: Vec<TensorInfo>,
+        metadata: Vec<MetadataInfo>,
+        config: Option<ModelConfig>,
+    ) -> Self {
+        Self::assemble(None, tensors, metadata, config)
+    }
+
+    /// Shared construction: canonicalise the tensors (dedup by name, natural-sort),
+    /// build the tree, and cache the parameter count.
+    fn assemble(
+        model: Option<Checkpoint>,
+        tensors: Vec<TensorInfo>,
+        metadata: Vec<MetadataInfo>,
+        config: Option<ModelConfig>,
+    ) -> Self {
+        let tensors = Self::canonical_tensors(tensors);
+        let total_parameters = tensors.iter().map(|t| t.num_elements).sum();
+        let flat = Self::flatten(&tensors, &metadata);
         Session {
             model,
+            tensors,
+            metadata,
+            config,
+            total_parameters,
             flat,
             screen: Screen::Tree,
             selected: 0,
@@ -199,22 +244,82 @@ impl Session {
         }
     }
 
-    /// The underlying model (for serialization / reports / other queries).
-    pub fn model(&self) -> &Checkpoint {
-        &self.model
+    /// Deduplicate tensors by name (keeping the first occurrence in shard order,
+    /// so a name in two shards is resolved to the first) and natural-sort them —
+    /// the canonical order the tree / stats / diff all consume.
+    fn canonical_tensors(mut tensors: Vec<TensorInfo>) -> Vec<TensorInfo> {
+        let mut seen = HashSet::new();
+        tensors.retain(|t| seen.insert(t.name.clone()));
+        // `sort_by_cached_key`, not `sort_by_key`: the natural-sort key allocates a
+        // `Vec`, and `sort_by_key` would recompute it O(n log n) times.
+        tensors.sort_by_cached_key(|a| natural_sort_key(&a.name));
+        tensors
     }
 
-    /// The checkpoint stats report — computed once from the model, then cached.
-    pub fn stats(&mut self) -> &CheckpointStats {
+    /// Build + flatten the tensor tree from the given tensors/metadata.
+    fn flatten(tensors: &[TensorInfo], metadata: &[MetadataInfo]) -> Vec<(TreeNode, usize)> {
+        let tree = if metadata.is_empty() {
+            TreeBuilder::build_tree(tensors)
+        } else {
+            TreeBuilder::build_tree_mixed(tensors, metadata)
+        };
+        TreeBuilder::flatten_tree(&tree)
+    }
+
+    /// Drop the tensors and metadata whose names don't pass `keep`, recompute the
+    /// parameter count, rebuild the flattened tree, and invalidate the cached
+    /// stats — backs the `--print-tree`/`--print-tensors` name-filter subset.
+    pub fn retain_named<F: FnMut(&str) -> bool>(&mut self, mut keep: F) {
+        self.tensors.retain(|t| keep(&t.name));
+        self.metadata.retain(|m| keep(&m.name));
+        self.total_parameters = self.tensors.iter().map(|t| t.num_elements).sum();
+        self.flat = Self::flatten(&self.tensors, &self.metadata);
+        self.stats = None;
+    }
+
+    /// The serializable model (local reads only), for serialization / reports.
+    pub fn model(&self) -> Option<&Checkpoint> {
+        self.model.as_ref()
+    }
+
+    /// The canonical tensor list (deduped + natural-sorted).
+    pub fn tensors(&self) -> &[TensorInfo] {
+        &self.tensors
+    }
+
+    /// The metadata entries (model / shard order).
+    pub fn metadata(&self) -> &[MetadataInfo] {
+        &self.metadata
+    }
+
+    /// The checkpoint's config, when present.
+    pub fn config(&self) -> Option<&ModelConfig> {
+        self.config.as_ref()
+    }
+
+    /// Total element count across the canonical tensors.
+    pub fn total_parameters(&self) -> usize {
+        self.total_parameters
+    }
+
+    /// The checkpoint stats report — computed once from the canonical data, cached.
+    /// `disk` is the on-disk footprint the caller resolves (from the model for a
+    /// local read, or the captured remote usage for `--ssh-read`).
+    pub fn stats_with_disk(&mut self, disk: Option<crate::stats::DiskUsage>) -> &CheckpointStats {
         if self.stats.is_none() {
-            let tensors = self.model.tensors_vec();
             self.stats = Some(CheckpointStats::compute(
-                &tensors,
-                self.model.config.as_ref(),
-                self.model.disk_usage(),
+                &self.tensors,
+                self.config.as_ref(),
+                disk,
             ));
         }
         self.stats.as_ref().expect("just set")
+    }
+
+    /// The checkpoint stats report, using the model's own disk usage (local reads).
+    pub fn stats(&mut self) -> &CheckpointStats {
+        let disk = self.model.as_ref().and_then(|m| m.disk_usage());
+        self.stats_with_disk(disk)
     }
 
     // ── Command methods (input) ──────────────────────────────────────────────
@@ -255,7 +360,7 @@ impl Session {
     fn rows_len(&self) -> usize {
         match self.screen {
             Screen::Tree => self.tree_rows().count(),
-            Screen::Files => self.model.files.len(),
+            Screen::Files => self.model.as_ref().map_or(0, |m| m.files.len()),
         }
     }
 
@@ -280,7 +385,9 @@ impl Session {
                 .collect(),
             Screen::Files => self
                 .model
-                .files
+                .as_ref()
+                .map(|m| m.files.as_slice())
+                .unwrap_or_default()
                 .iter()
                 .map(|f| Row {
                     depth: f.depth,
@@ -296,7 +403,11 @@ impl Session {
             .unwrap_or_default();
         ViewModel {
             screen: self.screen,
-            root: self.model.root.clone(),
+            root: self
+                .model
+                .as_ref()
+                .map(|m| m.root.clone())
+                .unwrap_or_default(),
             rows,
             selected,
             status,
@@ -373,7 +484,7 @@ mod tests {
 
     #[test]
     fn drives_by_methods_and_yields_a_serializable_viewmodel() {
-        let mut s = Session::new(model());
+        let mut s = Session::from_model(model());
         // Tree screen: rows derived from the model, no disk.
         let v = s.view();
         assert_eq!(v.screen, Screen::Tree);

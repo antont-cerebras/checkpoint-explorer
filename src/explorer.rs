@@ -21,7 +21,7 @@ use std::{
 
 use crate::sample::{HistShared, Histogram, PackingSchema, SampleMode, Stats, ViewDtype};
 
-use crate::tree::{MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key};
+use crate::tree::{MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode};
 use crate::ui::{DrawConfig, HelpCtx, Legend, NumBase, Overlay, StatsView, StripeMode, UI};
 use crate::utils::base64_encode;
 use ratatui::text::{Line, Span};
@@ -2231,7 +2231,7 @@ impl Mode for DetailMode {
         term: &mut crate::tui::LiveTerminal,
     ) -> Result<Outcome> {
         let Some(tensor) = ex
-            .tensors
+            .tensors()
             .iter()
             .find(|t| t.name == self.tensor_name)
             .cloned()
@@ -2677,12 +2677,9 @@ impl Mode for StatsMode {
         // Reuse the stats computed on a previous open (an O(tensors) header-only
         // pass over an immutable checkpoint), else compute + cache them now.
         if ex.checkpoint_stats_cache.borrow().is_none() {
-            let s = crate::stats::CheckpointStats::compute(
-                &ex.tensors,
-                ex.config.as_ref(),
-                ex.disk_usage(),
-            )
-            .with_s3(ex.s3_stats());
+            let s =
+                crate::stats::CheckpointStats::compute(ex.tensors(), ex.config(), ex.disk_usage())
+                    .with_s3(ex.s3_stats());
             *ex.checkpoint_stats_cache.borrow_mut() = Some(s);
         }
         Ok(Outcome::Stay)
@@ -2899,7 +2896,7 @@ impl Mode for DataMode {
         _term: &mut crate::tui::LiveTerminal,
     ) -> Result<Outcome> {
         let Some(tensor) = ex
-            .tensors
+            .tensors()
             .iter()
             .find(|t| t.name == self.tensor_name)
             .cloned()
@@ -3761,14 +3758,16 @@ enum RemoteBrowse {
 }
 
 pub struct Explorer {
+    /// The input path list (CLI args / globbed shard paths) — what to read. Not
+    /// the same as the model's walked `FileEntry` list; this is the frontend's
+    /// idea of "what the user asked to open".
     files: Vec<PathBuf>,
-    tensors: Vec<TensorInfo>,
-    metadata: Vec<MetadataInfo>,
-    /// The checkpoint's `config.json` (local sidecar or fetched over SSH), when
-    /// present — cross-checked against the tensor tree by the config check.
-    config: Option<crate::config::ModelConfig>,
-    /// The kernel session that owns the central serializable model (and its
-    /// derived views/reports), populated once at load. `Some` for a local
+    /// The kernel session — the single authoritative owner of the checkpoint's
+    /// canonical primary data (deduped + natural-sorted tensors, metadata, config,
+    /// parameter count) and, for a local read, the serializable model. Populated
+    /// once at load; `Some` afterwards. The Explorer reads its tensors/metadata/
+    /// config through it (see [`Self::tensors`]/[`Self::metadata`]/[`Self::config`])
+    /// so no frontend copy can drift. `Some` for a local
     /// checkpoint (built by `core::readers::read_local`); the remote readers fill
     /// it in a later step. The TUI is migrating to drive this `Session` and render
     /// its `ViewModel`; today its local views/reports derive from the model here.
@@ -3802,7 +3801,6 @@ pub struct Explorer {
     /// scroll, search) — owned by the kernel; the interactive tree screen drives
     /// and renders from it.
     tree_state: crate::kernel::TreeState,
-    total_parameters: usize,
     /// The remote shards' on-disk footprint, captured during the `--ssh-read`
     /// load while the session was live (SFTP carries no block count, so it can't
     /// be re-derived later without another connection). `None` for local
@@ -3923,9 +3921,6 @@ impl Explorer {
         let browse_root = browse_root_of(&files);
         Self {
             files,
-            tensors: Vec::new(),
-            metadata: Vec::new(),
-            config: None,
             session: None,
             remote_read: None,
             s3_meta: None,
@@ -3934,7 +3929,6 @@ impl Explorer {
             remote_password: RefCell::new(None),
             full_loaded: false,
             tree_state: crate::kernel::TreeState::default(),
-            total_parameters: 0,
             remote_disk: None,
             copied_flash: None,
             terminal: None,
@@ -4285,8 +4279,6 @@ impl Explorer {
         if self.full_loaded {
             return Ok(());
         }
-        self.tensors.clear();
-        self.metadata.clear();
 
         // Read the checkpoint structure on a worker thread so the UI stays
         // responsive: a cold file (e.g. a large HDF5 over the network) can take
@@ -4331,13 +4323,11 @@ impl Explorer {
         let ((tensors, metadata, config, disk, health), checkpoint) = handle
             .join()
             .map_err(|_| anyhow::anyhow!("checkpoint loader thread panicked"))??;
-        self.config = config;
-        self.session = checkpoint.map(crate::kernel::Session::new);
         self.remote_disk = disk;
         // Remote index/file health (empty for a local read, whose reports were
         // gathered up front); fold it in so the popup and `⚠ health` badge show it.
         self.health_reports.extend(health);
-        self.finalize_load(tensors, metadata);
+        self.finalize_load(tensors, metadata, config, checkpoint);
         Ok(())
     }
 
@@ -4345,8 +4335,6 @@ impl Explorer {
     /// for `--plain`, which renders once to a buffer and must not write spinner
     /// frames to stdout.
     fn load_quiet(&mut self) -> Result<()> {
-        self.tensors.clear();
-        self.metadata.clear();
         // A remote read opens one SSH session and keeps it alive on `self`, so the
         // file browser (and remote layout / sidecar reads) reuse it without a
         // second auth prompt. A local read uses the plain static gatherer.
@@ -4356,11 +4344,9 @@ impl Explorer {
         } else {
             Self::gather_checkpoint(&self.files, None)?
         };
-        self.config = config;
-        self.session = checkpoint.map(crate::kernel::Session::new);
         self.remote_disk = disk;
         self.health_reports.extend(health);
-        self.finalize_load(tensors, metadata);
+        self.finalize_load(tensors, metadata, config, checkpoint);
         Ok(())
     }
 
@@ -4532,7 +4518,13 @@ impl Explorer {
     }
 
     /// Shared post-read setup: dedup, sort, parameter/schema/tree build.
-    fn finalize_load(&mut self, tensors: Vec<TensorInfo>, metadata: Vec<MetadataInfo>) {
+    fn finalize_load(
+        &mut self,
+        tensors: Vec<TensorInfo>,
+        metadata: Vec<MetadataInfo>,
+        config: Option<crate::config::ModelConfig>,
+        model: Option<crate::model::Checkpoint>,
+    ) {
         // Local index/file health, computed from the freshly-parsed tensors (before
         // dedup, so a name in two shards is seen in both) — the loader already read
         // every header, so this re-reads nothing. Remote index health was folded in
@@ -4547,25 +4539,23 @@ impl Explorer {
         self.health_reports.extend(local);
         self.unindexed = Self::unindexed_files(&self.health_reports);
 
-        self.tensors = tensors;
-        self.metadata = metadata;
         // The derived reports (health / stats) are keyed to the tensors — drop any
         // cached from a prior load so they're recomputed against the new set.
         *self.cached_check.borrow_mut() = None;
         *self.checkpoint_stats_cache.borrow_mut() = None;
         *self.cached_group_files.borrow_mut() = None;
 
-        // Deduplicate tensors by name
-        let mut seen_names = HashSet::new();
-        self.tensors
-            .retain(|tensor| seen_names.insert(tensor.name.clone()));
+        // Install the session — the single owner of the canonical (deduped +
+        // natural-sorted) tensors/metadata/config. A local read hands over the
+        // serializable model; a remote read without an assembled model supplies
+        // the parts directly. Dedup + natural-sort now live in the kernel.
+        self.session = Some(match model {
+            Some(cp) => crate::kernel::Session::from_model(cp),
+            None => crate::kernel::Session::from_parts(tensors, metadata, config),
+        });
 
-        // `sort_by_cached_key`, not `sort_by_key`: the natural-sort key allocates a
-        // `Vec`, and `sort_by_key` would recompute it O(n log n) times.
-        self.tensors
-            .sort_by_cached_key(|a| natural_sort_key(&a.name));
-        self.total_parameters = self.tensors.iter().map(|t| t.num_elements).sum::<usize>();
-        self.packing_schemas = crate::sample::parse_packing_schemas(&self.tensors, &self.metadata);
+        let schemas = crate::sample::parse_packing_schemas(self.tensors(), self.metadata());
+        self.packing_schemas = schemas;
         self.build_tree();
         self.full_loaded = true;
     }
@@ -4601,11 +4591,17 @@ impl Explorer {
             }
             match crate::hdf5::read_one(path, name) {
                 Ok(Some((tensor, metadata))) => {
-                    self.total_parameters = tensor.num_elements;
-                    self.tensors = vec![tensor];
-                    self.metadata = metadata;
-                    self.packing_schemas =
-                        crate::sample::parse_packing_schemas(&self.tensors, &self.metadata);
+                    // A single-tensor fast open with no full model yet: install a
+                    // parts-only session so the data view reads it like any other
+                    // (the full load, which replaces this, still runs on `Tab`).
+                    self.session = Some(crate::kernel::Session::from_parts(
+                        vec![tensor],
+                        metadata,
+                        None,
+                    ));
+                    let schemas =
+                        crate::sample::parse_packing_schemas(self.tensors(), self.metadata());
+                    self.packing_schemas = schemas;
                     true
                 }
                 // Not found or a read error — let the full load handle it (and
@@ -4721,22 +4717,22 @@ impl Explorer {
     }
 
     fn build_tree(&mut self) {
-        let children = if self.metadata.is_empty() {
-            TreeBuilder::build_tree(&self.tensors)
+        let children = if self.metadata().is_empty() {
+            TreeBuilder::build_tree(self.tensors())
         } else {
-            TreeBuilder::build_tree_mixed(&self.tensors, &self.metadata)
+            TreeBuilder::build_tree_mixed(self.tensors(), self.metadata())
         };
         // Everything hangs off a single root node summarising the whole
         // checkpoint (tensor count, parameters and size), so the tree reads
         // top-down from one place instead of from a separate footer.
-        let total_size = self.tensors.iter().map(|t| t.size_bytes).sum();
-        let stored_size = self.tensors.iter().map(|t| t.on_disk_size()).sum();
+        let total_size = self.tensors().iter().map(|t| t.size_bytes).sum();
+        let stored_size = self.tensors().iter().map(|t| t.on_disk_size()).sum();
         let root = TreeNode::Group {
             name: self.root_label(),
             children,
             expanded: true,
-            tensor_count: self.tensors.len(),
-            params: self.total_parameters,
+            tensor_count: self.tensors().len(),
+            params: self.total_parameters(),
             total_size,
             stored_size,
         };
@@ -4791,7 +4787,7 @@ impl Explorer {
                 scroll: 0,
             })),
             crate::ui::Link::Tree(name) => {
-                if self.tensors.iter().any(|t| &t.name == name) {
+                if self.tensors().iter().any(|t| &t.name == name) {
                     self.reveal_tensor(name);
                     Some(Nav::Open(Screen::Tree))
                 } else {
@@ -4878,7 +4874,7 @@ impl Explorer {
             let mut scored_results: Vec<(TreeNode, i64)> = Vec::new();
 
             // Search through ALL tensors, not just the flattened tree
-            for tensor in &self.tensors {
+            for tensor in self.tensors() {
                 if let Some(score) =
                     matcher.fuzzy_match(&tensor.name, &self.tree_state.search_query)
                 {
@@ -4893,7 +4889,7 @@ impl Explorer {
             }
 
             // Also search through metadata if present
-            for metadata in &self.metadata {
+            for metadata in self.metadata() {
                 if let Some(score) =
                     matcher.fuzzy_match(&metadata.name, &self.tree_state.search_query)
                 {
@@ -5071,11 +5067,11 @@ impl Explorer {
                         .map(|p| p.display().to_string())
                         .collect::<Vec<_>>()
                         .join(", "),
-                    &self.tensors,
-                    &self.metadata,
+                    self.tensors(),
+                    self.metadata(),
                     &self.files,
                     &self.health_reports,
-                    self.config.as_ref(),
+                    self.config(),
                     &crate::filter::NameFilter::default(),
                     false,
                     1,
@@ -5087,12 +5083,9 @@ impl Explorer {
             // out of this deterministic headless render — the interactive mode and
             // its `r` report show it.
             if want_stats_popup {
-                let stats = crate::stats::CheckpointStats::compute(
-                    &self.tensors,
-                    self.config.as_ref(),
-                    None,
-                )
-                .with_s3(self.s3_stats());
+                let stats =
+                    crate::stats::CheckpointStats::compute(self.tensors(), self.config(), None)
+                        .with_s3(self.s3_stats());
                 let text = crate::tui::headless_render(120, 40, |f| {
                     UI::render_stats_frame(f, &stats, 0, want_stats_shards);
                 })?;
@@ -5165,7 +5158,7 @@ impl Explorer {
                 self.command_for_layout(path, select.as_deref())
             }
             Screen::Detail { tensor, .. } => {
-                let Some(t) = self.tensors.iter().find(|t| &t.name == tensor).cloned() else {
+                let Some(t) = self.tensors().iter().find(|t| &t.name == tensor).cloned() else {
                     return String::new();
                 };
                 let view = self.active_view(&t.name);
@@ -5182,7 +5175,7 @@ impl Explorer {
                 repr,
                 slice,
             } => {
-                let Some(t) = self.tensors.iter().find(|t| &t.name == tensor).cloned() else {
+                let Some(t) = self.tensors().iter().find(|t| &t.name == tensor).cloned() else {
                     return String::new();
                 };
                 self.command_for_data(&t, *repr, *slice)
@@ -5231,7 +5224,12 @@ impl Explorer {
         want_hist: bool,
         want_legend: bool,
     ) -> Result<String> {
-        let Some(tensor) = self.tensors.iter().find(|t| t.name == tensor_name).cloned() else {
+        let Some(tensor) = self
+            .tensors()
+            .iter()
+            .find(|t| t.name == tensor_name)
+            .cloned()
+        else {
             return Ok(String::new());
         };
         let view = self.active_view(&tensor.name);
@@ -5285,7 +5283,12 @@ impl Explorer {
         slice: usize,
         want_legend: bool,
     ) -> Result<String> {
-        let Some(tensor) = self.tensors.iter().find(|t| t.name == tensor_name).cloned() else {
+        let Some(tensor) = self
+            .tensors()
+            .iter()
+            .find(|t| t.name == tensor_name)
+            .cloned()
+        else {
             return Ok(String::new());
         };
         let view = self.active_view(&tensor.name);
@@ -5749,9 +5752,9 @@ impl Explorer {
         if !filter.is_active() {
             return;
         }
-        self.tensors.retain(|t| filter.matches(&t.name));
-        self.metadata.retain(|m| filter.matches(&m.name));
-        self.total_parameters = self.tensors.iter().map(|t| t.num_elements).sum();
+        if let Some(session) = self.session.as_mut() {
+            session.retain_named(|name| filter.matches(name));
+        }
         self.build_tree();
     }
 
@@ -5803,7 +5806,7 @@ impl Explorer {
     /// browser's tensor-row field layout but without its leading `·` bullet — a
     /// flat list needs no tree marker. `Full` appends each tensor's source file.
     fn tensors_text(&self, detail: TreeDetail) -> String {
-        self.tensors
+        self.tensors()
             .iter()
             .map(|t| {
                 let line = crate::ui::tensor_list_line(t, &self.unindexed, &self.packing_schemas);
@@ -5821,9 +5824,9 @@ impl Explorer {
     /// (summed logical bytes) and a `weight_map` of tensor name → shard file.
     /// `Full` adds a `tensors` block with each tensor's dtype / shape / counts.
     fn tree_json(&self, detail: TreeDetail) -> String {
-        let total_size: usize = self.tensors.iter().map(|t| t.size_bytes).sum();
+        let total_size: usize = self.tensors().iter().map(|t| t.size_bytes).sum();
         let weight_map: serde_json::Map<String, serde_json::Value> = self
-            .tensors
+            .tensors()
             .iter()
             .map(|t| (t.name.clone(), file_basename(&t.source_path).into()))
             .collect();
@@ -5835,7 +5838,7 @@ impl Explorer {
         root.insert("weight_map".into(), serde_json::Value::Object(weight_map));
         if detail == TreeDetail::Full {
             let tensors: serde_json::Map<String, serde_json::Value> = self
-                .tensors
+                .tensors()
                 .iter()
                 .map(|t| (t.name.clone(), tensor_facts(t)))
                 .collect();
@@ -5848,9 +5851,13 @@ impl Explorer {
     /// dtype, shape, element count and source file (`Full`). Natural-sorted.
     fn tensors_json(&self, detail: TreeDetail) -> String {
         let items: Vec<serde_json::Value> = match detail {
-            TreeDetail::Compact => self.tensors.iter().map(|t| t.name.clone().into()).collect(),
+            TreeDetail::Compact => self
+                .tensors()
+                .iter()
+                .map(|t| t.name.clone().into())
+                .collect(),
             TreeDetail::Full => self
-                .tensors
+                .tensors()
                 .iter()
                 .map(|t| {
                     let mut o = tensor_facts(t);
@@ -6057,7 +6064,7 @@ impl Explorer {
     /// plus the total tensor count.
     fn tensors_preview_lines(&self, detail: TreeDetail) -> (Vec<Line<'static>>, usize) {
         let lines = self
-            .tensors
+            .tensors()
             .iter()
             .take(MENU_PREVIEW_LINES)
             .map(|t| {
@@ -6072,7 +6079,7 @@ impl Explorer {
                 line
             })
             .collect();
-        (lines, self.tensors.len())
+        (lines, self.tensors().len())
     }
 
     /// Copy the export text for `choice`. If it fits the terminal clipboard, copy
@@ -7717,7 +7724,7 @@ impl Explorer {
             return Ok(None);
         }
         let name = seg.name.clone();
-        if self.tensors.iter().any(|t| t.name == name) {
+        if self.tensors().iter().any(|t| t.name == name) {
             self.ensure_full_load()?;
             self.reveal_tensor(&name);
             Ok(Some(Nav::Open(Screen::Tree)))
@@ -8324,7 +8331,7 @@ impl Explorer {
         // `--metadata`: metadata lives only in the tree, so reveal that entry and
         // stay on the tree (this is what `y` on a metadata row reproduces).
         if let Some(name) = &req.metadata {
-            if self.metadata.iter().any(|m| &m.name == name) {
+            if self.metadata().iter().any(|m| &m.name == name) {
                 self.reveal_tensor(name);
                 return Ok(None);
             }
@@ -8347,7 +8354,7 @@ impl Explorer {
         // omitted — the sole tensor if the checkpoint has exactly one (e.g. any
         // `.npy`, or a single-array `.npz`/HDF5/safetensors). Ambiguous otherwise.
         let tensor = match &req.tensor {
-            Some(name) => match self.tensors.iter().find(|t| t.name == *name) {
+            Some(name) => match self.tensors().iter().find(|t| t.name == *name) {
                 Some(t) => t.clone(),
                 None => {
                     return Err(self.reject_open(
@@ -8360,11 +8367,11 @@ impl Explorer {
                     ));
                 }
             },
-            None => match self.tensors.as_slice() {
+            None => match self.tensors() {
                 [only] => only.clone(),
                 // No `--tensor` and not a single-tensor checkpoint: ambiguous when
                 // there's more than one (an error), or nothing to open at all.
-                _ if self.tensors.len() > 1 => {
+                _ if self.tensors().len() > 1 => {
                     return Err(self.reject_open(
                         mode,
                         "Which tensor?",
@@ -9287,11 +9294,9 @@ impl Explorer {
         self.health_reports.clear();
         let ((tensors, metadata, config, disk, health), checkpoint) =
             Self::gather_checkpoint(&self.files, self.remote_read.as_ref())?;
-        self.config = config;
-        self.session = checkpoint.map(crate::kernel::Session::new);
         self.remote_disk = disk;
         self.health_reports.extend(health);
-        self.finalize_load(tensors, metadata);
+        self.finalize_load(tensors, metadata, config, checkpoint);
         Ok(())
     }
 
@@ -9670,11 +9675,11 @@ impl Explorer {
                 .join(", ");
             let computed = crate::check::run(
                 label,
-                &self.tensors,
-                &self.metadata,
+                self.tensors(),
+                self.metadata(),
                 &self.files,
                 &self.health_reports,
-                self.config.as_ref(),
+                self.config(),
                 &crate::filter::NameFilter::default(),
                 false,
                 1,
@@ -9879,7 +9884,29 @@ impl Explorer {
 
     /// The cached checkpoint model (owned by the kernel session), when loaded.
     fn checkpoint(&self) -> Option<&crate::model::Checkpoint> {
-        self.session.as_ref().map(|s| s.model())
+        self.session.as_ref().and_then(|s| s.model())
+    }
+
+    /// The canonical tensor list (deduped by name + natural-sorted) — owned by the
+    /// kernel [`Session`](crate::kernel::Session), the single source. Empty before
+    /// a load completes.
+    fn tensors(&self) -> &[TensorInfo] {
+        self.session.as_ref().map_or(&[], |s| s.tensors())
+    }
+
+    /// The checkpoint's metadata entries (model / shard order), from the session.
+    fn metadata(&self) -> &[MetadataInfo] {
+        self.session.as_ref().map_or(&[], |s| s.metadata())
+    }
+
+    /// The checkpoint's `config.json`, when present — from the session.
+    fn config(&self) -> Option<&crate::config::ModelConfig> {
+        self.session.as_ref().and_then(|s| s.config())
+    }
+
+    /// Total element (parameter) count across the canonical tensors.
+    fn total_parameters(&self) -> usize {
+        self.session.as_ref().map_or(0, |s| s.total_parameters())
     }
 
     fn disk_usage(&self) -> Option<crate::stats::DiskUsage> {
@@ -9893,7 +9920,7 @@ impl Explorer {
             return cp.disk_usage();
         }
         let mut paths: Vec<&str> = self
-            .tensors
+            .tensors()
             .iter()
             .map(|t| t.source_path.as_str())
             .collect();
@@ -9914,8 +9941,8 @@ impl Explorer {
     ) {
         use crate::ui::CheckPopup;
 
-        let tensors = self.tensors.clone();
-        let metadata = self.metadata.clone();
+        let tensors = self.tensors().to_vec();
+        let metadata = self.metadata().to_vec();
         let progress = Arc::new(crate::progress::LoadProgress::new());
         let cancel = Arc::new(AtomicBool::new(false));
         let jobs = std::thread::available_parallelism()
@@ -11145,8 +11172,12 @@ mod tests {
             None,
             false,
         );
-        e.tensors = vec![ti("lm_head.weight", "model-00016-of-00016.safetensors")];
-        e.build_tree();
+        e.finalize_load(
+            vec![ti("lm_head.weight", "model-00016-of-00016.safetensors")],
+            Vec::new(),
+            None,
+            None,
+        );
         e.tree_state.selected = 0; // the root row
         let view = e.describe_selection();
         assert_eq!(view.copy_path.as_deref(), Some("/ckpt"));
@@ -11169,14 +11200,18 @@ mod tests {
             None,
             false,
         );
-        e.tensors = vec![
-            ti(
-                "model.embed_tokens.weight",
-                "model-00001-of-00002.safetensors",
-            ),
-            ti("lm_head.weight", "model-00002-of-00002.safetensors"),
-        ];
-        e.build_tree();
+        e.finalize_load(
+            vec![
+                ti(
+                    "model.embed_tokens.weight",
+                    "model-00001-of-00002.safetensors",
+                ),
+                ti("lm_head.weight", "model-00002-of-00002.safetensors"),
+            ],
+            Vec::new(),
+            None,
+            None,
+        );
         e.tree_state.selected = 0;
         let view = e.describe_selection();
         assert_eq!(view.copy_path.as_deref(), Some("/ckpt"));
@@ -11417,7 +11452,7 @@ mod tests {
         let f = dir.join("model.safetensors");
         std::fs::write(&f, b"").unwrap();
         let mut e = Explorer::new(vec![f], Vec::new(), None, false);
-        e.finalize_load(vec![ti("blk.0.a"), ti("blk.1.b")], Vec::new());
+        e.finalize_load(vec![ti("blk.0.a"), ti("blk.1.b")], Vec::new(), None, None);
         assert!(
             e.can_rename(),
             "a writable local safetensors → Rename available"
@@ -11627,7 +11662,7 @@ mod tests {
             layout: Layout::None,
         };
         let mut e = Explorer::new(Vec::new(), Vec::new(), None, false);
-        e.finalize_load(vec![ti("blk.0.a"), ti("blk.1.b")], Vec::new());
+        e.finalize_load(vec![ti("blk.0.a"), ti("blk.1.b")], Vec::new(), None, None);
 
         // A `Layout` link opens that file's byte-layout view.
         assert!(matches!(
@@ -12015,6 +12050,8 @@ mod tests {
         e.finalize_load(
             vec![ti("blk.0.a"), ti("blk.0.b"), ti("blk.1.a"), ti("blk.1.b")],
             Vec::new(),
+            None,
+            None,
         );
 
         // Fully expanded: the leaf is already visible, so revealing it just moves
@@ -12066,6 +12103,8 @@ mod tests {
                 ti("model.layers.1.b", "model-00002.safetensors"),
             ],
             Vec::new(),
+            None,
+            None,
         );
         e
     }
@@ -12107,6 +12146,8 @@ mod tests {
                 value: long.clone(),
                 value_type: "string".into(),
             }],
+            None,
+            None,
         );
         let text = e.tree_text(TreeDetail::Compact);
         // The export shows the whole value — not the "…"-truncated tree-row form.
