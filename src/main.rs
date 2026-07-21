@@ -420,6 +420,14 @@ struct ExploreArgs {
     port: u16,
 
     #[arg(
+        long = "host",
+        value_name = "ADDR",
+        default_value = "0.0.0.0",
+        help = "IP address --web binds to. Defaults to 0.0.0.0 (all interfaces) so it's reachable at your machine's hostname, e.g. http://your-vm.example.com:8080/. Use 127.0.0.1 to restrict to loopback"
+    )]
+    host: std::net::IpAddr,
+
+    #[arg(
         long = "open",
         help = "With --web, open the served URL in the default browser (xdg-open / open / start)"
     )]
@@ -1962,7 +1970,7 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         }
         let model = readers::read_local(&files)?;
         let state = std::sync::Arc::new(web::WebState::build(model, &files, &index_specs));
-        return web::serve(state, args.port, args.open);
+        return web::serve(state, args.host, args.port, args.open);
     }
 
     let mut explorer = Explorer::new(files, index_specs, open, !args.no_preload);

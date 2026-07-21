@@ -11,6 +11,7 @@ pub mod dto;
 pub mod handlers;
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -121,16 +122,25 @@ impl WebState {
     }
 }
 
-/// Start the server and block until the process is stopped (Ctrl-C).
-pub fn serve(state: Arc<WebState>, port: u16, open: bool) -> Result<()> {
-    let server = tiny_http::Server::http(("127.0.0.1", port))
-        .map_err(|e| anyhow::anyhow!("failed to start web server on port {port}: {e}"))?;
+/// Start the server and block until the process is stopped (Ctrl-C). `host` is the
+/// bind address (default `0.0.0.0` — all interfaces, so it's reachable at this
+/// machine's hostname on the network, matching how VMs serve web apps here).
+pub fn serve(state: Arc<WebState>, host: IpAddr, port: u16, open: bool) -> Result<()> {
+    let server = tiny_http::Server::http(SocketAddr::new(host, port))
+        .map_err(|e| anyhow::anyhow!("failed to start web server on {host}:{port}: {e}"))?;
     let bound = server
         .server_addr()
         .to_ip()
         .map(|a| a.port())
         .unwrap_or(port);
-    let url = format!("http://127.0.0.1:{bound}");
+    // Print a URL the browser can actually reach: a wildcard bind (0.0.0.0 / ::)
+    // isn't clickable, so show this host's FQDN instead of the bind address.
+    let display = if host.is_unspecified() {
+        fqdn().unwrap_or_else(|| "localhost".to_string())
+    } else {
+        host.to_string()
+    };
+    let url = format!("http://{display}:{bound}/");
     println!("checkpoint-explorer web UI: {url}  (Ctrl-C to stop)");
     if open {
         open_browser(&url);
@@ -236,6 +246,20 @@ fn respond_asset(req: tiny_http::Request, path: &str) {
     let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes())
         .expect("valid header");
     let _ = req.respond(tiny_http::Response::from_data(data).with_header(header));
+}
+
+/// This machine's fully-qualified hostname (`hostname -f`), for the reachable URL
+/// when bound to all interfaces. `None` if it can't be determined.
+fn fqdn() -> Option<String> {
+    let out = std::process::Command::new("hostname")
+        .arg("-f")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if name.is_empty() { None } else { Some(name) }
 }
 
 fn open_browser(url: &str) {

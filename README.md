@@ -162,9 +162,14 @@ Prefer a browser? `--web` serves the same information as the TUI over a local HT
 server and opens it in your browser:
 
 ```bash
-checkpoint-explorer --web /path/to/checkpoint          # serve at http://127.0.0.1:8080
+checkpoint-explorer --web /path/to/checkpoint          # serve on all interfaces, port 8080
 checkpoint-explorer --web --port 9000 --open /path/…   # pick a port + open the browser
 ```
+
+It binds all interfaces by default (`--host 0.0.0.0`) and prints the reachable URL
+using this machine's hostname — e.g. `http://your-vm.example.com:8080/` — so you
+can open it from another machine's browser with no tunnel. Pass `--host 127.0.0.1`
+to restrict it to loopback.
 
 The server (a dependency-light, blocking `tiny_http` server — no async runtime)
 **supplies the data** as JSON; the **browser owns the view state** (which screen,
