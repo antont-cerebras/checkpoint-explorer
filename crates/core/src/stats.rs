@@ -242,21 +242,30 @@ impl PerLayerStats {
     }
 }
 
-/// How MoE experts are laid out on disk.
+/// How MoE experts are laid out on disk — and, folded in, the per-layer expert
+/// count. Unfused storage names each expert (`…experts.<e>.…`), so the count is
+/// **always** known (highest index + 1); fused storage stacks them, where the
+/// count can be underivable (no config, no usable shape) — hence the `Option`
+/// lives only in the `Fused` arm, and a `0`-means-unknown sentinel is gone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub enum ExpertStorage {
-    /// Each expert is its own tensor: `…experts.<e>.down_proj.weight`.
-    Unfused,
-    /// Experts are stacked into one tensor per projection (a leading expert
-    /// dimension), with no per-expert index in the name.
-    Fused,
+#[serde(tag = "storage", rename_all = "snake_case")]
+pub enum ExpertLayout {
+    Unfused { per_layer: usize },
+    Fused { per_layer: Option<usize> },
 }
 
-impl ExpertStorage {
+impl ExpertLayout {
+    /// Experts per layer, when known (unfused always; fused only when derivable).
+    pub fn per_layer(self) -> Option<usize> {
+        match self {
+            ExpertLayout::Unfused { per_layer } => Some(per_layer),
+            ExpertLayout::Fused { per_layer } => per_layer,
+        }
+    }
     pub fn label(self) -> &'static str {
         match self {
-            ExpertStorage::Unfused => "unfused (per-expert tensors)",
-            ExpertStorage::Fused => "fused (stacked tensors)",
+            ExpertLayout::Unfused { .. } => "unfused (per-expert tensors)",
+            ExpertLayout::Fused { .. } => "fused (stacked tensors)",
         }
     }
 }
@@ -273,9 +282,8 @@ pub struct ExpertCategory {
 /// MoE expert structure — present only when the checkpoint has experts.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExpertStats {
-    /// Experts per layer.
-    pub per_layer: usize,
-    pub storage: ExpertStorage,
+    /// Storage kind + the per-layer expert count (see [`ExpertLayout`]).
+    pub layout: ExpertLayout,
     /// gate & up projections combined into one tensor (`gate_up_proj` /
     /// `gate_proj__up_proj`), a common MoE fusion.
     pub gate_up_fused: bool,
@@ -292,7 +300,7 @@ pub struct ExpertStats {
 
 impl ExpertStats {
     fn divisor(&self) -> usize {
-        (self.layers.max(1) * self.per_layer.max(1)).max(1)
+        (self.layers.max(1) * self.layout.per_layer().unwrap_or(1).max(1)).max(1)
     }
     /// Average parameters in a single expert.
     pub fn params_each(&self) -> usize {
@@ -754,18 +762,17 @@ impl CheckpointStats {
         // Experts.
         if let Some(x) = &self.experts {
             out.push(String::new());
-            let count = if x.per_layer > 0 {
-                format!("  ×{} per layer", x.per_layer)
-            } else {
-                String::new()
+            let count = match x.layout.per_layer() {
+                Some(pl) => format!("  ×{pl} per layer"),
+                None => String::new(),
             };
             out.push(format!("{GLYPH_EXPERTS} Experts{count}"));
-            let mut storage = x.storage.label().to_string();
+            let mut storage = x.layout.label().to_string();
             if x.gate_up_fused {
                 storage.push_str(" · gate+up fused");
             }
             out.push(row("Storage", storage));
-            if x.per_layer > 0 || x.storage == ExpertStorage::Unfused {
+            if x.layout.per_layer().is_some() {
                 out.push(row(
                     "Params",
                     each_total(
@@ -1095,28 +1102,23 @@ fn expert_stats(
 
     // A per-expert index anywhere means the experts are stored unfused; experts
     // that appear only as stacked tensors (no index) are fused.
+    // A per-expert index anywhere ⇒ unfused (count = highest index + 1). Otherwise
+    // fused: the per-layer count is the declared config count, else the leading
+    // dimension of a stacked expert tensor (its expert axis), else unknown.
     let max_expert_idx = tensors.iter().filter_map(|t| expert_index(&t.name)).max();
-    let storage = if max_expert_idx.is_some() {
-        ExpertStorage::Unfused
-    } else {
-        ExpertStorage::Fused
-    };
-
-    // Experts per layer: for unfused, the highest expert index + 1; for fused,
-    // the declared config count, else the leading dimension of a stacked expert
-    // tensor (its expert axis).
-    let per_layer = match (storage, max_expert_idx) {
-        (ExpertStorage::Unfused, Some(m)) => m + 1,
-        _ => config
-            .and_then(|c| c.num_experts)
-            .map(|n| n as usize)
-            .or_else(|| {
-                tensors
-                    .iter()
-                    .find(|t| is_expert(&t.name) && !t.shape.is_empty())
-                    .map(|t| t.shape[0])
-            })
-            .unwrap_or(0),
+    let layout = match max_expert_idx {
+        Some(m) => ExpertLayout::Unfused { per_layer: m + 1 },
+        None => ExpertLayout::Fused {
+            per_layer: config
+                .and_then(|c| c.num_experts)
+                .map(|n| n as usize)
+                .or_else(|| {
+                    tensors
+                        .iter()
+                        .find(|t| is_expert(&t.name) && !t.shape.is_empty())
+                        .map(|t| t.shape[0])
+                }),
+        },
     };
 
     // Layers carrying experts, the expert totals, and the per-projection split.
@@ -1153,8 +1155,7 @@ fn expert_stats(
         .any(|t| t.name.contains("gate_up_proj") || t.name.contains("gate_proj__up_proj"));
 
     Some(ExpertStats {
-        per_layer,
-        storage,
+        layout,
         gate_up_fused,
         params,
         bytes,
@@ -1292,8 +1293,7 @@ mod tests {
         }
         let s = CheckpointStats::compute(&tensors, None, None);
         let x = s.experts.unwrap();
-        assert_eq!(x.storage, ExpertStorage::Unfused);
-        assert_eq!(x.per_layer, 4);
+        assert_eq!(x.layout, ExpertLayout::Unfused { per_layer: 4 });
         assert_eq!(x.layers, 2);
         assert_eq!(x.params, 80); // 8 experts × 10
         assert_eq!(x.params_each(), 10);
@@ -1444,8 +1444,8 @@ mod tests {
         ];
         let s = CheckpointStats::compute(&tensors, None, None);
         let x = s.experts.unwrap();
-        assert_eq!(x.storage, ExpertStorage::Fused);
-        assert_eq!(x.per_layer, 8); // leading dim of the stacked tensor
+        // Fused, per-layer count from the stacked tensor's leading dim.
+        assert_eq!(x.layout, ExpertLayout::Fused { per_layer: Some(8) });
         assert_eq!(x.layers, 2);
         assert!(x.gate_up_fused);
     }

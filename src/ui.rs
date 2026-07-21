@@ -3131,7 +3131,6 @@ impl UI {
         s: &crate::stats::CheckpointStats,
         shards_expanded: bool,
     ) -> (Vec<Line<'static>>, Option<usize>) {
-        use crate::stats::ExpertStorage;
         let sty = |t: String, style: Style| Span::styled(t, style);
         let plain = |t: String| sty(t, Style::default());
         let dim = |t: String| sty(t, Style::default().fg(palette::DIM));
@@ -3277,10 +3276,9 @@ impl UI {
         // ── Experts (MoE) ─────────────────────────────────────────────────────
         if let Some(x) = &s.experts {
             lines.push(Line::from(sty(String::new(), Style::default())));
-            let (count, qualifier) = if x.per_layer > 0 {
-                (format!("×{}", x.per_layer), " per layer")
-            } else {
-                (String::new(), "")
+            let (count, qualifier) = match x.layout.per_layer() {
+                Some(pl) => (format!("×{pl}"), " per layer"),
+                None => (String::new(), ""),
             };
             lines.push(section(
                 crate::stats::GLYPH_EXPERTS,
@@ -3288,13 +3286,13 @@ impl UI {
                 count,
                 qualifier,
             ));
-            let mut storage = x.storage.label().to_string();
+            let mut storage = x.layout.label().to_string();
             if x.gate_up_fused {
                 storage.push_str(" · gate+up fused");
             }
             lines.push(row("Storage", vec![plain(storage)]));
-            // Per-expert averages are only meaningful once we know the layout.
-            if x.per_layer > 0 || x.storage == ExpertStorage::Unfused {
+            // Per-expert averages are only meaningful once we know the count.
+            if x.layout.per_layer().is_some() {
                 lines.push(row(
                     "Params",
                     each_total(x.params_each(), x.params, format_parameters),
