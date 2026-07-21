@@ -1861,12 +1861,38 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         || args.layout.is_some()
         || args.rename
         || args.exit;
+    // `--tensor`/`--metadata` are mutually exclusive (clap enforces it); fold into
+    // one target, and the detail-implies-parent flag pairs into 3-state requests.
+    let target = if let Some(m) = args.metadata {
+        explorer::OpenTarget::Metadata(m)
+    } else if let Some(t) = args.tensor {
+        explorer::OpenTarget::Tensor(t)
+    } else {
+        explorer::OpenTarget::SoleTensor
+    };
+    let histogram = match args.bins {
+        Some(n) => explorer::HistogramReq::Bins(n),
+        None if args.histogram => explorer::HistogramReq::Auto,
+        None => explorer::HistogramReq::Off,
+    };
+    let health = if args.health_findings {
+        explorer::HealthReq::Findings
+    } else if args.health {
+        explorer::HealthReq::Summary
+    } else {
+        explorer::HealthReq::Off
+    };
+    let stats = if args.stats_shards {
+        explorer::StatsReq::Shards
+    } else if args.stats {
+        explorer::StatsReq::Summary
+    } else {
+        explorer::StatsReq::Off
+    };
     let open = wants_open.then_some(OpenRequest {
-        tensor: args.tensor,
-        metadata: args.metadata,
+        target,
         view,
-        histogram: args.histogram,
-        bins: args.bins,
+        histogram,
         dtype: args.dtype,
         layout,
         window_at,
@@ -1879,10 +1905,8 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         tree_state: args.tree_state,
         search: args.search,
         legend: args.legend,
-        health: args.health,
-        health_findings: args.health_findings,
-        stats: args.stats,
-        stats_shards: args.stats_shards,
+        health,
+        stats,
         exit_after: args.exit,
         files_view: args.files,
         layout_file: args.layout,

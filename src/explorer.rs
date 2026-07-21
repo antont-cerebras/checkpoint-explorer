@@ -187,23 +187,103 @@ const EXPORT_CHOICES: &[ExportChoice] = {
 /// How many lines of the highlighted export the `t` menu previews.
 const MENU_PREVIEW_LINES: usize = 14;
 
+/// What a `--tensor` / `--metadata` open targets — mutually exclusive by
+/// construction (both-set was representable with two `Option`s), with "neither"
+/// meaning the sole tensor of a single-tensor checkpoint.
+pub enum OpenTarget {
+    /// No `--tensor`/`--metadata`: the sole tensor (a single-tensor file — always
+    /// the case for `.npy` — needs no flag); ambiguous when there's more than one.
+    SoleTensor,
+    /// An exact tensor name (`--tensor`).
+    Tensor(String),
+    /// An exact metadata entry to reveal in the tree (`--metadata`); metadata lives
+    /// only in the tree, so there's no separate view.
+    Metadata(String),
+}
+
+impl OpenTarget {
+    /// The explicit tensor name, if `--tensor` named one.
+    pub fn tensor(&self) -> Option<&str> {
+        match self {
+            OpenTarget::Tensor(n) => Some(n),
+            _ => None,
+        }
+    }
+    /// The metadata entry name, if `--metadata` named one.
+    pub fn metadata(&self) -> Option<&str> {
+        match self {
+            OpenTarget::Metadata(n) => Some(n),
+            _ => None,
+        }
+    }
+}
+
+/// The histogram request (`--histogram` / `--bins N`): a bucket count implies
+/// showing the histogram, so it's one enum, not a bool + an `Option` that could
+/// disagree (bins set but histogram off).
+pub enum HistogramReq {
+    Off,
+    /// Show it, buckets chosen automatically.
+    Auto,
+    /// Show it with a fixed bucket count.
+    Bins(usize),
+}
+
+impl HistogramReq {
+    pub fn on(&self) -> bool {
+        !matches!(self, HistogramReq::Off)
+    }
+    pub fn bins(&self) -> Option<usize> {
+        match self {
+            HistogramReq::Bins(n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
+/// The health-popup request (`--health` / `--health-findings`): the findings
+/// detail implies opening the popup, so one 3-state enum, not two bools where
+/// `findings` could be set without `health`.
+pub enum HealthReq {
+    Off,
+    Summary,
+    Findings,
+}
+
+impl HealthReq {
+    pub fn wants(&self) -> bool {
+        !matches!(self, HealthReq::Off)
+    }
+    pub fn findings(&self) -> bool {
+        matches!(self, HealthReq::Findings)
+    }
+}
+
+/// The stats-view request (`--stats` / `--stats-shards`): the shard breakdown
+/// implies opening the view — one enum, not two bools.
+pub enum StatsReq {
+    Off,
+    Summary,
+    Shards,
+}
+
+impl StatsReq {
+    pub fn wants(&self) -> bool {
+        !matches!(self, StatsReq::Off)
+    }
+    pub fn shards(&self) -> bool {
+        matches!(self, StatsReq::Shards)
+    }
+}
+
 /// A tensor + view to open on startup, from the CLI flags.
 pub struct OpenRequest {
-    /// Exact tensor name to open. `None` targets the sole tensor when the
-    /// checkpoint has exactly one (so a single-tensor file — always the case for
-    /// `.npy` — needs no `--tensor`); ambiguous otherwise.
-    pub tensor: Option<String>,
-    /// Exact metadata entry name to reveal in the tree (`--metadata`). Mutually
-    /// exclusive with `tensor`; when set, the tree opens with that entry
-    /// selected (metadata lives only in the tree, so there's no separate view).
-    pub metadata: Option<String>,
+    /// What to open (tensor / metadata / the sole tensor).
+    pub target: OpenTarget,
     /// Which screen to show.
     pub view: OpenView,
-    /// Show the value histogram on the detail screen (the `h` key's result).
-    pub histogram: bool,
-    /// Requested histogram bucket count (`--bins N`, the `b` key's result);
-    /// `None` leaves the count automatic. Implies showing the histogram.
-    pub bins: Option<usize>,
+    /// The value-histogram request for the detail screen (the `h`/`b` keys).
+    pub histogram: HistogramReq,
     /// Optional dtype reinterpretation to apply first.
     pub dtype: Option<ViewDtype>,
     /// Which data-view layout to force (`--edge`/`--overview`/`--window`);
@@ -235,18 +315,12 @@ pub struct OpenRequest {
     /// render-time aid (for `--plain` / inspection); not part of `y`'s round-trip
     /// since the legend is a transient overlay you dismiss.
     pub legend: bool,
-    /// Open straight into the health-check popup on the tree (`--health`, the `h`
-    /// key). Part of `y`'s round-trip: the popup's `y` copies this command.
-    pub health: bool,
-    /// Like `health`, but with the per-finding detail expanded (`--health-findings`,
-    /// the popup's `f` toggle). Round-trips through `y`.
-    pub health_findings: bool,
-    /// Open straight into the full-screen checkpoint-stats view (`--stats`, the
-    /// `s` key). Part of `y`'s round-trip: the view's `y` copies this command.
-    pub stats: bool,
-    /// Like `stats`, but with the on-disk per-shard breakdown expanded
-    /// (`--stats-shards`, the view's `f` toggle). Round-trips through `y`.
-    pub stats_shards: bool,
+    /// The health-check popup request (`--health` / `--health-findings`, the `h`
+    /// key + its `f` toggle). Round-trips through `y`.
+    pub health: HealthReq,
+    /// The checkpoint-stats view request (`--stats` / `--stats-shards`, the `s`
+    /// key + its `f` toggle). Round-trips through `y`.
+    pub stats: StatsReq,
     /// Render the view once and exit without interactive navigation.
     pub exit_after: bool,
     /// Land in the file browser (`--files`, the `Tab` toggle) once the tree is
@@ -4865,14 +4939,16 @@ impl Explorer {
         // from the request so `open_requested` only applies the dtype/shape/slice
         // overrides (and doesn't kick off the interactive scan).
         let (want_hist, want_stats, bins) = match &self.open {
-            Some(r) => (r.histogram || r.bins.is_some(), r.compute_stats, r.bins),
+            Some(r) => (r.histogram.on(), r.compute_stats, r.histogram.bins()),
             None => (false, false, None),
         };
         let want_legend = self.open.as_ref().is_some_and(|r| r.legend);
-        let want_health_findings = self.open.as_ref().is_some_and(|r| r.health_findings);
-        let want_health = want_health_findings || self.open.as_ref().is_some_and(|r| r.health);
-        let want_stats_shards = self.open.as_ref().is_some_and(|r| r.stats_shards);
-        let want_stats_popup = want_stats_shards || self.open.as_ref().is_some_and(|r| r.stats);
+        let want_health_findings = self.open.as_ref().is_some_and(|r| r.health.findings());
+        let want_health =
+            want_health_findings || self.open.as_ref().is_some_and(|r| r.health.wants());
+        let want_stats_shards = self.open.as_ref().is_some_and(|r| r.stats.shards());
+        let want_stats_popup =
+            want_stats_shards || self.open.as_ref().is_some_and(|r| r.stats.wants());
         // The file-browser / layout-map / rename-editor screens (headless): rendered
         // directly below via their own frames, so `--plain` covers every screen (not
         // just tree / detail / data). Captured before the request is consumed.
@@ -4884,8 +4960,7 @@ impl Explorer {
         }
         let screen = match self.open.take() {
             Some(mut req) => {
-                req.histogram = false;
-                req.bins = None;
+                req.histogram = HistogramReq::Off;
                 req.exit_after = false;
                 // A failed request (unknown tensor/metadata, bad `--shape`/`--slice`)
                 // is fatal here — propagate it so the headless render exits non-zero
@@ -5354,10 +5429,12 @@ impl Explorer {
         let mut cursor = 0usize;
 
         // `--health` / `--stats` open straight into their popup once the tree is up.
-        let want_health_findings = self.open.as_ref().is_some_and(|r| r.health_findings);
-        let want_health = want_health_findings || self.open.as_ref().is_some_and(|r| r.health);
-        let want_stats_shards = self.open.as_ref().is_some_and(|r| r.stats_shards);
-        let want_stats_popup = want_stats_shards || self.open.as_ref().is_some_and(|r| r.stats);
+        let want_health_findings = self.open.as_ref().is_some_and(|r| r.health.findings());
+        let want_health =
+            want_health_findings || self.open.as_ref().is_some_and(|r| r.health.wants());
+        let want_stats_shards = self.open.as_ref().is_some_and(|r| r.stats.shards());
+        let want_stats_popup =
+            want_stats_shards || self.open.as_ref().is_some_and(|r| r.stats.wants());
         // `--files` lands in the file browser once the tree is up (like a seeded
         // `--tensor` screen, but pushed after the popups so it wins the landing).
         let want_files = self.open.as_ref().is_some_and(|r| r.files_view);
@@ -5380,11 +5457,11 @@ impl Explorer {
             // Fast path: a single tensor's detail/data view doesn't need the
             // whole tree, so read just that tensor and defer the (potentially
             // slow) full structure load until the browser is actually shown.
-            let fast = req.metadata.is_none()
+            let fast = req.target.metadata().is_none()
                 && !matches!(req.view, OpenView::Tree)
                 && req
-                    .tensor
-                    .as_deref()
+                    .target
+                    .tensor()
                     .is_some_and(|name| self.try_load_single_tensor(name));
             if !fast {
                 self.load_all_files()?;
@@ -8102,8 +8179,8 @@ impl Explorer {
 
         // `--metadata`: metadata lives only in the tree, so reveal that entry and
         // stay on the tree (this is what `y` on a metadata row reproduces).
-        if let Some(name) = &req.metadata {
-            if self.metadata().iter().any(|m| &m.name == name) {
+        if let Some(name) = req.target.metadata() {
+            if self.metadata().iter().any(|m| m.name == name) {
                 self.tree_state.reveal(name);
                 return Ok(None);
             }
@@ -8119,14 +8196,14 @@ impl Explorer {
         // A tree screen with no specific tensor (`--tree-state` / `--search` /
         // `--legend` alone, or a bare launch routed to the tree): just show the
         // browser in whatever state the flags above set — don't demand a tensor.
-        if req.view == OpenView::Tree && req.tensor.is_none() {
+        if req.view == OpenView::Tree && req.target.tensor().is_none() {
             return Ok(None);
         }
         // Resolve the target tensor: the named one, or — when `--tensor` is
         // omitted — the sole tensor if the checkpoint has exactly one (e.g. any
         // `.npy`, or a single-array `.npz`/HDF5/safetensors). Ambiguous otherwise.
-        let tensor = match &req.tensor {
-            Some(name) => match self.tensors().iter().find(|t| t.name == *name) {
+        let tensor = match req.target.tensor() {
+            Some(name) => match self.tensors().iter().find(|t| t.name == name) {
                 Some(t) => t.clone(),
                 None => {
                     return Err(self.reject_open(
@@ -8280,10 +8357,10 @@ impl Explorer {
         // (and `--bins N`) round-trip restore the view. A bucket count implies
         // showing the histogram. Done before the one-shot below so `--exit`
         // captures it too.
-        if let Some(n) = req.bins {
+        if let Some(n) = req.histogram.bins() {
             self.data_view.histogram_bins.set(Some(n));
         }
-        if (req.histogram || req.bins.is_some())
+        if req.histogram.on()
             && let Screen::Detail { .. } = screen
         {
             let view = self.active_view(&tensor.name);
