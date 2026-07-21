@@ -3820,6 +3820,32 @@ enum RemoteBrowse {
     S3(String),
 }
 
+/// Everything that makes a run **remote** (`--ssh-read`), bundled so it exists as
+/// a unit or not at all: a local checkpoint is simply `remote: None`, and the SSH
+/// session / cached password / captured on-disk usage / S3 metadata can't dangle
+/// without a remote read behind them (the old six parallel `Option`/`RefCell`
+/// fields let those states drift apart).
+struct RemoteContext {
+    /// The reader that runs cstorch/SFTP over SSH (`--ssh-read`/`--ssh-venv`).
+    read: crate::remote::RemoteRead,
+    /// The file browser's source kind, derived from the raw source at setup;
+    /// `None` only for the degenerate empty-input case (nothing to browse).
+    browse: Option<RemoteBrowse>,
+    /// The one SSH session kept alive for the run: opened during the pre-TUI read
+    /// and reused (reopened on idle-timeout with the cached password) by the file
+    /// browser / remote layout / sidecar reads without a second auth prompt.
+    session: RefCell<Option<crate::sftp::RemoteSession>>,
+    /// The entered password, cached so a mid-session reopen doesn't re-prompt.
+    password: RefCell<Option<String>>,
+    /// The remote shards' on-disk footprint, captured during the read while the
+    /// session was live (SFTP carries no block count, so it can't be re-derived
+    /// later). `None` for `s3://` / hosts without GNU `stat`.
+    disk: Option<crate::stats::DiskUsage>,
+    /// The underlying S3 objects' metadata (checksums/ETags/tags/sizes) for an
+    /// `s3://` source, shown in the stats report's S3 section. `None` for SFTP.
+    s3_meta: Option<crate::remote::S3Meta>,
+}
+
 pub struct Explorer {
     /// The input path list (CLI args / globbed shard paths) — what to read. Not
     /// the same as the model's walked `FileEntry` list; this is the frontend's
@@ -3835,27 +3861,10 @@ pub struct Explorer {
     /// it in a later step. The TUI is migrating to drive this `Session` and render
     /// its `ViewModel`; today its local views/reports derive from the model here.
     session: Option<crate::kernel::Session>,
-    /// When set (`--ssh-read`), remote `s3://…` sources have their metadata read
-    /// over SSH via cstorch on the remote, instead of directly (metadata-only).
-    remote_read: Option<crate::remote::RemoteRead>,
-    /// The underlying S3 objects' metadata, fetched up front for an `s3://` source
-    /// (checksums/ETags/tags/sizes) and shown in the stats report's S3 section.
-    /// `None` for a local / SFTP checkpoint.
-    s3_meta: Option<crate::remote::S3Meta>,
-    /// The remote source kind for the file browser (`None` locally). Set alongside
-    /// [`Self::remote_read`] from the raw `--ssh-read` source; gates
-    /// [`Self::file_view_available`] and selects the browse backend.
-    remote_browse: Option<RemoteBrowse>,
-    /// The one SSH session kept alive for the interactive run: opened during the
-    /// pre-TUI remote read ([`Self::gather_remote_keeping_session`]) and reused by
-    /// the file browser / remote layout / sidecar reads without a second auth
-    /// prompt. Reopened on an idle-timeout error with the cached password (see
-    /// [`Self::with_remote_session`]). `None` for a local checkpoint.
-    remote_session: RefCell<Option<crate::sftp::RemoteSession>>,
-    /// The password entered for [`Self::remote_session`], cached so a mid-session
-    /// reopen doesn't re-prompt. `RefCell` so a reopen (behind `&self`) can record
-    /// it.
-    remote_password: RefCell<Option<String>>,
+    /// Everything remote (`--ssh-read`), or `None` for a local checkpoint. Bundles
+    /// the reader, browse source, live SSH session + cached password, captured
+    /// on-disk usage, and S3 metadata — see [`RemoteContext`].
+    remote: Option<RemoteContext>,
     /// Whether the whole checkpoint structure has been read. A direct
     /// `--tensor X` open reads just that tensor first (fast path), leaving this
     /// `false` until the tree is shown and the full load runs.
@@ -3864,11 +3873,6 @@ pub struct Explorer {
     /// scroll, search) — owned by the kernel; the interactive tree screen drives
     /// and renders from it.
     tree_state: crate::kernel::TreeState,
-    /// The remote shards' on-disk footprint, captured during the `--ssh-read`
-    /// load while the session was live (SFTP carries no block count, so it can't
-    /// be re-derived later without another connection). `None` for local
-    /// checkpoints (statted lazily) and for `s3://` / hosts without GNU `stat`.
-    remote_disk: Option<crate::stats::DiskUsage>,
     /// Transient "✓ Copied …" confirmation shown after a copy shortcut
     /// (`c`/`f`/`n`) as a bottom-line overlay — leaving the path/name in the
     /// status bar intact — paired with the time it was set so it clears on its
@@ -3985,14 +3989,9 @@ impl Explorer {
         Self {
             files,
             session: None,
-            remote_read: None,
-            s3_meta: None,
-            remote_browse: None,
-            remote_session: RefCell::new(None),
-            remote_password: RefCell::new(None),
+            remote: None,
             full_loaded: false,
             tree_state: crate::kernel::TreeState::default(),
-            remote_disk: None,
             copied_flash: None,
             terminal: None,
             clickable: RefCell::new(Vec::new()),
@@ -4037,7 +4036,7 @@ impl Explorer {
     /// metadata-only badges only on the tree.
     fn screen_badges(&self, ctx: HelpCtx) -> Vec<crate::ui::Badge> {
         let (health, metadata_only) = if ctx == HelpCtx::Tree {
-            (self.health_alert(), self.remote_read.is_some())
+            (self.health_alert(), self.remote_read().is_some())
         } else {
             (None, false)
         };
@@ -4285,12 +4284,11 @@ impl Explorer {
     /// the venv at `venv`), instead of directly — so credentials stay on the
     /// remote (`--ssh-read` / `--ssh-venv`).
     pub fn set_remote_read(&mut self, host: String, venv: String) {
-        self.remote_read = Some(crate::remote::RemoteRead::new(host, venv));
         // The file browser adapts to the remote source kind, derived from the raw
         // `--ssh-read` argument: an `s3://…` URI browses s3-natively; any other
         // path is the SFTP directory to browse (or, for a single shard, its
         // parent). `browse_root` (a local `.parent()`) doesn't apply remotely.
-        self.remote_browse = self.files.first().map(|first| {
+        let browse = self.files.first().map(|first| {
             let src = first.to_string_lossy().into_owned();
             if src.starts_with("s3://") {
                 RemoteBrowse::S3(src)
@@ -4304,6 +4302,34 @@ impl Explorer {
                 RemoteBrowse::Sftp(src.trim_end_matches('/').to_string())
             }
         });
+        self.remote = Some(RemoteContext {
+            read: crate::remote::RemoteRead::new(host, venv),
+            browse,
+            session: RefCell::new(None),
+            password: RefCell::new(None),
+            disk: None,
+            s3_meta: None,
+        });
+    }
+
+    /// The remote reader (`--ssh-read`), when this is a remote run.
+    fn remote_read(&self) -> Option<&crate::remote::RemoteRead> {
+        self.remote.as_ref().map(|r| &r.read)
+    }
+
+    /// The file browser's remote source kind, when browsing a remote checkpoint.
+    fn remote_browse(&self) -> Option<&RemoteBrowse> {
+        self.remote.as_ref().and_then(|r| r.browse.as_ref())
+    }
+
+    /// The captured remote on-disk usage, if any.
+    fn remote_disk(&self) -> Option<crate::stats::DiskUsage> {
+        self.remote.as_ref().and_then(|r| r.disk.clone())
+    }
+
+    /// The remote S3 object metadata, if any.
+    fn remote_s3_meta(&self) -> Option<&crate::remote::S3Meta> {
+        self.remote.as_ref().and_then(|r| r.s3_meta.as_ref())
     }
 
     /// Run `f` with the live remote session, reopening once (with the cached
@@ -4315,24 +4341,24 @@ impl Explorer {
         &self,
         f: impl Fn(&crate::sftp::RemoteSession) -> Result<T>,
     ) -> Result<T> {
+        let rc = self
+            .remote
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no --ssh-read session configured"))?;
         // Try the stored session first; a success returns immediately.
-        if let Some(session) = self.remote_session.borrow().as_ref()
+        if let Some(session) = rc.session.borrow().as_ref()
             && let Ok(v) = f(session)
         {
             return Ok(v);
         }
         // No session, or it errored (likely an idle timeout): reopen once with the
         // cached password (entered during the pre-TUI read, so no new prompt).
-        let r = self
-            .remote_read
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no --ssh-read session configured"))?;
         let session = {
-            let mut pw = self.remote_password.borrow_mut();
-            r.open_with(&mut pw)?
+            let mut pw = rc.password.borrow_mut();
+            rc.read.open_with(&mut pw)?
         };
         let out = f(&session);
-        *self.remote_session.borrow_mut() = Some(session);
+        *rc.session.borrow_mut() = Some(session);
         out
     }
 
@@ -4349,7 +4375,7 @@ impl Explorer {
         // a loading frame — the same header/footer chrome as the tree, with a
         // spinner in place of the rows — until the worker finishes.
         let files = self.files.clone();
-        let remote = self.remote_read.clone();
+        let remote = self.remote_read().cloned();
         let handle = std::thread::spawn(move || Self::gather_checkpoint(&files, remote.as_ref()));
 
         let label = self
@@ -4386,7 +4412,9 @@ impl Explorer {
         let ((tensors, metadata, config, disk, health), checkpoint) = handle
             .join()
             .map_err(|_| anyhow::anyhow!("checkpoint loader thread panicked"))??;
-        self.remote_disk = disk;
+        if let Some(rc) = self.remote.as_mut() {
+            rc.disk = disk;
+        }
         // Remote index/file health (empty for a local read, whose reports were
         // gathered up front); fold it in so the popup and `⚠ health` badge show it.
         self.health_reports.extend(health);
@@ -4401,13 +4429,15 @@ impl Explorer {
         // A remote read opens one SSH session and keeps it alive on `self`, so the
         // file browser (and remote layout / sidecar reads) reuse it without a
         // second auth prompt. A local read uses the plain static gatherer.
-        let ((tensors, metadata, config, disk, health), checkpoint) = if self.remote_read.is_some()
-        {
-            self.gather_remote_keeping_session()?
-        } else {
-            Self::gather_checkpoint(&self.files, None)?
-        };
-        self.remote_disk = disk;
+        let ((tensors, metadata, config, disk, health), checkpoint) =
+            if self.remote_read().is_some() {
+                self.gather_remote_keeping_session()?
+            } else {
+                Self::gather_checkpoint(&self.files, None)?
+            };
+        if let Some(rc) = self.remote.as_mut() {
+            rc.disk = disk;
+        }
         self.health_reports.extend(health);
         self.finalize_load(tensors, metadata, config, checkpoint);
         Ok(())
@@ -4422,13 +4452,13 @@ impl Explorer {
         &mut self,
     ) -> Result<(CheckpointParts, Option<crate::model::Checkpoint>)> {
         let r = self
-            .remote_read
-            .clone()
+            .remote_read()
+            .cloned()
             .expect("gather_remote_keeping_session requires --ssh-read");
         // One authenticated session for the whole run; the password entered here is
         // cached (any later reopen after an idle timeout reuses it silently).
         let session = {
-            let mut pw = self.remote_password.borrow_mut();
+            let mut pw = self.remote.as_ref().unwrap().password.borrow_mut();
             r.open_with(&mut pw)?
         };
         eprintln!("checkpoint-explorer: reading tensor metadata over ssh …");
@@ -4446,7 +4476,7 @@ impl Explorer {
             // Fetch the S3 object metadata up front for an `s3://` source (checksums
             // /ETags/tags — a HEAD per object), so the stats report's S3 section is
             // ready; `want_s3` is a no-op for an SFTP source.
-            let pw = self.remote_password.borrow().clone();
+            let pw = self.remote.as_ref().unwrap().password.borrow().clone();
             let out = r.read(&session, &as_str, &pw, progress.as_deref(), true);
             bars.finish(0, out.is_ok());
             bars.join();
@@ -4464,14 +4494,14 @@ impl Explorer {
                 config = r.read_config(&session, &as_str);
             }
         }
-        *self.remote_session.borrow_mut() = Some(session);
+        *self.remote.as_ref().unwrap().session.borrow_mut() = Some(session);
 
         // Build the central model from what was just read — no extra network I/O:
         // group tensors by their source file into shard headers, roll the on-disk
         // `stat` results into file entries, and carry config + S3 metadata. The
         // remote views still read over SSH lazily; this makes the model (and
         // `--print-model`, serialization) cover remote checkpoints too.
-        let (root, source) = match &self.remote_browse {
+        let (root, source) = match self.remote_browse() {
             Some(RemoteBrowse::Sftp(dir)) => (
                 format!("{}:{dir}", self.remote_host_label()),
                 crate::model::Source::Sftp {
@@ -4543,7 +4573,9 @@ impl Explorer {
             s3: s3_meta.clone(),
         };
 
-        self.s3_meta = s3_meta;
+        if let Some(rc) = self.remote.as_mut() {
+            rc.s3_meta = s3_meta;
+        }
         let parts = (
             tensors,
             metadata,
@@ -5400,7 +5432,7 @@ impl Explorer {
         // prompt for a password/2FA. Do it BEFORE taking over the screen, so the
         // prompt uses the normal terminal; `fetch` announces + shows a spinner
         // after the prompt. `load_all_files` then no-ops.
-        if self.remote_read.is_some() {
+        if self.remote_read().is_some() {
             self.load_quiet()?;
         }
 
@@ -5525,7 +5557,7 @@ impl Explorer {
             let p = Path::new(&path);
             let abs = if p.is_absolute() {
                 path
-            } else if let Some(RemoteBrowse::Sftp(dir)) = &self.remote_browse {
+            } else if let Some(RemoteBrowse::Sftp(dir)) = self.remote_browse() {
                 // A remote-relative `--layout` resolves against the SFTP browse dir.
                 format!("{}/{path}", dir.trim_end_matches('/'))
             } else {
@@ -6739,7 +6771,7 @@ impl Explorer {
     /// the filesystem), or a remote source we know how to browse — a remote
     /// safetensors dir (SFTP) or an `s3://…` object list. Metadata-only either way.
     fn file_view_available(&self) -> bool {
-        self.remote_read.is_none() || self.remote_browse.is_some()
+        self.remote_read().is_none() || self.remote_browse().is_some()
     }
 
     /// Which access badge the bottom-right status line shows: `Editable` when the
@@ -6982,7 +7014,7 @@ impl Explorer {
     /// The header path shown atop the file browser: the local browse root, the
     /// remote SFTP directory, or the `s3://…` URI.
     fn browse_display_root(&self) -> String {
-        match &self.remote_browse {
+        match self.remote_browse() {
             Some(RemoteBrowse::Sftp(dir)) => format!("{}:{dir}", self.remote_host_label()),
             Some(RemoteBrowse::S3(uri)) => uri.clone(),
             None => self.browse_root.to_string_lossy().into_owned(),
@@ -6991,8 +7023,7 @@ impl Explorer {
 
     /// The remote host label for display (`host` from `--ssh-read`), or `remote`.
     fn remote_host_label(&self) -> String {
-        self.remote_read
-            .as_ref()
+        self.remote_read()
             .map(|r| r.host.clone())
             .unwrap_or_else(|| "remote".to_string())
     }
@@ -7002,7 +7033,7 @@ impl Explorer {
     /// one [`crate::filetree::FileNode`] either way. Returns a readable error
     /// string (shown as a popup) when a remote listing fails.
     fn build_browse_tree(&self) -> std::result::Result<crate::filetree::FileNode, String> {
-        match &self.remote_browse {
+        match self.remote_browse() {
             // Local: assemble the browser from the cached directory walk in the
             // model (no `readdir`/`stat` on `Tab`). Falls back to a fresh walk only
             // if the model wasn't populated.
@@ -7054,8 +7085,7 @@ impl Explorer {
             }
             Some(RemoteBrowse::S3(uri)) => {
                 let r = self
-                    .remote_read
-                    .as_ref()
+                    .remote_read()
                     .ok_or_else(|| "no --ssh-read session configured".to_string())?;
                 let objects = self
                     .with_remote_session(|s| r.list_s3(s, uri))
@@ -7126,7 +7156,7 @@ impl Explorer {
     /// it means switching back to the tensor tree, not loading a new checkpoint).
     fn is_loaded_checkpoint(&self, path: &Path) -> bool {
         // Remote paths can't be canonicalized locally — compare the strings.
-        if self.remote_read.is_some() {
+        if self.remote_read().is_some() {
             let p = path.to_string_lossy();
             return self.files.iter().any(|f| f.to_string_lossy() == p);
         }
@@ -7153,7 +7183,7 @@ impl Explorer {
         // s3-native browse is a read-only object listing: `Enter` on an object
         // shows an info pop-up (full key + size); there's no per-object layout map
         // or preview (cstorch objects aren't per-file safetensors).
-        if let Some(RemoteBrowse::S3(uri)) = &self.remote_browse {
+        if let Some(RemoteBrowse::S3(uri)) = self.remote_browse() {
             let full = format!(
                 "{}/{}",
                 uri.trim_end_matches('/'),
@@ -7243,7 +7273,7 @@ impl Explorer {
         const CAP: u64 = 4 << 20; // 4 MiB — plenty for config/tokenizer sidecars
         // Read the sidecar locally, or over SFTP for a remote checkpoint (small
         // file, read-only). s3 browse never previews (handled before this call).
-        let read = match &self.remote_browse {
+        let read = match self.remote_browse() {
             Some(RemoteBrowse::Sftp(_)) => {
                 self.read_remote_text_capped(&path.to_string_lossy(), CAP)
             }
@@ -7560,7 +7590,7 @@ impl Explorer {
         parts.push("--layout".to_string());
         // Emit the path relative to the checkpoint dir (which the launch path names)
         // — the remote SFTP dir for a remote source, else the local browse root.
-        let rel = match &self.remote_browse {
+        let rel = match self.remote_browse() {
             Some(RemoteBrowse::Sftp(dir)) => path
                 .strip_prefix(&format!("{}/", dir.trim_end_matches('/')))
                 .unwrap_or(path)
@@ -7593,7 +7623,7 @@ impl Explorer {
         &self,
         path: &str,
     ) -> std::result::Result<crate::safelayout::LayoutMap, String> {
-        match &self.remote_browse {
+        match self.remote_browse() {
             Some(RemoteBrowse::Sftp(_)) => {
                 let (total_len, header) = self
                     .with_remote_session(|s| s.read_header_sized(path))
@@ -7763,7 +7793,7 @@ impl Explorer {
     /// `Some` only for a local `.safetensors` source (the layout map reads the
     /// file's header locally). Backs the detail view's `Tab` → file layout.
     fn tensor_layout_screen(&self, tensor: &TensorInfo) -> Option<Screen> {
-        if self.remote_read.is_some() {
+        if self.remote_read().is_some() {
             return None;
         }
         let path = &tensor.source_path;
@@ -7939,7 +7969,7 @@ impl Explorer {
     /// local browse directory, the remote SFTP directory (scp-style `host:/dir`, so
     /// it's usable with `scp`/`rsync`), or the `s3://` prefix.
     fn checkpoint_dir(&self) -> String {
-        match &self.remote_browse {
+        match self.remote_browse() {
             Some(RemoteBrowse::S3(uri)) => uri.clone(),
             Some(RemoteBrowse::Sftp(dir)) => format!("{}:{dir}", self.remote_host_label()),
             None => self.browse_root.to_string_lossy().into_owned(),
@@ -9043,7 +9073,7 @@ impl Explorer {
     /// shards (so every shard *and* the index are renamed consistently). `None`
     /// (command hidden) for a remote source or any non-safetensors format.
     fn rename_target(&self) -> Option<PathBuf> {
-        if self.remote_read.is_some() || self.files.is_empty() {
+        if self.remote_read().is_some() || self.files.is_empty() {
             return None;
         }
         if !self.files.iter().all(|f| {
@@ -9142,8 +9172,10 @@ impl Explorer {
         self.index_specs = specs;
         self.health_reports.clear();
         let ((tensors, metadata, config, disk, health), checkpoint) =
-            Self::gather_checkpoint(&self.files, self.remote_read.as_ref())?;
-        self.remote_disk = disk;
+            Self::gather_checkpoint(&self.files, self.remote_read())?;
+        if let Some(rc) = self.remote.as_mut() {
+            rc.disk = disk;
+        }
         self.health_reports.extend(health);
         self.finalize_load(tensors, metadata, config, checkpoint);
         Ok(())
@@ -9553,7 +9585,7 @@ impl Explorer {
                 .map(|(_, what)| what);
             // Offer the value scan while it can still add something: a local
             // source that hasn't been scanned yet.
-            let can_scan = self.remote_read.is_none() && !report.values;
+            let can_scan = self.remote_read().is_none() && !report.values;
             let state = CheckPopup::Idle { copied, can_scan };
             let hint = layout_hint;
             let max_cell = std::cell::Cell::new(0usize);
@@ -9711,7 +9743,7 @@ impl Explorer {
     /// [`crate::stats::S3Stats`] (so `stats` stays free of a remote dependency).
     /// `None` for a local / SFTP checkpoint.
     fn s3_stats(&self) -> Option<crate::stats::S3Stats> {
-        let meta = self.s3_meta.as_ref()?;
+        let meta = self.remote_s3_meta()?;
         let objects = meta
             .objects
             .iter()
@@ -9759,8 +9791,8 @@ impl Explorer {
     }
 
     fn disk_usage(&self) -> Option<crate::stats::DiskUsage> {
-        if self.remote_read.is_some() {
-            return self.remote_disk.clone();
+        if self.remote_read().is_some() {
+            return self.remote_disk();
         }
         // Local: derived from the cached model's directory walk (symlink-followed
         // sizes) — no live `stat`. Falls back to a fresh stat only if the model
@@ -9863,7 +9895,7 @@ impl Explorer {
     /// whose source is a plain path (an `s3://…` cstorch source still needs
     /// `--ssh-read`, so `None` there and for local checkpoints).
     fn remote_scp_host(&self) -> Option<String> {
-        let remote = self.remote_read.as_ref()?;
+        let remote = self.remote_read()?;
         let any_s3 = self
             .files
             .iter()
@@ -9907,7 +9939,7 @@ impl Explorer {
     /// it needs no flag; local checkpoints get just the program name.
     fn command_prefix(&self) -> Vec<String> {
         let mut parts = vec![PROGRAM.to_string()];
-        if let Some(remote) = &self.remote_read
+        if let Some(remote) = self.remote_read()
             && self.remote_scp_host().is_none()
         {
             parts.push("--ssh-read".to_string());
@@ -11109,7 +11141,7 @@ mod tests {
         );
         e.set_remote_read("host".into(), "~/venv".into());
         assert!(
-            matches!(&e.remote_browse, Some(RemoteBrowse::S3(u)) if u == "s3://bucket/models/ckpt")
+            matches!(e.remote_browse(), Some(RemoteBrowse::S3(u)) if u == "s3://bucket/models/ckpt")
         );
         assert!(e.file_view_available());
 
@@ -11121,7 +11153,9 @@ mod tests {
             false,
         );
         e.set_remote_read("host".into(), "~/venv".into());
-        assert!(matches!(&e.remote_browse, Some(RemoteBrowse::Sftp(d)) if d == "/opt/models/ckpt"));
+        assert!(
+            matches!(e.remote_browse(), Some(RemoteBrowse::Sftp(d)) if d == "/opt/models/ckpt")
+        );
 
         // A single remote shard browses its parent directory.
         let mut e = Explorer::new(
@@ -11131,7 +11165,9 @@ mod tests {
             false,
         );
         e.set_remote_read("host".into(), "~/venv".into());
-        assert!(matches!(&e.remote_browse, Some(RemoteBrowse::Sftp(d)) if d == "/opt/models/ckpt"));
+        assert!(
+            matches!(e.remote_browse(), Some(RemoteBrowse::Sftp(d)) if d == "/opt/models/ckpt")
+        );
     }
 
     #[test]
