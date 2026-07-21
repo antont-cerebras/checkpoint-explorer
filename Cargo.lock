@@ -177,6 +177,7 @@ dependencies = [
  "clap",
  "colored_json",
  "crossterm",
+ "flate2",
  "fuzzy-matcher",
  "glob",
  "half",

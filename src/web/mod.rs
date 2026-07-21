@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use serde_json::Value;
 
 use crate::{check, filetree, filter, health, kernel, model, safelayout, sample, stats, tree};
 use handlers::{Query, Reply};
@@ -172,12 +171,14 @@ pub fn serve(state: Arc<WebState>, host: IpAddr, port: u16, open: bool) -> Resul
 fn handle(state: &WebState, req: tiny_http::Request) {
     let url = req.url().to_string();
     let (path, query_str) = url.split_once('?').unwrap_or((url.as_str(), ""));
+    let gzip = accepts_gzip(&req);
     if let Some(api) = path.strip_prefix("/api/") {
         let q = parse_query(query_str);
         let (status, body) = route_api(state, api, &q);
-        respond_json(req, status, &body);
+        let data = serde_json::to_vec(&body).unwrap_or_default();
+        send(req, status, data, "application/json; charset=utf-8", gzip);
     } else {
-        respond_asset(req, path);
+        respond_asset(req, path, gzip);
     }
 }
 
@@ -212,20 +213,7 @@ fn parse_query(qs: &str) -> Query {
     map
 }
 
-fn respond_json(req: tiny_http::Request, status: u16, body: &Value) {
-    let data = serde_json::to_vec(body).unwrap_or_default();
-    let header = tiny_http::Header::from_bytes(
-        &b"Content-Type"[..],
-        &b"application/json; charset=utf-8"[..],
-    )
-    .expect("valid header");
-    let resp = tiny_http::Response::from_data(data)
-        .with_status_code(status)
-        .with_header(header);
-    let _ = req.respond(resp);
-}
-
-fn respond_asset(req: tiny_http::Request, path: &str) {
+fn respond_asset(req: tiny_http::Request, path: &str, gzip: bool) {
     let rel = path.trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };
     // Serve the asset, else fall back to index.html (client-side routing).
@@ -243,9 +231,47 @@ fn respond_asset(req: tiny_http::Request, path: &str) {
             }
         },
     };
-    let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes())
-        .expect("valid header");
-    let _ = req.respond(tiny_http::Response::from_data(data).with_header(header));
+    send(req, 200, data, ctype, gzip);
+}
+
+/// Send a response, gzip-compressing the body when the client accepts it and the
+/// payload is large enough to be worth it (the tensor-tree JSON is tens of MB).
+fn send(req: tiny_http::Request, status: u16, data: Vec<u8>, content_type: &str, gzip: bool) {
+    let mut headers = vec![header("Content-Type", content_type)];
+    let body = if gzip && data.len() > 1024 {
+        match gzip_bytes(&data) {
+            Ok(compressed) => {
+                headers.push(header("Content-Encoding", "gzip"));
+                compressed
+            }
+            Err(_) => data,
+        }
+    } else {
+        data
+    };
+    let mut resp = tiny_http::Response::from_data(body).with_status_code(status);
+    for h in headers {
+        resp = resp.with_header(h);
+    }
+    let _ = req.respond(resp);
+}
+
+fn header(key: &str, value: &str) -> tiny_http::Header {
+    tiny_http::Header::from_bytes(key.as_bytes(), value.as_bytes()).expect("valid header")
+}
+
+fn gzip_bytes(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
+fn accepts_gzip(req: &tiny_http::Request) -> bool {
+    req.headers().iter().any(|h| {
+        h.field.equiv("Accept-Encoding") && h.value.as_str().to_ascii_lowercase().contains("gzip")
+    })
 }
 
 /// This machine's fully-qualified hostname (`hostname -f`), for the reachable URL

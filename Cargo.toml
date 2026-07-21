@@ -74,6 +74,9 @@ regex = "1"
 tiny_http = "0.12"
 # Decode URL-encoded query values (tensor names carry `/` and `.`).
 percent-encoding = "2"
+# gzip the web responses (the tensor-tree JSON is tens of MB for a big
+# checkpoint; gzip cuts the transfer ~10x). Pure-Rust (miniz_oxide backend).
+flate2 = "1"
 # Embed the built Svelte SPA (`web/dist`) into the binary so `--web` is
 # self-contained. Reads from disk in debug, embeds in release.
 rust-embed = "8"
