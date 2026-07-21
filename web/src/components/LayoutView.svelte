@@ -1,8 +1,10 @@
 <script lang="ts">
   import { tree } from '../stores/server';
+  import { screen } from '../stores/view';
   import { api } from '../lib/api';
   import type { LayoutMap, TreeNode } from '../lib/types';
   import { humanSize } from '../lib/format';
+  import Spinner from './Spinner.svelte';
 
   let shards: string[] = [];
   let selected = '';
@@ -13,7 +15,10 @@
   let hover = '';
 
   $: shards = collect($tree?.tree ?? []);
+  // Preselect the shard the file browser opened, else the first one.
+  $: wanted = $screen.kind === 'layout' ? $screen.file : undefined;
   $: if (shards.length && !shards.includes(selected)) selected = shards[0];
+  $: if (wanted && shards.includes(wanted)) selected = wanted;
   $: if (selected) load(selected);
 
   function collect(nodes: TreeNode[]): string[] {
@@ -88,7 +93,7 @@
   </div>
 
   {#if loading}
-    <p class="dim">loading…</p>
+    <Spinner label="parsing layout…" />
   {:else if err}
     <p class="err">{err}</p>
   {:else if map}

@@ -3,6 +3,7 @@
   import { api } from '../lib/api';
   import type { FileNode } from '../lib/types';
   import { humanSize } from '../lib/format';
+  import { openFile } from '../stores/view';
 
   let root: FileNode | null = null;
   let err = '';
@@ -37,11 +38,14 @@
     return out;
   })();
 
-  function toggle(node: FileNode) {
-    if (node.kind !== 'dir') return;
-    if (expanded.has(node.path)) expanded.delete(node.path);
-    else expanded.add(node.path);
-    expanded = expanded;
+  function activate(node: FileNode) {
+    if (node.kind === 'dir') {
+      if (expanded.has(node.path)) expanded.delete(node.path);
+      else expanded.add(node.path);
+      expanded = expanded;
+    } else {
+      openFile(node.path, node.name, node.file_kind);
+    }
   }
 </script>
 
@@ -57,11 +61,11 @@
         style="padding-left:{8 + depth * 16}px"
         role="button"
         tabindex="-1"
-        on:click={() => toggle(node)}
+        on:click={() => activate(node)}
         on:keydown={(e) => {
           if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
-            toggle(node);
+            activate(node);
           }
         }}
       >

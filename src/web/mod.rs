@@ -192,6 +192,7 @@ fn route_api(s: &WebState, path: &str, q: &Query) -> Reply {
         "model" => handlers::model(s),
         "tensor" => handlers::tensor(s, q),
         "layout" => handlers::layout(s, q),
+        "file" => handlers::file(s, q),
         "tensor/stats" => handlers::tensor_stats(s, q),
         "tensor/sample" => handlers::tensor_sample(s, q),
         "tensor/histogram" => handlers::tensor_histogram(s, q),

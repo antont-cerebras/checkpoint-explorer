@@ -27,8 +27,10 @@
   import LayoutView from './components/LayoutView.svelte';
   import StatsView from './components/StatsView.svelte';
   import HealthView from './components/HealthView.svelte';
+  import FilePreview from './components/FilePreview.svelte';
   import StatusBar from './components/StatusBar.svelte';
   import Footer from './components/Footer.svelte';
+  import { theme } from './stores/theme';
 
   onMount(ensureTree);
 
@@ -208,6 +210,11 @@
         <span class="dim">{$visibleRows.length} matches · Esc to exit</span>
       </span>
     {/if}
+    <select class="theme" bind:value={$theme} title="Color theme" aria-label="Color theme">
+      <option value="system">System</option>
+      <option value="dark">Dark</option>
+      <option value="light">Light</option>
+    </select>
   </header>
 
   <main>
@@ -225,6 +232,8 @@
       <StatsView />
     {:else if $screen.kind === 'health'}
       <HealthView />
+    {:else if $screen.kind === 'preview'}
+      <FilePreview path={$screen.path} name={$screen.name} />
     {/if}
   </main>
 
@@ -268,6 +277,12 @@
   }
   .search input {
     flex: 0 1 360px;
+  }
+  .theme {
+    margin-left: auto;
+    flex: 0 0 auto;
+    font-size: 12px;
+    padding: 2px 4px;
   }
   main {
     flex: 1 1 auto;

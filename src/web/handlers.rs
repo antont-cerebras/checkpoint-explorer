@@ -65,6 +65,38 @@ pub fn tensor(s: &WebState, q: &Query) -> Reply {
     }
 }
 
+/// Read a text/JSON file's content (capped) for the file browser's preview. Only
+/// serves paths that are in the checkpoint's own file list — no path traversal.
+pub fn file(s: &WebState, q: &Query) -> Reply {
+    let Some(rel) = q.get("path") else {
+        return err(400, "missing ?path=");
+    };
+    let Some(entry) = s
+        .checkpoint
+        .files
+        .iter()
+        .find(|f| f.rel_path == *rel && !f.is_dir())
+    else {
+        return err(404, format!("no such file: {rel}"));
+    };
+    let abs = std::path::Path::new(&s.root).join(&entry.rel_path);
+    const CAP: usize = 1 << 20; // 1 MiB — enough for config/index/readme/merges
+    match std::fs::read(&abs) {
+        Ok(bytes) => {
+            let truncated = bytes.len() > CAP;
+            let text = String::from_utf8_lossy(&bytes[..bytes.len().min(CAP)]).into_owned();
+            ok(json!({
+                "path": rel,
+                "name": entry.name,
+                "size": entry.apparent(),
+                "truncated": truncated,
+                "text": text,
+            }))
+        }
+        Err(e) => err(500, format!("read failed: {e}")),
+    }
+}
+
 pub fn layout(s: &WebState, q: &Query) -> Reply {
     let Some(file) = q.get("file") else {
         return err(400, "missing ?file=");

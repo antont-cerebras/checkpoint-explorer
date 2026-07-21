@@ -24,6 +24,28 @@
   background: var(--bg);
 }
 
+/* Light theme — applied when `data-theme="light"` is set on <html> (see
+   stores/theme.ts, which resolves dark/light/system to a concrete value). */
+:root[data-theme='light'] {
+  --bg: #ffffff;
+  --bg-panel: #f4f5f7;
+  --bg-elev: #eceef2;
+  --bg-hover: #e6e9ee;
+  --bg-sel: #cfe3ff;
+  --border: #d3d7de;
+  --fg: #1c2027;
+  --fg-dim: #67707d;
+  --accent: #0a6fbf;
+  --group: #0a6fbf;
+  --tensor: #2b313b;
+  --dtype: #8a5a00;
+  --meta: #7a3fa0;
+  --danger: #c0392b;
+  --warn: #8a6d00;
+  --ok: #3f8c2f;
+  color-scheme: light;
+}
+
 * {
   box-sizing: border-box;
 }

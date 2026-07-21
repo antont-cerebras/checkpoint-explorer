@@ -48,6 +48,10 @@ export const api = {
   check: () => getJson<Record<string, unknown> | null>('/api/check'),
   tensor: (name: string) => getJson<TensorInfo>(`/api/tensor?name=${enc(name)}`),
   layout: (file: string) => getJson<LayoutMap>(`/api/layout?file=${enc(file)}`),
+  file: (path: string) =>
+    getJson<{ path: string; name: string; size: number; truncated: boolean; text: string }>(
+      `/api/file?path=${enc(path)}`,
+    ),
   tensorStats: (name: string, dtype?: string) =>
     getJson<StatsDto>(`/api/tensor/stats?${qs({ name, dtype })}`),
   sample: (name: string, p: SampleParams) =>

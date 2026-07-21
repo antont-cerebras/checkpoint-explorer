@@ -14,9 +14,10 @@ export type Screen =
   | { kind: 'tree' }
   | { kind: 'detail'; tensor: string; tab: DataTab }
   | { kind: 'files' }
-  | { kind: 'layout' }
+  | { kind: 'layout'; file?: string }
   | { kind: 'stats' }
-  | { kind: 'health' };
+  | { kind: 'health' }
+  | { kind: 'preview'; path: string; name: string };
 
 export const screen = writable<Screen>({ kind: 'tree' });
 
@@ -62,6 +63,13 @@ export function forward(): void {
 
 export function openDetail(tensor: string): void {
   navigate({ kind: 'detail', tensor, tab: 'info' });
+}
+
+/** Open a file from the browser: a safetensors shard jumps to its byte-layout map;
+ * anything else gets a text preview. */
+export function openFile(path: string, name: string, fileKind: string): void {
+  if (fileKind === 'Checkpoint') navigate({ kind: 'layout', file: name });
+  else navigate({ kind: 'preview', path, name });
 }
 export function setTab(tab: DataTab): void {
   screen.update((s) => (s.kind === 'detail' ? { ...s, tab } : s));
