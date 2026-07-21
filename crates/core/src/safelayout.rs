@@ -18,20 +18,20 @@ use crate::tree::{Layout, MetadataInfo, TensorInfo};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
     pub name: String,
-    /// `None` for the header / gap rows; a tensor's dtype otherwise.
-    pub dtype: Option<String>,
-    pub shape: Vec<usize>,
     pub start: u64,
     pub end: u64,
     pub kind: SegmentKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a byte span in the file is. A tensor carries its dtype/shape; the header
+/// and gap rows carry none — instead of the old `dtype: Option<String>` +
+/// `shape: Vec` that were only meaningful (and only populated) for tensor rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SegmentKind {
     /// The 8-byte length prefix plus the JSON metadata header.
     Header,
-    /// A tensor's data.
-    Tensor,
+    /// A tensor's data, with its dtype and shape.
+    Tensor { dtype: String, shape: Vec<usize> },
     /// An unaccounted gap between segments (rare — alignment padding).
     Gap,
 }
@@ -171,11 +171,9 @@ pub fn parse_from(name: &str, total_len: u64, header_json: &[u8]) -> Result<Layo
         };
         tensors.push(Segment {
             name: key.clone(),
-            dtype: Some(dtype),
-            shape,
             start: data_start + begin,
             end: data_start + end,
-            kind: SegmentKind::Tensor,
+            kind: SegmentKind::Tensor { dtype, shape },
         });
     }
     Ok(assemble(name, total_len, header_len, tensors, metadata))
@@ -199,11 +197,12 @@ pub fn from_tensors(
             // `data_offsets` are relative to the data blob (past the header).
             Layout::ByteRange { start, end } => Some(Segment {
                 name: t.name.clone(),
-                dtype: Some(t.dtype.clone()),
-                shape: t.shape.clone(),
                 start: header_len + start,
                 end: header_len + end,
-                kind: SegmentKind::Tensor,
+                kind: SegmentKind::Tensor {
+                    dtype: t.dtype.clone(),
+                    shape: t.shape.clone(),
+                },
             }),
             _ => None,
         })
@@ -232,8 +231,6 @@ fn assemble(
     let mut segments: Vec<Segment> = Vec::with_capacity(tensor_count + 2);
     segments.push(Segment {
         name: "header (8 B length + JSON metadata)".to_string(),
-        dtype: None,
-        shape: Vec::new(),
         start: 0,
         end: header_len,
         kind: SegmentKind::Header,
@@ -306,8 +303,6 @@ pub fn read_header_full(path: &Path) -> Result<(u64, Vec<u8>), String> {
 fn gap(start: u64, end: u64) -> Segment {
     Segment {
         name: "(padding)".to_string(),
-        dtype: None,
-        shape: Vec::new(),
         start,
         end,
         kind: SegmentKind::Gap,
@@ -392,8 +387,13 @@ mod tests {
         assert_eq!(map.segments[1].name, "w1");
         assert_eq!(map.segments[1].start, hlen);
         assert_eq!(map.segments[1].end, hlen + 16);
-        assert_eq!(map.segments[1].dtype.as_deref(), Some("F32"));
-        assert_eq!(map.segments[1].shape, vec![2, 2]);
+        assert_eq!(
+            map.segments[1].kind,
+            SegmentKind::Tensor {
+                dtype: "F32".into(),
+                shape: vec![2, 2]
+            }
+        );
         assert_eq!(map.segments[2].name, "w2");
         assert_eq!(map.segments[2].start, hlen + 16);
         assert_eq!(map.segments[2].end, hlen + 24);

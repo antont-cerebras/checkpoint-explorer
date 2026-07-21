@@ -1853,7 +1853,7 @@ impl UI {
                 // A concrete tensor's name is a link to the tree (underlined, like
                 // the other in-app links); the spans above are a fixed 20 columns
                 // wide, so the name always starts at column 20.
-                let is_tensor = s.kind == SegmentKind::Tensor;
+                let is_tensor = matches!(s.kind, SegmentKind::Tensor { .. });
                 let name_style = if selected_row {
                     sel
                 } else if is_tensor {
@@ -1876,10 +1876,10 @@ impl UI {
                 }
                 spans.push(Span::styled(name, name_style));
                 let mut detail = String::new();
-                if let (SegmentKind::Tensor, Some(dt)) = (s.kind, &s.dtype) {
-                    detail.push_str(&format!("  {dt}"));
-                    if !s.shape.is_empty() {
-                        detail.push_str(&format!(" {}", format_shape(&s.shape)));
+                if let SegmentKind::Tensor { dtype, shape } = &s.kind {
+                    detail.push_str(&format!("  {dtype}"));
+                    if !shape.is_empty() {
+                        detail.push_str(&format!(" {}", format_shape(shape)));
                     }
                 }
                 detail.push_str(&format!("  {}", format_size(s.len() as usize)));
@@ -5882,10 +5882,10 @@ pub(crate) fn layout_hint_lines(width: u16) -> (Vec<Line<'static>>, Vec<ChipHit>
 /// map's ASCII "graphic", so a big tensor reads as a solid column.
 fn band_style(seg: &crate::safelayout::Segment, total_len: u64) -> (char, Color) {
     use crate::safelayout::SegmentKind;
-    match seg.kind {
+    match &seg.kind {
         SegmentKind::Header => ('█', palette::META),
         SegmentKind::Gap => ('░', palette::DIM),
-        SegmentKind::Tensor => {
+        SegmentKind::Tensor { .. } => {
             let share = seg.len() as f64 / total_len.max(1) as f64;
             let glyph = if share >= 0.10 {
                 '█'
@@ -5914,7 +5914,7 @@ fn band_rows(map: &crate::safelayout::LayoutMap, body_rows: usize) -> Vec<usize>
         .map(|s| {
             let share = s.len() as f64 / total_len;
             let proportional = (share * target as f64).round() as usize;
-            match s.kind {
+            match &s.kind {
                 // The header lists its `__metadata__` tree-like, so give it enough
                 // rows to show them (a label row + one per entry) even when its
                 // byte share is tiny — as it is for a multi-GB file.
@@ -7233,13 +7233,15 @@ mod tests {
     #[test]
     fn layout_map_renders_summary_and_bands() {
         use crate::safelayout::{LayoutMap, Segment, SegmentKind};
-        let seg = |name: &str, dtype: Option<&str>, shape: Vec<usize>, start, end, kind| Segment {
+        let seg = |name: &str, start, end, kind| Segment {
             name: name.to_string(),
-            dtype: dtype.map(str::to_string),
-            shape,
             start,
             end,
             kind,
+        };
+        let tensor = |dtype: &str, shape: Vec<usize>| SegmentKind::Tensor {
+            dtype: dtype.to_string(),
+            shape,
         };
         let map = LayoutMap {
             name: "model.safetensors".to_string(),
@@ -7250,28 +7252,17 @@ mod tests {
             segments: vec![
                 seg(
                     "header (8 B length + JSON metadata)",
-                    None,
-                    vec![],
                     0,
                     200,
                     SegmentKind::Header,
                 ),
                 seg(
                     "embed.weight",
-                    Some("BF16"),
-                    vec![1000, 256],
                     200,
                     800_200,
-                    SegmentKind::Tensor,
+                    tensor("BF16", vec![1000, 256]),
                 ),
-                seg(
-                    "norm.weight",
-                    Some("F32"),
-                    vec![256],
-                    800_200,
-                    1_000_000,
-                    SegmentKind::Tensor,
-                ),
+                seg("norm.weight", 800_200, 1_000_000, tensor("F32", vec![256])),
             ],
         };
         let out = crate::tui::headless_render(90, 24, |f| {
@@ -7292,13 +7283,15 @@ mod tests {
     #[test]
     fn layout_tensor_band_names_are_tree_links() {
         use crate::safelayout::{LayoutMap, Segment, SegmentKind};
-        let seg = |name: &str, dtype: Option<&str>, shape: Vec<usize>, start, end, kind| Segment {
+        let seg = |name: &str, start, end, kind| Segment {
             name: name.to_string(),
-            dtype: dtype.map(str::to_string),
-            shape,
             start,
             end,
             kind,
+        };
+        let tensor = |dtype: &str, shape: Vec<usize>| SegmentKind::Tensor {
+            dtype: dtype.to_string(),
+            shape,
         };
         let map = LayoutMap {
             name: "model.safetensors".to_string(),
@@ -7307,23 +7300,14 @@ mod tests {
             tensor_count: 2,
             metadata: vec![],
             segments: vec![
-                seg("header", None, vec![], 0, 200, SegmentKind::Header),
+                seg("header", 0, 200, SegmentKind::Header),
                 seg(
                     "embed.weight",
-                    Some("BF16"),
-                    vec![1000, 256],
                     200,
                     800_200,
-                    SegmentKind::Tensor,
+                    tensor("BF16", vec![1000, 256]),
                 ),
-                seg(
-                    "norm.weight",
-                    Some("F32"),
-                    vec![256],
-                    800_200,
-                    1_000_000,
-                    SegmentKind::Tensor,
-                ),
+                seg("norm.weight", 800_200, 1_000_000, tensor("F32", vec![256])),
             ],
         };
         let mut links = Vec::new();

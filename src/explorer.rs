@@ -1119,7 +1119,7 @@ impl Mode for LayoutMode {
             KeyCode::End => self.selected = n.saturating_sub(1),
             // Enter on the header previews the raw JSON header; on a tensor it jumps
             // to that tensor's place in the tree.
-            KeyCode::Enter => match self.map().segments.get(self.selected).map(|s| s.kind) {
+            KeyCode::Enter => match self.map().segments.get(self.selected).map(|s| &s.kind) {
                 Some(crate::safelayout::SegmentKind::Header) => {
                     ex.preview_header_json(
                         term,
@@ -1129,7 +1129,7 @@ impl Mode for LayoutMode {
                         self.scroll,
                     );
                 }
-                Some(crate::safelayout::SegmentKind::Tensor) => {
+                Some(crate::safelayout::SegmentKind::Tensor { .. }) => {
                     if let Some(nav) = ex.reveal_layout_selection(self.map(), self.selected)? {
                         return Ok(Outcome::Leave(nav));
                     }
@@ -5474,7 +5474,8 @@ impl Explorer {
                 .and_then(|name| {
                     self.parse_layout(&abs).ok().and_then(|m| {
                         m.segments.iter().position(|s| {
-                            s.kind == crate::safelayout::SegmentKind::Tensor && s.name == name
+                            matches!(s.kind, crate::safelayout::SegmentKind::Tensor { .. })
+                                && s.name == name
                         })
                     })
                 })
@@ -7576,7 +7577,7 @@ impl Explorer {
     ) -> Option<String> {
         map.segments
             .get(selected)
-            .filter(|s| s.kind == crate::safelayout::SegmentKind::Tensor)
+            .filter(|s| matches!(s.kind, crate::safelayout::SegmentKind::Tensor { .. }))
             .map(|s| s.name.clone())
     }
 
@@ -7611,7 +7612,7 @@ impl Explorer {
         let Some(seg) = map.segments.get(selected) else {
             return Ok(None);
         };
-        if seg.kind != SegmentKind::Tensor {
+        if !matches!(seg.kind, SegmentKind::Tensor { .. }) {
             return Ok(None);
         }
         let name = seg.name.clone();
@@ -7718,7 +7719,10 @@ impl Explorer {
         let selected = map
             .segments
             .iter()
-            .position(|s| s.kind == crate::safelayout::SegmentKind::Tensor && s.name == tensor.name)
+            .position(|s| {
+                matches!(s.kind, crate::safelayout::SegmentKind::Tensor { .. })
+                    && s.name == tensor.name
+            })
             .unwrap_or(0);
         Some(Screen::Layout {
             path: path.clone(),
@@ -10537,9 +10541,11 @@ fn layout_to_text(map: &crate::safelayout::LayoutMap) -> String {
         format_size(map.header_len as usize),
     );
     for s in &map.segments {
-        let detail = match &s.dtype {
-            Some(dt) => format!("  {dt} {}", format_shape(&s.shape)),
-            None => String::new(),
+        let detail = match &s.kind {
+            crate::safelayout::SegmentKind::Tensor { dtype, shape } => {
+                format!("  {dtype} {}", format_shape(shape))
+            }
+            _ => String::new(),
         };
         out.push_str(&format!(
             "{:#014x}  {:>10}  {}{}\n",

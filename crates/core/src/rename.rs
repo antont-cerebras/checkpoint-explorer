@@ -945,7 +945,7 @@ mod tests {
         let names: BTreeSet<&str> = layout
             .segments
             .iter()
-            .filter(|s| s.kind == safelayout::SegmentKind::Tensor)
+            .filter(|s| matches!(s.kind, safelayout::SegmentKind::Tensor { .. }))
             .map(|s| s.name.as_str())
             .collect();
         assert_eq!(names, BTreeSet::from(["xxx", "yyy"]));
@@ -1013,12 +1013,9 @@ mod tests {
         let plan = plan(&file, &map).unwrap();
         apply(&plan).unwrap();
         let layout = safelayout::parse(&file).unwrap();
-        assert!(
-            layout
-                .segments
-                .iter()
-                .any(|s| s.name == "weight" && s.kind == safelayout::SegmentKind::Tensor)
-        );
+        assert!(layout.segments.iter().any(|s| {
+            s.name == "weight" && matches!(s.kind, safelayout::SegmentKind::Tensor { .. })
+        }));
         let _ = fs::remove_dir_all(&dir);
     }
 
