@@ -11,6 +11,8 @@
 use std::io::Read;
 use std::path::Path;
 
+use crate::tree::{Layout, MetadataInfo, TensorInfo};
+
 /// One contiguous region of the file: the header, a tensor, or a gap (padding /
 /// an unaccounted span between tensors). Offsets are absolute within the file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,11 +178,57 @@ pub fn parse_from(name: &str, total_len: u64, header_json: &[u8]) -> Result<Layo
             kind: SegmentKind::Tensor,
         });
     }
+    Ok(assemble(name, total_len, header_len, tensors, metadata))
+}
+
+/// Build a [`LayoutMap`] directly from **already-parsed** tensors (the cached
+/// [`crate::model`] shard header) — no file read. The relative safetensors
+/// `data_offsets` in each [`TensorInfo`] (`Layout::ByteRange`) are shifted by
+/// `header_len` to absolute file positions; `metadata` becomes the header band's
+/// `__metadata__` list. Infallible: the header was already parsed at load.
+pub fn from_tensors(
+    name: &str,
+    total_len: u64,
+    header_len: u64,
+    tensors: &[TensorInfo],
+    metadata: &[MetadataInfo],
+) -> LayoutMap {
+    let segs: Vec<Segment> = tensors
+        .iter()
+        .filter_map(|t| match t.layout {
+            // `data_offsets` are relative to the data blob (past the header).
+            Layout::ByteRange { start, end } => Some(Segment {
+                name: t.name.clone(),
+                dtype: Some(t.dtype.clone()),
+                shape: t.shape.clone(),
+                start: header_len + start,
+                end: header_len + end,
+                kind: SegmentKind::Tensor,
+            }),
+            _ => None,
+        })
+        .collect();
+    let mut meta: Vec<(String, String)> = metadata
+        .iter()
+        .map(|m| (m.name.clone(), m.value.clone()))
+        .collect();
+    meta.sort_by(|a, b| a.0.cmp(&b.0));
+    assemble(name, total_len, header_len, segs, meta)
+}
+
+/// Order tensor segments by offset, prepend the header band, and fill any
+/// unaccounted spans with `Gap`s — the shared tail of [`parse_from`] and
+/// [`from_tensors`].
+fn assemble(
+    name: &str,
+    total_len: u64,
+    header_len: u64,
+    mut tensors: Vec<Segment>,
+    metadata: Vec<(String, String)>,
+) -> LayoutMap {
     tensors.sort_by_key(|s| (s.start, s.end));
     let tensor_count = tensors.len();
 
-    // Build the ordered segment list: header, then tensors, inserting a `Gap`
-    // wherever there's an unaccounted span (alignment padding, or a hole).
     let mut segments: Vec<Segment> = Vec::with_capacity(tensor_count + 2);
     segments.push(Segment {
         name: "header (8 B length + JSON metadata)".to_string(),
@@ -202,14 +250,14 @@ pub fn parse_from(name: &str, total_len: u64, header_json: &[u8]) -> Result<Layo
         segments.push(gap(cursor, total_len));
     }
 
-    Ok(LayoutMap {
+    LayoutMap {
         name: name.to_string(),
         total_len,
         header_len,
         tensor_count,
         metadata,
         segments,
-    })
+    }
 }
 
 /// Read the raw JSON header of the safetensors file at `path` (the `N` bytes
@@ -269,6 +317,52 @@ fn gap(start: u64, end: u64) -> Segment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_tensors_matches_parse_from() {
+        // Building the layout from already-parsed tensors (the cached model shard
+        // header) must be byte-for-byte identical to re-parsing the header JSON,
+        // so `Enter` on a shard needs no file read.
+        let header = r#"{"w1":{"dtype":"F32","shape":[2,2],"data_offsets":[0,16]},"w2":{"dtype":"F32","shape":[2],"data_offsets":[16,24]},"__metadata__":{"format":"pt"}}"#;
+        let total_len = 8 + header.len() as u64 + 24;
+        let via_json = parse_from("m.safetensors", total_len, header.as_bytes()).unwrap();
+
+        let header_len = 8 + header.len() as u64;
+        let tensors = vec![
+            TensorInfo {
+                name: "w1".into(),
+                dtype: "F32".into(),
+                shape: vec![2, 2],
+                size_bytes: 16,
+                num_elements: 4,
+                storage: crate::tree::Storage::Unknown,
+                source_path: "m.safetensors".into(),
+                layout: Layout::ByteRange { start: 0, end: 16 },
+            },
+            TensorInfo {
+                name: "w2".into(),
+                dtype: "F32".into(),
+                shape: vec![2],
+                size_bytes: 8,
+                num_elements: 2,
+                storage: crate::tree::Storage::Unknown,
+                source_path: "m.safetensors".into(),
+                layout: Layout::ByteRange { start: 16, end: 24 },
+            },
+        ];
+        let meta = vec![MetadataInfo {
+            name: "format".into(),
+            value: "pt".into(),
+            value_type: "string".into(),
+        }];
+        let via_model = from_tensors("m.safetensors", total_len, header_len, &tensors, &meta);
+
+        assert_eq!(via_model.segments, via_json.segments);
+        assert_eq!(via_model.metadata, via_json.metadata);
+        assert_eq!(via_model.tensor_count, via_json.tensor_count);
+        assert_eq!(via_model.header_len, via_json.header_len);
+        assert_eq!(via_model.total_len, via_json.total_len);
+    }
 
     /// Write a minimal safetensors file: two f32 tensors laid out back-to-back.
     fn write_fixture(path: &Path) {

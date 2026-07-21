@@ -7601,7 +7601,30 @@ impl Explorer {
                 let name = path.rsplit('/').next().unwrap_or(path);
                 crate::safelayout::parse_from(name, total_len, &header)
             }
-            _ => crate::safelayout::parse(Path::new(path)).map_err(|e| format!("{e:#}")),
+            _ => {
+                // Local: build from the cached shard header (no file read) when the
+                // requested file is one of the loaded shards. Otherwise (a file not
+                // in the model) fall back to reading its header.
+                if let Some(cp) = &self.checkpoint {
+                    let want = Path::new(path).file_name();
+                    if want.is_some()
+                        && let Some(sh) = cp
+                            .shards
+                            .iter()
+                            .find(|s| Path::new(&s.path).file_name() == want)
+                    {
+                        let name = want.and_then(|n| n.to_str()).unwrap_or(path);
+                        return Ok(crate::safelayout::from_tensors(
+                            name,
+                            sh.total_len,
+                            sh.header_len,
+                            &sh.tensors,
+                            &sh.metadata,
+                        ));
+                    }
+                }
+                crate::safelayout::parse(Path::new(path)).map_err(|e| format!("{e:#}"))
+            }
         }
     }
 
