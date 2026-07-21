@@ -30,11 +30,12 @@
     <path d="M62 57 Q64 74 59 97" />
     <path d="M33 98 59 97" />
     <path d="M47 62 Q49 80 48 97" />
-    <!-- near arm raised, thumbs-up fist -->
-    <path d="M30 58 Q18 54 18 42 Q18 32 26 28" />
-    <rect x="15" y="15" width="13" height="12" rx="3" />
-    <path d="M18.5 19 18.5 25 M22 19 22 25 M25.5 19 25.5 25" />
-    <path d="M21 15 q-2 -8 2 -10 q3 -1 4 2" />
+    <!-- near arm bent, thumbs-up fist held at chest height -->
+    <path d="M30 58 Q19 66 20 80" />
+    <path d="M20 80 Q24 68 33 65" />
+    <rect x="33" y="54" width="14" height="12" rx="3" />
+    <path d="M36.5 58 36.5 64 M40 58 40 64 M43.5 58 43.5 64" />
+    <path d="M43 54 q1 -8 -3 -9 q-3 -1 -4 2" />
     <!-- far arm hanging behind -->
     <path d="M62 57 Q70 64 68 90 q2 6 -2 8 q-3 1 -4 -2" />
     <!-- staggered legs (near leg forward) + boots -->
