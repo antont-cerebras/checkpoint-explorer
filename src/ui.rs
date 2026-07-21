@@ -2970,12 +2970,12 @@ impl UI {
                 Status::Na => ("⊘", palette::DIM),
             };
             let mut trailer_text = match r.status() {
-                Status::Pass => format!("— {}", r.summary.as_deref().unwrap_or(r.note)),
+                Status::Pass => format!("— {}", r.summary().unwrap_or(r.note)),
                 Status::Na => "— n/a for this checkpoint".to_string(),
                 _ => format!("({})", count_phrase(r.errors(), r.warnings())),
             };
             // The value scan carries its wall-clock time (like the CLI bar).
-            if let Some(d) = r.elapsed {
+            if let Some(d) = r.elapsed() {
                 trailer_text.push_str(&format!("  ({})", fmt_elapsed(d)));
             }
             let trailer = sty(trailer_text, Style::default().fg(palette::DIM));
@@ -2991,7 +2991,7 @@ impl UI {
             // toggle aligned with the check title; `f` (or a click on it, either
             // state) reveals the full list. The `f` hint lives in the footer, with
             // the other keys, so it stays put and consistently styled.
-            if !r.findings.is_empty() {
+            if !r.findings().is_empty() {
                 let arrow = if expanded { "▾" } else { "▸" };
                 fold_lines.push(lines.len());
                 lines.push(Line::from(vec![
@@ -3002,14 +3002,14 @@ impl UI {
                     sty(
                         format!(
                             "{} finding{}",
-                            r.findings.len(),
-                            if r.findings.len() == 1 { "" } else { "s" }
+                            r.findings().len(),
+                            if r.findings().len() == 1 { "" } else { "s" }
                         ),
                         Style::default().fg(palette::DIM),
                     ),
                 ]));
                 if expanded {
-                    for f in &r.findings {
+                    for f in r.findings() {
                         let (fm, fc) = match f.severity {
                             Severity::Error => ("✗", palette::ERROR),
                             Severity::Warning => ("⚠", palette::WARN),

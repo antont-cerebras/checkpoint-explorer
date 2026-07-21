@@ -53,28 +53,42 @@ impl Finding {
     }
 }
 
+/// The outcome of one named check: it either **didn't apply** to this checkpoint,
+/// or it **ran** and produced findings (plus optional timing / summary). A tagged
+/// sum instead of an `applicable: bool` gating `findings`/`elapsed`/`summary` —
+/// so an "n/a" check carrying findings is unrepresentable.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckOutcome {
+    /// The check doesn't apply to this checkpoint (e.g. byte-range integrity on a
+    /// GGUF file) — rendered as `n/a`, never as a pass.
+    NotApplicable,
+    /// The check ran; `findings` is empty on a clean pass.
+    Ran {
+        findings: Vec<Finding>,
+        /// Wall-clock time the check took — set only for the value scan (the one
+        /// check slow enough to be worth timing).
+        elapsed: Option<std::time::Duration>,
+        /// A dynamic one-line summary shown *in place of* `note` when the check
+        /// passes — lets a check report what it actually verified (e.g. the config
+        /// check's "48 layers · 128 experts/layer"). `None` falls back to `note`.
+        summary: Option<String>,
+    },
+}
+
 /// The outcome of one named check.
 #[derive(Clone, serde::Serialize)]
 pub struct CheckResult {
-    /// Stable machine id, e.g. `byte_ranges` — surfaced by the upcoming
-    /// `--format json` output.
+    /// Stable machine id, e.g. `byte_ranges` — surfaced by the `--format json`
+    /// output.
     #[allow(dead_code)]
     pub id: &'static str,
     /// Human title for the text report.
     pub title: &'static str,
     /// A one-line "what passing means" note, shown when the check passes.
     pub note: &'static str,
-    /// `false` when the check doesn't apply to this checkpoint (e.g. byte-range
-    /// integrity on a GGUF file) — rendered as `n/a`, never as a pass.
-    pub applicable: bool,
-    pub findings: Vec<Finding>,
-    /// Wall-clock time the check took, shown beside it — set only for the value
-    /// scan (the one check slow enough to be worth timing).
-    pub elapsed: Option<std::time::Duration>,
-    /// A dynamic one-line summary shown *in place of* `note` when the check
-    /// passes — lets a check report what it actually verified (e.g. the config
-    /// check's "48 layers · 128 experts/layer"). `None` falls back to `note`.
-    pub summary: Option<String>,
+    /// Whether the check applied, and if so what it found.
+    pub outcome: CheckOutcome,
 }
 
 impl CheckResult {
@@ -83,10 +97,7 @@ impl CheckResult {
             id,
             title,
             note,
-            applicable: false,
-            findings: Vec::new(),
-            elapsed: None,
-            summary: None,
+            outcome: CheckOutcome::NotApplicable,
         }
     }
     pub fn done(
@@ -99,20 +110,59 @@ impl CheckResult {
             id,
             title,
             note,
-            applicable: true,
-            findings,
-            elapsed: None,
-            summary: None,
+            outcome: CheckOutcome::Ran {
+                findings,
+                elapsed: None,
+                summary: None,
+            },
+        }
+    }
+
+    /// Whether the check applied (i.e. actually ran).
+    pub fn applicable(&self) -> bool {
+        matches!(self.outcome, CheckOutcome::Ran { .. })
+    }
+    /// The findings produced (empty when the check didn't apply).
+    pub fn findings(&self) -> &[Finding] {
+        match &self.outcome {
+            CheckOutcome::Ran { findings, .. } => findings,
+            CheckOutcome::NotApplicable => &[],
+        }
+    }
+    /// The check's wall-clock time, when timed.
+    pub fn elapsed(&self) -> Option<std::time::Duration> {
+        match &self.outcome {
+            CheckOutcome::Ran { elapsed, .. } => *elapsed,
+            CheckOutcome::NotApplicable => None,
+        }
+    }
+    /// The dynamic pass summary, when the check set one.
+    pub fn summary(&self) -> Option<&str> {
+        match &self.outcome {
+            CheckOutcome::Ran { summary, .. } => summary.as_deref(),
+            CheckOutcome::NotApplicable => None,
+        }
+    }
+    /// Set the dynamic pass summary (no-op on an n/a check).
+    pub fn set_summary(&mut self, s: String) {
+        if let CheckOutcome::Ran { summary, .. } = &mut self.outcome {
+            *summary = Some(s);
+        }
+    }
+    /// Record the check's wall-clock time (no-op on an n/a check).
+    pub fn set_elapsed(&mut self, d: std::time::Duration) {
+        if let CheckOutcome::Ran { elapsed, .. } = &mut self.outcome {
+            *elapsed = Some(d);
         }
     }
     pub fn errors(&self) -> usize {
-        self.findings
+        self.findings()
             .iter()
             .filter(|f| f.severity == Severity::Error)
             .count()
     }
     pub fn warnings(&self) -> usize {
-        self.findings
+        self.findings()
             .iter()
             .filter(|f| f.severity == Severity::Warning)
             .count()
@@ -171,7 +221,7 @@ impl Status {
 
 impl CheckResult {
     pub fn status(&self) -> Status {
-        if !self.applicable {
+        if !self.applicable() {
             Status::Na
         } else if self.errors() > 0 {
             Status::Fail
@@ -243,7 +293,7 @@ impl CheckReport {
             let title = format!("{:<width$}", r.title);
             let trailer = match r.status() {
                 Status::Pass => {
-                    let text = r.summary.as_deref().unwrap_or(r.note);
+                    let text = r.summary().unwrap_or(r.note);
                     paint(&format!("— {text}"), color, DIM)
                 }
                 Status::Na => paint("— n/a for this checkpoint", color, DIM),
@@ -255,7 +305,7 @@ impl CheckReport {
             };
             // The value scan carries its wall-clock time; show it dim at the end.
             let elapsed = r
-                .elapsed
+                .elapsed()
                 .map(|d| paint(&format!("  ({})", fmt_elapsed(d)), color, DIM))
                 .unwrap_or_default();
             let _ = writeln!(
@@ -267,7 +317,7 @@ impl CheckReport {
                 elapsed
             );
 
-            for f in &r.findings {
+            for f in r.findings() {
                 let (fmark, fcolor) = match f.severity {
                     Severity::Error => ("✗", RED),
                     Severity::Warning => ("⚠", YELLOW),
@@ -334,7 +384,7 @@ impl CheckReport {
                     "id": r.id,
                     "title": r.title,
                     "status": r.status().as_str(),
-                    "findings": r.findings.iter().map(|f| json!({
+                    "findings": r.findings().iter().map(|f| json!({
                         "severity": match f.severity {
                             Severity::Error => "error",
                             Severity::Warning => "warning",
@@ -382,7 +432,7 @@ impl CheckReport {
 
         let mut results: Vec<Value> = Vec::new();
         for r in &self.results {
-            for f in &r.findings {
+            for f in r.findings() {
                 let level = match f.severity {
                     Severity::Error => "error",
                     Severity::Warning => "warning",
@@ -1096,7 +1146,7 @@ fn check_config(
             .as_deref()
             .map(|m| format!("{m}: "))
             .unwrap_or_default();
-        result.summary = Some(format!("{arch}{}", facts.join(" · ")));
+        result.set_summary(format!("{arch}{}", facts.join(" · ")));
     }
     result
 }
@@ -1271,7 +1321,7 @@ pub fn scan_values(
         .unwrap_or_else(|_| scan_par(&targets, &schemas, &pause, cancel, progress));
     findings.sort_by(sort_key);
     let mut result = CheckResult::done(ID, TITLE, NOTE, findings);
-    result.elapsed = Some(started.elapsed());
+    result.set_elapsed(started.elapsed());
     result
 }
 
@@ -1475,13 +1525,13 @@ mod tests {
             tensors.push(ti(&format!("model.layers.{i}.attn.weight"), "F32", &[4]));
         }
         let r = check_byte_ranges(&tensors); // n/a (Layout::None) — sanity that it doesn't panic
-        assert!(!r.applicable);
+        assert!(!r.applicable());
 
         let r = check_layers(&tensors);
-        assert!(r.applicable);
+        assert!(r.applicable());
         assert_eq!(r.errors(), 1); // the missing layer 2
         assert!(
-            r.findings
+            r.findings()
                 .iter()
                 .any(|f| f.message.contains("missing layer 2"))
         );
@@ -1500,7 +1550,7 @@ mod tests {
         let r = check_layers(&tensors);
         assert_eq!(r.errors(), 0);
         assert_eq!(r.warnings(), 1);
-        assert!(r.findings.iter().any(|f| f.subject.as_deref()
+        assert!(r.findings().iter().any(|f| f.subject.as_deref()
             == Some("model.layers.*.attn.weight")
             && f.message.contains("missing from layer 2")));
     }
@@ -1522,16 +1572,16 @@ mod tests {
         tensors.push(ti("model.layers.1.attn.qscale", "F16", &[2]));
 
         let r = check_shapes_dtypes(&tensors);
-        assert!(r.findings.iter().any(|f| f.message.contains("duplicate")));
+        assert!(r.findings().iter().any(|f| f.message.contains("duplicate")));
         assert!(
-            r.findings
+            r.findings()
                 .iter()
                 .any(|f| f.message.contains("zero-element"))
         );
 
         // Exactly one dtype finding: the stray F32, anchored on layer 2.
         let dtype: Vec<_> = r
-            .findings
+            .findings()
             .iter()
             .filter(|f| f.message.contains("stored as"))
             .collect();
@@ -1542,7 +1592,7 @@ mod tests {
             Some("model.layers.2.mlp.weight")
         );
         // The uniform qscale role is left alone.
-        assert!(!r.findings.iter().any(|f| f.message.contains("qscale")));
+        assert!(!r.findings().iter().any(|f| f.message.contains("qscale")));
     }
 
     #[test]
@@ -1566,9 +1616,12 @@ mod tests {
             tensors.push(t);
         }
         let res = check_files(&tensors, &[], &[]);
-        assert!(res.applicable, "shard numbering applies from source paths");
+        assert!(
+            res.applicable(),
+            "shard numbering applies from source paths"
+        );
         assert!(res.status() == Status::Fail, "a missing shard should fail");
-        let msgs: Vec<&str> = res.findings.iter().map(|f| f.message.as_str()).collect();
+        let msgs: Vec<&str> = res.findings().iter().map(|f| f.message.as_str()).collect();
         assert!(
             msgs.iter().any(|m| m.contains("missing shard 2")),
             "expected a missing-shard finding, got {msgs:?}"
@@ -1591,7 +1644,7 @@ mod tests {
             res.status() == Status::Fail,
             "a missing referenced file fails"
         );
-        let msgs: Vec<&str> = res.findings.iter().map(|f| f.message.as_str()).collect();
+        let msgs: Vec<&str> = res.findings().iter().map(|f| f.message.as_str()).collect();
         assert!(
             msgs.iter().any(|m| m.contains("missing on disk")),
             "expected a missing-file finding, got {msgs:?}"
@@ -1612,8 +1665,8 @@ mod tests {
             tensors.push(ti(&format!("model.layers.{i}.attn.weight"), "F32", &[4]));
         }
         let r = check_layers(&tensors);
-        assert!(r.applicable); // no longer n/a
-        assert_eq!(r.findings.len(), 0); // both layers present and uniform
+        assert!(r.applicable()); // no longer n/a
+        assert_eq!(r.findings().len(), 0); // both layers present and uniform
     }
 
     #[test]
@@ -1642,7 +1695,7 @@ mod tests {
             }
         }
         let r = check_layers(&tensors);
-        assert!(r.applicable);
+        assert!(r.applicable());
         assert_eq!(r.errors(), 0, "layer indices 0–2 are contiguous");
         assert_eq!(
             r.warnings(),
@@ -1650,7 +1703,7 @@ mod tests {
             "one warning per expert *role*, not per expert"
         );
         assert!(
-            r.findings.iter().all(|f| f
+            r.findings().iter().all(|f| f
                 .subject
                 .as_deref()
                 .is_some_and(|s| s.contains("mlp.experts.*"))),
@@ -1668,10 +1721,10 @@ mod tests {
             ti("mm_projector.proj.2.weight", "F16", &[4, 4]),
         ];
         let r = check_layers(&tensors);
-        assert!(r.applicable);
+        assert!(r.applicable());
         assert_eq!(r.errors(), 0, "a non-'layers' stack gap isn't a hard error");
         assert_eq!(r.warnings(), 1);
-        let msg = &r.findings[0].message;
+        let msg = &r.findings()[0].message;
         assert!(msg.contains("paramless"), "{msg}");
         // Names the indices actually present, not a `0–2` span that would read as
         // if 1 (the absent one) were present too.
@@ -1690,11 +1743,11 @@ mod tests {
         tensors.push(unk);
 
         let r = check_hdf5(&tensors);
-        assert!(r.applicable);
+        assert!(r.applicable());
         assert_eq!(r.errors(), 2, "bad_rank + too_many");
         assert_eq!(r.warnings(), 1, "the '?' dtype");
         assert!(
-            r.findings
+            r.findings()
                 .iter()
                 .any(|f| f.message.contains("chunk index inconsistent"))
         );
@@ -1702,7 +1755,7 @@ mod tests {
 
     #[test]
     fn hdf5_check_is_na_for_safetensors() {
-        assert!(!check_hdf5(&[ti("w", "F32", &[2])]).applicable);
+        assert!(!check_hdf5(&[ti("w", "F32", &[2])]).applicable());
     }
 
     #[test]
@@ -1765,10 +1818,12 @@ mod tests {
             use_qk_norm: Some(false),
         };
         let r = check_config(&moe_tensors(), Some(&cfg));
-        assert!(r.applicable);
+        assert!(r.applicable());
         assert_eq!(r.errors(), 0);
         assert_eq!(r.warnings(), 0);
-        let summary = r.summary.expect("a passing config check summarizes facts");
+        let summary = r
+            .summary()
+            .expect("a passing config check summarizes facts");
         assert!(summary.contains("2 layers"), "{summary}");
         assert!(summary.contains("2 experts/layer"), "{summary}");
         assert!(summary.contains("untied lm_head"), "{summary}");
@@ -1785,8 +1840,8 @@ mod tests {
         };
         let r = check_config(&moe_tensors(), Some(&cfg));
         assert_eq!(r.errors(), 2, "layer + expert count mismatch");
-        assert!(r.findings.iter().any(|f| f.message.contains("3 layers")));
-        assert!(r.findings.iter().any(|f| f.message.contains("4 experts")));
+        assert!(r.findings().iter().any(|f| f.message.contains("3 layers")));
+        assert!(r.findings().iter().any(|f| f.message.contains("4 experts")));
     }
 
     #[test]
@@ -1805,6 +1860,6 @@ mod tests {
 
     #[test]
     fn config_check_is_na_without_config() {
-        assert!(!check_config(&[ti("w", "F16", &[2])], None).applicable);
+        assert!(!check_config(&[ti("w", "F16", &[2])], None).applicable());
     }
 }
