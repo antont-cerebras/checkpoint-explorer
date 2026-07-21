@@ -3742,11 +3742,12 @@ pub struct Explorer {
     /// The checkpoint's `config.json` (local sidecar or fetched over SSH), when
     /// present — cross-checked against the tensor tree by the config check.
     config: Option<crate::config::ModelConfig>,
-    /// The central serializable model, populated once at load. `Some` for a local
+    /// The kernel session that owns the central serializable model (and its
+    /// derived views/reports), populated once at load. `Some` for a local
     /// checkpoint (built by `core::readers::read_local`); the remote readers fill
-    /// it in a later step. Views/reports will derive from this instead of the
-    /// scattered per-field caches, so the whole checkpoint is read once and cached.
-    checkpoint: Option<crate::model::Checkpoint>,
+    /// it in a later step. The TUI is migrating to drive this `Session` and render
+    /// its `ViewModel`; today its local views/reports derive from the model here.
+    session: Option<crate::kernel::Session>,
     /// When set (`--ssh-read`), remote `s3://…` sources have their metadata read
     /// over SSH via cstorch on the remote, instead of directly (metadata-only).
     remote_read: Option<crate::remote::RemoteRead>,
@@ -3949,7 +3950,7 @@ impl Explorer {
             tensors: Vec::new(),
             metadata: Vec::new(),
             config: None,
-            checkpoint: None,
+            session: None,
             remote_read: None,
             s3_meta: None,
             remote_browse: None,
@@ -4378,7 +4379,7 @@ impl Explorer {
             .join()
             .map_err(|_| anyhow::anyhow!("checkpoint loader thread panicked"))??;
         self.config = config;
-        self.checkpoint = checkpoint;
+        self.session = checkpoint.map(crate::kernel::Session::new);
         self.remote_disk = disk;
         // Remote index/file health (empty for a local read, whose reports were
         // gathered up front); fold it in so the popup and `⚠ health` badge show it.
@@ -4403,7 +4404,7 @@ impl Explorer {
             Self::gather_checkpoint(&self.files, None)?
         };
         self.config = config;
-        self.checkpoint = checkpoint;
+        self.session = checkpoint.map(crate::kernel::Session::new);
         self.remote_disk = disk;
         self.health_reports.extend(health);
         self.finalize_load(tensors, metadata);
@@ -6950,7 +6951,7 @@ impl Explorer {
             // Local: assemble the browser from the cached directory walk in the
             // model (no `readdir`/`stat` on `Tab`). Falls back to a fresh walk only
             // if the model wasn't populated.
-            None => match &self.checkpoint {
+            None => match self.checkpoint() {
                 Some(cp) => {
                     let root = &self.browse_root;
                     let mut listing: HashMap<PathBuf, Vec<crate::filetree::DirEntry>> =
@@ -7605,7 +7606,7 @@ impl Explorer {
                 // Local: build from the cached shard header (no file read) when the
                 // requested file is one of the loaded shards. Otherwise (a file not
                 // in the model) fall back to reading its header.
-                if let Some(cp) = &self.checkpoint {
+                if let Some(cp) = self.checkpoint() {
                     let want = Path::new(path).file_name();
                     if want.is_some()
                         && let Some(sh) = cp
@@ -9221,7 +9222,7 @@ impl Explorer {
         let ((tensors, metadata, config, disk, health), checkpoint) =
             Self::gather_checkpoint(&self.files, self.remote_read.as_ref())?;
         self.config = config;
-        self.checkpoint = checkpoint;
+        self.session = checkpoint.map(crate::kernel::Session::new);
         self.remote_disk = disk;
         self.health_reports.extend(health);
         self.finalize_load(tensors, metadata);
@@ -9810,6 +9811,11 @@ impl Explorer {
         })
     }
 
+    /// The cached checkpoint model (owned by the kernel session), when loaded.
+    fn checkpoint(&self) -> Option<&crate::model::Checkpoint> {
+        self.session.as_ref().map(|s| s.model())
+    }
+
     fn disk_usage(&self) -> Option<crate::stats::DiskUsage> {
         if self.remote_read.is_some() {
             return self.remote_disk.clone();
@@ -9817,7 +9823,7 @@ impl Explorer {
         // Local: derived from the cached model's directory walk (symlink-followed
         // sizes) — no live `stat`. Falls back to a fresh stat only if the model
         // wasn't populated (shouldn't happen on a local load).
-        if let Some(cp) = &self.checkpoint {
+        if let Some(cp) = self.checkpoint() {
             return cp.disk_usage();
         }
         let mut paths: Vec<&str> = self

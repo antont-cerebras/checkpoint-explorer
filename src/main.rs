@@ -2,8 +2,8 @@
 // them at the crate root so the (still bin-side) `explorer`/`ui` keep resolving
 // their `crate::tree::…` / `crate::stats::…` paths unchanged during the refactor.
 pub use checkpoint_explorer_core::{
-    check, codec, config, diff, filetree, filter, gguf, health, model, npy, progress, readers,
-    remote, rename, s3, safelayout, sample, sftp, stats, stheader, tree, utils,
+    check, codec, config, diff, filetree, filter, gguf, health, kernel, model, npy, progress,
+    readers, remote, rename, s3, safelayout, sample, sftp, stats, stheader, tree, utils,
 };
 #[cfg(feature = "hdf5")]
 pub use checkpoint_explorer_core::{convert, hdf5, hdf5_lz4, hdf5_zstd};
