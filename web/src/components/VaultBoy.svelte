@@ -1,48 +1,47 @@
-<!-- Original phosphor line-art of a cheerful vault-dweller in the classic
-     standing, winking, thumbs-up pose — an homage (the real Vault Boy is
-     Bethesda's copyrighted mascot, not reproduced here). Fallout theme only. -->
+<!-- Original phosphor line-art of a cheerful vault-dweller in a half-turned (3/4)
+     standing pose, winking, near arm raised in a thumbs-up — an homage (the real
+     Vault Boy is Bethesda's copyrighted mascot, not reproduced). Fallout theme only. -->
 <svg class="vaultboy" viewBox="0 0 96 160" fill="none" stroke="currentColor" aria-hidden="true">
   <g stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-    <!-- hair + fringe -->
-    <path d="M28 24 Q26 9 46 7 Q65 7 66 24" />
-    <path d="M36 10 35 20 M45 8 44 19 M55 9 56 20" />
-    <!-- head / jaw -->
-    <path d="M28 24 Q27 41 38 47 Q46 51 54 47 Q66 41 66 24" />
-    <!-- ear -->
-    <path d="M27 27 q-4 1 -3 6 q1 3 4 2" />
+    <!-- hair sweeping over a head turned toward the viewer's right -->
+    <path d="M26 26 Q24 9 45 7 Q65 7 68 24" />
+    <path d="M35 10 34 20 M45 8 45 19 M55 9 57 19" />
+    <!-- head / jaw (3/4) -->
+    <path d="M26 26 Q26 42 37 48 Q45 52 53 48 Q65 43 68 26" />
+    <!-- ear on the far (back) side -->
+    <path d="M27 30 q-4 1 -3 6 q1 3 4 2" />
     <!-- brows -->
-    <path d="M33 22 q5 -2 8 0 M50 22 q4 -2 7 1" />
-    <!-- winking eye + open eye -->
-    <path d="M34 28 q3.5 3 7 1" />
-    <ellipse cx="53" cy="27" rx="2.5" ry="3" />
-    <circle cx="53" cy="27.5" r="1" fill="currentColor" stroke="none" />
-    <!-- nose -->
-    <path d="M46 28 q-1 5 -3 7 q2 1 4 0" />
-    <!-- big grin + teeth -->
-    <path d="M35 38 Q46 50 56 37" />
-    <path d="M38 39 H53" />
+    <path d="M32 23 q4 -2 7 0 M48 22 q5 -2 8 2" />
+    <!-- winking eye (far) + open eye (near the nose) -->
+    <path d="M33 29 q3 2.5 6 0.5" />
+    <ellipse cx="52" cy="27" rx="2.4" ry="3" />
+    <circle cx="52" cy="27.5" r="1" fill="currentColor" stroke="none" />
+    <!-- nose to the turned side -->
+    <path d="M55 27 q1 5 -1 7 q-2 1 -4 0" />
+    <!-- grin + teeth -->
+    <path d="M35 39 Q47 50 57 38" />
+    <path d="M39 40 H54" />
     <!-- neck -->
-    <path d="M42 47 42 55 M52 47 52 55" />
-    <!-- shoulders, collar, jumpsuit torso + zipper + belt -->
-    <path d="M32 55 Q46 49 60 55" />
-    <path d="M40 54 46 61 52 54" />
-    <path d="M46 61 46 96" />
-    <path d="M32 57 Q29 74 34 96" />
-    <path d="M60 57 Q63 74 58 96" />
-    <path d="M34 96 H58" />
-    <!-- left arm at side -->
-    <path d="M32 57 Q22 63 24 90 q-2 6 2 8 q3 1 4 -2" />
-    <!-- right arm raised with a thumbs-up fist -->
-    <path d="M60 55 Q76 54 78 42 Q80 32 72 27" />
-    <rect x="63" y="16" width="13" height="12" rx="3" />
-    <path d="M66.5 20 66.5 26 M70 20 70 26 M73.5 20 73.5 26" />
-    <path d="M69 16 q2 -8 -2 -10 q-3 -1 -4 2" />
-    <!-- legs + boots -->
-    <path d="M36 97 33 141 M56 97 59 141" />
-    <path d="M46 96 46 110" />
-    <path d="M46 110 44 141 M46 110 48 141" />
-    <path d="M33 141 Q32 150 41 150 L44 142" />
-    <path d="M59 141 Q60 150 51 150 L48 142" />
+    <path d="M44 48 44 56 M53 48 54 56" />
+    <!-- turned torso: near (left) shoulder forward; collar, off-centre zipper, belt -->
+    <path d="M30 57 Q46 50 62 56" />
+    <path d="M41 55 47 62 53 55" />
+    <path d="M30 58 Q27 76 33 98" />
+    <path d="M62 57 Q64 74 59 97" />
+    <path d="M33 98 59 97" />
+    <path d="M47 62 Q49 80 48 97" />
+    <!-- near arm raised, thumbs-up fist -->
+    <path d="M30 58 Q18 54 18 42 Q18 32 26 28" />
+    <rect x="15" y="15" width="13" height="12" rx="3" />
+    <path d="M18.5 19 18.5 25 M22 19 22 25 M25.5 19 25.5 25" />
+    <path d="M21 15 q-2 -8 2 -10 q3 -1 4 2" />
+    <!-- far arm hanging behind -->
+    <path d="M62 57 Q70 64 68 90 q2 6 -2 8 q-3 1 -4 -2" />
+    <!-- staggered legs (near leg forward) + boots -->
+    <path d="M35 99 32 142 M46 99 44 138" />
+    <path d="M32 142 Q31 151 40 150 L44 142" />
+    <path d="M57 98 60 138 M48 99 49 134" />
+    <path d="M60 138 Q61 146 53 146 L49 138" />
   </g>
 </svg>
 
