@@ -927,7 +927,7 @@ impl Mode for FilesMode {
             KeyCode::Left => ex.file_state.collapse_or_parent(),
             KeyCode::Right => ex.file_state.expand_or_child(),
             KeyCode::Enter => {
-                if let Some(nav) = ex.activate_file_selection() {
+                if let Some(nav) = ex.activate_file_selection(term) {
                     return Ok(Outcome::Leave(nav));
                 }
             }
@@ -960,7 +960,7 @@ impl Mode for FilesMode {
                         ex.file_state.selected = idx;
                         if on_arrow {
                             self.last_click = None;
-                            ex.activate_file_selection();
+                            ex.activate_file_selection(term);
                         } else {
                             let double = matches!(
                                 self.last_click,
@@ -968,7 +968,7 @@ impl Mode for FilesMode {
                             );
                             if double {
                                 self.last_click = None;
-                                if let Some(nav) = ex.activate_file_selection() {
+                                if let Some(nav) = ex.activate_file_selection(term) {
                                     return MouseOutcome::Leave(nav);
                                 }
                             } else {
@@ -1475,7 +1475,7 @@ impl Mode for TreeMode {
                 code: KeyCode::Enter,
                 ..
             } => {
-                if let Some(nav) = ex.activate_selection() {
+                if let Some(nav) = ex.activate_selection(term) {
                     return Ok(Outcome::Leave(nav));
                 }
             }
@@ -1544,7 +1544,7 @@ impl Mode for TreeMode {
                         ex.tree_state.selected = idx;
                         if on_arrow {
                             self.last_click = None;
-                            ex.activate_selection();
+                            ex.activate_selection(term);
                         } else {
                             let double = matches!(
                                 self.last_click,
@@ -1554,7 +1554,7 @@ impl Mode for TreeMode {
                                 self.last_click = None;
                                 if ex.tree_state.search_mode() {
                                     ex.reveal_search_result();
-                                } else if let Some(nav) = ex.activate_selection() {
+                                } else if let Some(nav) = ex.activate_selection(term) {
                                     return MouseOutcome::Leave(nav);
                                 }
                             } else {
@@ -6449,21 +6449,6 @@ impl Explorer {
         ));
     }
 
-    /// Run `f` with the live terminal temporarily taken out of `self` and handed
-    /// to it, then put back — the take/restore dance the pop-up commands share.
-    fn with_terminal<R>(
-        &mut self,
-        f: impl FnOnce(&mut Self, &mut crate::tui::LiveTerminal) -> R,
-    ) -> R {
-        let mut term = self
-            .terminal
-            .take()
-            .expect("interactive loop owns the terminal");
-        let out = f(self, &mut term);
-        self.terminal = Some(term);
-        out
-    }
-
     /// The generic interactive driver: run one [`Mode`] until it returns a [`Nav`].
     /// Owns the live terminal (taken into a local for the loop, like the old
     /// detail/data screens) and all the shared plumbing — the input-drain gate, the
@@ -6788,7 +6773,7 @@ impl Explorer {
 
     /// Perform a tree command, from its key or the palette. Returns `Some(Nav)` for
     /// a command that leaves the tree (only `Quit` so far), else `None`. Pop-up
-    /// commands borrow the terminal via [`Self::with_terminal`].
+    /// commands draw through the passed-in `term`.
     fn run_command(&mut self, cmd: Cmd, term: &mut crate::tui::LiveTerminal) -> Option<Nav> {
         match cmd {
             Cmd::Search => self.enter_search_mode(),
@@ -7170,7 +7155,7 @@ impl Explorer {
     /// directory, open a checkpoint's file view (the layout map for safetensors,
     /// else the tensor tree / an info pop-up), or preview a text / JSON sidecar.
     /// Returns `Some(Nav)` only when it leaves the file view.
-    fn activate_file_selection(&mut self) -> Option<Nav> {
+    fn activate_file_selection(&mut self, term: &mut crate::tui::LiveTerminal) -> Option<Nav> {
         use crate::filetree::FileKind;
         let row = self.file_state.rows.get(self.file_state.selected)?.clone();
         if row.is_dir() {
@@ -7201,9 +7186,7 @@ impl Explorer {
                     "Remote object — browse-only (no per-object layout or preview).",
                 )),
             ];
-            self.with_terminal(|s, t| {
-                s.float_scroll_popup(t, row.name.as_str(), body, PopupBackdrop::Files, None);
-            });
+            self.float_scroll_popup(term, row.name.as_str(), body, PopupBackdrop::Files, None);
             return None;
         }
         // A safetensors file opens its byte-layout map (the "proper" file view) —
@@ -7236,12 +7219,10 @@ impl Explorer {
                     Line::from(crate::ui::dim_span("Open it in its own view with:")),
                     Line::from(Span::raw(format!("  {cmd}"))),
                 ];
-                self.with_terminal(|s, t| {
-                    s.float_scroll_popup(t, row.name.as_str(), body, PopupBackdrop::Files, None);
-                });
+                self.float_scroll_popup(term, row.name.as_str(), body, PopupBackdrop::Files, None);
             }
             FileKind::Json | FileKind::Text => {
-                self.with_terminal(|s, t| s.preview_sidecar(t, &row.path, &row.name, kind));
+                self.preview_sidecar(term, &row.path, &row.name, kind);
             }
             FileKind::Other => {
                 let body = vec![
@@ -7252,9 +7233,7 @@ impl Explorer {
                     Line::default(),
                     Line::from(Span::raw("No preview available.".to_string())),
                 ];
-                self.with_terminal(|s, t| {
-                    s.float_scroll_popup(t, row.name.as_str(), body, PopupBackdrop::Files, None);
-                });
+                self.float_scroll_popup(term, row.name.as_str(), body, PopupBackdrop::Files, None);
             }
         }
         None
@@ -8115,13 +8094,11 @@ impl Explorer {
     /// Activate the highlighted tree row (shared by Enter, Space, and a left
     /// mouse click): open a tensor (returns `Nav::Open`), toggle a group, or show
     /// metadata in place. Returns `Some(nav)` when the caller should navigate.
-    fn activate_selection(&mut self) -> Option<Nav> {
+    fn activate_selection(&mut self, term: &mut crate::tui::LiveTerminal) -> Option<Nav> {
         match self.handle_selection() {
             (Some(screen), _) => Some(Nav::Open(screen)),
             (None, Some(info)) => {
-                let mut term = self.terminal.take().expect("interactive loop owns it");
-                self.show_metadata_detail(&mut term, &info);
-                self.terminal = Some(term);
+                self.show_metadata_detail(term, &info);
                 None
             }
             (None, None) => None,
