@@ -402,38 +402,6 @@ struct ExploreArgs {
     print_view: bool,
 
     #[arg(
-        long = "web",
-        conflicts_with = "print_tree",
-        conflicts_with = "print_tensors",
-        conflicts_with = "print_model",
-        conflicts_with = "print_view",
-        help = "Serve a web UI (Svelte) that shows the same info as the TUI, and block until Ctrl-C. The server supplies the data over a JSON API; the browser owns the view state. Local checkpoints only for now"
-    )]
-    web: bool,
-
-    #[arg(
-        long = "port",
-        value_name = "PORT",
-        default_value_t = 8080,
-        help = "Port for --web (0 = let the OS pick a free port, printed at startup)"
-    )]
-    port: u16,
-
-    #[arg(
-        long = "host",
-        value_name = "ADDR",
-        default_value = "0.0.0.0",
-        help = "IP address --web binds to. Defaults to 0.0.0.0 (all interfaces) so it's reachable at your machine's hostname, e.g. http://your-vm.example.com:8080/. Use 127.0.0.1 to restrict to loopback"
-    )]
-    host: std::net::IpAddr,
-
-    #[arg(
-        long = "open",
-        help = "With --web, open the served URL in the default browser (xdg-open / open / start)"
-    )]
-    open: bool,
-
-    #[arg(
         long,
         value_enum,
         default_value_t = explorer::TreeFormat::default(),
@@ -689,6 +657,36 @@ enum Command {
         #[arg(long = "ssh-venv", value_name = "PATH")]
         ssh_venv: Option<String>,
     },
+
+    /// Serve a web UI (Svelte) showing the same information as the TUI, and block
+    /// until Ctrl-C.
+    ///
+    /// The server supplies the checkpoint as JSON (the data); the browser owns the
+    /// view state. It binds all interfaces by default and prints a URL using this
+    /// machine's hostname (e.g. http://your-vm.example.com:8080/), so you can open
+    /// it from another machine's browser with no tunnel. Local checkpoints only.
+    Web {
+        /// The checkpoint to serve — a file, directory, or glob (shards merge into
+        /// one checkpoint).
+        #[arg(value_name = "PATH", required = true)]
+        paths: Vec<PathBuf>,
+        /// Recursively search directories for checkpoint files.
+        #[arg(short, long)]
+        recursive: bool,
+        /// Port to serve on (0 = let the OS pick a free port, printed at startup).
+        #[arg(long, value_name = "PORT", default_value_t = 8080)]
+        port: u16,
+        /// IP address to bind. Defaults to 0.0.0.0 (all interfaces) so it's
+        /// reachable at your machine's hostname; use 127.0.0.1 for loopback only.
+        #[arg(long, value_name = "ADDR", default_value = "0.0.0.0")]
+        host: std::net::IpAddr,
+        /// Open the served URL in the default browser (xdg-open / open / start).
+        #[arg(long)]
+        open: bool,
+        /// Skip parsing model.safetensors.index.json for the health check.
+        #[arg(long = "no-health-check")]
+        no_health_check: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -870,6 +868,14 @@ fn main() -> Result<()> {
                 remote.as_ref(),
             ))
         }
+        Some(Command::Web {
+            paths,
+            recursive,
+            port,
+            host,
+            open,
+            no_health_check,
+        }) => run_web(&paths, recursive, no_health_check, host, port, open),
         None => run_explore(cli.explore),
     }
 }
@@ -1751,6 +1757,26 @@ fn split_scp(s: &str) -> Option<(String, String)> {
     Some((s[..colon].to_string(), s[colon + 1..].to_string()))
 }
 
+/// `web` subcommand: read a local checkpoint once and serve the web UI + JSON API,
+/// blocking until Ctrl-C. The server supplies the data; the browser owns the view
+/// state (see `crate::web`).
+fn run_web(
+    paths: &[PathBuf],
+    recursive: bool,
+    no_health_check: bool,
+    host: std::net::IpAddr,
+    port: u16,
+    open: bool,
+) -> Result<()> {
+    let (files, index_specs) = collect_safetensors_files(paths, recursive, no_health_check)?;
+    if files.is_empty() {
+        anyhow::bail!("No checkpoint files found in the specified paths.");
+    }
+    let model = readers::read_local(&files)?;
+    let state = std::sync::Arc::new(web::WebState::build(model, &files, &index_specs));
+    web::serve(state, host, port, open)
+}
+
 fn run_explore(mut args: ExploreArgs) -> Result<()> {
     if args.paths.is_empty() {
         eprintln!("checkpoint-explorer: no checkpoint given.\n");
@@ -1960,17 +1986,6 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         let model = readers::read_local(&files)?;
         println!("{}", serde_json::to_string_pretty(&model)?);
         return Ok(());
-    }
-
-    // `--web`: serve the checkpoint over an HTTP JSON API + the embedded Svelte UI
-    // (the browser owns the view state). Local only for now; blocks until Ctrl-C.
-    if args.web {
-        if args.ssh_read.is_some() {
-            anyhow::bail!("--web is local-only for now (remote --ssh-read web serving is pending)");
-        }
-        let model = readers::read_local(&files)?;
-        let state = std::sync::Arc::new(web::WebState::build(model, &files, &index_specs));
-        return web::serve(state, args.host, args.port, args.open);
     }
 
     let mut explorer = Explorer::new(files, index_specs, open, !args.no_preload);
