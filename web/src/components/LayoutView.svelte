@@ -140,7 +140,10 @@
             >
               <i class="dot" style="background:{segColor(s.kind.kind)}"></i>
               <span class="sname">{s.name}</span>
-              {#if s.kind.kind === 'tensor'}<span class="dtype">{s.kind.dtype}</span>{/if}
+              {#if s.kind.kind === 'tensor'}
+                <span class="dtype">{s.kind.dtype}</span>
+                <span class="sshape dim mono">[{s.kind.shape.join('×')}]</span>
+              {/if}
               <span class="ssize dim mono">{humanSize(s.end - s.start)}</span>
             </div>
           {/each}
@@ -252,6 +255,10 @@
     flex: 0 1 auto;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .sshape {
+    flex: 0 0 auto;
+    font-size: 11px;
   }
   .dtype {
     flex: 0 0 auto;

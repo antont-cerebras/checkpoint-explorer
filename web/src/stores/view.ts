@@ -90,6 +90,16 @@ export const visibleRows = derived(
   },
 );
 
+// Expand the synthetic root node once the tree first loads, so its children show.
+let seededExpand = false;
+treeData.subscribe((t) => {
+  if (t && !seededExpand) {
+    seededExpand = true;
+    const first = t.tree[0];
+    if (first) expanded.set(new Set([nodeId(first, '')]));
+  }
+});
+
 // ---- navigation (URL hash = source of truth; browser back/forward just work) ----
 
 export function navigate(s: Screen): void {

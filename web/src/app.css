@@ -46,6 +46,31 @@
   color-scheme: light;
 }
 
+/* Fallout Pip-Boy — green phosphor CRT. */
+:root[data-theme='fallout'] {
+  --bg: #04140a;
+  --bg-panel: #07230f;
+  --bg-elev: #0a2a13;
+  --bg-hover: #0e3a1c;
+  --bg-sel: #165a2c;
+  --border: #1c5a2b;
+  --fg: #35e46a;
+  --fg-dim: #1f9a45;
+  --accent: #86ffab;
+  --group: #86ffab;
+  --tensor: #35e46a;
+  --dtype: #c2ff8a;
+  --meta: #5cffb2;
+  --danger: #ff7a5c;
+  --warn: #ffe066;
+  --ok: #35e46a;
+  color-scheme: dark;
+}
+/* Subtle phosphor glow. */
+:root[data-theme='fallout'] body {
+  text-shadow: 0 0 2px color-mix(in srgb, var(--fg) 45%, transparent);
+}
+
 * {
   box-sizing: border-box;
 }

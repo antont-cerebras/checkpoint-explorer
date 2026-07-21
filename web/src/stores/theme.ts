@@ -3,14 +3,14 @@
 
 import { get, writable } from 'svelte/store';
 
-export type Theme = 'system' | 'dark' | 'light';
+export type Theme = 'system' | 'dark' | 'light' | 'fallout';
 
 const KEY = 'ce-theme';
 const mq = window.matchMedia('(prefers-color-scheme: light)');
 
 function load(): Theme {
   const v = localStorage.getItem(KEY);
-  return v === 'dark' || v === 'light' || v === 'system' ? v : 'system';
+  return v === 'dark' || v === 'light' || v === 'system' || v === 'fallout' ? v : 'system';
 }
 
 /** Resolve the preference to a concrete theme and apply it to the document. */

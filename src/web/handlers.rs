@@ -28,10 +28,22 @@ pub fn err(status: u16, msg: impl Into<String>) -> Reply {
 // ---- metadata / derived-view routes (served from precomputed state) ----
 
 pub fn tree(s: &WebState) -> Reply {
+    // Wrap the forest in a single root node summarising the whole checkpoint, the
+    // way the TUI's tree does (`▾ <name> (▦ N, P params, S)`), with the metadata
+    // group (when present) among its children.
+    let root = crate::tree::TreeNode::Group {
+        name: basename(&s.root).to_string(),
+        children: s.tree.clone(),
+        expanded: true,
+        tensor_count: s.tensors.len(),
+        params: s.tensors.iter().map(|t| t.num_elements).sum(),
+        total_size: s.tensors.iter().map(|t| t.size_bytes).sum(),
+        stored_size: s.tensors.iter().map(|t| t.on_disk_size()).sum(),
+    };
     ok(json!({
         "root": s.root,
         "tensor_count": s.tensors.len(),
-        "tree": s.tree,
+        "tree": [root],
     }))
 }
 
