@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::{
     cursor,
     event::{
@@ -13,18 +13,15 @@ use std::{
     cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap, HashSet},
     fs::File,
-    io::{self, Read, Seek, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use crate::gguf::GGUFFile;
 use crate::sample::{HistShared, Histogram, PackingSchema, SampleMode, Stats, ViewDtype};
 
-use crate::tree::{
-    Layout, MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key,
-};
+use crate::tree::{MetadataInfo, Storage, TensorInfo, TreeBuilder, TreeNode, natural_sort_key};
 use crate::ui::{DrawConfig, HelpCtx, Legend, NumBase, Overlay, StatsView, StripeMode, UI};
 use crate::utils::base64_encode;
 use ratatui::text::{Line, Span};
@@ -3745,6 +3742,11 @@ pub struct Explorer {
     /// The checkpoint's `config.json` (local sidecar or fetched over SSH), when
     /// present — cross-checked against the tensor tree by the config check.
     config: Option<crate::config::ModelConfig>,
+    /// The central serializable model, populated once at load. `Some` for a local
+    /// checkpoint (built by `core::readers::read_local`); the remote readers fill
+    /// it in a later step. Views/reports will derive from this instead of the
+    /// scattered per-field caches, so the whole checkpoint is read once and cached.
+    checkpoint: Option<crate::model::Checkpoint>,
     /// When set (`--ssh-read`), remote `s3://…` sources have their metadata read
     /// over SSH via cstorch on the remote, instead of directly (metadata-only).
     remote_read: Option<crate::remote::RemoteRead>,
@@ -3947,6 +3949,7 @@ impl Explorer {
             tensors: Vec::new(),
             metadata: Vec::new(),
             config: None,
+            checkpoint: None,
             remote_read: None,
             s3_meta: None,
             remote_browse: None,
@@ -4371,10 +4374,11 @@ impl Explorer {
             }
             frame += 1;
         }
-        let (tensors, metadata, config, disk, health) = handle
+        let ((tensors, metadata, config, disk, health), checkpoint) = handle
             .join()
             .map_err(|_| anyhow::anyhow!("checkpoint loader thread panicked"))??;
         self.config = config;
+        self.checkpoint = checkpoint;
         self.remote_disk = disk;
         // Remote index/file health (empty for a local read, whose reports were
         // gathered up front); fold it in so the popup and `⚠ health` badge show it.
@@ -4392,12 +4396,14 @@ impl Explorer {
         // A remote read opens one SSH session and keeps it alive on `self`, so the
         // file browser (and remote layout / sidecar reads) reuse it without a
         // second auth prompt. A local read uses the plain static gatherer.
-        let (tensors, metadata, config, disk, health) = if self.remote_read.is_some() {
+        let ((tensors, metadata, config, disk, health), checkpoint) = if self.remote_read.is_some()
+        {
             self.gather_remote_keeping_session()?
         } else {
             Self::gather_checkpoint(&self.files, None)?
         };
         self.config = config;
+        self.checkpoint = checkpoint;
         self.remote_disk = disk;
         self.health_reports.extend(health);
         self.finalize_load(tensors, metadata);
@@ -4409,7 +4415,9 @@ impl Explorer {
     /// [`Self::remote_password`] — so the file browser and remote layout / sidecar
     /// reads reuse it without re-prompting. Mirrors
     /// [`crate::remote::RemoteRead::fetch_with_config`] but over one owned session.
-    fn gather_remote_keeping_session(&mut self) -> Result<CheckpointParts> {
+    fn gather_remote_keeping_session(
+        &mut self,
+    ) -> Result<(CheckpointParts, Option<crate::model::Checkpoint>)> {
         let r = self
             .remote_read
             .clone()
@@ -4455,13 +4463,15 @@ impl Explorer {
         }
         *self.remote_session.borrow_mut() = Some(session);
         self.s3_meta = s3_meta;
-        Ok((
+        let parts = (
             tensors,
             metadata,
             config,
             crate::stats::DiskUsage::from_shards(disk_shards),
             health,
-        ))
+        );
+        // The remote reader doesn't fill the central model yet (later step).
+        Ok((parts, None))
     }
 
     /// The health badge's alert level: red for a real error (a referenced file or
@@ -4619,198 +4629,6 @@ impl Explorer {
         self.cached_stats(tensor, view).map(|s| (s.min, s.max))
     }
 
-    fn read_safetensors_file(file_path: &Path) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
-        let source_path = absolute_path(file_path);
-        let mut file = File::open(file_path)
-            .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
-
-        // A safetensors file begins with an 8-byte little-endian header length N
-        // followed by N bytes of JSON describing every tensor (name, dtype, shape,
-        // byte offsets) and an optional `__metadata__` map. The tensor data follows.
-        // We only display that header, so read just it instead of the whole file
-        // (which can be many GB per shard).
-        let mut len_buf = [0u8; 8];
-        file.read_exact(&mut len_buf)
-            .with_context(|| format!("Failed to read header length: {}", file_path.display()))?;
-        let header_len = crate::stheader::header_len(u64::from_le_bytes(len_buf), &source_path)?;
-        let mut header_buf = vec![0u8; header_len];
-        file.read_exact(&mut header_buf)
-            .with_context(|| format!("Failed to read header: {}", file_path.display()))?;
-        crate::stheader::parse_header(&header_buf, &source_path)
-    }
-
-    /// Load a NumPy `.npy` file: one array behind a small header, then raw
-    /// row-major little-endian data running to EOF. The byte range is absolute
-    /// (the data follows the header), and the tensor is named after the file.
-    fn read_numpy_file(file_path: &Path) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
-        let source_path = absolute_path(file_path);
-        let mut file = File::open(file_path)
-            .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
-        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-        let name = file_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("array")
-            .to_string();
-        Self::read_numpy_reader(&mut file, file_len, name, source_path)
-    }
-
-    /// Build a `.npy` tensor from a reader positioned at the start of the file:
-    /// parse the header, then record the data byte-range up to `total_len`. Shared
-    /// by the local-file and S3 readers.
-    fn read_numpy_reader<R: Read>(
-        reader: &mut R,
-        total_len: u64,
-        name: String,
-        source_path: String,
-    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
-        let header =
-            crate::npy::parse_header(reader).map_err(|e| anyhow::anyhow!("{source_path}: {e}"))?;
-        let num_elements = header.shape.iter().product::<usize>();
-        let tensor = TensorInfo {
-            name,
-            dtype: header.dtype,
-            shape: header.shape,
-            size_bytes: (total_len as usize).saturating_sub(header.data_offset),
-            num_elements,
-            storage: Storage::Unknown,
-            source_path,
-            layout: Layout::ByteRange {
-                start: header.data_offset as u64,
-                end: total_len,
-            },
-        };
-        Ok((vec![tensor], Vec::new()))
-    }
-
-    /// Load a NumPy `.npz` archive: a ZIP whose `<name>.npy` entries are each a
-    /// `.npy` array. We read each entry's header (decompressing only that much)
-    /// to list the tensors; the reader decompresses the full entry on demand.
-    fn read_npz_file(file_path: &Path) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
-        let source_path = absolute_path(file_path);
-        let file = File::open(file_path)
-            .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
-        Self::read_npz_reader(file, source_path)
-    }
-
-    /// List the arrays in a `.npz` archive from a seekable reader: read each
-    /// `<name>.npy` entry's header (decompressing only that much). Shared by the
-    /// local-file reader and the S3 reader (whose seeks are range GETs).
-    fn read_npz_reader<R: Read + Seek>(
-        reader: R,
-        source_path: String,
-    ) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
-        let mut tensors: Vec<TensorInfo> = Vec::new();
-        let mut zip = zip::ZipArchive::new(reader)
-            .with_context(|| format!("Failed to read .npz archive: {source_path}"))?;
-        let entries: Vec<String> = zip.file_names().map(String::from).collect();
-        for entry_name in entries {
-            let Some(name) = entry_name.strip_suffix(".npy") else {
-                continue; // not an array entry
-            };
-            let mut entry = zip
-                .by_name(&entry_name)
-                .with_context(|| format!("Failed to read {entry_name} in {source_path}"))?;
-            let stored_bytes = entry.compressed_size() as usize;
-            let uncompressed = entry.size() as usize;
-            let compressed = entry.compression() != zip::CompressionMethod::Stored;
-            let header = crate::npy::parse_header(&mut entry)
-                .map_err(|e| anyhow::anyhow!("{source_path}: {entry_name}: {e}"))?;
-            let num_elements = header.shape.iter().product::<usize>();
-            let storage = if compressed {
-                Storage::Compressed {
-                    codec: "deflate".to_string(),
-                    stored_bytes,
-                }
-            } else {
-                Storage::Raw
-            };
-            tensors.push(TensorInfo {
-                name: name.to_string(),
-                dtype: header.dtype,
-                shape: header.shape,
-                // Data bytes = the entry's uncompressed size minus its header.
-                size_bytes: uncompressed.saturating_sub(header.data_offset),
-                num_elements,
-                storage,
-                source_path: source_path.clone(),
-                layout: Layout::None,
-            });
-        }
-        Ok((tensors, Vec::new()))
-    }
-
-    fn read_gguf_file(file_path: &Path) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
-        let mut tensors: Vec<TensorInfo> = Vec::new();
-        let mut metadata: Vec<MetadataInfo> = Vec::new();
-        let source_path = absolute_path(file_path);
-        let mut file = File::open(file_path)
-            .with_context(|| format!("Failed to open file: {}", file_path.display()))?;
-
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)
-            .with_context(|| format!("Failed to read file: {}", file_path.display()))?;
-
-        let gguf = GGUFFile::read(&buffer)
-            .with_context(|| format!("Failed to parse GGUF file: {}", file_path.display()))?;
-
-        // Load metadata
-        for (key, value) in &gguf.metadata {
-            let value_type = match value {
-                crate::gguf::GGUFValue::U8(_) => "u8",
-                crate::gguf::GGUFValue::I8(_) => "i8",
-                crate::gguf::GGUFValue::U16(_) => "u16",
-                crate::gguf::GGUFValue::I16(_) => "i16",
-                crate::gguf::GGUFValue::U32(_) => "u32",
-                crate::gguf::GGUFValue::I32(_) => "i32",
-                crate::gguf::GGUFValue::F32(_) => "f32",
-                crate::gguf::GGUFValue::U64(_) => "u64",
-                crate::gguf::GGUFValue::I64(_) => "i64",
-                crate::gguf::GGUFValue::F64(_) => "f64",
-                crate::gguf::GGUFValue::Bool(_) => "bool",
-                crate::gguf::GGUFValue::String(_) => "string",
-                crate::gguf::GGUFValue::Array(_) => "array",
-            };
-
-            metadata.push(MetadataInfo {
-                name: key.clone(),
-                value: value.to_string(),
-                value_type: value_type.to_string(),
-            });
-        }
-
-        // Load tensors
-        for tensor in &gguf.tensors {
-            let shape: Vec<usize> = tensor.dimensions.iter().map(|&d| d as usize).collect();
-            let dtype = tensor.tensor_type.to_string();
-
-            // Calculate size using the element size from our custom implementation
-            let num_elements = shape.iter().product::<usize>();
-            let size_bytes =
-                (num_elements as f32 * tensor.tensor_type.element_size_bytes()) as usize;
-
-            tensors.push(TensorInfo {
-                name: tensor.name.clone(),
-                dtype,
-                shape,
-                size_bytes,
-                num_elements,
-                storage: Storage::Unknown,
-                source_path: source_path.clone(),
-                layout: Layout::Offset(tensor.offset),
-            });
-        }
-
-        Ok((tensors, metadata))
-    }
-
-    #[cfg(feature = "hdf5")]
-    fn read_hdf5_file(file_path: &Path) -> Result<(Vec<TensorInfo>, Vec<MetadataInfo>)> {
-        // Tensors plus root-attribute metadata (version, per-tensor and config
-        // `__metadata__`) from a single file open.
-        crate::hdf5::read(file_path)
-    }
-
     /// Read every file's top-level structure (tensors + metadata) into owned
     /// vectors. A free function (no `&self`) so it can run on a worker thread
     /// while the UI animates a loading spinner, and so the `diff` subcommand can
@@ -4818,23 +4636,19 @@ impl Explorer {
     pub(crate) fn gather_checkpoint(
         files: &[PathBuf],
         remote: Option<&crate::remote::RemoteRead>,
-    ) -> Result<CheckpointParts> {
-        let mut tensors: Vec<TensorInfo> = Vec::new();
-        let mut metadata: Vec<MetadataInfo> = Vec::new();
-        // The checkpoint's `config.json` (for the config-consistency check):
-        // fetched over SSH beside the remote read, or read locally below.
-        let mut config: Option<crate::config::ModelConfig> = None;
-        // Remote shards' on-disk footprint (local files are statted lazily when
-        // the stats popup opens; the remote session is only live during the read).
-        let mut disk_shards: Vec<crate::stats::ShardDisk> = Vec::new();
-        // Remote index/file health (local health is gathered up front, in main).
-        let mut remote_health: Vec<crate::health::HealthReport> = Vec::new();
-        for file_path in files {
-            let as_str = file_path.to_string_lossy();
-            // `--ssh-read`: every source is read on the remote (an s3:// cstorch
-            // checkpoint, or a remote safetensors directory/file), keeping the
-            // credentials and data there.
-            if let Some(r) = remote {
+    ) -> Result<(CheckpointParts, Option<crate::model::Checkpoint>)> {
+        // `--ssh-read`: every source is read on the remote (an s3:// cstorch
+        // checkpoint, or a remote safetensors directory/file), keeping the
+        // credentials and data there. (The central model is filled by the remote
+        // reader in a later step; the remote path returns the parts tuple only.)
+        if let Some(r) = remote {
+            let mut tensors: Vec<TensorInfo> = Vec::new();
+            let mut metadata: Vec<MetadataInfo> = Vec::new();
+            let mut config: Option<crate::config::ModelConfig> = None;
+            let mut disk_shards: Vec<crate::stats::ShardDisk> = Vec::new();
+            let mut remote_health: Vec<crate::health::HealthReport> = Vec::new();
+            for file_path in files {
+                let as_str = file_path.to_string_lossy();
                 let (t, m, cfg, disk, health) = r.fetch_with_config(&as_str)?;
                 tensors.extend(t);
                 metadata.extend(m);
@@ -4843,53 +4657,37 @@ impl Explorer {
                     disk_shards.extend(d.shards);
                 }
                 remote_health.extend(health);
-                continue;
             }
-            // Without --ssh-read a bare s3:// URI has no local credentials to read.
+            let parts = (
+                tensors,
+                metadata,
+                config,
+                crate::stats::DiskUsage::from_shards(disk_shards),
+                remote_health,
+            );
+            return Ok((parts, None));
+        }
+        // Local: a bare s3:// URI has no local credentials to read.
+        for file_path in files {
+            let as_str = file_path.to_string_lossy();
             if crate::s3::is_uri(&as_str) {
                 anyhow::bail!(
                     "{as_str}: reading an s3:// checkpoint needs --ssh-read <[user@]host> \
                      (its credentials stay on the remote)"
                 );
             }
-            let (t, m) = match file_path.extension().and_then(|s| s.to_str()) {
-                Some("safetensors") => Self::read_safetensors_file(file_path)?,
-                Some("gguf") => Self::read_gguf_file(file_path)?,
-                Some("npy") => Self::read_numpy_file(file_path)?,
-                Some("npz") => Self::read_npz_file(file_path)?,
-                Some("h5") | Some("hdf5") => {
-                    #[cfg(feature = "hdf5")]
-                    {
-                        Self::read_hdf5_file(file_path)?
-                    }
-                    #[cfg(not(feature = "hdf5"))]
-                    {
-                        eprintln!(
-                            "Warning: HDF5 support is not compiled in; rebuild with `--features hdf5` to read {}",
-                            file_path.display()
-                        );
-                        (Vec::new(), Vec::new())
-                    }
-                }
-                _ => {
-                    eprintln!("Warning: Unsupported file format: {}", file_path.display());
-                    (Vec::new(), Vec::new())
-                }
-            };
-            tensors.extend(t);
-            metadata.extend(m);
         }
-        // Local checkpoint: read the sidecar `config.json` from its directory.
-        if remote.is_none() {
-            config = crate::config::load_local(files);
-        }
-        Ok((
-            tensors,
-            metadata,
-            config,
-            crate::stats::DiskUsage::from_shards(disk_shards),
-            remote_health,
-        ))
+        // Read the whole local checkpoint into the central model in one pass (fs
+        // walk + every header + config + index); the tuple is derived from it.
+        let cp = crate::readers::read_local(files)?;
+        let parts = (
+            cp.tensors_vec(),
+            cp.metadata_vec(),
+            cp.config.clone(),
+            None,
+            Vec::new(),
+        );
+        Ok((parts, Some(cp)))
     }
 
     fn build_tree(&mut self) {
@@ -9370,9 +9168,10 @@ impl Explorer {
         }
         self.index_specs = specs;
         self.health_reports.clear();
-        let (tensors, metadata, config, disk, health) =
+        let ((tensors, metadata, config, disk, health), checkpoint) =
             Self::gather_checkpoint(&self.files, self.remote_read.as_ref())?;
         self.config = config;
+        self.checkpoint = checkpoint;
         self.remote_disk = disk;
         self.health_reports.extend(health);
         self.finalize_load(tensors, metadata);
@@ -11467,6 +11266,7 @@ mod tests {
     /// checks each available `TREE_COMMANDS` key appears among the footer chips.
     #[test]
     fn tree_footer_advertises_every_available_command_key() {
+        use crate::tree::Layout;
         let ti = |name: &str| TensorInfo {
             name: name.to_string(),
             dtype: "F32".into(),
