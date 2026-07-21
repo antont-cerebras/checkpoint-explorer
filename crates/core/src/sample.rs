@@ -515,15 +515,23 @@ pub struct Sample {
     /// The header shows it against the stored shape.
     pub display_shape: Vec<usize>,
     /// For the codebook [`ViewDtype::Unpacked`] view: which expert field this
-    /// slice unmerges (`(stored_slice, field, len_p, field_bits)`), so the slice
-    /// header can spell out the mapping. `None` for every other view.
-    pub unpacked_field: Option<UnpackedField>,
-    /// The schema-derived dtype label (e.g. `u3×5`) for the unmerged view, so the
-    /// data-view header can show it without re-deriving from the schema.
-    pub schema_label: Option<String>,
+    /// slice unmerges and its schema-derived label — `Some` only for that view,
+    /// `None` for every other. The field descriptor and label always travel
+    /// together (both derived from the same packing schema), so they're one
+    /// optional rather than two that could drift apart.
+    pub unpacked: Option<UnpackedView>,
 }
 
-/// Describes the field a single unpacked slice shows (see [`Sample::unpacked_field`]).
+/// The [`ViewDtype::Unpacked`] slice's field mapping plus its display label.
+#[derive(Clone, Debug)]
+pub struct UnpackedView {
+    pub field: UnpackedField,
+    /// The schema-derived dtype label (e.g. `u3×5`), so the data-view header can
+    /// show it without re-deriving from the schema.
+    pub label: String,
+}
+
+/// Describes the field a single unpacked slice shows (see [`UnpackedView`]).
 #[derive(Clone, Copy, Debug)]
 pub struct UnpackedField {
     pub stored_slice: usize,
@@ -661,11 +669,14 @@ pub fn sample_tensor_with(
     let slices = stored_slices * len_p;
     let slice = slice.min(slices - 1);
     let (stored_slice, field) = (slice / len_p, slice % len_p);
-    let unpacked_field = unpack.map(|s| UnpackedField {
-        stored_slice,
-        field,
-        len_p,
-        field_bits: s.width(field),
+    let unpacked = unpack.map(|s| UnpackedView {
+        field: UnpackedField {
+            stored_slice,
+            field,
+            len_p,
+            field_bits: s.width(field),
+        },
+        label: s.label(),
     });
     // Logical elements to skip to reach the chosen stored slice (0 for 1D/2D).
     let base = stored_slice * total_rows * total_cols;
@@ -718,8 +729,7 @@ pub fn sample_tensor_with(
         overridable,
         mode,
         display_shape: view.logical_shape_with(shape, &t.dtype, unpack),
-        unpacked_field,
-        schema_label: unpack.map(PackingSchema::label),
+        unpacked,
     })
 }
 

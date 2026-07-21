@@ -2297,8 +2297,11 @@ impl UI {
             SampleMode::Window { .. } => "window",
             SampleMode::Grid => "sampled",
         };
-        let mut dtype_line =
-            view_dtype_spans(&tensor.dtype, sample.view, sample.schema_label.as_deref());
+        let mut dtype_line = view_dtype_spans(
+            &tensor.dtype,
+            sample.view,
+            sample.unpacked.as_ref().map(|u| u.label.as_str()),
+        );
         dtype_line.push(Span::raw(" "));
         dtype_line.extend(view_shape_spans(&tensor.shape, &sample.display_shape));
         dtype_line.push(Span::raw(format!(
@@ -2430,8 +2433,11 @@ impl UI {
 
         let mut lines: Vec<Line> = data_view_title_lines("Values", tensor, width);
 
-        let mut dtype_line =
-            view_dtype_spans(&tensor.dtype, sample.view, sample.schema_label.as_deref());
+        let mut dtype_line = view_dtype_spans(
+            &tensor.dtype,
+            sample.view,
+            sample.unpacked.as_ref().map(|u| u.label.as_str()),
+        );
         dtype_line.push(Span::raw(" "));
         dtype_line.extend(view_shape_spans(&tensor.shape, &sample.display_shape));
         let edges = matches!(sample.mode, SampleMode::Edges { .. });
@@ -5280,7 +5286,7 @@ fn data_stats_view_line(stats: StatsView) -> Option<Line<'static>> {
 /// [`write_slice_header`]. Only used when `sample.slices > 1`.
 fn slice_header_line(sample: &Sample) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::new();
-    match sample.unpacked_field {
+    match sample.unpacked.as_ref().map(|u| u.field) {
         Some(f) => spans.push(Span::raw(format!(
             "expert {} of {} — stored word {}, field {}/{} ({}-bit) — ",
             sample.slice, sample.slices, f.stored_slice, f.field, f.len_p, f.field_bits,
