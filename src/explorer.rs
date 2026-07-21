@@ -4,8 +4,7 @@ use crossterm::{
     event::{
         self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
-    execute,
-    terminal::{self, ClearType},
+    execute, terminal,
 };
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -5436,16 +5435,14 @@ impl Explorer {
             self.load_quiet()?;
         }
 
-        // Set up the Ratatui terminal (raw mode, cleared screen, hidden cursor,
-        // no alternate screen) and own it for the session.
+        // Set up the Ratatui terminal (raw mode, alternate screen, hidden cursor)
+        // and own it for the session.
         self.terminal = Some(crate::tui::init()?);
 
         let result = self.interactive_loop();
 
-        // Restore the terminal: leave the last frame on screen and drop the shell
-        // prompt onto a fresh line just below it (see `tui::restore`). Keeps what
-        // you were looking at visible after quitting (and lets `--exit` output be
-        // read / captured).
+        // Restore the terminal: leave the alternate screen, bringing back the
+        // pre-launch primary buffer + shell prompt (see `tui::restore`).
         if let Some(mut terminal) = self.terminal.take() {
             crate::tui::restore(&mut terminal)?;
         }
@@ -6487,7 +6484,12 @@ impl Explorer {
                 return Err(e);
             }
         }
-        let _ = term.clear();
+        // No `term.clear()` on entry: clearing blanks the screen, and the new frame
+        // only lands on the first draw — a visible black flash between screens.
+        // Instead the first `term.draw` below diffs against the previous screen and
+        // each frame blanks stale cells via an in-buffer `Clear` widget, so a switch
+        // is just the changed cells overwritten in place — no black gap. (The whole
+        // TUI runs on the alternate screen; see `tui::init`.)
         let mut layout_hint: Option<char> = None;
 
         let nav = loop {
@@ -6504,6 +6506,14 @@ impl Explorer {
                 // draws it here — so a mode can't scroll without showing a bar.
                 *self.vscrollbar.borrow_mut() = None;
                 let drawn = term.draw(|f| {
+                    // Blank the frame buffer (in-memory, not a terminal clear) so a
+                    // screen that paints fewer cells than the previous one leaves no
+                    // stale cells; the diff still only writes what actually changed.
+                    // No synchronized-update (DEC 2026) wrapper: at ~6 KB/frame it
+                    // buys nothing, and its ESC[?2026h/l markers are mishandled under
+                    // tmux -CC / iTerm2 (blanks the screen). Ratatui's cell diff over
+                    // the persistent back-buffer already gives clean in-place redraws.
+                    f.render_widget(ratatui::widgets::Clear, f.area());
                     mode.render_frame(self, f);
                     if let Some(sb) = *self.vscrollbar.borrow() {
                         UI::render_vscrollbar(f, &sb);
@@ -10783,23 +10793,21 @@ fn layout_hint_msg(c: char) -> String {
     format!("⚠ '{c}' is not a shortcut — a non-US/Latin keyboard layout may be active")
 }
 
-/// Restore the terminal (leave raw mode, show the cursor) and exit the process
-/// immediately, leaving the last frame on screen with the prompt just below it.
-/// Used for Ctrl-C from any of the detail/data sub-screens so it quits outright
-/// instead of stepping back one screen.
+/// Restore the terminal (stop mouse capture, leave the alternate screen, show the
+/// cursor, leave raw mode) and exit the process immediately. Used for Ctrl-C from
+/// any of the detail/data sub-screens so it quits outright instead of stepping
+/// back one screen.
 fn quit_immediately() -> ! {
     let mut stdout = io::stdout();
-    // Clear below the cursor so no frame content lingers under the prompt (e.g.
-    // the rows beneath a mid-screen overlay like the `y` command pop-up), then
-    // drop the prompt onto a fresh line below the preserved frame.
+    // Mirror `tui::restore`: leaving the alternate screen brings back the
+    // pre-launch primary buffer + shell prompt, so nothing lingers underneath.
     let _ = execute!(
         stdout,
         crossterm::event::DisableMouseCapture,
-        terminal::Clear(ClearType::FromCursorDown),
+        terminal::LeaveAlternateScreen,
         cursor::Show
     );
     let _ = terminal::disable_raw_mode();
-    println!();
     std::process::exit(0);
 }
 

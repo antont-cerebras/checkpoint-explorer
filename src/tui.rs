@@ -1,9 +1,9 @@
 //! Ratatui scaffolding shared by the interactive and headless render paths.
 //!
 //! This module owns the bits both the live loop and the `--plain` / screen-copy
-//! paths need: the live [`Terminal`] lifecycle (deliberately *not* using the
-//! alternate screen, so the last frame stays on exit) and an in-memory
-//! [`TestBackend`] render for headless output.
+//! paths need: the live [`Terminal`] lifecycle (on the **alternate screen**, so
+//! quitting restores the pre-launch screen and tmux -CC / iTerm2 render it
+//! efficiently) and an in-memory [`TestBackend`] render for headless output.
 
 use std::io::{self, Stdout};
 
@@ -11,8 +11,7 @@ use anyhow::Result;
 use crossterm::{
     cursor,
     event::{DisableMouseCapture, EnableMouseCapture},
-    execute,
-    terminal::{self, ClearType},
+    execute, terminal,
 };
 use ratatui::{
     Frame, Terminal, TerminalOptions, Viewport,
@@ -23,25 +22,23 @@ use ratatui::{
 /// The live terminal type owned by the interactive loop.
 pub type LiveTerminal = Terminal<CrosstermBackend<Stdout>>;
 
-/// Set up the live terminal: raw mode, a cleared screen, hidden cursor, and a
-/// Ratatui terminal over stdout. Deliberately **no** alternate screen — quitting
-/// leaves the last frame on screen (see [`restore`]).
+/// Set up the live terminal: raw mode, the **alternate screen**, hidden cursor,
+/// and a Ratatui terminal over stdout. The alternate screen gives the TUI its own
+/// buffer — quitting restores the pre-launch screen (see [`restore`]), and, since
+/// tmux -CC / iTerm2 render an alt-screen app on a dedicated surface, dense full
+/// repaints forward far faster than they do on the primary buffer (which caused
+/// ~1s tmux -CC lag switching into a big tree). Entering it also hides any pre-TUI
+/// output (e.g. the `--ssh-read` password prompt + read spinner) without having to
+/// scrub the primary scrollback.
 pub fn init() -> Result<LiveTerminal> {
     terminal::enable_raw_mode()?;
     let mut out = io::stdout();
     // Capture the mouse so rows can be clicked and the wheel scrolls. (This means
     // the terminal's own text selection needs Shift held — the `y`/`c` shortcuts
     // and OSC-52 copy are the primary copy paths anyway.)
-    // Clear the screen AND the scrollback, then home the cursor, before the
-    // fullscreen viewport takes over. Any pre-TUI output (e.g. the `--ssh-read`
-    // password prompt + read spinner) otherwise leaves lines the plain screen
-    // clear (`\x1b[2J`) doesn't remove from the scrollback, so the tree appears
-    // pushed down from the top.
     execute!(
         out,
-        terminal::Clear(ClearType::All),
-        terminal::Clear(ClearType::Purge),
-        cursor::MoveTo(0, 0),
+        terminal::EnterAlternateScreen,
         cursor::Hide,
         EnableMouseCapture
     )?;
@@ -54,21 +51,13 @@ pub fn init() -> Result<LiveTerminal> {
     Ok(terminal)
 }
 
-/// Restore the terminal after the interactive loop. Mirrors the previous
-/// hand-rolled exit: leave the last rendered frame on screen, clear anything
-/// below the cursor, show the cursor, leave raw mode, and drop the shell prompt
-/// onto a fresh line just below the frame.
-pub fn restore(terminal: &mut LiveTerminal) -> Result<()> {
-    let height = terminal.size().map(|s| s.height).unwrap_or(0);
+/// Restore the terminal after the interactive loop: stop mouse capture, leave the
+/// alternate screen (which brings back the pre-launch primary buffer + shell
+/// prompt), show the cursor, and leave raw mode.
+pub fn restore(_terminal: &mut LiveTerminal) -> Result<()> {
     let mut out = io::stdout();
-    // Park the cursor at the bottom of the frame so the prompt lands below it.
-    execute!(
-        out,
-        DisableMouseCapture,
-        cursor::MoveTo(0, height.saturating_sub(1)),
-        terminal::Clear(ClearType::FromCursorDown),
-        cursor::Show
-    )?;
+    // Stop mouse capture before leaving the alternate screen / handing back the tty.
+    execute!(out, DisableMouseCapture)?;
     // Discard input still arriving before we hand the (cooked, echoing) terminal
     // back to the shell. Quitting mid-scroll (e.g. Ctrl-C during a mouse-wheel
     // burst) leaves a tail of unread SGR mouse reports in the buffer — plus, over
@@ -110,8 +99,8 @@ pub fn restore(terminal: &mut LiveTerminal) -> Result<()> {
         }
         libc::tcflush(fd, libc::TCIFLUSH);
     }
+    execute!(out, terminal::LeaveAlternateScreen, cursor::Show)?;
     terminal::disable_raw_mode()?;
-    println!();
     Ok(())
 }
 
