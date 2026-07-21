@@ -21,14 +21,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How serious a finding is. `Error` always fails the run; `Warning` fails only
 /// under `--strict`. Ordered so `Error > Warning` for sorting/severity.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum Severity {
     Warning,
     Error,
 }
 
 /// A single problem a check turned up.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 pub struct Finding {
     pub severity: Severity,
     /// The tensor / file the finding concerns, when it's about one thing.
@@ -54,7 +54,7 @@ impl Finding {
 }
 
 /// The outcome of one named check.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 pub struct CheckResult {
     /// Stable machine id, e.g. `byte_ranges` — surfaced by the upcoming
     /// `--format json` output.
@@ -120,7 +120,7 @@ impl CheckResult {
 }
 
 /// The full report for one checkpoint.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 pub struct CheckReport {
     pub label: String,
     pub n_files: usize,
@@ -150,7 +150,7 @@ impl CheckReport {
 }
 
 /// Whether a check passed, warned, failed, or didn't apply.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Status {
     Pass,
     Warn,

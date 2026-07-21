@@ -53,7 +53,7 @@ pub struct DiffOpts {
 
 /// A tensor's distribution shift for `diff --histogram`: total variation distance
 /// (`0` = same shape, `1` = disjoint) and the bin count it was measured over.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize)]
 pub struct HistShift {
     pub tvd: f64,
     pub bins: usize,
@@ -412,7 +412,7 @@ fn group_changed(items: &[TensorChange], group: bool) -> Vec<ChangedGroup> {
 
 /// A tensor's compared identity: dtype + shape. Two tensors with the same name
 /// are "changed" when these differ (data bytes are not part of the comparison).
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct TensorSig {
     pub dtype: String,
     pub shape: Vec<usize>,
@@ -445,7 +445,7 @@ pub enum ValueCmp {
 }
 
 /// A metadata entry's compared value: its string value + declared type.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct MetaVal {
     pub value: String,
     pub value_type: String,
@@ -453,6 +453,7 @@ pub struct MetaVal {
 
 /// One checkpoint reduced to what the structural diff compares. Both maps are
 /// keyed by name and ordered, so the diff output is deterministic and alphabetical.
+#[derive(serde::Serialize)]
 pub struct CheckpointSummary {
     pub tensors: BTreeMap<String, TensorSig>,
     pub metadata: BTreeMap<String, MetaVal>,
@@ -806,6 +807,7 @@ impl TensorFilter {
 
 /// A tensor present in both checkpoints that differs — by dtype/shape, or (with
 /// `--values`) by element values even when the signature is unchanged.
+#[derive(serde::Serialize)]
 pub struct TensorChange {
     pub name: String,
     pub old: TensorSig,
@@ -818,6 +820,7 @@ pub struct TensorChange {
 }
 
 /// A metadata entry present in both checkpoints whose value and/or type differ.
+#[derive(serde::Serialize)]
 pub struct MetaChange {
     pub name: String,
     pub old: MetaVal,
@@ -827,6 +830,7 @@ pub struct MetaChange {
 /// The structural difference between two checkpoints (old → new). "Removed" is in
 /// the old but not the new; "added" is in the new but not the old; "changed" is in
 /// both with a differing signature.
+#[derive(serde::Serialize)]
 pub struct DiffReport {
     pub tensors_removed: Vec<(String, TensorSig)>,
     pub tensors_added: Vec<(String, TensorSig)>,
@@ -1258,6 +1262,7 @@ impl DiffReport {
 
 /// An S3 object present in both checkpoints (matched by prefix-relative key) that
 /// differs in one or more **material** fields (never a timestamp — those are info).
+#[derive(serde::Serialize)]
 pub struct S3ObjectChange {
     pub key: String,
     /// Which material fields differ: any of `size`, `etag`, `checksum`, `tags`, `meta`.
@@ -1266,6 +1271,7 @@ pub struct S3ObjectChange {
 
 /// An object whose only differences are timestamp-like (last-modified, or a
 /// timestamp-valued tag / metadata entry) — reported as info, never a difference.
+#[derive(serde::Serialize)]
 pub struct S3InfoChange {
     pub key: String,
     pub fields: Vec<&'static str>,
@@ -1275,7 +1281,7 @@ pub struct S3InfoChange {
 /// report can spell out which fields carried a real signal (ETag/size always do;
 /// checksums only when stored; tags only when readable), rather than leaving
 /// "N unchanged" ambiguous.
-#[derive(Default)]
+#[derive(Default, serde::Serialize)]
 pub struct S3Scope {
     /// Objects present on both sides (the ones actually compared field-by-field).
     pub matched: usize,
@@ -1302,6 +1308,7 @@ pub fn is_multipart_etag(etag: &str) -> bool {
 }
 
 /// The S3-object-metadata difference between two `s3://` checkpoints.
+#[derive(serde::Serialize)]
 pub struct S3Diff {
     pub added: Vec<String>,
     pub removed: Vec<String>,

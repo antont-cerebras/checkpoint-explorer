@@ -147,14 +147,14 @@ pub(crate) fn composition_bar(totals: [usize; 3], width: usize) -> String {
 }
 
 /// One named tensor with its logical size — for the largest / smallest rows.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct NamedSize {
     pub name: String,
     pub bytes: usize,
 }
 
 /// The repeated transformer-layer stack (`…layers.<i>.…`), aggregated.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct LayerStats {
     /// Number of layers (highest layer index + 1).
     pub count: usize,
@@ -177,7 +177,7 @@ impl LayerStats {
 
 /// One layer's aggregate, with a byte-composition split for the stacked chart.
 /// (The layer index is the row's position in [`PerLayerStats::rows`].)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct LayerRow {
     /// Tensor count in this layer.
     pub tensors: usize,
@@ -193,7 +193,7 @@ pub struct LayerRow {
 
 /// The per-layer series behind the stats graphs. Present only when a canonical
 /// layer family exists (`None` for a dense checkpoint with no indexed stack).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct PerLayerStats {
     /// One row per index `0..count`, in order (so index ↔ position always align).
     pub rows: Vec<LayerRow>,
@@ -243,7 +243,7 @@ impl PerLayerStats {
 }
 
 /// How MoE experts are laid out on disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ExpertStorage {
     /// Each expert is its own tensor: `…experts.<e>.down_proj.weight`.
     Unfused,
@@ -263,7 +263,7 @@ impl ExpertStorage {
 
 /// One expert projection category (`down_proj` / `gate_proj` / `up_proj` /
 /// `gate_up_proj`) aggregated across every expert and layer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ExpertCategory {
     pub name: String,
     /// Total logical bytes in this projection across all experts.
@@ -271,7 +271,7 @@ pub struct ExpertCategory {
 }
 
 /// MoE expert structure — present only when the checkpoint has experts.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ExpertStats {
     /// Experts per layer.
     pub per_layer: usize,
@@ -305,7 +305,7 @@ impl ExpertStats {
 }
 
 /// A dtype and how much of the checkpoint it accounts for.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DtypeStat {
     pub dtype: String,
     pub count: usize,
@@ -314,7 +314,7 @@ pub struct DtypeStat {
 
 /// Per-file (per-shard) logical-size distribution — the tensor-size stats, but
 /// over whole files. Sizes are logical (Σ of each file's tensor `size_bytes`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FileStats {
     /// Number of distinct files the tensors were read from; 1 for a single file.
     pub count: usize,
@@ -403,7 +403,7 @@ pub fn shard_name(path: &str) -> String {
 /// section — the fields worth surfacing about the underlying object store. Built
 /// from the remote read's `S3Meta` at the explorer boundary (like [`ShardDisk`]),
 /// so this module stays free of a remote/network dependency.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct S3ObjectStat {
     /// Key relative to the checkpoint prefix (the shard-ish name).
     pub key: String,
@@ -422,7 +422,7 @@ pub struct S3ObjectStat {
 /// S3 section): the per-object rows plus any warnings the remote raised while
 /// reading them (e.g. tags denied). The summary figures are derived on demand so
 /// the styled and plain reports agree. `None` for a local / SFTP checkpoint.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct S3Stats {
     pub objects: Vec<S3ObjectStat>,
     pub warnings: Vec<String>,
@@ -489,7 +489,7 @@ impl S3Stats {
 }
 
 /// Everything the `s` popup shows, computed once when the popup opens.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CheckpointStats {
     /// Per-file (shard) count and size distribution.
     pub files: FileStats,
@@ -1140,6 +1140,22 @@ fn expert_stats(
 mod tests {
     use super::*;
     use crate::tree::Layout;
+
+    #[test]
+    fn checkpoint_stats_serializes_to_json() {
+        // Reports are serializable — the machine-readable output contract for the
+        // CLI's `--format json` and the future web/MCP frontends.
+        let tensors = vec![
+            ti("model.embed_tokens.weight", "F32", &[100], 4),
+            ti("model.layers.0.mlp.down_proj.weight", "F32", &[10], 4),
+        ];
+        let s = CheckpointStats::compute(&tensors, None, None);
+        let json = serde_json::to_string(&s).unwrap();
+        // Key fields make it into the JSON.
+        assert!(json.contains("\"n_tensors\":2"), "{json}");
+        assert!(json.contains("\"params\":110"), "{json}");
+        assert!(json.contains("\"dtypes\""), "{json}");
+    }
 
     fn ti(name: &str, dtype: &str, shape: &[usize], dsize: usize) -> TensorInfo {
         let num_elements = shape.iter().product();
