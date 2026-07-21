@@ -125,15 +125,16 @@ impl Checkpoint {
         self.metadata().cloned().collect()
     }
 
-    /// The on-disk footprint rolled up from [`FileEntry`]s that are safetensors
-    /// shards — the `DiskUsage` the stats "on disk" section shows, now derived
-    /// from the cached model instead of a live `stat`.
+    /// The on-disk footprint rolled up from every **checkpoint file** the walk
+    /// found (all `.safetensors`/`.gguf`/… in the directory, not just the loaded
+    /// shards) — the `DiskUsage` the stats "on disk" section shows, now derived
+    /// from the cached model (symlink-followed sizes) instead of a live `stat`.
     pub fn disk_usage(&self) -> Option<DiskUsage> {
         use crate::stats::ShardDisk;
         let shards: Vec<ShardDisk> = self
             .files
             .iter()
-            .filter(|f| !f.is_dir && f.name.ends_with(".safetensors"))
+            .filter(|f| !f.is_dir && f.kind == FileKind::Checkpoint)
             .map(|f| ShardDisk {
                 name: f.name.clone(),
                 apparent: f.apparent,

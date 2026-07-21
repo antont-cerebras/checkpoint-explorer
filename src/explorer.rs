@@ -6947,7 +6947,34 @@ impl Explorer {
     /// string (shown as a popup) when a remote listing fails.
     fn build_browse_tree(&self) -> std::result::Result<crate::filetree::FileNode, String> {
         match &self.remote_browse {
-            None => Ok(crate::filetree::build(&self.browse_root, 8)),
+            // Local: assemble the browser from the cached directory walk in the
+            // model (no `readdir`/`stat` on `Tab`). Falls back to a fresh walk only
+            // if the model wasn't populated.
+            None => match &self.checkpoint {
+                Some(cp) => {
+                    let root = &self.browse_root;
+                    let mut listing: HashMap<PathBuf, Vec<crate::filetree::DirEntry>> =
+                        HashMap::new();
+                    for fe in &cp.files {
+                        let full = root.join(&fe.rel_path);
+                        let parent = full
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| root.clone());
+                        listing
+                            .entry(parent)
+                            .or_default()
+                            .push(crate::filetree::DirEntry {
+                                name: fe.name.clone(),
+                                size: fe.apparent,
+                                is_dir: fe.is_dir,
+                            });
+                    }
+                    let list = move |p: &Path| listing.get(p).cloned().unwrap_or_default();
+                    Ok(crate::filetree::build_from(&list, root, 8))
+                }
+                None => Ok(crate::filetree::build(&self.browse_root, 8)),
+            },
             Some(RemoteBrowse::Sftp(dir)) => {
                 // Fetch the whole tree in one SFTP channel + one batch `stat -L`
                 // (up front), then assemble it from the in-memory listing — so the
@@ -9763,6 +9790,12 @@ impl Explorer {
     fn disk_usage(&self) -> Option<crate::stats::DiskUsage> {
         if self.remote_read.is_some() {
             return self.remote_disk.clone();
+        }
+        // Local: derived from the cached model's directory walk (symlink-followed
+        // sizes) — no live `stat`. Falls back to a fresh stat only if the model
+        // wasn't populated (shouldn't happen on a local load).
+        if let Some(cp) = &self.checkpoint {
+            return cp.disk_usage();
         }
         let mut paths: Vec<&str> = self
             .tensors
