@@ -239,6 +239,75 @@ pub struct FileState {
     pub scroll: usize,
 }
 
+impl FileState {
+    /// Re-flatten the directory tree into visible rows, clamping the selection.
+    pub fn rebuild_rows(&mut self) {
+        self.rows = self
+            .tree
+            .as_ref()
+            .map(crate::filetree::flatten)
+            .unwrap_or_default();
+        let n = self.rows.len();
+        self.selected = self.selected.min(n.saturating_sub(1));
+    }
+
+    /// Move the cursor by `delta` rows within the file list, clamped.
+    pub fn move_selection(&mut self, delta: i32) {
+        let len = self.rows.len();
+        if len == 0 {
+            return;
+        }
+        self.selected = if delta < 0 {
+            self.selected.saturating_sub((-delta) as usize)
+        } else {
+            (self.selected + delta as usize).min(len - 1)
+        };
+    }
+
+    /// Expand/collapse the directory at row `idx` and re-flatten.
+    pub fn toggle_dir(&mut self, idx: usize) {
+        if let Some(tree) = self.tree.as_mut() {
+            crate::filetree::toggle_by_index(tree, idx);
+        }
+        self.rebuild_rows();
+    }
+
+    /// `←`: collapse the selected directory if it's open, else jump to its parent.
+    pub fn collapse_or_parent(&mut self) {
+        let Some((is_dir, expanded, depth)) = self
+            .rows
+            .get(self.selected)
+            .map(|r| (r.is_dir, r.expanded, r.depth))
+        else {
+            return;
+        };
+        if is_dir && expanded {
+            self.toggle_dir(self.selected);
+            return;
+        }
+        if depth == 0 {
+            return;
+        }
+        if let Some(parent) = (0..self.selected)
+            .rev()
+            .find(|&i| self.rows[i].depth < depth)
+        {
+            self.selected = parent;
+        }
+    }
+
+    /// `→`: expand the selected directory if it's collapsed (a no-op otherwise).
+    pub fn expand_or_child(&mut self) {
+        let Some((is_dir, expanded)) = self.rows.get(self.selected).map(|r| (r.is_dir, r.expanded))
+        else {
+            return;
+        };
+        if is_dir && !expanded {
+            self.toggle_dir(self.selected);
+        }
+    }
+}
+
 /// The **data-view presentation state** — the session-remembered toggles that
 /// control how the numeric grid / heatmap / histogram screens render a tensor:
 /// the per-tensor dtype/shape reinterpretations, the histogram bucket count, the

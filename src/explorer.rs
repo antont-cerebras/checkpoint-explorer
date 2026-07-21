@@ -762,7 +762,7 @@ impl Mode for FilesMode {
             match ex.build_browse_tree() {
                 Ok(tree) => {
                     ex.file_state.tree = Some(tree);
-                    ex.rebuild_file_rows();
+                    ex.file_state.rebuild_rows();
                 }
                 Err(e) => {
                     let body = vec![
@@ -832,26 +832,26 @@ impl Mode for FilesMode {
             KeyCode::Char('\\') => return Ok(Outcome::Leave(Nav::Forward)),
             KeyCode::Up => {
                 let step = ex.held_step(KeyCode::Up, accel_step_row) as i32;
-                ex.move_file_selection(-step);
+                ex.file_state.move_selection(-step);
             }
             KeyCode::Down => {
                 let step = ex.held_step(KeyCode::Down, accel_step_row) as i32;
-                ex.move_file_selection(step);
+                ex.file_state.move_selection(step);
             }
             KeyCode::PageUp => {
                 let step =
                     (ex.file_page_rows() * ex.held_step(KeyCode::PageUp, accel_step_page)) as i32;
-                ex.move_file_selection(-step);
+                ex.file_state.move_selection(-step);
             }
             KeyCode::PageDown => {
                 let step =
                     (ex.file_page_rows() * ex.held_step(KeyCode::PageDown, accel_step_page)) as i32;
-                ex.move_file_selection(step);
+                ex.file_state.move_selection(step);
             }
             KeyCode::Home => ex.file_state.selected = 0,
             KeyCode::End => ex.file_state.selected = total.saturating_sub(1),
-            KeyCode::Left => ex.file_collapse_or_parent(),
-            KeyCode::Right => ex.file_expand_or_child(),
+            KeyCode::Left => ex.file_state.collapse_or_parent(),
+            KeyCode::Right => ex.file_state.expand_or_child(),
             KeyCode::Enter => {
                 if let Some(nav) = ex.activate_file_selection() {
                     return Ok(Outcome::Leave(nav));
@@ -4945,7 +4945,7 @@ impl Explorer {
             if self.file_state.tree.is_none() {
                 self.file_state.tree =
                     Some(self.build_browse_tree().map_err(|e| anyhow::anyhow!(e))?);
-                self.rebuild_file_rows();
+                self.file_state.rebuild_rows();
             }
             let text = crate::tui::headless_render(120, 40, |f| self.render_files_frame(f, false))?;
             println!("{text}");
@@ -6907,17 +6907,6 @@ impl Explorer {
     /// Recompute the cached flattened file rows from the tree (after a build or a
     /// directory fold), clamping the selection into the new row count — the
     /// file-view analogue of the tensor tree's flatten-on-change.
-    fn rebuild_file_rows(&mut self) {
-        self.file_state.rows = self
-            .file_state
-            .tree
-            .as_ref()
-            .map(crate::filetree::flatten)
-            .unwrap_or_default();
-        let n = self.file_state.rows.len();
-        self.file_state.selected = self.file_state.selected.min(n.saturating_sub(1));
-    }
-
     /// The header path shown atop the file browser: the local browse root, the
     /// remote SFTP directory, or the `s3://…` URI.
     fn browse_display_root(&self) -> String {
@@ -7049,18 +7038,6 @@ impl Explorer {
         UI::visible_file_rows(w, h)
     }
 
-    fn move_file_selection(&mut self, delta: i32) {
-        let len = self.file_state.rows.len();
-        if len == 0 {
-            return;
-        }
-        self.file_state.selected = if delta < 0 {
-            self.file_state.selected.saturating_sub((-delta) as usize)
-        } else {
-            (self.file_state.selected + delta as usize).min(len - 1)
-        };
-    }
-
     /// Keep the selected file row in view (snap the scroll offset), mirroring
     /// [`Self::update_tree_scroll`].
     fn update_files_scroll(&mut self, width: u16, height: u16) {
@@ -7073,55 +7050,6 @@ impl Explorer {
         } else {
             self.file_state.scroll
         };
-    }
-
-    /// `←`: collapse the selected directory if it's open, else jump to its parent.
-    fn file_collapse_or_parent(&mut self) {
-        let Some((is_dir, expanded, depth)) = self
-            .file_state
-            .rows
-            .get(self.file_state.selected)
-            .map(|r| (r.is_dir, r.expanded, r.depth))
-        else {
-            return;
-        };
-        if is_dir && expanded {
-            self.toggle_file_dir(self.file_state.selected);
-            return;
-        }
-        if depth == 0 {
-            return;
-        }
-        if let Some(parent) = (0..self.file_state.selected)
-            .rev()
-            .find(|&i| self.file_state.rows[i].depth < depth)
-        {
-            self.file_state.selected = parent;
-        }
-    }
-
-    /// `→`: expand the selected directory if it's collapsed (a no-op otherwise).
-    fn file_expand_or_child(&mut self) {
-        let Some((is_dir, expanded)) = self
-            .file_state
-            .rows
-            .get(self.file_state.selected)
-            .map(|r| (r.is_dir, r.expanded))
-        else {
-            return;
-        };
-        if is_dir && !expanded {
-            self.toggle_file_dir(self.file_state.selected);
-        }
-    }
-
-    /// Toggle the fold of the directory at flattened index `idx` and refresh the
-    /// cached rows so the collapsed / expanded subtree shows immediately.
-    fn toggle_file_dir(&mut self, idx: usize) {
-        if let Some(tree) = self.file_state.tree.as_mut() {
-            crate::filetree::toggle_by_index(tree, idx);
-        }
-        self.rebuild_file_rows();
     }
 
     /// Whether `path` is one of the checkpoint files currently loaded (so opening
@@ -7146,7 +7074,7 @@ impl Explorer {
         use crate::filetree::FileKind;
         let row = self.file_state.rows.get(self.file_state.selected)?.clone();
         if row.is_dir {
-            self.toggle_file_dir(self.file_state.selected);
+            self.file_state.toggle_dir(self.file_state.selected);
             return None;
         }
         // s3-native browse is a read-only object listing: `Enter` on an object
