@@ -1223,10 +1223,10 @@ impl Mode for TreeMode {
     // While searching, typed letters edit the query — skip the wrong-layout hint,
     // the badge-click actions, and the Space/`:` palette trigger.
     fn accepts_text(&self, ex: &Explorer) -> bool {
-        ex.tree_state.search_mode
+        ex.tree_state.search_mode()
     }
     fn palette_on_space(&self, ex: &Explorer) -> bool {
-        !ex.tree_state.search_mode
+        !ex.tree_state.search_mode()
     }
 
     fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
@@ -1252,7 +1252,7 @@ impl Mode for TreeMode {
             let body = UI::tree_visible_rows(
                 sz.width,
                 sz.height,
-                ex.tree_state.search_mode,
+                ex.tree_state.search_mode(),
                 ex.can_repack(),
                 ex.can_rename(),
             );
@@ -1291,7 +1291,7 @@ impl Mode for TreeMode {
                 code: KeyCode::Char(c),
                 modifiers,
                 ..
-            } if !ex.tree_state.search_mode
+            } if !ex.tree_state.search_mode()
                 && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                 && tree_command_for_key(c).is_some() =>
             {
@@ -1307,7 +1307,7 @@ impl Mode for TreeMode {
             } => {}
             KeyEvent {
                 code: KeyCode::Esc, ..
-            } if ex.tree_state.search_mode => ex.exit_search_mode(),
+            } if ex.tree_state.search_mode() => ex.exit_search_mode(),
             // Shift+↑/↓ jump to the previous/next sibling — before the plain arrows.
             KeyEvent {
                 code: KeyCode::Up,
@@ -1337,35 +1337,28 @@ impl Mode for TreeMode {
                 code: KeyCode::Left,
                 modifiers: KeyModifiers::SHIFT,
                 ..
-            } if ex.tree_state.search_mode => ex.tree_state.search_cursor = 0,
+            } if ex.tree_state.search_mode() => ex.tree_state.search_cursor_home(),
             KeyEvent {
                 code: KeyCode::Right,
                 modifiers: KeyModifiers::SHIFT,
                 ..
-            } if ex.tree_state.search_mode => {
-                ex.tree_state.search_cursor = ex.tree_state.search_query.chars().count()
-            }
+            } if ex.tree_state.search_mode() => ex.tree_state.search_cursor_end(),
             KeyEvent {
                 code: KeyCode::Left,
                 ..
-            } if ex.tree_state.search_mode => {
-                ex.tree_state.search_cursor = ex.tree_state.search_cursor.saturating_sub(1)
-            }
+            } if ex.tree_state.search_mode() => ex.tree_state.search_cursor_left(),
             KeyEvent {
                 code: KeyCode::Right,
                 ..
-            } if ex.tree_state.search_mode => {
-                ex.tree_state.search_cursor = (ex.tree_state.search_cursor + 1)
-                    .min(ex.tree_state.search_query.chars().count());
-            }
+            } if ex.tree_state.search_mode() => ex.tree_state.search_cursor_right(),
             KeyEvent {
                 code: KeyCode::Home,
                 ..
-            } if ex.tree_state.search_mode => ex.tree_state.selected = 0,
+            } if ex.tree_state.search_mode() => ex.tree_state.selected = 0,
             KeyEvent {
                 code: KeyCode::End, ..
-            } if ex.tree_state.search_mode => {
-                ex.tree_state.selected = ex.tree_state.filtered.len().saturating_sub(1);
+            } if ex.tree_state.search_mode() => {
+                ex.tree_state.selected = ex.tree_state.visible().len().saturating_sub(1);
             }
             KeyEvent {
                 code: KeyCode::PageUp,
@@ -1395,7 +1388,7 @@ impl Mode for TreeMode {
             // (leaving search); otherwise Tab toggles to the file browser.
             KeyEvent {
                 code: KeyCode::Tab, ..
-            } if ex.tree_state.search_mode => ex.reveal_search_result(),
+            } if ex.tree_state.search_mode() => ex.reveal_search_result(),
             KeyEvent {
                 code: KeyCode::Tab, ..
             } => {
@@ -1421,7 +1414,7 @@ impl Mode for TreeMode {
             KeyEvent {
                 code: KeyCode::Backspace,
                 ..
-            } if ex.tree_state.search_mode => ex.search_backspace(),
+            } if ex.tree_state.search_mode() => ex.search_backspace(),
             KeyEvent {
                 code: KeyCode::Backspace,
                 ..
@@ -1429,12 +1422,12 @@ impl Mode for TreeMode {
             KeyEvent {
                 code: KeyCode::Char('\\'),
                 ..
-            } if !ex.tree_state.search_mode => return Ok(Outcome::Leave(Nav::Forward)),
+            } if !ex.tree_state.search_mode() => return Ok(Outcome::Leave(Nav::Forward)),
             // Any other char while searching is inserted into the query.
             KeyEvent {
                 code: KeyCode::Char(c),
                 ..
-            } if ex.tree_state.search_mode => ex.search_insert(c),
+            } if ex.tree_state.search_mode() => ex.search_insert(c),
             _ => {}
         }
         Ok(Outcome::Stay)
@@ -1453,11 +1446,11 @@ impl Mode for TreeMode {
         match m.kind {
             // (Scroll-bar clicks / drags are handled by the engine's `route_mouse`.)
             MouseEventKind::Down(MouseButton::Left) => {
-                let body_top = UI::tree_header_rows(ex.tree_state.search_mode) as u16;
+                let body_top = UI::tree_header_rows(ex.tree_state.search_mode()) as u16;
                 // Body ends above the bottom-pinned hint footer + the 2-line status bar.
                 let hint_rows = UI::tree_hint_rows(
                     sz.width,
-                    ex.tree_state.search_mode,
+                    ex.tree_state.search_mode(),
                     ex.can_repack(),
                     ex.can_rename(),
                 ) as u16;
@@ -1468,11 +1461,7 @@ impl Mode for TreeMode {
                         // A click exactly on a group's ▸/▾ twisty (column `2*depth`)
                         // toggles it on a single click.
                         let on_arrow = {
-                            let tree = if ex.tree_state.search_mode {
-                                &ex.tree_state.filtered
-                            } else {
-                                &ex.tree_state.flattened
-                            };
+                            let tree = ex.tree_state.visible();
                             matches!(
                                 tree.get(idx),
                                 Some((TreeNode::Group { .. }, depth)) if col == 2 * *depth as u16
@@ -1489,7 +1478,7 @@ impl Mode for TreeMode {
                             );
                             if double {
                                 self.last_click = None;
-                                if ex.tree_state.search_mode {
+                                if ex.tree_state.search_mode() {
                                     ex.reveal_search_result();
                                 } else if let Some(nav) = ex.activate_selection() {
                                     return MouseOutcome::Leave(nav);
@@ -4811,25 +4800,21 @@ impl Explorer {
     }
 
     fn update_filtered_tree(&mut self) {
-        // `filtered_tree` is only ever read while searching, so during plain
-        // browsing don't spend a full clone of the (possibly huge) flattened tree
-        // keeping it in sync — the dominant cost of returning to a big expanded
-        // tree from a detail view. `enter_search_mode` sets `search_mode` before
-        // calling this, so the results list is still built the moment you search.
-        if !self.tree_state.search_mode {
+        // Only meaningful while searching; the filtered list lives inside the
+        // `search` state, so plain browsing never spends a clone of the (possibly
+        // huge) flattened tree keeping it in sync.
+        let Some(query) = self.tree_state.search.as_ref().map(|s| s.query.clone()) else {
             return;
-        }
-        if self.tree_state.search_query.is_empty() {
-            self.tree_state.filtered = self.tree_state.flattened.clone();
+        };
+        let filtered: Vec<(TreeNode, usize)> = if query.is_empty() {
+            self.tree_state.flattened.clone()
         } else {
             let matcher = SkimMatcherV2::default();
             let mut scored_results: Vec<(TreeNode, i64)> = Vec::new();
 
             // Search through ALL tensors, not just the flattened tree
             for tensor in self.tensors() {
-                if let Some(score) =
-                    matcher.fuzzy_match(&tensor.name, &self.tree_state.search_query)
-                {
+                if let Some(score) = matcher.fuzzy_match(&tensor.name, &query) {
                     scored_results.push((
                         TreeNode::Tensor {
                             info: tensor.clone(),
@@ -4842,9 +4827,7 @@ impl Explorer {
 
             // Also search through metadata if present
             for metadata in self.metadata() {
-                if let Some(score) =
-                    matcher.fuzzy_match(&metadata.name, &self.tree_state.search_query)
-                {
+                if let Some(score) = matcher.fuzzy_match(&metadata.name, &query) {
                     scored_results.push((
                         TreeNode::Metadata {
                             info: metadata.clone(),
@@ -4854,14 +4837,15 @@ impl Explorer {
                 }
             }
 
-            // Sort by score (highest first)
+            // Sort by score (highest first), flat list at depth 0.
             scored_results.sort_by_key(|b| std::cmp::Reverse(b.1));
-
-            // Create a flat list with depth 0 for all results
-            self.tree_state.filtered = scored_results
+            scored_results
                 .into_iter()
                 .map(|(node, _)| (node, 0))
-                .collect();
+                .collect()
+        };
+        if let Some(s) = self.tree_state.search.as_mut() {
+            s.filtered = filtered;
         }
     }
 
@@ -5608,11 +5592,7 @@ impl Explorer {
         } else {
             "Multiple files".to_string()
         };
-        let tree_to_display = if self.tree_state.search_mode {
-            &self.tree_state.filtered
-        } else {
-            &self.tree_state.flattened
-        };
+        let tree_to_display = self.tree_state.visible();
         let (status_icon, status_bar, status_secondary) = self.status_bar();
         let badges = self.screen_badges(HelpCtx::Tree);
         let config = DrawConfig {
@@ -5622,9 +5602,9 @@ impl Explorer {
             total_files: 1,
             selected_idx: self.tree_state.selected,
             scroll_offset: self.tree_state.scroll,
-            search_mode: self.tree_state.search_mode,
-            search_query: &self.tree_state.search_query,
-            search_cursor: self.tree_state.search_cursor,
+            search_mode: self.tree_state.search_mode(),
+            search_query: self.tree_state.search_query(),
+            search_cursor: self.tree_state.search_cursor(),
             status_icon,
             status_bar: &status_bar,
             status_secondary: &status_secondary,
@@ -5646,7 +5626,7 @@ impl Explorer {
                 UI::tree_scrollbar(
                     area.width,
                     area.height,
-                    self.tree_state.search_mode,
+                    self.tree_state.search_mode(),
                     self.repack_input().is_some(),
                     self.can_rename(),
                     tree_to_display.len(),
@@ -6319,8 +6299,8 @@ impl Explorer {
     /// Number of rows in the tree currently shown (the search results when
     /// searching, else the full flattened tree).
     fn current_tree_len(&self) -> usize {
-        if self.tree_state.search_mode {
-            self.tree_state.filtered.len()
+        if self.tree_state.search_mode() {
+            self.tree_state.visible().len()
         } else {
             self.tree_state.flattened.len()
         }
@@ -6330,7 +6310,7 @@ impl Explorer {
         let body = UI::tree_visible_rows(
             width,
             height,
-            self.tree_state.search_mode,
+            self.tree_state.search_mode(),
             self.can_repack(),
             self.can_rename(),
         );
@@ -7745,15 +7725,11 @@ impl Explorer {
     /// `f`/`t` copy. The key (selection index, tree length, search mode) changes
     /// whenever the selection or tree structure (expand/collapse/search) does.
     fn selected_source_files(&self) -> BTreeSet<String> {
-        let tree = if self.tree_state.search_mode {
-            &self.tree_state.filtered
-        } else {
-            &self.tree_state.flattened
-        };
+        let tree = self.tree_state.visible();
         let key = (
             self.tree_state.selected,
             tree.len(),
-            self.tree_state.search_mode,
+            self.tree_state.search_mode(),
         );
         if let Some(c) = self.cached_group_files.borrow().as_ref()
             && (c.0, c.1, c.2) == key
@@ -7803,11 +7779,7 @@ impl Explorer {
     /// share (or a "stored across N files" span when they don't); **metadata** →
     /// no path.
     fn describe_selection(&self) -> SelectionView {
-        let tree = if self.tree_state.search_mode {
-            &self.tree_state.filtered
-        } else {
-            &self.tree_state.flattened
-        };
+        let tree = self.tree_state.visible();
         let Some((node, depth)) = tree.get(self.tree_state.selected) else {
             return SelectionView::empty();
         };
@@ -7948,9 +7920,7 @@ impl Explorer {
     }
 
     fn enter_search_mode(&mut self) {
-        self.tree_state.search_mode = true;
-        self.tree_state.search_query.clear();
-        self.tree_state.search_cursor = 0;
+        self.tree_state.search = Some(crate::kernel::SearchState::default());
         self.update_filtered_tree();
         self.tree_state.selected = 0;
         self.tree_state.scroll = 0;
@@ -7959,34 +7929,36 @@ impl Explorer {
     /// Open the tree in search mode with a preset query (`--search`), cursor at
     /// the end — as if the query had just been typed into the search bar.
     fn open_search(&mut self, query: &str) {
-        self.tree_state.search_mode = true;
-        self.tree_state.search_query = query.to_string();
-        self.tree_state.search_cursor = self.tree_state.search_query.chars().count();
+        self.tree_state.search = Some(crate::kernel::SearchState {
+            query: query.to_string(),
+            cursor: query.chars().count(),
+            filtered: Vec::new(),
+        });
         self.update_filtered_tree();
         self.tree_state.selected = 0;
         self.tree_state.scroll = 0;
     }
 
     fn exit_search_mode(&mut self) {
-        self.tree_state.search_mode = false;
-        self.tree_state.search_query.clear();
-        self.tree_state.search_cursor = 0;
-        self.update_filtered_tree();
+        // Dropping the search state clears query/cursor/filtered atomically —
+        // there's no stale search data left behind.
+        self.tree_state.search = None;
         self.tree_state.selected = 0;
         self.tree_state.scroll = 0;
     }
 
     /// Insert a character into the query at the caret and advance past it.
     fn search_insert(&mut self, c: char) {
-        let byte = self
-            .tree_state
-            .search_query
-            .char_indices()
-            .nth(self.tree_state.search_cursor)
-            .map(|(b, _)| b)
-            .unwrap_or(self.tree_state.search_query.len());
-        self.tree_state.search_query.insert(byte, c);
-        self.tree_state.search_cursor += 1;
+        if let Some(s) = self.tree_state.search.as_mut() {
+            let byte = s
+                .query
+                .char_indices()
+                .nth(s.cursor)
+                .map(|(b, _)| b)
+                .unwrap_or(s.query.len());
+            s.query.insert(byte, c);
+            s.cursor += 1;
+        }
         self.update_filtered_tree();
         self.tree_state.selected = 0;
         self.tree_state.scroll = 0;
@@ -7994,18 +7966,22 @@ impl Explorer {
 
     /// Delete the character before the caret (Backspace) and step the caret back.
     fn search_backspace(&mut self) {
-        if self.tree_state.search_cursor == 0 {
-            return;
+        {
+            let Some(s) = self.tree_state.search.as_mut() else {
+                return;
+            };
+            if s.cursor == 0 {
+                return;
+            }
+            let byte = s
+                .query
+                .char_indices()
+                .nth(s.cursor - 1)
+                .map(|(b, _)| b)
+                .unwrap_or(0);
+            s.query.remove(byte);
+            s.cursor -= 1;
         }
-        let byte = self
-            .tree_state
-            .search_query
-            .char_indices()
-            .nth(self.tree_state.search_cursor - 1)
-            .map(|(b, _)| b)
-            .unwrap_or(0);
-        self.tree_state.search_query.remove(byte);
-        self.tree_state.search_cursor -= 1;
         self.update_filtered_tree();
         self.tree_state.selected = 0;
         self.tree_state.scroll = 0;
@@ -8015,7 +7991,13 @@ impl Explorer {
     /// tree: leave search mode, then expand to and select it so it's shown in
     /// context (a no-op if the highlighted result isn't a tensor).
     fn reveal_search_result(&mut self) {
-        let name = match self.tree_state.filtered.get(self.tree_state.selected) {
+        let sel = self.tree_state.selected;
+        let name = match self
+            .tree_state
+            .search
+            .as_ref()
+            .and_then(|s| s.filtered.get(sel))
+        {
             Some((TreeNode::Tensor { info, .. }, _)) => info.name.clone(),
             _ => return,
         };
@@ -8045,11 +8027,7 @@ impl Explorer {
     /// (cloned out so the caller, which owns the live terminal, can draw it through
     /// Ratatui) — `None` for groups/tensors.
     fn handle_selection(&mut self) -> (Option<Screen>, Option<MetadataInfo>) {
-        let tree = if self.tree_state.search_mode {
-            &self.tree_state.filtered
-        } else {
-            &self.tree_state.flattened
-        };
+        let tree = self.tree_state.visible();
 
         let Some((selected_node, _)) = tree.get(self.tree_state.selected) else {
             return (None, None);
@@ -8073,7 +8051,7 @@ impl Explorer {
             // In search mode groups shouldn't appear, but if one does, do nothing.
             TreeNode::Group { .. } => {}
         }
-        if !self.tree_state.search_mode {
+        if !self.tree_state.search_mode() {
             self.tree_state.toggle_group_at(self.tree_state.selected);
         }
         (None, None)
@@ -12053,7 +12031,7 @@ mod tests {
         // Not searching, so move_selection (what PageUp/PageDown call) walks the
         // full flattened tree rather than the filtered results.
         let mut e = explorer_with_depths(&vec![0; 100]);
-        assert!(!e.tree_state.search_mode);
+        assert!(!e.tree_state.search_mode());
 
         // A page-sized jump down advances by the delta.
         e.tree_state.selected = 0;

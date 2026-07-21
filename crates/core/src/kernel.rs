@@ -74,28 +74,71 @@ pub struct TreeState {
     pub tree: Vec<TreeNode>,
     /// The tree flattened to visible rows `(node, depth)` (fold-aware).
     pub flattened: Vec<(TreeNode, usize)>,
-    /// The search-filtered rows (used instead of `flattened` in search mode).
-    pub filtered: Vec<(TreeNode, usize)>,
     /// Highlighted row index (into the visible tree).
     pub selected: usize,
     /// Viewport scroll offset.
     pub scroll: usize,
+    /// Live search — `Some` only while searching. The query, its caret, and the
+    /// results it produced travel together (a `Some` iff we're in search mode),
+    /// so there's no `search_mode` bool that can disagree with a stale query /
+    /// filtered list.
+    pub search: Option<SearchState>,
+}
+
+/// The tree screen's live search: the query being typed, its caret, and the
+/// (fuzzy-matched) result rows shown instead of the folded tree.
+#[derive(Default)]
+pub struct SearchState {
     /// The live search query.
-    pub search_query: String,
-    /// Caret position within `search_query` (character index).
-    pub search_cursor: usize,
-    /// Whether search input is active.
-    pub search_mode: bool,
+    pub query: String,
+    /// Caret position within `query` (character index in `0..=query.chars().count()`).
+    pub cursor: usize,
+    /// The search-result rows (shown instead of `flattened` while searching).
+    pub filtered: Vec<(TreeNode, usize)>,
 }
 
 impl TreeState {
+    /// Whether search input is active.
+    pub fn search_mode(&self) -> bool {
+        self.search.is_some()
+    }
+    /// The live search query, or `""` when not searching.
+    pub fn search_query(&self) -> &str {
+        self.search.as_ref().map_or("", |s| s.query.as_str())
+    }
+    /// The caret position, or 0 when not searching.
+    pub fn search_cursor(&self) -> usize {
+        self.search.as_ref().map_or(0, |s| s.cursor)
+    }
+
+    // Search-caret motion (all no-ops when not searching).
+    pub fn search_cursor_home(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.cursor = 0;
+        }
+    }
+    pub fn search_cursor_end(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.cursor = s.query.chars().count();
+        }
+    }
+    pub fn search_cursor_left(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.cursor = s.cursor.saturating_sub(1);
+        }
+    }
+    pub fn search_cursor_right(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.cursor = (s.cursor + 1).min(s.query.chars().count());
+        }
+    }
+
     /// The currently visible rows: the search results while searching, else the
     /// fold-aware flattened tree. The one selector every navigation op reads.
     pub fn visible(&self) -> &[(TreeNode, usize)] {
-        if self.search_mode {
-            &self.filtered
-        } else {
-            &self.flattened
+        match &self.search {
+            Some(s) => &s.filtered,
+            None => &self.flattened,
         }
     }
 
@@ -181,7 +224,7 @@ impl TreeState {
     /// its first child. No-op for leaf rows or empty groups (and in search mode,
     /// where the list is flat).
     pub fn move_to_first_child(&mut self) {
-        if self.search_mode {
+        if self.search_mode() {
             return;
         }
         let (expanded, has_children, depth) = match self.flattened.get(self.selected) {
@@ -220,7 +263,7 @@ impl TreeState {
             self.selected = idx;
             return;
         }
-        if !self.search_mode {
+        if !self.search_mode() {
             TreeBuilder::expand_to_tensor(&mut self.tree, name);
             self.reflatten();
             if let Some(idx) = self.flattened.iter().position(|(n, _)| n.name() == name) {
@@ -558,8 +601,9 @@ impl ViewModel {
             selected,
             status,
             search: tree
-                .search_mode
-                .then(|| tree.search_query.clone())
+                .search
+                .as_ref()
+                .map(|s| s.query.clone())
                 .filter(|q| !q.is_empty()),
         }
     }
@@ -686,14 +730,16 @@ mod tests {
         assert!(vm.search.is_none());
 
         // Search state flows through the projection.
-        tree.search_mode = true;
-        tree.search_query = "q".into();
-        tree.filtered = tree.flattened.iter().take(1).cloned().collect();
+        tree.search = Some(SearchState {
+            query: "q".into(),
+            cursor: 1,
+            filtered: tree.flattened.iter().take(1).cloned().collect(),
+        });
         let vm = ViewModel::from_tree("/ckpt", &tree);
         assert_eq!(vm.search.as_deref(), Some("q"));
         assert_eq!(vm.rows.len(), 1);
         // An empty query projects no search even in search mode.
-        tree.search_query.clear();
+        tree.search.as_mut().unwrap().query.clear();
         assert!(ViewModel::from_tree("/ckpt", &tree).search.is_none());
 
         // The file screen projects from a FileState the same way.
