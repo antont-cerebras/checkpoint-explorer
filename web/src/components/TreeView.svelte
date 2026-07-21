@@ -2,6 +2,7 @@
   import { visibleRows, selectedId, expanded, searching, toggle, openDetail } from '../stores/view';
   import type { Row } from '../lib/flatten';
   import { humanCount, humanSize } from '../lib/format';
+  import Dtype from './Dtype.svelte';
 
   const ROW_H = 22;
   let scrollEl: HTMLDivElement;
@@ -73,7 +74,11 @@
       >
         <span class="caret">{row.hasChildren ? ($expanded.has(row.id) ? '▾' : '▸') : ''}</span>
         <span class="lbl">{label(row, $searching)}</span>
-        <span class="rmeta dim">{rowMeta(row)}</span>
+        {#if row.node.kind === 'tensor'}
+          <span class="rmeta dim">[<Dtype dtype={row.node.info.dtype} bubble={false} />, {row.node.info.shape.join('×')}, {humanSize(row.node.info.size_bytes)}]</span>
+        {:else}
+          <span class="rmeta dim">{rowMeta(row)}</span>
+        {/if}
       </div>
     {/each}
   </div>

@@ -5,6 +5,7 @@
   import { humanCount, humanSize, num, shape } from '../lib/format';
   import DataView from './DataView.svelte';
   import HistogramView from './HistogramView.svelte';
+  import Dtype from './Dtype.svelte';
   import Spinner from './Spinner.svelte';
 
   export let tensor: string;
@@ -62,7 +63,7 @@
       <h2>{info.name}</h2>
       <table>
         <tbody>
-          <tr><th>Data Type</th><td class="mono">{info.dtype}</td></tr>
+          <tr><th>Data Type</th><td><Dtype dtype={info.dtype} /></td></tr>
           <tr><th>Shape</th><td class="mono">{shape(info.shape)}</td></tr>
           <tr><th>Parameters</th><td class="mono">{humanCount(info.num_elements)} ({info.num_elements.toLocaleString()})</td></tr>
           <tr><th>Size</th><td class="mono">{humanSize(info.size_bytes)}</td></tr>

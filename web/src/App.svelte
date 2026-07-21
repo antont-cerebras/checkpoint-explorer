@@ -20,6 +20,9 @@
     startSearch,
     exitSearch,
     setTab,
+    dtypeFilter,
+    clearDtypeFilter,
+    paletteOpen,
   } from './stores/view';
   import TreeView from './components/TreeView.svelte';
   import Detail from './components/Detail.svelte';
@@ -32,6 +35,7 @@
   import Footer from './components/Footer.svelte';
   import Spinner from './components/Spinner.svelte';
   import VaultBoy from './components/VaultBoy.svelte';
+  import Palette from './components/Palette.svelte';
   import { theme } from './stores/theme';
   import type { Screen } from './stores/view';
 
@@ -74,7 +78,16 @@
   function onKeydown(e: KeyboardEvent) {
     // Let real browser/system chords through.
     if (e.ctrlKey || e.metaKey || e.altKey) return;
+    // The palette owns the keyboard while open (its input handles keys).
+    if (get(paletteOpen)) return;
     const s = get(screen);
+
+    // --- command palette: `:` anywhere, or Space on the tree ---
+    if (e.key === ':' || (e.key === ' ' && s.kind === 'tree' && !get(searching))) {
+      e.preventDefault();
+      paletteOpen.set(true);
+      return;
+    }
 
     // --- search mode: the input is focused; only steal a few keys ---
     if (get(searching)) {
@@ -223,6 +236,12 @@
     {#if $screen.kind !== 'tree'}
       <span class="crumb dim">{crumb($screen)}</span>
     {/if}
+    {#if $dtypeFilter}
+      <span class="filterchip">
+        dtype: {$dtypeFilter}
+        <button on:click={clearDtypeFilter} title="Clear filter" aria-label="Clear dtype filter">×</button>
+      </span>
+    {/if}
     <span class="root" title={$tree?.root ?? ''}>{$tree?.root ?? '…'}</span>
     {#if $searching}
       <span class="search">
@@ -270,6 +289,7 @@
   <StatusBar />
   <Footer />
   {#if $theme === 'fallout'}<VaultBoy />{/if}
+  {#if $paletteOpen}<Palette />{/if}
 </div>
 
 <style>
@@ -326,6 +346,27 @@
   }
   .search input {
     flex: 0 1 360px;
+  }
+  .filterchip {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--dtype);
+    background: color-mix(in srgb, var(--dtype) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--dtype) 30%, transparent);
+    border-radius: 4px;
+    padding: 1px 4px 1px 8px;
+  }
+  .filterchip button {
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 0 2px;
+    line-height: 1;
   }
   .theme {
     margin-left: auto;

@@ -6,6 +6,7 @@
 import { derived, get, writable } from 'svelte/store';
 import { flatten, nodeId, type Row } from '../lib/flatten';
 import { searchRows } from '../lib/search';
+import type { TreeNode } from '../lib/types';
 import { tree as treeData } from './server';
 
 export type DataTab = 'info' | 'heatmap' | 'values' | 'histogram';
@@ -81,15 +82,48 @@ export const selectedId = writable<string | null>(null);
 export const searching = writable<boolean>(false);
 export const search = writable<string>('');
 
-/** The flattened, fold-/search-aware visible rows — shared by TreeView (render)
- * and the key handler (cursor movement). */
+/** Active dtype filter (set by clicking a dtype badge); flat-lists tensors of that dtype. */
+export const dtypeFilter = writable<string | null>(null);
+
+/** Command palette (Space / `:`) open state. */
+export const paletteOpen = writable<boolean>(false);
+
+/** The flattened rows — fold-aware, or a flat list while searching / dtype-filtering.
+ * Shared by TreeView (render) and the key handler (cursor movement). */
 export const visibleRows = derived(
-  [treeData, expanded, search, searching],
-  ([$t, $exp, $q, $searching]) => {
+  [treeData, expanded, search, searching, dtypeFilter],
+  ([$t, $exp, $q, $searching, $dt]) => {
     if (!$t) return [] as Row[];
-    return $searching && $q.trim() ? searchRows($t.tree, $q.trim()) : flatten($t.tree, $exp);
+    if ($searching && $q.trim()) return searchRows($t.tree, $q.trim());
+    if ($dt) return dtypeRows($t.tree, $dt);
+    return flatten($t.tree, $exp);
   },
 );
+
+/** Flat list of tensor rows whose dtype matches (for the dtype-badge filter). */
+function dtypeRows(nodes: TreeNode[], dt: string): Row[] {
+  const out: Row[] = [];
+  const walk = (ns: TreeNode[], parentId: string) => {
+    for (const n of ns) {
+      const id = nodeId(n, parentId);
+      if (n.kind === 'group') walk(n.children, id);
+      else if (n.kind === 'tensor' && n.info.dtype === dt)
+        out.push({ id, node: n, depth: 0, hasChildren: false });
+    }
+  };
+  walk(nodes, '');
+  return out;
+}
+
+export function filterByDtype(dt: string): void {
+  dtypeFilter.set(dt);
+  searching.set(false);
+  search.set('');
+  navigate({ kind: 'tree' });
+}
+export function clearDtypeFilter(): void {
+  dtypeFilter.set(null);
+}
 
 // Expand the synthetic root node once the tree first loads, so its children show.
 let seededExpand = false;

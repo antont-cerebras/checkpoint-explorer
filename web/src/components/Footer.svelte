@@ -7,6 +7,7 @@
     setAllExpanded,
     startSearch,
     setTab,
+    paletteOpen,
     type Screen,
   } from '../stores/view';
 
@@ -24,6 +25,7 @@
     { keys: '⇧↑↓', label: 'sibling', act: () => {} },
     { keys: 'Enter', label: 'open', act: activateSelection },
     { keys: 'Tab', label: 'files', act: () => navigate({ kind: 'files' }) },
+    { keys: 'Space/:', label: 'commands', act: () => paletteOpen.set(true) },
     { keys: 'E/C', label: 'expand all', act: () => setAllExpanded(true) },
     { keys: '/', label: 'search', act: startSearch },
     { keys: 'h', label: 'health', act: () => navigate({ kind: 'health' }) },

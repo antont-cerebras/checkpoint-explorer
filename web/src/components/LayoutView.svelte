@@ -7,6 +7,7 @@
   import { cssVar } from '../lib/color';
   import { theme } from '../stores/theme';
   import Spinner from './Spinner.svelte';
+  import Dtype from './Dtype.svelte';
 
   let shards: string[] = [];
   let selected = '';
@@ -144,7 +145,7 @@
               <i class="dot" style="background:var({segVar(s.kind.kind)})"></i>
               <span class="sname">{s.name}</span>
               {#if s.kind.kind === 'tensor'}
-                <span class="dtype">{s.kind.dtype}</span>
+                <Dtype dtype={s.kind.dtype} bubble={false} />
                 <span class="sshape dim mono">[{s.kind.shape.join('×')}]</span>
               {/if}
               <span class="ssize dim mono">{humanSize(s.end - s.start)}</span>
@@ -262,14 +263,6 @@
   .sshape {
     flex: 0 0 auto;
     font-size: 11px;
-  }
-  .dtype {
-    flex: 0 0 auto;
-    font-size: 11px;
-    color: var(--dtype);
-    background: color-mix(in srgb, var(--dtype) 15%, transparent);
-    padding: 0 5px;
-    border-radius: 3px;
   }
   .ssize {
     flex: 1 1 auto;

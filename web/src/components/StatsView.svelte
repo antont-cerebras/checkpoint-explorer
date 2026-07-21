@@ -3,6 +3,7 @@
   import { api } from '../lib/api';
   import { humanCount, humanSize } from '../lib/format';
   import Spinner from './Spinner.svelte';
+  import Dtype from './Dtype.svelte';
 
   interface DtypeStat {
     dtype: string;
@@ -75,7 +76,7 @@
       <div class="dtypes">
         {#each [...s.dtypes].sort((a, b) => b.bytes - a.bytes) as d}
           <div class="drow">
-            <span class="pill">{d.dtype}</span>
+            <span class="pillcell"><Dtype dtype={d.dtype} /></span>
             <div class="track"><div class="fill" style="width:{pct(d.bytes, dtypeTotal)}%"></div></div>
             <span class="dim mono cnt">{d.count.toLocaleString()} tensors</span>
             <span class="mono sz">{humanSize(d.bytes)}</span>
@@ -197,6 +198,10 @@
     align-items: center;
     gap: 12px;
     padding: 3px 0;
+  }
+  .pillcell {
+    flex: 0 0 auto;
+    min-width: 60px;
   }
   .pill {
     flex: 0 0 auto;
