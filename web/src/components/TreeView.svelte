@@ -1,8 +1,6 @@
 <script lang="ts">
-  import { tree } from '../stores/server';
-  import { expanded, selectedId, search, toggleExpanded } from '../stores/view';
-  import { flatten, type Row } from '../lib/flatten';
-  import { searchRows } from '../lib/search';
+  import { visibleRows, selectedId, expanded, toggle, openDetail } from '../stores/view';
+  import type { Row } from '../lib/flatten';
   import { humanCount, humanSize } from '../lib/format';
 
   const ROW_H = 22;
@@ -10,11 +8,7 @@
   let scrollTop = 0;
   let viewportH = 600;
 
-  $: nodes = $tree?.tree ?? [];
-  $: query = $search.trim();
-  $: rows = query ? searchRows(nodes, query) : flatten(nodes, $expanded);
-
-  // Virtualization: render only the rows overlapping the viewport (31k-safe).
+  $: rows = $visibleRows;
   $: total = rows.length;
   $: first = Math.max(0, Math.floor(scrollTop / ROW_H) - 6);
   $: slice = rows.slice(first, first + Math.ceil(viewportH / ROW_H) + 12);
@@ -23,9 +17,23 @@
     scrollTop = scrollEl.scrollTop;
   }
 
-  function activate(row: Row) {
-    if (row.hasChildren) toggleExpanded(row.id);
+  function click(row: Row) {
     selectedId.set(row.id);
+    if (row.node.kind === 'tensor') openDetail(row.node.info.name);
+    else if (row.hasChildren) toggle(row.id);
+  }
+
+  // Keep the keyboard-selected row visible (essential at 31k rows).
+  $: keepVisible($selectedId, rows);
+  function keepVisible(id: string | null, rs: Row[]) {
+    if (!scrollEl || id == null) return;
+    const idx = rs.findIndex((r) => r.id === id);
+    if (idx < 0) return;
+    const top = idx * ROW_H;
+    if (top < scrollEl.scrollTop) scrollEl.scrollTop = top;
+    else if (top + ROW_H > scrollEl.scrollTop + viewportH) {
+      scrollEl.scrollTop = top + ROW_H - viewportH;
+    }
   }
 
   function label(row: Row): string {
@@ -37,65 +45,40 @@
 
   function rowMeta(row: Row): string {
     const n = row.node;
-    if (n.kind === 'group') return `${humanCount(n.tensor_count)} · ${humanSize(n.total_size)}`;
-    if (n.kind === 'tensor') return `${n.info.dtype} [${n.info.shape.join(',')}]`;
-    return n.info.value;
+    if (n.kind === 'group') {
+      return ` (${humanCount(n.tensor_count)}, ${humanSize(n.total_size)})`;
+    }
+    if (n.kind === 'tensor') {
+      return ` [${n.info.dtype}, ${n.info.shape.join('×')}, ${humanSize(n.info.size_bytes)}]`;
+    }
+    return ` [${n.info.value_type}]: ${n.info.value}`;
   }
 </script>
 
-<div class="tree">
-  <div class="searchbar">
-    <input placeholder="search tensors (fuzzy)…" bind:value={$search} spellcheck="false" />
-    {#if query}<span class="dim count">{total}</span>{/if}
-  </div>
-  <div class="rows" bind:this={scrollEl} on:scroll={onScroll} bind:clientHeight={viewportH}>
-    <div class="spacer" style="height:{total * ROW_H}px">
-      {#each slice as row, i (row.id)}
-        <div
-          class="row {row.node.kind}"
-          class:sel={$selectedId === row.id}
-          style="top:{(first + i) * ROW_H}px; padding-left:{6 + row.depth * 14}px"
-          role="button"
-          tabindex="-1"
-          on:click={() => activate(row)}
-          on:keydown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              activate(row);
-            }
-          }}
-        >
-          <span class="caret">{row.hasChildren ? ($expanded.has(row.id) ? '▾' : '▸') : ''}</span>
-          <span class="lbl">{label(row)}</span>
-          <span class="rmeta dim">{rowMeta(row)}</span>
-        </div>
-      {/each}
-    </div>
+<div class="rows" bind:this={scrollEl} on:scroll={onScroll} bind:clientHeight={viewportH}>
+  <div class="spacer" style="height:{total * ROW_H}px">
+    {#each slice as row, i (row.id)}
+      <!-- svelte-ignore a11y-click-events-have-key-events a11y-no-static-element-interactions -->
+      <div
+        class="row {row.node.kind}"
+        class:sel={$selectedId === row.id}
+        style="top:{(first + i) * ROW_H}px; padding-left:{6 + row.depth * 14}px"
+        role="button"
+        tabindex="-1"
+        on:click={() => click(row)}
+      >
+        <span class="caret">{row.hasChildren ? ($expanded.has(row.id) ? '▾' : '▸') : ''}</span>
+        <span class="lbl">{label(row)}</span>
+        <span class="rmeta dim">{rowMeta(row)}</span>
+      </div>
+    {/each}
   </div>
 </div>
 
 <style>
-  .tree {
-    display: flex;
-    flex-direction: column;
-    height: 100%;
-  }
-  .searchbar {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px;
-    border-bottom: 1px solid var(--border);
-  }
-  .searchbar input {
-    flex: 1 1 auto;
-  }
-  .count {
-    flex: 0 0 auto;
-  }
   .rows {
     position: relative;
-    flex: 1 1 auto;
+    height: 100%;
     overflow: auto;
   }
   .spacer {
@@ -111,7 +94,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    padding-right: 8px;
+    padding-right: 10px;
     white-space: nowrap;
     cursor: pointer;
     overflow: hidden;
@@ -128,9 +111,7 @@
     text-align: center;
   }
   .lbl {
-    flex: 0 1 auto;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    flex: 0 0 auto;
   }
   .row.group .lbl {
     color: var(--group);
@@ -142,8 +123,7 @@
     color: var(--meta);
   }
   .rmeta {
-    flex: 1 1 auto;
-    text-align: right;
+    flex: 0 1 auto;
     overflow: hidden;
     text-overflow: ellipsis;
     font-size: 12px;

@@ -1,13 +1,14 @@
 <script lang="ts">
   import { cachedStats } from '../stores/server';
   import { num } from '../lib/format';
+  import Spinner from './Spinner.svelte';
 
   export let name: string;
   $: promise = cachedStats(name);
 </script>
 
 {#await promise}
-  <p class="dim">scanning tensor…</p>
+  <Spinner label="scanning tensor…" />
 {:then s}
   <table>
     <tbody>

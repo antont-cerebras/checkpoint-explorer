@@ -3,6 +3,7 @@
   import type { SampleDto } from '../lib/types';
   import { viridis } from '../lib/color';
   import { num } from '../lib/format';
+  import Spinner from './Spinner.svelte';
 
   export let name: string;
 
@@ -78,7 +79,7 @@
   </div>
 
   {#if loading}
-    <p class="dim">scanning tensor…</p>
+    <Spinner label="sampling tensor…" />
   {:else if err}
     <p class="err">{err}</p>
   {:else if data}

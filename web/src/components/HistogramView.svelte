@@ -2,6 +2,7 @@
   import { cachedHistogram } from '../stores/server';
   import type { HistogramDto } from '../lib/types';
   import { num } from '../lib/format';
+  import Spinner from './Spinner.svelte';
 
   export let name: string;
   export let dtype: string;
@@ -78,7 +79,7 @@
     <span class="hover mono">{hover}</span>
   </div>
   {#if loading}
-    <p class="dim">scanning tensor…</p>
+    <Spinner label="scanning tensor…" />
   {:else if err}
     <p class="err">{err}</p>
   {:else if data}

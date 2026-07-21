@@ -2,6 +2,7 @@
   import { cachedSample } from '../stores/server';
   import type { SampleDto } from '../lib/types';
   import { num } from '../lib/format';
+  import Spinner from './Spinner.svelte';
 
   export let name: string;
 
@@ -52,7 +53,7 @@
   </div>
 
   {#if loading}
-    <p class="dim">reading window…</p>
+    <Spinner label="reading window…" />
   {:else if err}
     <p class="err">{err}</p>
   {:else if data}

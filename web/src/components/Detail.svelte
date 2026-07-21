@@ -1,77 +1,99 @@
 <script lang="ts">
   import { tree } from '../stores/server';
-  import { selectedId } from '../stores/view';
-  import { nodeId } from '../lib/flatten';
-  import type { TreeNode } from '../lib/types';
+  import { setTab, type DataTab } from '../stores/view';
+  import type { TensorInfo, TreeNode } from '../lib/types';
   import { humanCount, humanSize, shape } from '../lib/format';
-  import TensorDataPanel from './TensorDataPanel.svelte';
+  import Heatmap from './Heatmap.svelte';
+  import HistogramView from './HistogramView.svelte';
+  import ValueGrid from './ValueGrid.svelte';
+  import TensorStats from './TensorStats.svelte';
 
-  $: node = find($tree?.tree ?? [], $selectedId);
+  export let tensor: string;
+  export let tab: DataTab;
 
-  function find(nodes: TreeNode[], id: string | null): TreeNode | null {
-    if (!id) return null;
-    let out: TreeNode | null = null;
-    const walk = (ns: TreeNode[], parentId: string) => {
-      for (const n of ns) {
-        if (out) return;
-        const nid = nodeId(n, parentId);
-        if (nid === id) {
-          out = n;
-          return;
-        }
-        if (n.kind === 'group') walk(n.children, nid);
+  $: info = findTensor($tree?.tree ?? [], tensor);
+
+  function findTensor(nodes: TreeNode[], name: string): TensorInfo | null {
+    for (const n of nodes) {
+      if (n.kind === 'tensor' && n.info.name === name) return n.info;
+      if (n.kind === 'group') {
+        const found = findTensor(n.children, name);
+        if (found) return found;
       }
-    };
-    walk(nodes, '');
-    return out;
+    }
+    return null;
   }
+
+  function offsets(layout: unknown): string | null {
+    const l = layout as Record<string, { start?: number; end?: number }>;
+    if (l && l.ByteRange) return `${l.ByteRange.start} – ${l.ByteRange.end} (within file data)`;
+    return null;
+  }
+
+  const tabs: { id: DataTab; label: string }[] = [
+    { id: 'info', label: 'Info' },
+    { id: 'heatmap', label: 'Heatmap' },
+    { id: 'values', label: 'Values' },
+    { id: 'histogram', label: 'Histogram' },
+    { id: 'stats', label: 'Statistics' },
+  ];
 </script>
 
 <div class="detail">
-  {#if !node}
-    <p class="empty dim">Select a tensor or group in the tree.</p>
-  {:else if node.kind === 'tensor'}
-    <h2>{node.info.name}</h2>
-    <table>
-      <tbody>
-        <tr><th>dtype</th><td class="mono">{node.info.dtype}</td></tr>
-        <tr><th>shape</th><td class="mono">{shape(node.info.shape)}</td></tr>
-        <tr><th>params</th><td class="mono">{humanCount(node.info.num_elements)} ({node.info.num_elements.toLocaleString()})</td></tr>
-        <tr><th>size</th><td class="mono">{humanSize(node.info.size_bytes)}</td></tr>
-        <tr><th>source</th><td class="dim src">{node.info.source_path}</td></tr>
-      </tbody>
-    </table>
-    <TensorDataPanel name={node.info.name} dtype={node.info.dtype} />
-  {:else if node.kind === 'metadata'}
-    <h2>{node.info.name}</h2>
-    <table>
-      <tbody>
-        <tr><th>type</th><td class="mono">{node.info.value_type}</td></tr>
-        <tr><th>value</th><td class="mono val">{node.info.value}</td></tr>
-      </tbody>
-    </table>
-  {:else}
-    <h2>{node.name}</h2>
-    <table>
-      <tbody>
-        <tr><th>tensors</th><td class="mono">{humanCount(node.tensor_count)}</td></tr>
-        <tr><th>params</th><td class="mono">{humanCount(node.params)}</td></tr>
-        <tr><th>size</th><td class="mono">{humanSize(node.total_size)}</td></tr>
-        {#if node.stored_size !== node.total_size}
-          <tr><th>on disk</th><td class="mono">{humanSize(node.stored_size)}</td></tr>
-        {/if}
-      </tbody>
-    </table>
-  {/if}
+  <div class="tabbar">
+    {#each tabs as t}
+      <button class:active={tab === t.id} on:click={() => setTab(t.id)}>{t.label}</button>
+    {/each}
+  </div>
+
+  <div class="body">
+    {#if !info}
+      <p class="dim">Tensor not found: {tensor}</p>
+    {:else if tab === 'info'}
+      <h2>{info.name}</h2>
+      <table>
+        <tbody>
+          <tr><th>Data Type</th><td class="mono">{info.dtype}</td></tr>
+          <tr><th>Shape</th><td class="mono">{shape(info.shape)}</td></tr>
+          <tr><th>Parameters</th><td class="mono">{humanCount(info.num_elements)} ({info.num_elements.toLocaleString()})</td></tr>
+          <tr><th>Size</th><td class="mono">{humanSize(info.size_bytes)}</td></tr>
+          {#if offsets(info.layout)}
+            <tr><th>Data offsets</th><td class="mono">{offsets(info.layout)}</td></tr>
+          {/if}
+          <tr><th>File</th><td class="dim src">{info.source_path}</td></tr>
+        </tbody>
+      </table>
+      <p class="dim hint">Press <b>m</b> heatmap · <b>v</b> values · <b>h</b> histogram · <b>s</b> statistics — or click a tab above. These read the tensor's bytes on demand.</p>
+    {:else if tab === 'heatmap'}
+      <Heatmap name={tensor} />
+    {:else if tab === 'values'}
+      <ValueGrid name={tensor} />
+    {:else if tab === 'histogram'}
+      <HistogramView name={tensor} dtype={info.dtype} />
+    {:else if tab === 'stats'}
+      <TensorStats name={tensor} />
+    {/if}
+  </div>
 </div>
 
 <style>
   .detail {
-    padding: 14px 18px;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
   }
-  .empty {
-    margin-top: 40px;
-    text-align: center;
+  .tabbar {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 6px;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-panel);
+  }
+  .body {
+    flex: 1 1 auto;
+    overflow: auto;
+    padding: 14px 18px;
   }
   h2 {
     margin: 0 0 12px;
@@ -81,7 +103,7 @@
   }
   table {
     border-collapse: collapse;
-    margin-bottom: 16px;
+    margin-bottom: 14px;
   }
   th {
     text-align: right;
@@ -94,8 +116,11 @@
   td {
     padding: 2px 0;
   }
-  .src,
-  .val {
+  .src {
     word-break: break-all;
+  }
+  .hint {
+    font-size: 12px;
+    max-width: 620px;
   }
 </style>

@@ -7,10 +7,11 @@
   --border: #2a2e39;
   --fg: #d6dae3;
   --fg-dim: #7f8796;
-  --accent: #6db3f2;
-  --group: #e2b877;
-  --tensor: #b6c2d4;
-  --meta: #9aa7b8;
+  --accent: #5fd7ff;
+  --group: #5fd7ff;
+  --tensor: #c6ccd6;
+  --dtype: #e2b877;
+  --meta: #b48ead;
   --danger: #e06c75;
   --warn: #e5c07b;
   --ok: #98c379;
