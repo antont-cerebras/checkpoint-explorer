@@ -14,9 +14,14 @@
 //! nothing from disk — everything comes from the model the readers already
 //! cached.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+
 use crate::model::Checkpoint;
+use crate::sample::ViewDtype;
 use crate::stats::CheckpointStats;
 use crate::tree::{TreeBuilder, TreeNode};
+use crate::viewstate::{DataLayout, NumBase, StripeMode};
 
 /// Which screen the session is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -87,6 +92,77 @@ pub struct FileState {
     pub rows: Vec<crate::filetree::FileRow>,
     pub selected: usize,
     pub scroll: usize,
+}
+
+/// The **data-view presentation state** — the session-remembered toggles that
+/// control how the numeric grid / heatmap / histogram screens render a tensor:
+/// the per-tensor dtype/shape reinterpretations, the histogram bucket count, the
+/// layout (overview / edges / window) and its edge-split / window-offset knobs,
+/// and the zebra-striping + numeral-base choices.
+///
+/// Kernel-owned, like [`TreeState`]/[`FileState`]. The fields keep interior
+/// mutability (`Cell`/`RefCell`) because the TUI mutates them from within `&self`
+/// renders; a `&mut self` command surface and serde (for `y` / JSON) come when
+/// the data-view screens migrate onto the kernel. These toggles already
+/// round-trip through the argv-based `--emit-command` path today.
+pub struct DataViewState {
+    /// Per-tensor dtype reinterpretation chosen in the data views, keyed by
+    /// tensor name. Session-scoped: remembered until the app exits.
+    pub dtype_overrides: RefCell<HashMap<String, ViewDtype>>,
+    /// Per-tensor shape override (a reshape with the same element count) chosen
+    /// in the data views with `r`, keyed by tensor name. Session-scoped.
+    pub shape_overrides: RefCell<HashMap<String, Vec<usize>>>,
+    /// Requested histogram bucket count (the `b` key / `--bins`); `None` lets the
+    /// layout pick automatically. Session-wide, like the other view toggles.
+    pub histogram_bins: Cell<Option<usize>>,
+    /// Which layout the data views use (overview / edges / window). Session-
+    /// scoped: remembered as you move between tensors and in/out of the preview.
+    pub data_view_layout: Cell<DataLayout>,
+    /// In the edges view, how the fixed row/column budget is split between the
+    /// first (head) and last (tail) indices: `0.0` shows only the first, `1.0`
+    /// only the last, `0.5` is balanced. Adjustable with the arrow keys.
+    pub data_view_row_tail: Cell<f32>,
+    pub data_view_col_tail: Cell<f32>,
+    /// The last edges-view row/column budgets actually rendered, so an arrow
+    /// press can move the divider by exactly one index (step = 1 / budget).
+    pub edge_row_budget: Cell<usize>,
+    pub edge_col_budget: Cell<usize>,
+    /// The window view's top-left corner (row/column offset into the matrix).
+    /// Clamped to a valid position on every draw (read back from the rendered
+    /// sample), so panning behaves at the edges. Session-remembered.
+    pub data_view_win_row: Cell<usize>,
+    pub data_view_win_col: Cell<usize>,
+    /// The last window's visible size (rows/cols actually shown), so a
+    /// `Shift`+arrow press can stride by one screenful.
+    pub win_page_rows: Cell<usize>,
+    pub win_page_cols: Cell<usize>,
+    /// The numeric grid's zebra striping (rows / columns / off). Session-
+    /// remembered; cycled with `z`.
+    pub data_view_stripe: Cell<StripeMode>,
+    /// The numeric grid's numeral base (dec / hex / oct / bin). Session-
+    /// remembered; cycled with `b`.
+    pub data_view_base: Cell<NumBase>,
+}
+
+impl Default for DataViewState {
+    fn default() -> Self {
+        DataViewState {
+            dtype_overrides: RefCell::new(HashMap::new()),
+            shape_overrides: RefCell::new(HashMap::new()),
+            histogram_bins: Cell::new(None),
+            data_view_layout: Cell::new(DataLayout::default()),
+            data_view_row_tail: Cell::new(0.5),
+            data_view_col_tail: Cell::new(0.5),
+            edge_row_budget: Cell::new(1),
+            edge_col_budget: Cell::new(1),
+            data_view_win_row: Cell::new(0),
+            data_view_win_col: Cell::new(0),
+            win_page_rows: Cell::new(1),
+            win_page_cols: Cell::new(1),
+            data_view_stripe: Cell::new(StripeMode::default()),
+            data_view_base: Cell::new(NumBase::default()),
+        }
+    }
 }
 
 /// A frontend-agnostic browsing session over a cached checkpoint.

@@ -29,6 +29,7 @@ pub mod stats;
 pub mod stheader;
 pub mod tree;
 pub mod utils;
+pub mod viewstate;
 
 #[cfg(feature = "hdf5")]
 pub mod convert;

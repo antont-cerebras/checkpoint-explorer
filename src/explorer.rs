@@ -26,29 +26,10 @@ use crate::ui::{DrawConfig, HelpCtx, Legend, NumBase, Overlay, StatsView, Stripe
 use crate::utils::base64_encode;
 use ratatui::text::{Line, Span};
 
-/// Whether the data views show the evenly-spaced overview or the first/last
-/// How a data view lays out the values it shows: an evenly-spaced overview, the
-/// first/last edges (padding) sample, or a contiguous pannable window. Cycled
-/// with `e`, remembered for the session; defaults to the edges view (most useful
-/// for inspecting padding).
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-pub enum DataLayout {
-    Overview,
-    #[default]
-    Edges,
-    Window,
-}
-
-impl DataLayout {
-    /// The next layout in the `e` cycle: Overview → Edges → Window → Overview.
-    fn next(self) -> Self {
-        match self {
-            DataLayout::Overview => DataLayout::Edges,
-            DataLayout::Edges => DataLayout::Window,
-            DataLayout::Window => DataLayout::Overview,
-        }
-    }
-}
+// The data-view layout enum lives in core (frontend-free, so the kernel's
+// data-view state can own it); re-exported here so `crate::explorer::DataLayout`
+// keeps resolving for the renderers and the CLI.
+pub use crate::viewstate::DataLayout;
 
 /// Which screen to jump straight to for a `--tensor` opened from the CLI.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2184,7 +2165,8 @@ impl DetailMode {
 
     fn shape(&self, ex: &Explorer) -> Vec<usize> {
         let t = self.tensor();
-        ex.shape_overrides
+        ex.data_view
+            .shape_overrides
             .borrow()
             .get(&t.name)
             .cloned()
@@ -2271,6 +2253,7 @@ impl Mode for DetailMode {
         if self.stats_start == StatsStart::Auto && !self.remote {
             let view = ex.active_view(&tensor.name);
             let shape = ex
+                .data_view
                 .shape_overrides
                 .borrow()
                 .get(&tensor.name)
@@ -2341,7 +2324,7 @@ impl Mode for DetailMode {
         let hist = ex
             .histogram_cache
             .borrow()
-            .get(&(tensor.name.clone(), view, ex.histogram_bins.get()))
+            .get(&(tensor.name.clone(), view, ex.data_view.histogram_bins.get()))
             .cloned();
         ex.render_detail_frame(
             f,
@@ -2373,7 +2356,7 @@ impl Mode for DetailMode {
         let hist = ex
             .histogram_cache
             .borrow()
-            .get(&(tensor.name.clone(), view, ex.histogram_bins.get()))
+            .get(&(tensor.name.clone(), view, ex.data_view.histogram_bins.get()))
             .cloned();
         let entries = available_detail_commands(self.overridable, self.layout_ok());
         let (overridable, unindexed) = (self.overridable, self.unindexed);
@@ -2460,7 +2443,7 @@ impl Mode for DetailMode {
                 let hist = ex
                     .histogram_cache
                     .borrow()
-                    .get(&(tensor.name.clone(), view, ex.histogram_bins.get()))
+                    .get(&(tensor.name.clone(), view, ex.data_view.histogram_bins.get()))
                     .cloned();
                 let background = |f: &mut ratatui::Frame| {
                     ex.render_detail_frame(
@@ -2476,17 +2459,18 @@ impl Mode for DetailMode {
                         None,
                     );
                 };
-                let changed = match ex.prompt_bins(term, background, ex.histogram_bins.get()) {
-                    BinsChoice::Set(n) => {
-                        ex.histogram_bins.set(Some(n));
-                        true
-                    }
-                    BinsChoice::Clear => {
-                        ex.histogram_bins.set(None);
-                        true
-                    }
-                    BinsChoice::Cancel => false,
-                };
+                let changed =
+                    match ex.prompt_bins(term, background, ex.data_view.histogram_bins.get()) {
+                        BinsChoice::Set(n) => {
+                            ex.data_view.histogram_bins.set(Some(n));
+                            true
+                        }
+                        BinsChoice::Clear => {
+                            ex.data_view.histogram_bins.set(None);
+                            true
+                        }
+                        BinsChoice::Cancel => false,
+                    };
                 if changed {
                     ex.ensure_detail_histogram(
                         term,
@@ -2527,7 +2511,7 @@ impl Mode for DetailMode {
             KeyCode::Char('d') | KeyCode::Char('D') if self.overridable => {
                 if let Some(chosen) = ex.prompt_dtype(term, &tensor, DtypePreview::Detail) {
                     let def = ex.default_view(&tensor.name);
-                    let mut overrides = ex.dtype_overrides.borrow_mut();
+                    let mut overrides = ex.data_view.dtype_overrides.borrow_mut();
                     if chosen == def {
                         overrides.remove(&tensor.name);
                     } else {
@@ -2536,14 +2520,19 @@ impl Mode for DetailMode {
                 }
             }
             KeyCode::Char('r') | KeyCode::Char('R') if self.overridable => {
-                let current = ex.shape_overrides.borrow().get(&tensor.name).cloned();
+                let current = ex
+                    .data_view
+                    .shape_overrides
+                    .borrow()
+                    .get(&tensor.name)
+                    .cloned();
                 let (overridable, unindexed) = (self.overridable, self.unindexed);
                 let stats = ex.cached_stats(&tensor, view);
                 let stats_view = self.stats_view(&stats);
                 let hist = ex
                     .histogram_cache
                     .borrow()
-                    .get(&(tensor.name.clone(), view, ex.histogram_bins.get()))
+                    .get(&(tensor.name.clone(), view, ex.data_view.histogram_bins.get()))
                     .cloned();
                 let background = |f: &mut ratatui::Frame| {
                     ex.render_detail_frame(
@@ -2561,12 +2550,16 @@ impl Mode for DetailMode {
                 };
                 match ex.prompt_reshape(term, background, &tensor, current.as_deref()) {
                     ReshapeChoice::Set(s) => {
-                        ex.shape_overrides
+                        ex.data_view
+                            .shape_overrides
                             .borrow_mut()
                             .insert(tensor.name.clone(), s);
                     }
                     ReshapeChoice::Clear => {
-                        ex.shape_overrides.borrow_mut().remove(&tensor.name);
+                        ex.data_view
+                            .shape_overrides
+                            .borrow_mut()
+                            .remove(&tensor.name);
                     }
                     ReshapeChoice::Cancel => {}
                 }
@@ -2577,7 +2570,7 @@ impl Mode for DetailMode {
                 let hist = ex
                     .histogram_cache
                     .borrow()
-                    .get(&(tensor.name.clone(), view, ex.histogram_bins.get()))
+                    .get(&(tensor.name.clone(), view, ex.data_view.histogram_bins.get()))
                     .cloned();
                 if let Ok(text) = ex.detail_plain(
                     &tensor,
@@ -2961,8 +2954,8 @@ impl Mode for DataMode {
         let mode = ex.data_sample_mode();
         let stats = ex.cached_stats(tensor, view);
         let stats_view = self.stats_view(&stats);
-        let stripe = ex.data_view_stripe.get();
-        let base = ex.data_view_base.get();
+        let stripe = ex.data_view.data_view_stripe.get();
+        let base = ex.data_view.data_view_base.get();
         match ex.render_data_frame(
             f,
             tensor,
@@ -2997,8 +2990,8 @@ impl Mode for DataMode {
         let mode = ex.data_sample_mode();
         let stats = ex.cached_stats(tensor, view);
         let stats_view = self.stats_view(&stats);
-        let stripe = ex.data_view_stripe.get();
-        let base = ex.data_view_base.get();
+        let stripe = ex.data_view.data_view_stripe.get();
+        let base = ex.data_view.data_view_base.get();
         let (repr, slice) = (self.repr, self.slice.get());
         let entries = available_data_commands(self.overridable.get());
         let chosen = ex.run_palette(term, entries, HelpCtx::Data, |s, f| {
@@ -3024,8 +3017,8 @@ impl Mode for DataMode {
         let mode = ex.data_sample_mode();
         let slices = self.slices.get();
         let overridable = self.overridable.get();
-        let stripe = ex.data_view_stripe.get();
-        let base = ex.data_view_base.get();
+        let stripe = ex.data_view.data_view_stripe.get();
+        let base = ex.data_view.data_view_base.get();
         let KeyEvent {
             code, modifiers, ..
         } = key;
@@ -3061,51 +3054,66 @@ impl Mode for DataMode {
         match code {
             KeyCode::Char('m') => self.repr = Representation::Heatmap,
             KeyCode::Char('v') => self.repr = Representation::Values,
-            KeyCode::Char('e') | KeyCode::Char('E') => {
-                ex.data_view_layout.set(ex.data_view_layout.get().next())
-            }
-            KeyCode::Char('z') | KeyCode::Char('Z') => {
-                ex.data_view_stripe.set(ex.data_view_stripe.get().next())
-            }
-            KeyCode::Char('b') | KeyCode::Char('B') => {
-                ex.data_view_base.set(ex.data_view_base.get().next())
-            }
-            KeyCode::Up if edges => nudge(&ex.data_view_row_tail, true, ex.edge_row_budget.get()),
-            KeyCode::Down if edges => {
-                nudge(&ex.data_view_row_tail, false, ex.edge_row_budget.get())
-            }
-            KeyCode::Left if edges => nudge(&ex.data_view_col_tail, true, ex.edge_col_budget.get()),
-            KeyCode::Right if edges => {
-                nudge(&ex.data_view_col_tail, false, ex.edge_col_budget.get())
-            }
-            KeyCode::Up if window => pan(
-                &ex.data_view_win_row,
+            KeyCode::Char('e') | KeyCode::Char('E') => ex
+                .data_view
+                .data_view_layout
+                .set(ex.data_view.data_view_layout.get().next()),
+            KeyCode::Char('z') | KeyCode::Char('Z') => ex
+                .data_view
+                .data_view_stripe
+                .set(ex.data_view.data_view_stripe.get().next()),
+            KeyCode::Char('b') | KeyCode::Char('B') => ex
+                .data_view
+                .data_view_base
+                .set(ex.data_view.data_view_base.get().next()),
+            KeyCode::Up if edges => nudge(
+                &ex.data_view.data_view_row_tail,
+                true,
+                ex.data_view.edge_row_budget.get(),
+            ),
+            KeyCode::Down if edges => nudge(
+                &ex.data_view.data_view_row_tail,
                 false,
-                ex.win_page_rows.get(),
+                ex.data_view.edge_row_budget.get(),
+            ),
+            KeyCode::Left if edges => nudge(
+                &ex.data_view.data_view_col_tail,
+                true,
+                ex.data_view.edge_col_budget.get(),
+            ),
+            KeyCode::Right if edges => nudge(
+                &ex.data_view.data_view_col_tail,
+                false,
+                ex.data_view.edge_col_budget.get(),
+            ),
+            KeyCode::Up if window => pan(
+                &ex.data_view.data_view_win_row,
+                false,
+                ex.data_view.win_page_rows.get(),
                 ex.held_step(KeyCode::Up, accel_step_row),
             ),
             KeyCode::Down if window => pan(
-                &ex.data_view_win_row,
+                &ex.data_view.data_view_win_row,
                 true,
-                ex.win_page_rows.get(),
+                ex.data_view.win_page_rows.get(),
                 ex.held_step(KeyCode::Down, accel_step_row),
             ),
             KeyCode::Left if window => pan(
-                &ex.data_view_win_col,
+                &ex.data_view.data_view_win_col,
                 false,
-                ex.win_page_cols.get(),
+                ex.data_view.win_page_cols.get(),
                 ex.held_step(KeyCode::Left, accel_step_row),
             ),
             KeyCode::Right if window => pan(
-                &ex.data_view_win_col,
+                &ex.data_view.data_view_win_col,
                 true,
-                ex.win_page_cols.get(),
+                ex.data_view.win_page_cols.get(),
                 ex.held_step(KeyCode::Right, accel_step_row),
             ),
-            KeyCode::Home if window => ex.data_view_win_col.set(0),
-            KeyCode::End if window => ex.data_view_win_col.set(usize::MAX),
-            KeyCode::PageUp if window => ex.data_view_win_row.set(0),
-            KeyCode::PageDown if window => ex.data_view_win_row.set(usize::MAX),
+            KeyCode::Home if window => ex.data_view.data_view_win_col.set(0),
+            KeyCode::End if window => ex.data_view.data_view_win_col.set(usize::MAX),
+            KeyCode::PageUp if window => ex.data_view.data_view_win_row.set(0),
+            KeyCode::PageDown if window => ex.data_view.data_view_win_row.set(usize::MAX),
             KeyCode::Char('d') | KeyCode::Char('D') if overridable => {
                 if let Some(chosen) = ex.prompt_dtype(
                     term,
@@ -3117,7 +3125,7 @@ impl Mode for DataMode {
                     },
                 ) {
                     let def = ex.default_view(&tensor.name);
-                    let mut overrides = ex.dtype_overrides.borrow_mut();
+                    let mut overrides = ex.data_view.dtype_overrides.borrow_mut();
                     if chosen == def {
                         overrides.remove(&tensor.name);
                     } else {
@@ -3126,7 +3134,12 @@ impl Mode for DataMode {
                 }
             }
             KeyCode::Char('r') | KeyCode::Char('R') if overridable => {
-                let current = ex.shape_overrides.borrow().get(&tensor.name).cloned();
+                let current = ex
+                    .data_view
+                    .shape_overrides
+                    .borrow()
+                    .get(&tensor.name)
+                    .cloned();
                 let stats = ex.cached_stats(&tensor, view);
                 let stats_view = self.stats_view(&stats);
                 let repr = self.repr;
@@ -3135,13 +3148,17 @@ impl Mode for DataMode {
                 };
                 match ex.prompt_reshape(term, background, &tensor, current.as_deref()) {
                     ReshapeChoice::Set(s) => {
-                        ex.shape_overrides
+                        ex.data_view
+                            .shape_overrides
                             .borrow_mut()
                             .insert(tensor.name.clone(), s);
                         self.slice.set(0);
                     }
                     ReshapeChoice::Clear => {
-                        ex.shape_overrides.borrow_mut().remove(&tensor.name);
+                        ex.data_view
+                            .shape_overrides
+                            .borrow_mut()
+                            .remove(&tensor.name);
                         self.slice.set(0);
                     }
                     ReshapeChoice::Cancel => {}
@@ -3825,15 +3842,13 @@ pub struct Explorer {
     /// tensors — deferred to `finalize_load` so the shard headers are read once (by
     /// the loader), not again for the check.
     index_specs: Vec<crate::health::IndexSpec>,
-    /// Per-tensor dtype reinterpretation chosen in the data views, keyed by
-    /// tensor name. Session-scoped: remembered until the app exits.
-    dtype_overrides: RefCell<HashMap<String, ViewDtype>>,
+    /// The **data-view presentation state** (dtype/shape overrides, histogram
+    /// bucket count, layout + edge-split/window-offset knobs, zebra/base toggles)
+    /// — session-remembered. Kernel-owned; see [`crate::kernel::DataViewState`].
+    data_view: crate::kernel::DataViewState,
     /// Per-tensor fused-codebook packing schema parsed from metadata at load.
     /// A tensor with a schema defaults to the [`ViewDtype::Unpacked`] view.
     packing_schemas: HashMap<String, PackingSchema>,
-    /// Per-tensor shape override (a reshape with the same element count) chosen
-    /// in the data views with `r`, keyed by tensor name. Session-scoped.
-    shape_overrides: RefCell<HashMap<String, Vec<usize>>>,
     /// Exact whole-tensor statistics, cached per (tensor name, view) since the
     /// scan is expensive. Session-scoped.
     stats_cache: RefCell<HashMap<(String, ViewDtype), Stats>>,
@@ -3841,42 +3856,11 @@ pub struct Explorer {
     /// requested bucket count (so a different `--bins` / `b` count caches and
     /// redraws separately rather than reusing a stale layout).
     histogram_cache: RefCell<HashMap<HistKey, Histogram>>,
-    /// Requested histogram bucket count (the `b` key / `--bins`); `None` lets the
-    /// layout pick automatically. Session-wide, like the other view toggles.
-    histogram_bins: Cell<Option<usize>>,
-    /// Which layout the data views use (overview / edges / window). Session-
-    /// scoped: remembered as you move between tensors and in/out of the preview.
-    data_view_layout: Cell<DataLayout>,
-    /// In the edges view, how the fixed row/column budget is split between the
-    /// first (head) and last (tail) indices: `0.0` shows only the first, `1.0`
-    /// only the last, `0.5` is balanced. Adjustable with the arrow keys and
-    /// session-remembered alongside [`Self::data_view_layout`].
-    data_view_row_tail: Cell<f32>,
-    data_view_col_tail: Cell<f32>,
-    /// The last edges-view row/column budgets actually rendered, so an arrow
-    /// press can move the divider by exactly one index (step = 1 / budget).
-    edge_row_budget: Cell<usize>,
-    edge_col_budget: Cell<usize>,
-    /// The window view's top-left corner (row/column offset into the matrix).
-    /// Clamped to a valid position on every draw (read back from the rendered
-    /// sample), so panning behaves at the edges. Session-remembered.
-    data_view_win_row: Cell<usize>,
-    data_view_win_col: Cell<usize>,
-    /// The last window's visible size (rows/cols actually shown), so a
-    /// `Shift`+arrow press can stride by one screenful.
-    win_page_rows: Cell<usize>,
-    win_page_cols: Cell<usize>,
     /// Held-key scroll acceleration: the last navigation key, when it fired, and
     /// how many consecutive fast repeats (terminal auto-repeat) it's had — so
     /// holding ↑/↓ (tree) or an arrow (data view) ramps the step up. See
     /// [`Explorer::held_step`].
     scroll_accel: Cell<Option<(KeyCode, std::time::Instant, u32)>>,
-    /// The numeric grid's zebra striping (rows / columns / off). Session-
-    /// remembered; cycled with `z`.
-    data_view_stripe: Cell<StripeMode>,
-    /// The numeric grid's numeral base (dec / hex / oct / bin). Session-
-    /// remembered; cycled with `b`.
-    data_view_base: Cell<NumBase>,
     /// A tensor/view to jump straight to on startup (from CLI flags); consumed
     /// once after loading, then normal browsing resumes.
     open: Option<OpenRequest>,
@@ -3960,24 +3944,11 @@ impl Explorer {
             scrollbar_drag: false,
             health_reports: Vec::new(),
             index_specs,
-            dtype_overrides: RefCell::new(HashMap::new()),
+            data_view: crate::kernel::DataViewState::default(),
             packing_schemas: HashMap::new(),
-            shape_overrides: RefCell::new(HashMap::new()),
             stats_cache: RefCell::new(HashMap::new()),
             histogram_cache: RefCell::new(HashMap::new()),
-            histogram_bins: Cell::new(None),
-            data_view_layout: Cell::new(DataLayout::default()),
-            data_view_row_tail: Cell::new(0.5),
-            data_view_col_tail: Cell::new(0.5),
-            edge_row_budget: Cell::new(1),
-            edge_col_budget: Cell::new(1),
-            data_view_win_row: Cell::new(0),
-            data_view_win_col: Cell::new(0),
-            win_page_rows: Cell::new(1),
-            win_page_cols: Cell::new(1),
             scroll_accel: Cell::new(None),
-            data_view_stripe: Cell::new(StripeMode::default()),
-            data_view_base: Cell::new(NumBase::default()),
             open,
             reader_cache: RefCell::new(None),
             sample_cache: RefCell::new(None),
@@ -4667,7 +4638,8 @@ impl Explorer {
     /// The active view for a tensor: an explicit `d`/`--dtype` override if set,
     /// otherwise its [`default_view`].
     fn active_view(&self, name: &str) -> ViewDtype {
-        self.dtype_overrides
+        self.data_view
+            .dtype_overrides
             .borrow()
             .get(name)
             .copied()
@@ -4976,7 +4948,7 @@ impl Explorer {
         let want_layout = self.open.as_ref().and_then(|r| r.layout_file.clone());
         let want_rename = self.open.as_ref().is_some_and(|r| r.rename);
         if let Some(n) = bins {
-            self.histogram_bins.set(Some(n));
+            self.data_view.histogram_bins.set(Some(n));
         }
         let screen = match self.open.take() {
             Some(mut req) => {
@@ -5264,6 +5236,7 @@ impl Explorer {
         };
         let view = self.active_view(&tensor.name);
         let shape = self
+            .data_view
             .shape_overrides
             .borrow()
             .get(&tensor.name)
@@ -5316,15 +5289,15 @@ impl Explorer {
             return Ok(String::new());
         };
         let view = self.active_view(&tensor.name);
-        let mode = match self.data_view_layout.get() {
+        let mode = match self.data_view.data_view_layout.get() {
             DataLayout::Edges => SampleMode::Edges {
-                row_tail: self.data_view_row_tail.get(),
-                col_tail: self.data_view_col_tail.get(),
+                row_tail: self.data_view.data_view_row_tail.get(),
+                col_tail: self.data_view.data_view_col_tail.get(),
             },
             DataLayout::Overview => SampleMode::Grid,
             DataLayout::Window => SampleMode::Window {
-                row_off: self.data_view_win_row.get(),
-                col_off: self.data_view_win_col.get(),
+                row_off: self.data_view.data_view_win_row.get(),
+                col_off: self.data_view.data_view_win_col.get(),
             },
         };
         let stats = self.compute_stats_sync(&tensor, view);
@@ -5344,8 +5317,8 @@ impl Explorer {
             view,
             mode,
             stats_view,
-            self.data_view_stripe.get(),
-            self.data_view_base.get(),
+            self.data_view.data_view_stripe.get(),
+            self.data_view.data_view_base.get(),
             overlay.as_ref(),
         )
     }
@@ -5371,7 +5344,7 @@ impl Explorer {
     /// cancellation: floats and wide integers need stats for their bin range, so
     /// those are computed first only when required.
     fn compute_histogram_sync(&self, tensor: &TensorInfo, view: ViewDtype) -> Option<Histogram> {
-        let count = self.histogram_bins.get();
+        let count = self.data_view.histogram_bins.get();
         let key = (tensor.name.clone(), view, count);
         if let Some(h) = self.histogram_cache.borrow().get(&key) {
             return Some(h.clone());
@@ -6250,15 +6223,15 @@ impl Explorer {
     /// The data view's current sampling mode, from the session-remembered layout
     /// prefs (overview / edges split / window offset).
     fn data_sample_mode(&self) -> SampleMode {
-        match self.data_view_layout.get() {
+        match self.data_view.data_view_layout.get() {
             DataLayout::Edges => SampleMode::Edges {
-                row_tail: self.data_view_row_tail.get(),
-                col_tail: self.data_view_col_tail.get(),
+                row_tail: self.data_view.data_view_row_tail.get(),
+                col_tail: self.data_view.data_view_col_tail.get(),
             },
             DataLayout::Overview => SampleMode::Grid,
             DataLayout::Window => SampleMode::Window {
-                row_off: self.data_view_win_row.get(),
-                col_off: self.data_view_win_col.get(),
+                row_off: self.data_view.data_view_win_row.get(),
+                col_off: self.data_view.data_view_win_col.get(),
             },
         }
     }
@@ -8415,7 +8388,7 @@ impl Explorer {
             } else {
                 dt
             };
-            let mut overrides = self.dtype_overrides.borrow_mut();
+            let mut overrides = self.data_view.dtype_overrides.borrow_mut();
             // Record only an explicit non-default choice, so an unset tensor falls
             // back to its default (Unpacked for schema tensors) and `y` round-trips.
             if dt == def {
@@ -8430,7 +8403,8 @@ impl Explorer {
         {
             match parse_shape_input(s, tensor.num_elements) {
                 Ok(shape) => {
-                    self.shape_overrides
+                    self.data_view
+                        .shape_overrides
                         .borrow_mut()
                         .insert(tensor.name.clone(), shape);
                 }
@@ -8445,28 +8419,29 @@ impl Explorer {
             }
         }
         if let Some(layout) = req.layout {
-            self.data_view_layout.set(layout);
+            self.data_view.data_view_layout.set(layout);
         }
         // Position within the layout (clamped to valid bounds on the first draw).
         if let Some((row, col)) = req.window_at {
-            self.data_view_win_row.set(row);
-            self.data_view_win_col.set(col);
+            self.data_view.data_view_win_row.set(row);
+            self.data_view.data_view_win_col.set(col);
         }
         if let Some((row_tail, col_tail)) = req.edge_split {
-            self.data_view_row_tail.set(row_tail);
-            self.data_view_col_tail.set(col_tail);
+            self.data_view.data_view_row_tail.set(row_tail);
+            self.data_view.data_view_col_tail.set(col_tail);
         }
         if let Some(zebra) = req.zebra {
-            self.data_view_stripe.set(zebra);
+            self.data_view.data_view_stripe.set(zebra);
         }
         if let Some(base) = req.base {
-            self.data_view_base.set(base);
+            self.data_view.data_view_base.set(base);
         }
         // Resolve the starting slice against this tensor's slice count — the
         // leading dimension of the (possibly overridden) squeezed shape (so an
         // (N, M, 1, K) tensor pages through N slices, matching the data view);
         // 1D/2D have a single slice. Accepts an index or a percentage.
         let eff_shape = self
+            .data_view
             .shape_overrides
             .borrow()
             .get(&tensor.name)
@@ -8527,13 +8502,14 @@ impl Explorer {
         // showing the histogram. Done before the one-shot below so `--exit`
         // captures it too.
         if let Some(n) = req.bins {
-            self.histogram_bins.set(Some(n));
+            self.data_view.histogram_bins.set(Some(n));
         }
         if (req.histogram || req.bins.is_some())
             && let Screen::Detail { .. } = screen
         {
             let view = self.active_view(&tensor.name);
             let shape = self
+                .data_view
                 .shape_overrides
                 .borrow()
                 .get(&tensor.name)
@@ -8608,6 +8584,7 @@ impl Explorer {
             let overridable = dtype_overridable(&tensor);
             let unindexed = self.unindexed.contains(&tensor.source_path);
             let shape = self
+                .data_view
                 .shape_overrides
                 .borrow()
                 .get(&tensor.name)
@@ -8651,10 +8628,14 @@ impl Explorer {
         unindexed: bool,
     ) {
         let range = self.histogram_range(tensor, view);
-        let need_stats =
-            crate::sample::histogram_bins(view, &tensor.dtype, range, self.histogram_bins.get())
-                .is_none()
-                && self.cached_stats(tensor, view).is_none();
+        let need_stats = crate::sample::histogram_bins(
+            view,
+            &tensor.dtype,
+            range,
+            self.data_view.histogram_bins.get(),
+        )
+        .is_none()
+            && self.cached_stats(tensor, view).is_none();
         let ready = !need_stats
             || matches!(
                 self.compute_stats_animated(term, tensor, view, |f, sv| {
@@ -8719,7 +8700,7 @@ impl Explorer {
             Option<&Overlay>,
         ),
     ) {
-        let count = self.histogram_bins.get();
+        let count = self.data_view.histogram_bins.get();
         let key = (tensor.name.clone(), view, count);
         if self.histogram_cache.borrow().contains_key(&key) {
             return;
@@ -8853,7 +8834,7 @@ impl Explorer {
         // Leading-index count of the (possibly reshaped) tensor — drives whether
         // a slice line appears in the header.
         let slices = {
-            let overrides = self.shape_overrides.borrow();
+            let overrides = self.data_view.shape_overrides.borrow();
             let eff = overrides
                 .get(&tensor.name)
                 .cloned()
@@ -8883,8 +8864,8 @@ impl Explorer {
             slices,
             dtype_overridable(tensor),
             heatmap,
-            self.data_view_stripe.get(),
-            self.data_view_base.get(),
+            self.data_view.data_view_stripe.get(),
+            self.data_view.data_view_base.get(),
             width,
         );
         let text_rows = (rows as usize).saturating_sub(header + footer).max(1);
@@ -8898,18 +8879,21 @@ impl Explorer {
             // The exact range comes from stats once computed. Must match the
             // width `draw_values` renders with, or the grid overflows the line.
             Representation::Values => {
-                let cell =
-                    self.data_view_base
-                        .get()
-                        .cell_width(view, &tensor.dtype, stats.value_range());
+                let cell = self.data_view.data_view_base.get().cell_width(
+                    view,
+                    &tensor.dtype,
+                    stats.value_range(),
+                );
                 (text_rows, ((cols as usize).saturating_sub(7) / cell).max(1))
             }
         };
         // Remember the edges-view budgets so an arrow press can move the divider
         // by exactly one index (step = 1 / budget).
-        self.edge_row_budget
+        self.data_view
+            .edge_row_budget
             .set(crate::sample::edge_total(max_rows));
-        self.edge_col_budget
+        self.data_view
+            .edge_col_budget
             .set(crate::sample::edge_total(max_cols));
         // Reuse the last sample when nothing that affects the grid changed. This
         // is what keeps a stats scan's spinner-frame redraws from re-reading the
@@ -8920,6 +8904,7 @@ impl Explorer {
         // shape. Region reads still use the real stored shape, so any reshape
         // with a matching element count is a valid row-major reinterpretation.
         let eff_shape = self
+            .data_view
             .shape_overrides
             .borrow()
             .get(&tensor.name)
@@ -8951,12 +8936,14 @@ impl Explorer {
             // visible size back from the rendered sample, so panning stays in
             // bounds and a Shift+arrow strides exactly one screenful.
             if let SampleMode::Window { .. } = mode {
-                self.data_view_win_row
+                self.data_view
+                    .data_view_win_row
                     .set(sample.rows.first().copied().unwrap_or(0));
-                self.data_view_win_col
+                self.data_view
+                    .data_view_win_col
                     .set(sample.cols.first().copied().unwrap_or(0));
-                self.win_page_rows.set(sample.rows.len().max(1));
-                self.win_page_cols.set(sample.cols.len().max(1));
+                self.data_view.win_page_rows.set(sample.rows.len().max(1));
+                self.data_view.win_page_cols.set(sample.cols.len().max(1));
             }
             *self.sample_cache.borrow_mut() = Some(CachedSample { key, sample });
         }
@@ -8984,13 +8971,14 @@ impl Explorer {
         let mut idx = options.iter().position(|v| *v == current).unwrap_or(0);
         // The shape override (if any) is fixed while the dtype menu is open.
         let shape = self
+            .data_view
             .shape_overrides
             .borrow()
             .get(&tensor.name)
             .cloned()
             .unwrap_or_else(|| tensor.shape.clone());
-        let stripe = self.data_view_stripe.get();
-        let base = self.data_view_base.get();
+        let stripe = self.data_view.data_view_stripe.get();
+        let base = self.data_view.data_view_base.get();
         loop {
             // Live preview of the highlighted view, then the menu band over it —
             // all in one Ratatui frame. Only read cached stats: navigating the menu
@@ -10127,13 +10115,13 @@ impl Explorer {
         parts.extend(self.checkpoint_path_parts());
         parts.push("--tensor".to_string());
         parts.push(shell_quote(&tensor.name));
-        if let Some(dt) = self.dtype_overrides.borrow().get(&tensor.name)
+        if let Some(dt) = self.data_view.dtype_overrides.borrow().get(&tensor.name)
             && let Some(value) = dt.cli_value()
         {
             parts.push("--dtype".to_string());
             parts.push(value);
         }
-        if let Some(shape) = self.shape_overrides.borrow().get(&tensor.name) {
+        if let Some(shape) = self.data_view.shape_overrides.borrow().get(&tensor.name) {
             parts.push("--shape".to_string());
             parts.push(
                 shape
@@ -10151,7 +10139,7 @@ impl Explorer {
         let mut parts = self.command_base(tensor);
         let view = self.active_view(&tensor.name);
         // Reopen with the histogram showing when it's been computed for this view.
-        let bins = self.histogram_bins.get();
+        let bins = self.data_view.histogram_bins.get();
         if self
             .histogram_cache
             .borrow()
@@ -10187,10 +10175,13 @@ impl Explorer {
         // edges head/tail split, so the command reopens the same view — not just
         // the same layout at its default position. The bare flag (no value) is
         // emitted at the default position to keep the command tidy.
-        parts.push(match self.data_view_layout.get() {
+        parts.push(match self.data_view.data_view_layout.get() {
             DataLayout::Overview => "--overview".to_string(),
             DataLayout::Edges => {
-                let (rt, ct) = (self.data_view_row_tail.get(), self.data_view_col_tail.get());
+                let (rt, ct) = (
+                    self.data_view.data_view_row_tail.get(),
+                    self.data_view.data_view_col_tail.get(),
+                );
                 if rt == 0.5 && ct == 0.5 {
                     "--edge".to_string()
                 } else {
@@ -10198,7 +10189,10 @@ impl Explorer {
                 }
             }
             DataLayout::Window => {
-                let (row, col) = (self.data_view_win_row.get(), self.data_view_win_col.get());
+                let (row, col) = (
+                    self.data_view.data_view_win_row.get(),
+                    self.data_view.data_view_win_col.get(),
+                );
                 if row == 0 && col == 0 {
                     "--window".to_string()
                 } else {
@@ -10209,7 +10203,7 @@ impl Explorer {
         // Zebra applies only to the numeric grid; emit it only when it differs
         // from the default (rows), which a fresh launch already uses.
         if matches!(repr, Representation::Values) {
-            let zebra = match self.data_view_stripe.get() {
+            let zebra = match self.data_view.data_view_stripe.get() {
                 StripeMode::Rows => None,
                 StripeMode::Cols => Some("cols"),
                 StripeMode::Off => Some("off"),
@@ -10220,7 +10214,7 @@ impl Explorer {
             }
             // Base applies only to the numeric grid; emit it only when it differs
             // from the default (decimal).
-            let base = self.data_view_base.get();
+            let base = self.data_view.data_view_base.get();
             if base != NumBase::Decimal {
                 parts.push("--base".to_string());
                 parts.push(base.label().to_string());
