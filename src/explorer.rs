@@ -4463,6 +4463,82 @@ impl Explorer {
             }
         }
         *self.remote_session.borrow_mut() = Some(session);
+
+        // Build the central model from what was just read — no extra network I/O:
+        // group tensors by their source file into shard headers, roll the on-disk
+        // `stat` results into file entries, and carry config + S3 metadata. The
+        // remote views still read over SSH lazily; this makes the model (and
+        // `--print-model`, serialization) cover remote checkpoints too.
+        let (root, source) = match &self.remote_browse {
+            Some(RemoteBrowse::Sftp(dir)) => (
+                format!("{}:{dir}", self.remote_host_label()),
+                crate::model::Source::Sftp {
+                    host: self.remote_host_label(),
+                    root: dir.clone(),
+                },
+            ),
+            Some(RemoteBrowse::S3(uri)) => {
+                (uri.clone(), crate::model::Source::S3 { uri: uri.clone() })
+            }
+            None => (String::new(), crate::model::Source::Local),
+        };
+        let mut order: Vec<String> = Vec::new();
+        let mut by_src: HashMap<String, Vec<TensorInfo>> = HashMap::new();
+        for t in &tensors {
+            if !by_src.contains_key(&t.source_path) {
+                order.push(t.source_path.clone());
+            }
+            by_src
+                .entry(t.source_path.clone())
+                .or_default()
+                .push(t.clone());
+        }
+        let mut shards: Vec<crate::model::ShardHeader> = order
+            .iter()
+            .enumerate()
+            .map(|(i, src)| crate::model::ShardHeader {
+                path: src.clone(),
+                total_len: 0,
+                header_len: 0,
+                tensors: by_src.remove(src).unwrap_or_default(),
+                // All `__metadata__` on the first shard (it isn't keyed per file).
+                metadata: if i == 0 { metadata.clone() } else { Vec::new() },
+            })
+            .collect();
+        if shards.is_empty() && !metadata.is_empty() {
+            shards.push(crate::model::ShardHeader {
+                path: root.clone(),
+                total_len: 0,
+                header_len: 0,
+                tensors: Vec::new(),
+                metadata: metadata.clone(),
+            });
+        }
+        let files = disk_shards
+            .iter()
+            .map(|d| crate::model::FileEntry {
+                rel_path: d.name.clone(),
+                name: d.name.clone(),
+                depth: 0,
+                apparent: d.apparent,
+                allocated: d.allocated,
+                is_dir: false,
+                kind: crate::filetree::FileKind::of(&d.name),
+                symlink_target: None,
+                mode: None,
+                mtime: None,
+            })
+            .collect();
+        let cp = crate::model::Checkpoint {
+            source,
+            root,
+            files,
+            shards,
+            config: config.clone(),
+            index: Vec::new(),
+            s3: s3_meta.clone(),
+        };
+
         self.s3_meta = s3_meta;
         let parts = (
             tensors,
@@ -4471,8 +4547,7 @@ impl Explorer {
             crate::stats::DiskUsage::from_shards(disk_shards),
             health,
         );
-        // The remote reader doesn't fill the central model yet (later step).
-        Ok((parts, None))
+        Ok((parts, Some(cp)))
     }
 
     /// The health badge's alert level: red for a real error (a referenced file or
