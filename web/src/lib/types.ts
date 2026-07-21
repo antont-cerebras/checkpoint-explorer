@@ -75,6 +75,9 @@ export interface SampleDto {
   view: string;
   mode: string;
   overridable: boolean;
+  /** Raw stored bits per cell as zero-padded hex (only when ?raw=1); width in `raw_width`. */
+  raw_width?: number;
+  raw?: string[][];
 }
 
 export type HistBins =

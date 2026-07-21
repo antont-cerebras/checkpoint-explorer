@@ -8,7 +8,7 @@ import { flatten, nodeId, type Row } from '../lib/flatten';
 import { searchRows } from '../lib/search';
 import { tree as treeData } from './server';
 
-export type DataTab = 'info' | 'heatmap' | 'values' | 'histogram' | 'stats';
+export type DataTab = 'info' | 'heatmap' | 'values' | 'histogram';
 
 export type Screen =
   | { kind: 'tree' }
@@ -50,7 +50,8 @@ function parseHash(): Screen {
   switch (kind) {
     case 'detail': {
       const t = q.get('t');
-      const tab = (q.get('tab') ?? 'info') as DataTab;
+      const raw = q.get('tab') ?? 'info';
+      const tab = (['info', 'heatmap', 'values', 'histogram'].includes(raw) ? raw : 'info') as DataTab;
       if (t) return { kind: 'detail', tensor: t, tab };
       break;
     }

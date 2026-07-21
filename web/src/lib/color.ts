@@ -8,6 +8,12 @@ const STOPS: [number, number, number][] = [
   [253, 231, 37],
 ];
 
+/** Read a CSS custom property off :root (so canvas colors follow the theme). */
+export function cssVar(name: string, fallback = '#888'): string {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
 /** Map t in [0,1] to an `rgb(...)` string along the gradient. */
 export function viridis(t: number): string {
   const x = Math.max(0, Math.min(1, t)) * (STOPS.length - 1);

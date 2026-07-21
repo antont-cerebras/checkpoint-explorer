@@ -4,6 +4,8 @@
   import { api } from '../lib/api';
   import type { LayoutMap, Segment, TreeNode } from '../lib/types';
   import { humanSize } from '../lib/format';
+  import { cssVar } from '../lib/color';
+  import { theme } from '../stores/theme';
   import Spinner from './Spinner.svelte';
 
   let shards: string[] = [];
@@ -50,7 +52,7 @@
   }
 
   const W = 90;
-  $: if (map && canvas && barH) draw(map, barH);
+  $: if (map && canvas && barH && $theme) draw(map, barH);
   function draw(m: LayoutMap, h: number) {
     canvas.width = W;
     canvas.height = h;
@@ -61,13 +63,14 @@
     for (const s of m.segments) {
       const y = (s.start / total) * h;
       const sh = Math.max(0.5, ((s.end - s.start) / total) * h);
-      ctx.fillStyle = segColor(s.kind.kind);
+      ctx.fillStyle = cssVar(segVar(s.kind.kind));
       ctx.fillRect(0, y, W, sh);
     }
   }
 
-  function segColor(k: string): string {
-    return k === 'header' ? '#e2b877' : k === 'gap' ? '#e06c75' : '#5fd7ff';
+  /** Theme CSS var for a segment kind (so colors follow the theme, incl. Fallout). */
+  function segVar(k: string): string {
+    return k === 'header' ? '--dtype' : k === 'gap' ? '--danger' : '--accent';
   }
 
   function segAt(clientY: number): Segment | undefined {
@@ -117,9 +120,9 @@
       </div>
       <div class="side">
         <div class="legend">
-          <span><i style="background:#e2b877"></i> header</span>
-          <span><i style="background:#5fd7ff"></i> tensor</span>
-          <span><i style="background:#e06c75"></i> gap</span>
+          <span><i style="background:var(--dtype)"></i> header</span>
+          <span><i style="background:var(--accent)"></i> tensor</span>
+          <span><i style="background:var(--danger)"></i> gap</span>
           <span class="hover mono">{hover}</span>
         </div>
         <div class="seglist">
@@ -138,7 +141,7 @@
                 }
               }}
             >
-              <i class="dot" style="background:{segColor(s.kind.kind)}"></i>
+              <i class="dot" style="background:var({segVar(s.kind.kind)})"></i>
               <span class="sname">{s.name}</span>
               {#if s.kind.kind === 'tensor'}
                 <span class="dtype">{s.kind.dtype}</span>

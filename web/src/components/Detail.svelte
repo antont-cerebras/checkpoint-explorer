@@ -1,12 +1,11 @@
 <script lang="ts">
-  import { tree } from '../stores/server';
+  import { tree, cachedStats } from '../stores/server';
   import { setTab, navigate, type DataTab } from '../stores/view';
-  import type { TensorInfo, TreeNode } from '../lib/types';
-  import { humanCount, humanSize, shape } from '../lib/format';
-  import Heatmap from './Heatmap.svelte';
+  import type { StatsDto, TensorInfo, TreeNode } from '../lib/types';
+  import { humanCount, humanSize, num, shape } from '../lib/format';
+  import DataView from './DataView.svelte';
   import HistogramView from './HistogramView.svelte';
-  import ValueGrid from './ValueGrid.svelte';
-  import TensorStats from './TensorStats.svelte';
+  import Spinner from './Spinner.svelte';
 
   export let tensor: string;
   export let tab: DataTab;
@@ -34,12 +33,18 @@
     return null;
   }
 
+  // Whole-tensor statistics are shown on the Info tab, scanned on demand.
+  let statsPromise: Promise<StatsDto> | null = null;
+  $: if (tensor) statsPromise = null; // reset when the selected tensor changes
+  function scan() {
+    statsPromise = cachedStats(tensor);
+  }
+
   const tabs: { id: DataTab; label: string }[] = [
     { id: 'info', label: 'Info' },
     { id: 'heatmap', label: 'Heatmap' },
     { id: 'values', label: 'Values' },
     { id: 'histogram', label: 'Histogram' },
-    { id: 'stats', label: 'Statistics' },
   ];
 </script>
 
@@ -61,29 +66,42 @@
           <tr><th>Shape</th><td class="mono">{shape(info.shape)}</td></tr>
           <tr><th>Parameters</th><td class="mono">{humanCount(info.num_elements)} ({info.num_elements.toLocaleString()})</td></tr>
           <tr><th>Size</th><td class="mono">{humanSize(info.size_bytes)}</td></tr>
-          {#if offsets(info.layout)}
-            <tr><th>Data offsets</th><td class="mono">{offsets(info.layout)}</td></tr>
-          {/if}
+          {#if offsets(info.layout)}<tr><th>Data offsets</th><td class="mono">{offsets(info.layout)}</td></tr>{/if}
           <tr>
             <th>File</th>
-            <td>
-              <button
-                class="link src"
-                title="Show this shard's byte-layout map"
-                on:click={() => navigate({ kind: 'layout', file: baseName(info.source_path) })}
-              >{info.source_path}</button>
-            </td>
+            <td><button class="link src" title="Show this shard's byte-layout map" on:click={() => navigate({ kind: 'layout', file: baseName(info.source_path) })}>{info.source_path}</button></td>
           </tr>
         </tbody>
       </table>
+
+      <div class="statsblock">
+        <h3>Statistics</h3>
+        {#if !statsPromise}
+          <button on:click={scan}>Scan tensor</button>
+          <span class="dim">reads the whole tensor's values</span>
+        {:else}
+          {#await statsPromise}
+            <Spinner label="scanning tensor…" />
+          {:then st}
+            <table>
+              <tbody>
+                <tr><th>min</th><td class="mono">{num(st.min)}</td><th>max</th><td class="mono">{num(st.max)}</td></tr>
+                <tr><th>mean</th><td class="mono">{num(st.mean)}</td><th>std</th><td class="mono">{num(st.std)}</td></tr>
+                <tr><th>zeros</th><td class="mono">{(st.zero_fraction * 100).toFixed(2)}%</td><th>non-finite</th><td class="mono">{st.nonfinite.toLocaleString()}</td></tr>
+              </tbody>
+            </table>
+            <span class="dim">scanned {st.count.toLocaleString()} elements in {st.elapsed_ms.toFixed(0)} ms</span>
+          {:catch e}
+            <p class="err">{e.message}</p>
+          {/await}
+        {/if}
+      </div>
     {:else if tab === 'heatmap'}
-      <Heatmap name={tensor} />
+      <DataView {tensor} kind="heatmap" />
     {:else if tab === 'values'}
-      <ValueGrid name={tensor} />
+      <DataView {tensor} kind="values" />
     {:else if tab === 'histogram'}
       <HistogramView name={tensor} dtype={info.dtype} />
-    {:else if tab === 'stats'}
-      <TensorStats name={tensor} />
     {/if}
   </div>
 </div>
@@ -113,6 +131,13 @@
     color: var(--accent);
     word-break: break-all;
   }
+  h3 {
+    margin: 0 0 8px;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--fg-dim);
+  }
   table {
     border-collapse: collapse;
     margin-bottom: 14px;
@@ -126,7 +151,17 @@
     white-space: nowrap;
   }
   td {
-    padding: 2px 0;
+    padding: 2px 18px 2px 0;
+  }
+  .statsblock {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    align-items: flex-start;
+  }
+  .statsblock table {
+    margin: 0;
   }
   .src {
     word-break: break-all;
@@ -141,5 +176,8 @@
     text-decoration-style: dotted;
     cursor: pointer;
     font: inherit;
+  }
+  .err {
+    color: var(--danger);
   }
 </style>

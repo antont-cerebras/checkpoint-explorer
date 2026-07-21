@@ -264,13 +264,13 @@
     min-width: 2px;
   }
   .seg.attn {
-    background: #5fd7ff;
+    background: var(--accent);
   }
   .seg.ffn {
-    background: #e2b877;
+    background: var(--dtype);
   }
   .seg.other {
-    background: #b48ead;
+    background: var(--meta);
   }
   .lsz {
     flex: 0 0 auto;
@@ -293,13 +293,13 @@
     vertical-align: middle;
   }
   .legend i.attn {
-    background: #5fd7ff;
+    background: var(--accent);
   }
   .legend i.ffn {
-    background: #e2b877;
+    background: var(--dtype);
   }
   .legend i.other {
-    background: #b48ead;
+    background: var(--meta);
   }
   .shards {
     border-collapse: collapse;

@@ -30,6 +30,8 @@
   import FilePreview from './components/FilePreview.svelte';
   import StatusBar from './components/StatusBar.svelte';
   import Footer from './components/Footer.svelte';
+  import Spinner from './components/Spinner.svelte';
+  import VaultBoy from './components/VaultBoy.svelte';
   import { theme } from './stores/theme';
   import type { Screen } from './stores/view';
 
@@ -193,7 +195,8 @@
         back();
         break;
       case 's':
-        setTab('stats');
+      case 'i':
+        setTab('info'); // statistics live on the info tab
         break;
       case 'h':
         setTab('histogram');
@@ -203,9 +206,6 @@
         break;
       case 'v':
         setTab('values');
-        break;
-      case 'i':
-        setTab('info');
         break;
     }
   }
@@ -248,6 +248,8 @@
   <main>
     {#if $treeError}
       <div class="error">Failed to load checkpoint: {$treeError}</div>
+    {:else if !$tree}
+      <div class="loading"><Spinner label="reading checkpoint…" /></div>
     {:else if $screen.kind === 'tree'}
       <TreeView />
     {:else if $screen.kind === 'detail'}
@@ -267,6 +269,7 @@
 
   <StatusBar />
   <Footer />
+  {#if $theme === 'fallout'}<VaultBoy />{/if}
 </div>
 
 <style>
@@ -338,5 +341,8 @@
   .error {
     padding: 16px;
     color: var(--danger);
+  }
+  .loading {
+    padding: 24px;
   }
 </style>

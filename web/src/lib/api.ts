@@ -31,6 +31,7 @@ export interface SampleParams {
   dtype?: string;
   row_off?: number;
   col_off?: number;
+  raw?: number;
 }
 
 function qs(params: Record<string, string | number | undefined>): string {

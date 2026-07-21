@@ -36,7 +36,6 @@
     { keys: 'm', label: 'heatmap', act: () => setTab('heatmap') },
     { keys: 'v', label: 'values', act: () => setTab('values') },
     { keys: 'h', label: 'histogram', act: () => setTab('histogram') },
-    { keys: 's', label: 'statistics', act: () => setTab('stats') },
     { keys: 'Esc/⌫', label: 'back', act: back },
   ];
 
