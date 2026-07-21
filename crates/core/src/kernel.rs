@@ -53,6 +53,31 @@ pub struct ViewModel {
     pub search: Option<String>,
 }
 
+/// The tensor-tree browser state — the tree itself, its flattened/filtered rows,
+/// and the selection/scroll/search. Owned by the kernel (this is the state the
+/// interactive tree screen drives and renders from); the operations currently
+/// live on the frontend and mutate these fields directly, and will move onto this
+/// type as the migration continues.
+#[derive(Default)]
+pub struct TreeState {
+    /// The grouped tree (a single root node summarising the checkpoint).
+    pub tree: Vec<TreeNode>,
+    /// The tree flattened to visible rows `(node, depth)` (fold-aware).
+    pub flattened: Vec<(TreeNode, usize)>,
+    /// The search-filtered rows (used instead of `flattened` in search mode).
+    pub filtered: Vec<(TreeNode, usize)>,
+    /// Highlighted row index (into the visible tree).
+    pub selected: usize,
+    /// Viewport scroll offset.
+    pub scroll: usize,
+    /// The live search query.
+    pub search_query: String,
+    /// Caret position within `search_query` (character index).
+    pub search_cursor: usize,
+    /// Whether search input is active.
+    pub search_mode: bool,
+}
+
 /// A frontend-agnostic browsing session over a cached checkpoint.
 pub struct Session {
     model: Checkpoint,

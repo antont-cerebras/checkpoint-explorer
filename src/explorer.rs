@@ -1242,10 +1242,10 @@ impl Mode for TreeMode {
     // While searching, typed letters edit the query — skip the wrong-layout hint,
     // the badge-click actions, and the Space/`:` palette trigger.
     fn accepts_text(&self, ex: &Explorer) -> bool {
-        ex.search_mode
+        ex.tree_state.search_mode
     }
     fn palette_on_space(&self, ex: &Explorer) -> bool {
-        !ex.search_mode
+        !ex.tree_state.search_mode
     }
 
     fn render_frame(&self, ex: &Explorer, f: &mut ratatui::Frame) {
@@ -1264,19 +1264,19 @@ impl Mode for TreeMode {
 
     fn pre_draw(&mut self, ex: &mut Explorer, term: &mut crate::tui::LiveTerminal) {
         if let Ok(sz) = term.size() {
-            if ex.selected_idx != self.last_sel {
+            if ex.tree_state.selected != self.last_sel {
                 ex.update_tree_scroll(sz.width, sz.height); // snap to the moved selection
-                self.last_sel = ex.selected_idx;
+                self.last_sel = ex.tree_state.selected;
             }
             let body = UI::tree_visible_rows(
                 sz.width,
                 sz.height,
-                ex.search_mode,
+                ex.tree_state.search_mode,
                 ex.can_repack(),
                 ex.can_rename(),
             );
             let total = ex.current_tree_len();
-            ex.scroll_offset = ex.scroll_offset.min(total.saturating_sub(body));
+            ex.tree_state.scroll = ex.tree_state.scroll.min(total.saturating_sub(body));
         }
     }
 
@@ -1310,7 +1310,7 @@ impl Mode for TreeMode {
                 code: KeyCode::Char(c),
                 modifiers,
                 ..
-            } if !ex.search_mode
+            } if !ex.tree_state.search_mode
                 && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                 && tree_command_for_key(c).is_some() =>
             {
@@ -1326,7 +1326,7 @@ impl Mode for TreeMode {
             } => {}
             KeyEvent {
                 code: KeyCode::Esc, ..
-            } if ex.search_mode => ex.exit_search_mode(),
+            } if ex.tree_state.search_mode => ex.exit_search_mode(),
             // Shift+↑/↓ jump to the previous/next sibling — before the plain arrows.
             KeyEvent {
                 code: KeyCode::Up,
@@ -1356,30 +1356,35 @@ impl Mode for TreeMode {
                 code: KeyCode::Left,
                 modifiers: KeyModifiers::SHIFT,
                 ..
-            } if ex.search_mode => ex.search_cursor = 0,
+            } if ex.tree_state.search_mode => ex.tree_state.search_cursor = 0,
             KeyEvent {
                 code: KeyCode::Right,
                 modifiers: KeyModifiers::SHIFT,
                 ..
-            } if ex.search_mode => ex.search_cursor = ex.search_query.chars().count(),
+            } if ex.tree_state.search_mode => {
+                ex.tree_state.search_cursor = ex.tree_state.search_query.chars().count()
+            }
             KeyEvent {
                 code: KeyCode::Left,
                 ..
-            } if ex.search_mode => ex.search_cursor = ex.search_cursor.saturating_sub(1),
+            } if ex.tree_state.search_mode => {
+                ex.tree_state.search_cursor = ex.tree_state.search_cursor.saturating_sub(1)
+            }
             KeyEvent {
                 code: KeyCode::Right,
                 ..
-            } if ex.search_mode => {
-                ex.search_cursor = (ex.search_cursor + 1).min(ex.search_query.chars().count());
+            } if ex.tree_state.search_mode => {
+                ex.tree_state.search_cursor = (ex.tree_state.search_cursor + 1)
+                    .min(ex.tree_state.search_query.chars().count());
             }
             KeyEvent {
                 code: KeyCode::Home,
                 ..
-            } if ex.search_mode => ex.selected_idx = 0,
+            } if ex.tree_state.search_mode => ex.tree_state.selected = 0,
             KeyEvent {
                 code: KeyCode::End, ..
-            } if ex.search_mode => {
-                ex.selected_idx = ex.filtered_tree.len().saturating_sub(1);
+            } if ex.tree_state.search_mode => {
+                ex.tree_state.selected = ex.tree_state.filtered.len().saturating_sub(1);
             }
             KeyEvent {
                 code: KeyCode::PageUp,
@@ -1409,7 +1414,7 @@ impl Mode for TreeMode {
             // (leaving search); otherwise Tab toggles to the file browser.
             KeyEvent {
                 code: KeyCode::Tab, ..
-            } if ex.search_mode => ex.reveal_search_result(),
+            } if ex.tree_state.search_mode => ex.reveal_search_result(),
             KeyEvent {
                 code: KeyCode::Tab, ..
             } => {
@@ -1435,7 +1440,7 @@ impl Mode for TreeMode {
             KeyEvent {
                 code: KeyCode::Backspace,
                 ..
-            } if ex.search_mode => ex.search_backspace(),
+            } if ex.tree_state.search_mode => ex.search_backspace(),
             KeyEvent {
                 code: KeyCode::Backspace,
                 ..
@@ -1443,12 +1448,12 @@ impl Mode for TreeMode {
             KeyEvent {
                 code: KeyCode::Char('\\'),
                 ..
-            } if !ex.search_mode => return Ok(Outcome::Leave(Nav::Forward)),
+            } if !ex.tree_state.search_mode => return Ok(Outcome::Leave(Nav::Forward)),
             // Any other char while searching is inserted into the query.
             KeyEvent {
                 code: KeyCode::Char(c),
                 ..
-            } if ex.search_mode => ex.search_insert(c),
+            } if ex.tree_state.search_mode => ex.search_insert(c),
             _ => {}
         }
         Ok(Outcome::Stay)
@@ -1467,29 +1472,32 @@ impl Mode for TreeMode {
         match m.kind {
             // (Scroll-bar clicks / drags are handled by the engine's `route_mouse`.)
             MouseEventKind::Down(MouseButton::Left) => {
-                let body_top = UI::tree_header_rows(ex.search_mode) as u16;
+                let body_top = UI::tree_header_rows(ex.tree_state.search_mode) as u16;
                 // Body ends above the bottom-pinned hint footer + the 2-line status bar.
-                let hint_rows =
-                    UI::tree_hint_rows(sz.width, ex.search_mode, ex.can_repack(), ex.can_rename())
-                        as u16;
+                let hint_rows = UI::tree_hint_rows(
+                    sz.width,
+                    ex.tree_state.search_mode,
+                    ex.can_repack(),
+                    ex.can_rename(),
+                ) as u16;
                 let body_bottom = sz.height.saturating_sub(2 + hint_rows);
                 if row >= body_top && row < body_bottom {
-                    let idx = ex.scroll_offset + (row - body_top) as usize;
+                    let idx = ex.tree_state.scroll + (row - body_top) as usize;
                     if idx < ex.current_tree_len() {
                         // A click exactly on a group's ▸/▾ twisty (column `2*depth`)
                         // toggles it on a single click.
                         let on_arrow = {
-                            let tree = if ex.search_mode {
-                                &ex.filtered_tree
+                            let tree = if ex.tree_state.search_mode {
+                                &ex.tree_state.filtered
                             } else {
-                                &ex.flattened_tree
+                                &ex.tree_state.flattened
                             };
                             matches!(
                                 tree.get(idx),
                                 Some((TreeNode::Group { .. }, depth)) if col == 2 * *depth as u16
                             )
                         };
-                        ex.selected_idx = idx;
+                        ex.tree_state.selected = idx;
                         if on_arrow {
                             self.last_click = None;
                             ex.activate_selection();
@@ -1500,7 +1508,7 @@ impl Mode for TreeMode {
                             );
                             if double {
                                 self.last_click = None;
-                                if ex.search_mode {
+                                if ex.tree_state.search_mode {
                                     ex.reveal_search_result();
                                 } else if let Some(nav) = ex.activate_selection() {
                                     return MouseOutcome::Leave(nav);
@@ -1514,11 +1522,11 @@ impl Mode for TreeMode {
                 MouseOutcome::Redraw
             }
             MouseEventKind::ScrollDown => {
-                ex.scroll_offset = ex.scroll_offset.saturating_add(WHEEL_STEP);
+                ex.tree_state.scroll = ex.tree_state.scroll.saturating_add(WHEEL_STEP);
                 MouseOutcome::Redraw
             }
             MouseEventKind::ScrollUp => {
-                ex.scroll_offset = ex.scroll_offset.saturating_sub(WHEEL_STEP);
+                ex.tree_state.scroll = ex.tree_state.scroll.saturating_sub(WHEEL_STEP);
                 MouseOutcome::Redraw
             }
             _ => MouseOutcome::Ignored,
@@ -1526,7 +1534,7 @@ impl Mode for TreeMode {
     }
 
     fn set_scroll(&mut self, ex: &mut Explorer, offset: usize) {
-        ex.scroll_offset = offset;
+        ex.tree_state.scroll = offset;
     }
 
     fn residual(&self) -> Screen {
@@ -3773,21 +3781,16 @@ pub struct Explorer {
     /// `--tensor X` open reads just that tensor first (fast path), leaving this
     /// `false` until the tree is shown and the full load runs.
     full_loaded: bool,
-    tree: Vec<TreeNode>,
-    selected_idx: usize,
-    scroll_offset: usize,
-    flattened_tree: Vec<(TreeNode, usize)>,
+    /// The tensor-tree browser state (tree, flattened/filtered rows, selection,
+    /// scroll, search) — owned by the kernel; the interactive tree screen drives
+    /// and renders from it.
+    tree_state: crate::kernel::TreeState,
     total_parameters: usize,
     /// The remote shards' on-disk footprint, captured during the `--ssh-read`
     /// load while the session was live (SFTP carries no block count, so it can't
     /// be re-derived later without another connection). `None` for local
     /// checkpoints (statted lazily) and for `s3://` / hosts without GNU `stat`.
     remote_disk: Option<crate::stats::DiskUsage>,
-    search_query: String,
-    /// Caret position within `search_query`, as a character index in `0..=len`.
-    search_cursor: usize,
-    search_mode: bool,
-    filtered_tree: Vec<(TreeNode, usize)>,
     /// Transient "✓ Copied …" confirmation shown after a copy shortcut
     /// (`c`/`f`/`n`) as a bottom-line overlay — leaving the path/name in the
     /// status bar intact — paired with the time it was set so it clears on its
@@ -3957,16 +3960,9 @@ impl Explorer {
             remote_session: RefCell::new(None),
             remote_password: RefCell::new(None),
             full_loaded: false,
-            tree: Vec::new(),
-            selected_idx: 0,
-            scroll_offset: 0,
-            flattened_tree: Vec::new(),
+            tree_state: crate::kernel::TreeState::default(),
             total_parameters: 0,
             remote_disk: None,
-            search_query: String::new(),
-            search_cursor: 0,
-            search_mode: false,
-            filtered_tree: Vec::new(),
             copied_flash: None,
             terminal: None,
             clickable: RefCell::new(Vec::new()),
@@ -4786,7 +4782,7 @@ impl Explorer {
             total_size,
             stored_size,
         };
-        self.tree = vec![root];
+        self.tree_state.tree = vec![root];
         self.flatten_tree();
     }
 
@@ -4814,15 +4810,15 @@ impl Explorer {
     }
 
     fn flatten_tree(&mut self) {
-        self.flattened_tree = TreeBuilder::flatten_tree(&self.tree);
+        self.tree_state.flattened = TreeBuilder::flatten_tree(&self.tree_state.tree);
         self.update_filtered_tree();
     }
 
     /// Expand/collapse the group at flattened index `idx` in place and re-flatten.
-    /// Toggles `self.tree` directly rather than cloning the whole tree first —
+    /// Toggles `self.tree_state.tree` directly rather than cloning the whole tree first —
     /// that full deep-clone made every expand/collapse lag on a big checkpoint.
     fn toggle_group_at(&mut self, idx: usize) {
-        TreeBuilder::toggle_node_by_index(idx, &mut self.tree);
+        TreeBuilder::toggle_node_by_index(idx, &mut self.tree_state.tree);
         self.flatten_tree();
     }
 
@@ -4868,10 +4864,10 @@ impl Explorer {
     /// returning to the tree from a detail/data view, and when the app was
     /// opened with `--tensor`/`--metadata`, so you land back on that row.
     fn reveal_tensor(&mut self, name: &str) {
-        let visible = if self.search_mode {
-            &self.filtered_tree
+        let visible = if self.tree_state.search_mode {
+            &self.tree_state.filtered
         } else {
-            &self.flattened_tree
+            &self.tree_state.flattened
         };
         // Fast path — the row is already on screen (e.g. returning to an expanded
         // tree from a detail view, the common case): just move the cursor. No
@@ -4879,21 +4875,22 @@ impl Explorer {
         // rebuild the (possibly large) flattened tree — that rebuild was the
         // source of the lag going back to a big remote checkpoint's tree.
         if let Some(idx) = visible.iter().position(|(node, _)| node.name() == name) {
-            self.selected_idx = idx;
+            self.tree_state.selected = idx;
             return;
         }
         // Otherwise the target sits under a collapsed group: expand its ancestors,
         // re-flatten, then locate it. (Search results are a flat list, so if it
         // wasn't found above it isn't a current match — leave the cursor put.)
-        if !self.search_mode {
-            TreeBuilder::expand_to_tensor(&mut self.tree, name);
+        if !self.tree_state.search_mode {
+            TreeBuilder::expand_to_tensor(&mut self.tree_state.tree, name);
             self.flatten_tree();
             if let Some(idx) = self
-                .flattened_tree
+                .tree_state
+                .flattened
                 .iter()
                 .position(|(n, _)| n.name() == name)
             {
-                self.selected_idx = idx;
+                self.tree_state.selected = idx;
             }
         }
     }
@@ -4901,10 +4898,10 @@ impl Explorer {
     /// Expand or collapse every group, then reset the cursor to the top since
     /// the visible rows change wholesale.
     fn set_all_expanded(&mut self, expanded: bool) {
-        TreeBuilder::set_all_expanded(&mut self.tree, expanded);
+        TreeBuilder::set_all_expanded(&mut self.tree_state.tree, expanded);
         self.flatten_tree();
-        self.selected_idx = 0;
-        self.scroll_offset = 0;
+        self.tree_state.selected = 0;
+        self.tree_state.scroll = 0;
     }
 
     fn update_filtered_tree(&mut self) {
@@ -4913,18 +4910,20 @@ impl Explorer {
         // keeping it in sync — the dominant cost of returning to a big expanded
         // tree from a detail view. `enter_search_mode` sets `search_mode` before
         // calling this, so the results list is still built the moment you search.
-        if !self.search_mode {
+        if !self.tree_state.search_mode {
             return;
         }
-        if self.search_query.is_empty() {
-            self.filtered_tree = self.flattened_tree.clone();
+        if self.tree_state.search_query.is_empty() {
+            self.tree_state.filtered = self.tree_state.flattened.clone();
         } else {
             let matcher = SkimMatcherV2::default();
             let mut scored_results: Vec<(TreeNode, i64)> = Vec::new();
 
             // Search through ALL tensors, not just the flattened tree
             for tensor in &self.tensors {
-                if let Some(score) = matcher.fuzzy_match(&tensor.name, &self.search_query) {
+                if let Some(score) =
+                    matcher.fuzzy_match(&tensor.name, &self.tree_state.search_query)
+                {
                     scored_results.push((
                         TreeNode::Tensor {
                             info: tensor.clone(),
@@ -4937,7 +4936,9 @@ impl Explorer {
 
             // Also search through metadata if present
             for metadata in &self.metadata {
-                if let Some(score) = matcher.fuzzy_match(&metadata.name, &self.search_query) {
+                if let Some(score) =
+                    matcher.fuzzy_match(&metadata.name, &self.tree_state.search_query)
+                {
                     scored_results.push((
                         TreeNode::Metadata {
                             info: metadata.clone(),
@@ -4951,7 +4952,7 @@ impl Explorer {
             scored_results.sort_by_key(|b| std::cmp::Reverse(b.1));
 
             // Create a flat list with depth 0 for all results
-            self.filtered_tree = scored_results
+            self.tree_state.filtered = scored_results
                 .into_iter()
                 .map(|(node, _)| (node, 0))
                 .collect();
@@ -5691,10 +5692,10 @@ impl Explorer {
         } else {
             "Multiple files".to_string()
         };
-        let tree_to_display = if self.search_mode {
-            &self.filtered_tree
+        let tree_to_display = if self.tree_state.search_mode {
+            &self.tree_state.filtered
         } else {
-            &self.flattened_tree
+            &self.tree_state.flattened
         };
         let (status_icon, status_bar, status_secondary) = self.status_bar();
         let badges = self.screen_badges(HelpCtx::Tree);
@@ -5703,11 +5704,11 @@ impl Explorer {
             current_file: &title,
             file_idx: 0,
             total_files: 1,
-            selected_idx: self.selected_idx,
-            scroll_offset: self.scroll_offset,
-            search_mode: self.search_mode,
-            search_query: &self.search_query,
-            search_cursor: self.search_cursor,
+            selected_idx: self.tree_state.selected,
+            scroll_offset: self.tree_state.scroll,
+            search_mode: self.tree_state.search_mode,
+            search_query: &self.tree_state.search_query,
+            search_cursor: self.tree_state.search_cursor,
             status_icon,
             status_bar: &status_bar,
             status_secondary: &status_secondary,
@@ -5729,11 +5730,11 @@ impl Explorer {
                 UI::tree_scrollbar(
                     area.width,
                     area.height,
-                    self.search_mode,
+                    self.tree_state.search_mode,
                     self.repack_input().is_some(),
                     self.can_rename(),
                     tree_to_display.len(),
-                    self.scroll_offset,
+                    self.tree_state.scroll,
                 )
             })
             .flatten();
@@ -5822,7 +5823,7 @@ impl Explorer {
         }
         // Render a fully-expanded copy so every group's arrow (▾) matches the
         // listing below it, regardless of the live collapse state.
-        let mut tree = self.tree.clone();
+        let mut tree = self.tree_state.tree.clone();
         TreeBuilder::set_all_expanded(&mut tree, true);
         let mut out = Vec::new();
         for node in &tree {
@@ -6078,7 +6079,7 @@ impl Explorer {
         }
         let mut out = Vec::new();
         let mut total = 0;
-        for node in &self.tree {
+        for node in &self.tree_state.tree {
             walk(
                 node,
                 0,
@@ -6386,10 +6387,10 @@ impl Explorer {
     /// Number of rows in the tree currently shown (the search results when
     /// searching, else the full flattened tree).
     fn current_tree_len(&self) -> usize {
-        if self.search_mode {
-            self.filtered_tree.len()
+        if self.tree_state.search_mode {
+            self.tree_state.filtered.len()
         } else {
-            self.flattened_tree.len()
+            self.tree_state.flattened.len()
         }
     }
 
@@ -6397,17 +6398,17 @@ impl Explorer {
         let body = UI::tree_visible_rows(
             width,
             height,
-            self.search_mode,
+            self.tree_state.search_mode,
             self.can_repack(),
             self.can_rename(),
         );
-        let sel = self.selected_idx;
-        self.scroll_offset = if sel >= self.scroll_offset + body {
+        let sel = self.tree_state.selected;
+        self.tree_state.scroll = if sel >= self.tree_state.scroll + body {
             sel.saturating_sub(body - 1)
-        } else if sel < self.scroll_offset {
+        } else if sel < self.tree_state.scroll {
             sel
         } else {
-            self.scroll_offset
+            self.tree_state.scroll
         };
     }
 
@@ -7875,19 +7876,23 @@ impl Explorer {
     /// `f`/`t` copy. The key (selection index, tree length, search mode) changes
     /// whenever the selection or tree structure (expand/collapse/search) does.
     fn selected_source_files(&self) -> BTreeSet<String> {
-        let tree = if self.search_mode {
-            &self.filtered_tree
+        let tree = if self.tree_state.search_mode {
+            &self.tree_state.filtered
         } else {
-            &self.flattened_tree
+            &self.tree_state.flattened
         };
-        let key = (self.selected_idx, tree.len(), self.search_mode);
+        let key = (
+            self.tree_state.selected,
+            tree.len(),
+            self.tree_state.search_mode,
+        );
         if let Some(c) = self.cached_group_files.borrow().as_ref()
             && (c.0, c.1, c.2) == key
         {
             return c.3.clone();
         }
         let mut files = BTreeSet::new();
-        match tree.get(self.selected_idx) {
+        match tree.get(self.tree_state.selected) {
             Some((node @ TreeNode::Group { .. }, _)) => collect_source_paths(node, &mut files),
             Some((TreeNode::Tensor { info, .. }, _)) => {
                 files.insert(info.source_path.clone());
@@ -7929,12 +7934,12 @@ impl Explorer {
     /// share (or a "stored across N files" span when they don't); **metadata** →
     /// no path.
     fn describe_selection(&self) -> SelectionView {
-        let tree = if self.search_mode {
-            &self.filtered_tree
+        let tree = if self.tree_state.search_mode {
+            &self.tree_state.filtered
         } else {
-            &self.flattened_tree
+            &self.tree_state.flattened
         };
-        let Some((node, depth)) = tree.get(self.selected_idx) else {
+        let Some((node, depth)) = tree.get(self.tree_state.selected) else {
             return SelectionView::empty();
         };
         match node {
@@ -8027,7 +8032,7 @@ impl Explorer {
     /// tensor's complete name (e.g. `model.layers.0.self_attn.k_norm.weight`,
     /// which the tree may show abbreviated), or a group's path.
     fn copy_selected_name(&mut self) {
-        let Some((node, _)) = self.flattened_tree.get(self.selected_idx) else {
+        let Some((node, _)) = self.tree_state.flattened.get(self.tree_state.selected) else {
             return;
         };
         // Name the thing copied so the confirmation is unambiguous — `n` yields a
@@ -8074,10 +8079,10 @@ impl Explorer {
     }
 
     fn move_selection(&mut self, delta: i32) {
-        let tree = if self.search_mode {
-            &self.filtered_tree
+        let tree = if self.tree_state.search_mode {
+            &self.tree_state.filtered
         } else {
-            &self.flattened_tree
+            &self.tree_state.flattened
         };
 
         if tree.is_empty() {
@@ -8085,49 +8090,52 @@ impl Explorer {
         }
 
         let new_idx = if delta < 0 {
-            self.selected_idx.saturating_sub((-delta) as usize)
+            self.tree_state.selected.saturating_sub((-delta) as usize)
         } else {
-            (self.selected_idx + delta as usize).min(tree.len() - 1)
+            (self.tree_state.selected + delta as usize).min(tree.len() - 1)
         };
 
-        self.selected_idx = new_idx;
+        self.tree_state.selected = new_idx;
     }
 
     /// Move the cursor to the parent group of the selected row (the nearest
     /// preceding row at a shallower depth). No-op at the top level.
     fn move_to_parent(&mut self) {
-        let tree = if self.search_mode {
-            &self.filtered_tree
+        let tree = if self.tree_state.search_mode {
+            &self.tree_state.filtered
         } else {
-            &self.flattened_tree
+            &self.tree_state.flattened
         };
-        let Some(&(_, depth)) = tree.get(self.selected_idx) else {
+        let Some(&(_, depth)) = tree.get(self.tree_state.selected) else {
             return;
         };
         if depth == 0 {
             return;
         }
-        if let Some(parent) = (0..self.selected_idx).rev().find(|&i| tree[i].1 < depth) {
-            self.selected_idx = parent;
+        if let Some(parent) = (0..self.tree_state.selected)
+            .rev()
+            .find(|&i| tree[i].1 < depth)
+        {
+            self.tree_state.selected = parent;
         }
     }
 
     /// Move the cursor to the next/previous sibling: the nearest row at the
     /// same depth before a shallower row (i.e. without leaving the parent).
     fn move_to_sibling(&mut self, forward: bool) {
-        let tree = if self.search_mode {
-            &self.filtered_tree
+        let tree = if self.tree_state.search_mode {
+            &self.tree_state.filtered
         } else {
-            &self.flattened_tree
+            &self.tree_state.flattened
         };
-        let Some(&(_, depth)) = tree.get(self.selected_idx) else {
+        let Some(&(_, depth)) = tree.get(self.tree_state.selected) else {
             return;
         };
 
         let indices: Vec<usize> = if forward {
-            (self.selected_idx + 1..tree.len()).collect()
+            (self.tree_state.selected + 1..tree.len()).collect()
         } else {
-            (0..self.selected_idx).rev().collect()
+            (0..self.tree_state.selected).rev().collect()
         };
         for i in indices {
             let d = tree[i].1;
@@ -8135,7 +8143,7 @@ impl Explorer {
                 break; // left the parent: no sibling in this direction
             }
             if d == depth {
-                self.selected_idx = i;
+                self.tree_state.selected = i;
                 break;
             }
             // d > depth: a descendant, keep scanning
@@ -8146,99 +8154,102 @@ impl Explorer {
     /// to its first child. No-op for leaf rows or empty groups (and in search
     /// mode, where the list is flat).
     fn move_to_first_child(&mut self) {
-        if self.search_mode {
+        if self.tree_state.search_mode {
             return;
         }
-        let (expanded, has_children, depth) = match self.flattened_tree.get(self.selected_idx) {
-            Some((
-                TreeNode::Group {
-                    expanded, children, ..
-                },
-                depth,
-            )) => (*expanded, !children.is_empty(), *depth),
-            _ => return,
-        };
+        let (expanded, has_children, depth) =
+            match self.tree_state.flattened.get(self.tree_state.selected) {
+                Some((
+                    TreeNode::Group {
+                        expanded, children, ..
+                    },
+                    depth,
+                )) => (*expanded, !children.is_empty(), *depth),
+                _ => return,
+            };
         if !has_children {
             return;
         }
         if !expanded {
-            self.toggle_group_at(self.selected_idx);
+            self.toggle_group_at(self.tree_state.selected);
         }
         // The first child is the next row, one level deeper.
-        if let Some((_, child_depth)) = self.flattened_tree.get(self.selected_idx + 1)
+        if let Some((_, child_depth)) = self.tree_state.flattened.get(self.tree_state.selected + 1)
             && *child_depth == depth + 1
         {
-            self.selected_idx += 1;
+            self.tree_state.selected += 1;
         }
     }
 
     fn enter_search_mode(&mut self) {
-        self.search_mode = true;
-        self.search_query.clear();
-        self.search_cursor = 0;
+        self.tree_state.search_mode = true;
+        self.tree_state.search_query.clear();
+        self.tree_state.search_cursor = 0;
         self.update_filtered_tree();
-        self.selected_idx = 0;
-        self.scroll_offset = 0;
+        self.tree_state.selected = 0;
+        self.tree_state.scroll = 0;
     }
 
     /// Open the tree in search mode with a preset query (`--search`), cursor at
     /// the end — as if the query had just been typed into the search bar.
     fn open_search(&mut self, query: &str) {
-        self.search_mode = true;
-        self.search_query = query.to_string();
-        self.search_cursor = self.search_query.chars().count();
+        self.tree_state.search_mode = true;
+        self.tree_state.search_query = query.to_string();
+        self.tree_state.search_cursor = self.tree_state.search_query.chars().count();
         self.update_filtered_tree();
-        self.selected_idx = 0;
-        self.scroll_offset = 0;
+        self.tree_state.selected = 0;
+        self.tree_state.scroll = 0;
     }
 
     fn exit_search_mode(&mut self) {
-        self.search_mode = false;
-        self.search_query.clear();
-        self.search_cursor = 0;
+        self.tree_state.search_mode = false;
+        self.tree_state.search_query.clear();
+        self.tree_state.search_cursor = 0;
         self.update_filtered_tree();
-        self.selected_idx = 0;
-        self.scroll_offset = 0;
+        self.tree_state.selected = 0;
+        self.tree_state.scroll = 0;
     }
 
     /// Insert a character into the query at the caret and advance past it.
     fn search_insert(&mut self, c: char) {
         let byte = self
+            .tree_state
             .search_query
             .char_indices()
-            .nth(self.search_cursor)
+            .nth(self.tree_state.search_cursor)
             .map(|(b, _)| b)
-            .unwrap_or(self.search_query.len());
-        self.search_query.insert(byte, c);
-        self.search_cursor += 1;
+            .unwrap_or(self.tree_state.search_query.len());
+        self.tree_state.search_query.insert(byte, c);
+        self.tree_state.search_cursor += 1;
         self.update_filtered_tree();
-        self.selected_idx = 0;
-        self.scroll_offset = 0;
+        self.tree_state.selected = 0;
+        self.tree_state.scroll = 0;
     }
 
     /// Delete the character before the caret (Backspace) and step the caret back.
     fn search_backspace(&mut self) {
-        if self.search_cursor == 0 {
+        if self.tree_state.search_cursor == 0 {
             return;
         }
         let byte = self
+            .tree_state
             .search_query
             .char_indices()
-            .nth(self.search_cursor - 1)
+            .nth(self.tree_state.search_cursor - 1)
             .map(|(b, _)| b)
             .unwrap_or(0);
-        self.search_query.remove(byte);
-        self.search_cursor -= 1;
+        self.tree_state.search_query.remove(byte);
+        self.tree_state.search_cursor -= 1;
         self.update_filtered_tree();
-        self.selected_idx = 0;
-        self.scroll_offset = 0;
+        self.tree_state.selected = 0;
+        self.tree_state.scroll = 0;
     }
 
     /// Jump from the highlighted search result to that tensor's place in the
     /// tree: leave search mode, then expand to and select it so it's shown in
     /// context (a no-op if the highlighted result isn't a tensor).
     fn reveal_search_result(&mut self) {
-        let name = match self.filtered_tree.get(self.selected_idx) {
+        let name = match self.tree_state.filtered.get(self.tree_state.selected) {
             Some((TreeNode::Tensor { info, .. }, _)) => info.name.clone(),
             _ => return,
         };
@@ -8268,13 +8279,13 @@ impl Explorer {
     /// (cloned out so the caller, which owns the live terminal, can draw it through
     /// Ratatui) — `None` for groups/tensors.
     fn handle_selection(&mut self) -> (Option<Screen>, Option<MetadataInfo>) {
-        let tree = if self.search_mode {
-            &self.filtered_tree
+        let tree = if self.tree_state.search_mode {
+            &self.tree_state.filtered
         } else {
-            &self.flattened_tree
+            &self.tree_state.flattened
         };
 
-        let Some((selected_node, _)) = tree.get(self.selected_idx) else {
+        let Some((selected_node, _)) = tree.get(self.tree_state.selected) else {
             return (None, None);
         };
         // Tensor / metadata return owned data (the `tree` borrow ends here). A
@@ -8296,8 +8307,8 @@ impl Explorer {
             // In search mode groups shouldn't appear, but if one does, do nothing.
             TreeNode::Group { .. } => {}
         }
-        if !self.search_mode {
-            self.toggle_group_at(self.selected_idx);
+        if !self.tree_state.search_mode {
+            self.toggle_group_at(self.tree_state.selected);
         }
         (None, None)
     }
@@ -10075,9 +10086,9 @@ impl Explorer {
     /// `collapsed`), or nothing for the default / a mixed (per-group) state. The
     /// shared tail for the tree's reopen commands so `E` / `C` round-trip.
     fn tree_state_args(&self) -> Vec<String> {
-        let state = if TreeBuilder::all_groups(&self.tree, true) {
+        let state = if TreeBuilder::all_groups(&self.tree_state.tree, true) {
             Some(TreeState::Expanded)
-        } else if TreeBuilder::all_groups(&self.tree, false) {
+        } else if TreeBuilder::all_groups(&self.tree_state.tree, false) {
             Some(TreeState::Collapsed)
         } else {
             None
@@ -10094,7 +10105,7 @@ impl Explorer {
     /// dtype/shape override — rather than opening its detail; for a group/root
     /// row, the plain file list.
     fn command_for_tree_selection(&self) -> String {
-        match self.flattened_tree.get(self.selected_idx) {
+        match self.tree_state.flattened.get(self.tree_state.selected) {
             Some((TreeNode::Tensor { info, .. }, _)) => {
                 let mut parts = self.command_base(info);
                 parts.push("--tree".to_string());
@@ -11150,7 +11161,7 @@ mod tests {
         );
         e.tensors = vec![ti("lm_head.weight", "model-00016-of-00016.safetensors")];
         e.build_tree();
-        e.selected_idx = 0; // the root row
+        e.tree_state.selected = 0; // the root row
         let view = e.describe_selection();
         assert_eq!(view.copy_path.as_deref(), Some("/ckpt"));
         assert_eq!(view.status.1, "/ckpt"); // status bar shows the dir, not the shard
@@ -11180,7 +11191,7 @@ mod tests {
             ti("lm_head.weight", "model-00002-of-00002.safetensors"),
         ];
         e.build_tree();
-        e.selected_idx = 0;
+        e.tree_state.selected = 0;
         let view = e.describe_selection();
         assert_eq!(view.copy_path.as_deref(), Some("/ckpt"));
         assert_eq!(view.status.1, "2 files in /ckpt");
@@ -11644,7 +11655,10 @@ mod tests {
             e.open_link(&crate::ui::Link::Tree("blk.1.b".into())),
             Some(Nav::Open(Screen::Tree))
         ));
-        assert_eq!(e.flattened_tree[e.selected_idx].0.name(), "blk.1.b");
+        assert_eq!(
+            e.tree_state.flattened[e.tree_state.selected].0.name(),
+            "blk.1.b"
+        );
 
         // A `Tree` link to an absent tensor is a no-op (a stray click).
         assert!(e.open_link(&crate::ui::Link::Tree("nope".into())).is_none());
@@ -11956,7 +11970,7 @@ mod tests {
     /// node contents don't matter for coarse navigation, only the depths).
     fn explorer_with_depths(depths: &[usize]) -> Explorer {
         let mut e = Explorer::new(Vec::new(), Vec::new(), None, false);
-        e.flattened_tree = depths
+        e.tree_state.flattened = depths
             .iter()
             .map(|&d| {
                 (
@@ -11981,18 +11995,18 @@ mod tests {
     fn move_to_parent_jumps_to_the_nearest_shallower_row() {
         let mut e = explorer_with_depths(&[0, 1, 1, 2, 1, 0]);
 
-        e.selected_idx = 3;
+        e.tree_state.selected = 3;
         e.move_to_parent();
-        assert_eq!(e.selected_idx, 2);
+        assert_eq!(e.tree_state.selected, 2);
 
-        e.selected_idx = 1;
+        e.tree_state.selected = 1;
         e.move_to_parent();
-        assert_eq!(e.selected_idx, 0);
+        assert_eq!(e.tree_state.selected, 0);
 
         // Top-level row has no parent.
-        e.selected_idx = 0;
+        e.tree_state.selected = 0;
         e.move_to_parent();
-        assert_eq!(e.selected_idx, 0);
+        assert_eq!(e.tree_state.selected, 0);
     }
 
     // reveal_tensor lands the cursor on a leaf whether or not its group is already
@@ -12020,11 +12034,11 @@ mod tests {
         // Fully expanded: the leaf is already visible, so revealing it just moves
         // the cursor onto that exact row without changing the flattened tree.
         e.set_all_expanded(true);
-        let before = e.flattened_tree.clone();
+        let before = e.tree_state.flattened.clone();
         e.reveal_tensor("blk.1.b");
-        assert_eq!(e.flattened_tree.len(), before.len());
+        assert_eq!(e.tree_state.flattened.len(), before.len());
         assert_eq!(
-            e.flattened_tree[e.selected_idx].0.name(),
+            e.tree_state.flattened[e.tree_state.selected].0.name(),
             "blk.1.b",
             "cursor should land on the revealed leaf"
         );
@@ -12032,14 +12046,17 @@ mod tests {
         // Collapsed: the leaf isn't visible, so reveal must expand its ancestors,
         // grow the flattened tree, and still land on it.
         e.set_all_expanded(false);
-        let collapsed_rows = e.flattened_tree.len();
-        e.selected_idx = 0;
+        let collapsed_rows = e.tree_state.flattened.len();
+        e.tree_state.selected = 0;
         e.reveal_tensor("blk.1.b");
         assert!(
-            e.flattened_tree.len() > collapsed_rows,
+            e.tree_state.flattened.len() > collapsed_rows,
             "reveal expands to it"
         );
-        assert_eq!(e.flattened_tree[e.selected_idx].0.name(), "blk.1.b");
+        assert_eq!(
+            e.tree_state.flattened[e.tree_state.selected].0.name(),
+            "blk.1.b"
+        );
     }
 
     fn export_fixture() -> Explorer {
@@ -12213,22 +12230,22 @@ mod tests {
         // Not searching, so move_selection (what PageUp/PageDown call) walks the
         // full flattened tree rather than the filtered results.
         let mut e = explorer_with_depths(&vec![0; 100]);
-        assert!(!e.search_mode);
+        assert!(!e.tree_state.search_mode);
 
         // A page-sized jump down advances by the delta.
-        e.selected_idx = 0;
+        e.tree_state.selected = 0;
         e.move_selection(20);
-        assert_eq!(e.selected_idx, 20);
+        assert_eq!(e.tree_state.selected, 20);
 
         // Past the end it clamps to the last row rather than overshooting.
         e.move_selection(1000);
-        assert_eq!(e.selected_idx, 99);
+        assert_eq!(e.tree_state.selected, 99);
 
         // A page-sized jump up steps back, and never underflows past the top.
         e.move_selection(-20);
-        assert_eq!(e.selected_idx, 79);
+        assert_eq!(e.tree_state.selected, 79);
         e.move_selection(-1000);
-        assert_eq!(e.selected_idx, 0);
+        assert_eq!(e.tree_state.selected, 0);
     }
 
     #[test]
@@ -12236,19 +12253,19 @@ mod tests {
         let mut e = explorer_with_depths(&[0, 1, 1, 2, 1, 0]);
 
         // Forward from idx2 (depth 1) skips the descendant idx3 (depth 2).
-        e.selected_idx = 2;
+        e.tree_state.selected = 2;
         e.move_to_sibling(true);
-        assert_eq!(e.selected_idx, 4);
+        assert_eq!(e.tree_state.selected, 4);
 
         // Forward from idx4: the next row (idx5) is shallower, so no sibling.
-        e.selected_idx = 4;
+        e.tree_state.selected = 4;
         e.move_to_sibling(true);
-        assert_eq!(e.selected_idx, 4);
+        assert_eq!(e.tree_state.selected, 4);
 
         // Backward from idx4 lands on idx2, skipping idx3.
-        e.selected_idx = 4;
+        e.tree_state.selected = 4;
         e.move_to_sibling(false);
-        assert_eq!(e.selected_idx, 2);
+        assert_eq!(e.tree_state.selected, 2);
     }
 
     fn group(depth: usize, expanded: bool, child: bool) -> (TreeNode, usize) {
@@ -12284,19 +12301,19 @@ mod tests {
         let mut e = Explorer::new(Vec::new(), Vec::new(), None, false);
         // idx0: expanded group with a child; idx1: that child (depth 1);
         // idx2: a childless group at depth 0.
-        e.flattened_tree = vec![
+        e.tree_state.flattened = vec![
             group(0, true, true),
             group(1, false, false),
             group(0, false, false),
         ];
 
-        e.selected_idx = 0;
+        e.tree_state.selected = 0;
         e.move_to_first_child();
-        assert_eq!(e.selected_idx, 1);
+        assert_eq!(e.tree_state.selected, 1);
 
         // A group with no children does not move.
-        e.selected_idx = 2;
+        e.tree_state.selected = 2;
         e.move_to_first_child();
-        assert_eq!(e.selected_idx, 2);
+        assert_eq!(e.tree_state.selected, 2);
     }
 }
