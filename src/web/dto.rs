@@ -102,8 +102,10 @@ impl From<&Stats> for StatsDto {
     }
 }
 
-/// A sampled value grid (`sample::Sample`) — the heatmap / slice payload. The raw
-/// stored bits are dropped (heavy; the client renders from `values`).
+/// A sampled value grid (`sample::Sample`) — the heatmap / slice payload. Raw
+/// stored bits are included only when asked for (the hex/oct/bin value view): each
+/// cell as a zero-padded hex string of `raw_width` bits, so the client can reformat
+/// to any base via BigInt without u64 precision loss.
 #[derive(Serialize)]
 pub struct SampleDto {
     pub rows: Vec<usize>,
@@ -119,10 +121,28 @@ pub struct SampleDto {
     pub view: String,
     pub mode: String,
     pub overridable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_width: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<Vec<Vec<String>>>,
 }
 
-impl From<&Sample> for SampleDto {
-    fn from(s: &Sample) -> Self {
+impl SampleDto {
+    pub fn from_sample(s: &Sample, include_raw: bool) -> Self {
+        let raw_width = s.raw.iter().flatten().next().map(|b| b.width);
+        let raw = include_raw.then(|| {
+            s.raw
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|b| {
+                            let hex_digits = (b.width as usize).div_ceil(4).max(1);
+                            format!("{:0hex_digits$x}", b.bits)
+                        })
+                        .collect()
+                })
+                .collect()
+        });
         SampleDto {
             rows: s.rows.clone(),
             cols: s.cols.clone(),
@@ -137,6 +157,8 @@ impl From<&Sample> for SampleDto {
             view: view_label(s.view),
             mode: mode_label(&s.mode),
             overridable: s.overridable,
+            raw_width,
+            raw,
         }
     }
 }

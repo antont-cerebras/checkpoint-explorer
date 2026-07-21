@@ -152,8 +152,9 @@ pub fn tensor_sample(s: &WebState, q: &Query) -> Reply {
         _ => SampleMode::Grid,
     };
     let schema = s.schemas.get(name_of(q));
+    let include_raw = matches!(q.get("raw").map(String::as_str), Some("1") | Some("true"));
     match sample::sample_tensor(t, rows, cols, slice, view, mode, schema) {
-        Ok(sample) => ok(SampleDto::from(&sample)),
+        Ok(sample) => ok(SampleDto::from_sample(&sample, include_raw)),
         Err(e) => err(500, e),
     }
 }

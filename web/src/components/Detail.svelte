@@ -1,6 +1,6 @@
 <script lang="ts">
   import { tree } from '../stores/server';
-  import { setTab, type DataTab } from '../stores/view';
+  import { setTab, navigate, type DataTab } from '../stores/view';
   import type { TensorInfo, TreeNode } from '../lib/types';
   import { humanCount, humanSize, shape } from '../lib/format';
   import Heatmap from './Heatmap.svelte';
@@ -22,6 +22,10 @@
       }
     }
     return null;
+  }
+
+  function baseName(p: string): string {
+    return p.split('/').pop() || p;
   }
 
   function offsets(layout: unknown): string | null {
@@ -60,7 +64,16 @@
           {#if offsets(info.layout)}
             <tr><th>Data offsets</th><td class="mono">{offsets(info.layout)}</td></tr>
           {/if}
-          <tr><th>File</th><td class="dim src">{info.source_path}</td></tr>
+          <tr>
+            <th>File</th>
+            <td>
+              <button
+                class="link src"
+                title="Show this shard's byte-layout map"
+                on:click={() => navigate({ kind: 'layout', file: baseName(info.source_path) })}
+              >{info.source_path}</button>
+            </td>
+          </tr>
         </tbody>
       </table>
     {:else if tab === 'heatmap'}
@@ -117,5 +130,16 @@
   }
   .src {
     word-break: break-all;
+  }
+  .link {
+    background: none;
+    border: none;
+    padding: 0;
+    text-align: left;
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-style: dotted;
+    cursor: pointer;
+    font: inherit;
   }
 </style>

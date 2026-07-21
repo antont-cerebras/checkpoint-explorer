@@ -31,8 +31,28 @@
   import StatusBar from './components/StatusBar.svelte';
   import Footer from './components/Footer.svelte';
   import { theme } from './stores/theme';
+  import type { Screen } from './stores/view';
 
   onMount(ensureTree);
+
+  function crumb(s: Screen): string {
+    switch (s.kind) {
+      case 'tree':
+        return '';
+      case 'detail':
+        return `› ${s.tensor}`;
+      case 'files':
+        return '› Files';
+      case 'layout':
+        return `› Layout${s.file ? `: ${s.file}` : ''}`;
+      case 'stats':
+        return '› Statistics';
+      case 'health':
+        return '› Health';
+      case 'preview':
+        return `› ${s.name}`;
+    }
+  }
 
   const PAGE = 20;
 
@@ -195,7 +215,14 @@
 
 <div class="app">
   <header>
-    <span class="title">Checkpoint&nbsp;Explorer</span>
+    <button class="nav" on:click={back} title="Back (Backspace)" aria-label="Back">‹</button>
+    <button class="nav" on:click={forward} title="Forward (\\)" aria-label="Forward">›</button>
+    <button class="home" on:click={() => navigate({ kind: 'tree' })} title="Tensor tree">
+      Checkpoint&nbsp;Explorer
+    </button>
+    {#if $screen.kind !== 'tree'}
+      <span class="crumb dim">{crumb($screen)}</span>
+    {/if}
     <span class="root" title={$tree?.root ?? ''}>{$tree?.root ?? '…'}</span>
     {#if $searching}
       <span class="search">
@@ -256,10 +283,27 @@
     background: var(--bg-panel);
     flex: 0 0 auto;
   }
-  .title {
+  .nav {
+    flex: 0 0 auto;
+    padding: 0 7px;
+    font-size: 16px;
+    line-height: 1;
+    color: var(--fg-dim);
+  }
+  .home {
     font-weight: 600;
     color: var(--accent);
     flex: 0 0 auto;
+    background: none;
+    border: none;
+    padding: 2px 4px;
+    cursor: pointer;
+  }
+  .crumb {
+    flex: 0 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .root {
     flex: 0 1 auto;
@@ -267,6 +311,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--fg-dim);
+    font-size: 12px;
   }
   .search {
     flex: 1 1 auto;

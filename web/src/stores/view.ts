@@ -19,7 +19,60 @@ export type Screen =
   | { kind: 'health' }
   | { kind: 'preview'; path: string; name: string };
 
-export const screen = writable<Screen>({ kind: 'tree' });
+// The current screen is driven by the URL hash, so the browser's back/forward
+// buttons work natively and every screen+mode has a shareable link.
+export const screen = writable<Screen>(parseHash());
+
+function screenToHash(s: Screen): string {
+  const enc = encodeURIComponent;
+  switch (s.kind) {
+    case 'tree':
+      return 'tree';
+    case 'detail':
+      return `detail?t=${enc(s.tensor)}&tab=${s.tab}`;
+    case 'files':
+      return 'files';
+    case 'layout':
+      return s.file ? `layout?file=${enc(s.file)}` : 'layout';
+    case 'stats':
+      return 'stats';
+    case 'health':
+      return 'health';
+    case 'preview':
+      return `preview?path=${enc(s.path)}&name=${enc(s.name)}`;
+  }
+}
+
+function parseHash(): Screen {
+  const raw = location.hash.replace(/^#/, '');
+  const [kind, queryStr] = raw.split('?');
+  const q = new URLSearchParams(queryStr ?? '');
+  switch (kind) {
+    case 'detail': {
+      const t = q.get('t');
+      const tab = (q.get('tab') ?? 'info') as DataTab;
+      if (t) return { kind: 'detail', tensor: t, tab };
+      break;
+    }
+    case 'files':
+      return { kind: 'files' };
+    case 'layout':
+      return { kind: 'layout', file: q.get('file') ?? undefined };
+    case 'stats':
+      return { kind: 'stats' };
+    case 'health':
+      return { kind: 'health' };
+    case 'preview': {
+      const path = q.get('path');
+      if (path) return { kind: 'preview', path, name: q.get('name') ?? path };
+      break;
+    }
+  }
+  return { kind: 'tree' };
+}
+
+// Keep the store in sync with the URL (covers the browser back/forward buttons).
+window.addEventListener('hashchange', () => screen.set(parseHash()));
 
 // Persistent tree state (survives screen changes, like the TUI).
 export const expanded = writable<Set<string>>(new Set());
@@ -37,28 +90,18 @@ export const visibleRows = derived(
   },
 );
 
-// ---- screen history (browser-style back/forward) ----
-
-let stack: Screen[] = [{ kind: 'tree' }];
-let cursor = 0;
+// ---- navigation (URL hash = source of truth; browser back/forward just work) ----
 
 export function navigate(s: Screen): void {
-  stack = stack.slice(0, cursor + 1);
-  stack.push(s);
-  cursor = stack.length - 1;
-  screen.set(s);
+  const h = `#${screenToHash(s)}`;
+  if (location.hash !== h) location.hash = h; // pushes a history entry
+  screen.set(s); // optimistic (hashchange will confirm)
 }
 export function back(): void {
-  if (cursor > 0) {
-    cursor -= 1;
-    screen.set(stack[cursor]);
-  }
+  history.back();
 }
 export function forward(): void {
-  if (cursor < stack.length - 1) {
-    cursor += 1;
-    screen.set(stack[cursor]);
-  }
+  history.forward();
 }
 
 export function openDetail(tensor: string): void {
@@ -72,7 +115,8 @@ export function openFile(path: string, name: string, fileKind: string): void {
   else navigate({ kind: 'preview', path, name });
 }
 export function setTab(tab: DataTab): void {
-  screen.update((s) => (s.kind === 'detail' ? { ...s, tab } : s));
+  const s = get(screen);
+  if (s.kind === 'detail') navigate({ ...s, tab });
 }
 
 // ---- tree cursor movement (mirrors kernel::TreeState nav) ----

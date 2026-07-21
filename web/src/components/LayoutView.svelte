@@ -1,8 +1,8 @@
 <script lang="ts">
   import { tree } from '../stores/server';
-  import { screen } from '../stores/view';
+  import { screen, openDetail } from '../stores/view';
   import { api } from '../lib/api';
-  import type { LayoutMap, TreeNode } from '../lib/types';
+  import type { LayoutMap, Segment, TreeNode } from '../lib/types';
   import { humanSize } from '../lib/format';
   import Spinner from './Spinner.svelte';
 
@@ -12,10 +12,10 @@
   let err = '';
   let loading = false;
   let canvas: HTMLCanvasElement;
+  let barH = 640;
   let hover = '';
 
   $: shards = collect($tree?.tree ?? []);
-  // Preselect the shard the file browser opened, else the first one.
   $: wanted = $screen.kind === 'layout' ? $screen.file : undefined;
   $: if (shards.length && !shards.includes(selected)) selected = shards[0];
   $: if (wanted && shards.includes(wanted)) selected = wanted;
@@ -49,33 +49,40 @@
     loading = false;
   }
 
-  const W = 960;
-  const H = 48;
-  $: if (map && canvas) draw(map);
-  function draw(m: LayoutMap) {
+  const W = 90;
+  $: if (map && canvas && barH) draw(map, barH);
+  function draw(m: LayoutMap, h: number) {
     canvas.width = W;
-    canvas.height = H;
+    canvas.height = h;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    ctx.clearRect(0, 0, W, H);
+    ctx.clearRect(0, 0, W, h);
     const total = m.total_len || 1;
     for (const s of m.segments) {
-      const x = (s.start / total) * W;
-      const w = Math.max(0.5, ((s.end - s.start) / total) * W);
+      const y = (s.start / total) * h;
+      const sh = Math.max(0.5, ((s.end - s.start) / total) * h);
       ctx.fillStyle = segColor(s.kind.kind);
-      ctx.fillRect(x, 0, w, H);
+      ctx.fillRect(0, y, W, sh);
     }
   }
 
   function segColor(k: string): string {
-    return k === 'header' ? '#e2b877' : k === 'gap' ? '#e06c75' : '#6db3f2';
+    return k === 'header' ? '#e2b877' : k === 'gap' ? '#e06c75' : '#5fd7ff';
+  }
+
+  function segAt(clientY: number): Segment | undefined {
+    if (!map) return undefined;
+    const pos = (clientY / (canvas.clientHeight || 1)) * map.total_len;
+    return map.segments.find((s) => pos >= s.start && pos < s.end);
   }
 
   function onMove(e: MouseEvent) {
-    if (!map) return;
-    const pos = (e.offsetX / canvas.clientWidth) * map.total_len;
-    const seg = map.segments.find((s) => pos >= s.start && pos < s.end);
+    const seg = segAt(e.offsetY);
     hover = seg ? `${seg.name} — ${humanSize(seg.end - seg.start)}` : '';
+  }
+
+  function open(seg: Segment) {
+    if (seg.kind.kind === 'tensor') openDetail(seg.name);
   }
 </script>
 
@@ -89,7 +96,6 @@
     {#if map}
       <span class="dim">{humanSize(map.total_len)} · header {humanSize(map.header_len)} · {map.tensor_count} tensors{map.metadata.length ? ` · ${map.metadata.length} metadata` : ''}</span>
     {/if}
-    <span class="hover mono">{hover}</span>
   </div>
 
   {#if loading}
@@ -97,53 +103,110 @@
   {:else if err}
     <p class="err">{err}</p>
   {:else if map}
-    <canvas bind:this={canvas} on:mousemove={onMove} on:mouseleave={() => (hover = '')}></canvas>
-    <div class="legend">
-      <span><i style="background:#e2b877"></i> header</span>
-      <span><i style="background:#6db3f2"></i> tensor</span>
-      <span><i style="background:#e06c75"></i> gap</span>
+    <div class="map">
+      <div class="bar" bind:clientHeight={barH}>
+        <canvas
+          bind:this={canvas}
+          on:mousemove={onMove}
+          on:mouseleave={() => (hover = '')}
+          on:click={(e) => {
+            const s = segAt(e.offsetY);
+            if (s) open(s);
+          }}
+        ></canvas>
+      </div>
+      <div class="side">
+        <div class="legend">
+          <span><i style="background:#e2b877"></i> header</span>
+          <span><i style="background:#5fd7ff"></i> tensor</span>
+          <span><i style="background:#e06c75"></i> gap</span>
+          <span class="hover mono">{hover}</span>
+        </div>
+        <div class="seglist">
+          {#each map.segments as s}
+            <!-- svelte-ignore a11y-no-noninteractive-tabindex -->
+            <div
+              class="seg {s.kind.kind}"
+              class:clickable={s.kind.kind === 'tensor'}
+              role={s.kind.kind === 'tensor' ? 'button' : undefined}
+              tabindex={s.kind.kind === 'tensor' ? 0 : undefined}
+              on:click={() => open(s)}
+              on:keydown={(e) => {
+                if ((e.key === 'Enter' || e.key === ' ') && s.kind.kind === 'tensor') {
+                  e.preventDefault();
+                  open(s);
+                }
+              }}
+            >
+              <i class="dot" style="background:{segColor(s.kind.kind)}"></i>
+              <span class="sname">{s.name}</span>
+              {#if s.kind.kind === 'tensor'}<span class="dtype">{s.kind.dtype}</span>{/if}
+              <span class="ssize dim mono">{humanSize(s.end - s.start)}</span>
+            </div>
+          {/each}
+        </div>
+        {#if map.metadata.length}
+          <table class="meta">
+            <tbody>
+              {#each map.metadata as [k, v]}<tr><th>{k}</th><td class="mono">{v}</td></tr>{/each}
+            </tbody>
+          </table>
+        {/if}
+      </div>
     </div>
-    {#if map.metadata.length}
-      <table class="meta">
-        <tbody>
-          {#each map.metadata as [k, v]}<tr><th>{k}</th><td class="mono">{v}</td></tr>{/each}
-        </tbody>
-      </table>
-    {/if}
   {/if}
 </div>
 
 <style>
   .layout {
-    padding: 16px;
     height: 100%;
-    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    padding: 14px 18px;
   }
   .head {
+    flex: 0 0 auto;
     display: flex;
     align-items: center;
     gap: 16px;
     margin-bottom: 12px;
     flex-wrap: wrap;
   }
-  .hover {
-    margin-left: auto;
-    color: var(--accent);
+  .map {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    gap: 18px;
+  }
+  .bar {
+    flex: 0 0 auto;
+    width: 90px;
+    height: 100%;
   }
   canvas {
-    width: 100%;
-    max-width: 960px;
-    height: 48px;
+    width: 90px;
+    height: 100%;
     border: 1px solid var(--border);
-    border-radius: 3px;
+    border-radius: 4px;
     display: block;
+    cursor: pointer;
+    image-rendering: pixelated;
+  }
+  .side {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
   }
   .legend {
     display: flex;
     gap: 16px;
-    margin-top: 8px;
+    align-items: center;
     font-size: 12px;
     color: var(--fg-dim);
+    margin-bottom: 8px;
+    flex-wrap: wrap;
   }
   .legend i {
     display: inline-block;
@@ -153,8 +216,59 @@
     vertical-align: middle;
     margin-right: 4px;
   }
+  .hover {
+    color: var(--accent);
+  }
+  .seglist {
+    flex: 1 1 auto;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+  .seg {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 10px;
+    white-space: nowrap;
+    border-bottom: 1px solid var(--border);
+  }
+  .seg:last-child {
+    border-bottom: none;
+  }
+  .seg.clickable {
+    cursor: pointer;
+  }
+  .seg.clickable:hover {
+    background: var(--bg-hover);
+  }
+  .dot {
+    flex: 0 0 auto;
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+  }
+  .sname {
+    flex: 0 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .dtype {
+    flex: 0 0 auto;
+    font-size: 11px;
+    color: var(--dtype);
+    background: color-mix(in srgb, var(--dtype) 15%, transparent);
+    padding: 0 5px;
+    border-radius: 3px;
+  }
+  .ssize {
+    flex: 1 1 auto;
+    text-align: right;
+    font-size: 12px;
+  }
   .meta {
-    margin-top: 16px;
+    flex: 0 0 auto;
+    margin-top: 12px;
     border-collapse: collapse;
   }
   .meta th {
