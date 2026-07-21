@@ -43,22 +43,29 @@ pub enum Source {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FsNode {
-    /// A regular file — its own apparent/allocated size and content [`FileKind`].
+    /// A regular file — its own apparent/allocated size, content [`FileKind`], and
+    /// hard-link count (`links > 1` ⇒ the inode has other names; a hardlink is a
+    /// regular file, not a distinct node kind, so it's this variant with `links`
+    /// set, never a variant of its own).
     File {
         apparent: u64,
         allocated: u64,
         kind: FileKind,
+        /// `st_nlink`; 1 for an ordinary file, `>1` when hardlinked. `1` when
+        /// unknown (remote / non-Unix).
+        links: u64,
     },
     /// A real, descendable directory. (A symlink *to* a directory is a
     /// [`FsNode::Symlink`], kept as a leaf so the walk can't cycle.)
     Directory,
-    /// A symbolic link: `target` is the raw link text; the size/kind are the
+    /// A symbolic link: `target` is the raw link text; the size/kind/links are the
     /// **followed** target's (0 / a broken-link fallback when it can't be statted).
     Symlink {
         target: String,
         apparent: u64,
         allocated: u64,
         kind: FileKind,
+        links: u64,
     },
 }
 
@@ -95,6 +102,18 @@ impl FsNode {
             _ => None,
         }
     }
+    /// Hard-link count (`st_nlink`) of the underlying inode; `>1` means the file
+    /// is hardlinked. 0 for a directory.
+    pub fn links(&self) -> u64 {
+        match self {
+            FsNode::File { links, .. } | FsNode::Symlink { links, .. } => *links,
+            FsNode::Directory => 0,
+        }
+    }
+    /// Whether this entry is a hardlinked file (its inode has more than one name).
+    pub fn is_hardlinked(&self) -> bool {
+        self.links() > 1
+    }
 }
 
 /// One entry in the checkpoint's directory tree — the unified filesystem metadata
@@ -119,6 +138,12 @@ pub struct FileEntry {
     pub mode: Option<u32>,
     /// Modification time (seconds since the epoch), when known.
     pub mtime: Option<i64>,
+    /// The **followed** inode number (`st_ino`), for de-duplicating shared inodes
+    /// in the on-disk rollup: two hardlinks — or two symlinks to one blob — share
+    /// it, so their bytes are counted once. `None` for a directory, a remote read,
+    /// or a non-Unix platform. (Scoped to the checkpoint's own filesystem, so the
+    /// bare inode number suffices — no `st_dev`.)
+    pub inode: Option<u64>,
 }
 
 impl FileEntry {
@@ -218,10 +243,15 @@ impl Checkpoint {
     /// from the cached model (symlink-followed sizes) instead of a live `stat`.
     pub fn disk_usage(&self) -> Option<DiskUsage> {
         use crate::stats::ShardDisk;
+        // Count each physical inode once: a hardlink, or a symlink to a blob that
+        // another shard also links, shares an inode and so adds no real bytes.
+        // Entries without a known inode (remote / non-Unix) are never deduped.
+        let mut seen = std::collections::HashSet::new();
         let shards: Vec<ShardDisk> = self
             .files
             .iter()
             .filter(|f| f.file_kind() == Some(FileKind::Checkpoint))
+            .filter(|f| f.inode.is_none_or(|ino| seen.insert(ino)))
             .map(|f| ShardDisk {
                 name: f.name.clone(),
                 apparent: f.apparent(),
@@ -250,6 +280,7 @@ mod tests {
                 depth: 0,
                 mode: Some(0o644),
                 mtime: Some(1_700_000_000),
+                inode: Some(42),
                 // An HF-cache-style symlink into a blob store: the followed target
                 // sizes drive disk usage.
                 node: FsNode::Symlink {
@@ -257,6 +288,7 @@ mod tests {
                     apparent: 4_000_000_000,
                     allocated: 4_000_000_000,
                     kind: FileKind::Checkpoint,
+                    links: 1,
                 },
             }],
             shards: vec![ShardHeader {

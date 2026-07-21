@@ -99,15 +99,17 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<FileEntry>) {
         let is_symlink = entry.file_type().ok().is_some_and(|t| t.is_symlink());
         // Followed metadata (target), with the link's own as a broken-link fallback.
         let meta = std::fs::metadata(&path).or_else(|_| entry.metadata());
-        let (is_dir, apparent, allocated, mode, mtime) = match &meta {
+        let (is_dir, apparent, allocated, mode, mtime, links, inode) = match &meta {
             Ok(m) => (
                 m.is_dir(),
                 if m.is_dir() { 0 } else { m.len() },
                 block_bytes(m),
                 unix_mode(m),
                 mtime_secs(m),
+                nlink(m),
+                inode_of(m),
             ),
-            Err(_) => (false, 0, 0, None, None),
+            Err(_) => (false, 0, 0, None, None, 1, None),
         };
         // A real directory descends; a symlinked directory stays a leaf.
         let descendable = is_dir && !is_symlink;
@@ -128,6 +130,7 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<FileEntry>) {
                 apparent,
                 allocated,
                 kind: FileKind::of(&name),
+                links,
             }
         } else if descendable {
             FsNode::Directory
@@ -136,6 +139,7 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<FileEntry>) {
                 apparent,
                 allocated,
                 kind: FileKind::of(&name),
+                links,
             }
         };
         out.push(FileEntry {
@@ -144,6 +148,7 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<FileEntry>) {
             depth,
             mode,
             mtime,
+            inode,
             node,
         });
         if descendable {
@@ -169,6 +174,28 @@ fn unix_mode(m: &std::fs::Metadata) -> Option<u32> {
 }
 #[cfg(not(unix))]
 fn unix_mode(_m: &std::fs::Metadata) -> Option<u32> {
+    None
+}
+
+/// Hard-link count (`st_nlink`) of the (followed) target; `1` when unknown.
+#[cfg(unix)]
+fn nlink(m: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    m.nlink()
+}
+#[cfg(not(unix))]
+fn nlink(_m: &std::fs::Metadata) -> u64 {
+    1
+}
+
+/// The (followed) inode number (`st_ino`), for the on-disk dedup; `None` off-Unix.
+#[cfg(unix)]
+fn inode_of(m: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(m.ino())
+}
+#[cfg(not(unix))]
+fn inode_of(_m: &std::fs::Metadata) -> Option<u64> {
     None
 }
 
@@ -519,6 +546,40 @@ mod tests {
             }
             other => panic!("expected a symlink fs-node, got {other:?}"),
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two hard links to one shard share an inode, so the on-disk rollup counts
+    /// its bytes once (not twice) — and the walk records `links > 1`.
+    #[cfg(unix)]
+    #[test]
+    fn disk_usage_dedups_hardlinked_shards() {
+        use crate::model::FsNode;
+        let dir = std::env::temp_dir().join("ce_readers_hardlink_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_st(&dir.join("model.safetensors"));
+        // A second name for the same inode (a hard link, not a symlink).
+        std::fs::hard_link(
+            dir.join("model.safetensors"),
+            dir.join("model-copy.safetensors"),
+        )
+        .unwrap();
+
+        let cp = read_local(&[dir.join("model.safetensors")]).unwrap();
+        // Both names are regular files reporting links == 2 (the inode has 2 names).
+        for name in ["model.safetensors", "model-copy.safetensors"] {
+            let f = cp.files.iter().find(|f| f.name == name).unwrap();
+            assert!(
+                matches!(f.node, FsNode::File { links: 2, .. }),
+                "{name} should report 2 hard links, got {:?}",
+                f.node
+            );
+        }
+        // Two shard files on disk, but one physical inode → counted once.
+        let disk = cp.disk_usage().unwrap();
+        assert_eq!(disk.shards.len(), 1, "shared inode counted once");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

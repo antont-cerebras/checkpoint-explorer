@@ -4461,10 +4461,12 @@ impl Explorer {
                 depth: 0,
                 mode: None,
                 mtime: None,
+                inode: None, // remote reads carry no inode identity
                 node: crate::model::FsNode::File {
                     apparent: d.apparent,
                     allocated: d.allocated,
                     kind: crate::filetree::FileKind::of(&d.name),
+                    links: 1,
                 },
             })
             .collect();

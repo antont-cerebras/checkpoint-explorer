@@ -619,10 +619,12 @@ mod tests {
                     depth: 0,
                     mode: None,
                     mtime: None,
+                    inode: None,
                     node: crate::model::FsNode::File {
                         apparent: 100,
                         allocated: 512,
                         kind: crate::filetree::FileKind::Checkpoint,
+                        links: 1,
                     },
                 },
                 FileEntry {
@@ -631,10 +633,12 @@ mod tests {
                     depth: 0,
                     mode: None,
                     mtime: None,
+                    inode: None,
                     node: crate::model::FsNode::File {
                         apparent: 20,
                         allocated: 512,
                         kind: crate::filetree::FileKind::Json,
+                        links: 1,
                     },
                 },
             ],
