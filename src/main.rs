@@ -384,6 +384,14 @@ struct ExploreArgs {
     print_tensors: bool,
 
     #[arg(
+        long = "print-model",
+        conflicts_with = "print_tree",
+        conflicts_with = "print_tensors",
+        help = "Print the whole central checkpoint model (files, headers, config, index) as JSON and exit — the serializable datatype the app reads everything into"
+    )]
+    print_model: bool,
+
+    #[arg(
         long,
         value_enum,
         default_value_t = explorer::TreeFormat::default(),
@@ -1873,6 +1881,20 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         rename: args.rename,
         rename_rules: args.rename_rule,
     });
+
+    // `--print-model`: dump the whole central serializable model as JSON and exit
+    // — a CLI frontend reading the kernel's model directly (the "serializable into
+    // JSON" contract). Local only for now; the remote reader fills the model next.
+    if args.print_model {
+        if args.ssh_read.is_some() {
+            anyhow::bail!(
+                "--print-model is local-only for now (remote --ssh-read model dump is pending)"
+            );
+        }
+        let model = readers::read_local(&files)?;
+        println!("{}", serde_json::to_string_pretty(&model)?);
+        return Ok(());
+    }
 
     let mut explorer = Explorer::new(files, index_specs, open, !args.no_preload);
     if let Some(host) = args.ssh_read {

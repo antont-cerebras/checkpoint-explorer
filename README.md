@@ -311,6 +311,7 @@ checkpoint-explorer model.safetensors --print-tensors --name '!*.bias'
 |------|--------|
 | `--print-tree` | Print the grouped tree (fully expanded) and exit |
 | `--print-tensors` | Print a flat list of every tensor and exit |
+| `--print-model` | Print the whole central checkpoint model (files + headers + config + index) as JSON and exit — the serializable datatype the app reads everything into |
 | `--format <text\|json>` | Output format for the above (default `text`) |
 | `-v` / `--verbose` | Add per-tensor detail (source file in text; a `tensors` block / detail objects — dtype, shape, element count, and codec + on-disk size for compressed tensors — in JSON) |
 | `--name <GLOB>` | Restrict the printed tree/list to matching tensor names (repeatable; prefix `!` to exclude, e.g. `'!*.bias'` = everything but biases) |

@@ -414,6 +414,27 @@ fn print_tensors_json() {
     settings().bind(|| insta::assert_snapshot!(export(&["--print-tensors", "--format", "json"])));
 }
 
+/// `--print-model` dumps the whole central serializable model as JSON. Not
+/// snapshotted (it carries machine-specific mtimes / absolute paths / block
+/// sizes); instead assert the structure + key contents are present.
+#[test]
+fn print_model_emits_json() {
+    ensure_fixture();
+    let out = run_bin(&[FIXTURE, "--print-model"]);
+    // The top-level model shape.
+    assert!(out.contains("\"source\""), "has a source:\n{out}");
+    assert!(out.contains("\"Local\""), "local source:\n{out}");
+    assert!(out.contains("\"files\""), "has the fs walk:\n{out}");
+    assert!(out.contains("\"shards\""), "has parsed headers:\n{out}");
+    // The fixture's tensors made it into a shard header.
+    assert!(out.contains("lm_head.weight"), "tensor present:\n{out}");
+    assert!(out.contains("\"dtype\""), "tensor dtype present:\n{out}");
+    // It's valid JSON (balanced enough to parse as a value via a trivial check:
+    // starts with `{` and the fixture file name appears in `files`).
+    assert!(out.trim_start().starts_with('{'), "json object:\n{out}");
+    assert!(out.contains("tiny.safetensors"), "file entry:\n{out}");
+}
+
 #[test]
 fn print_tensors_json_verbose() {
     settings()
