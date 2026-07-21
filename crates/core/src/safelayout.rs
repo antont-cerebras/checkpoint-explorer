@@ -15,7 +15,7 @@ use crate::tree::{Layout, MetadataInfo, TensorInfo};
 
 /// One contiguous region of the file: the header, a tensor, or a gap (padding /
 /// an unaccounted span between tensors). Offsets are absolute within the file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Segment {
     pub name: String,
     pub start: u64,
@@ -26,7 +26,8 @@ pub struct Segment {
 /// What a byte span in the file is. A tensor carries its dtype/shape; the header
 /// and gap rows carry none — instead of the old `dtype: Option<String>` +
 /// `shape: Vec` that were only meaningful (and only populated) for tensor rows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SegmentKind {
     /// The 8-byte length prefix plus the JSON metadata header.
     Header,
@@ -49,7 +50,7 @@ impl Segment {
 /// The parsed layout of a safetensors file: its total size, the header size, and
 /// every segment in file order (header first, then tensors by offset, with any
 /// gaps filled in).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct LayoutMap {
     /// The file's leaf name, for the title.
     pub name: String,

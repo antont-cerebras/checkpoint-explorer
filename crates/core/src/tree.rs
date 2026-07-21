@@ -67,7 +67,11 @@ pub struct MetadataInfo {
     pub value_type: String,
 }
 
-#[derive(Debug, Clone)]
+// `Serialize` (no `Deserialize`) is the web/MCP output contract for the tensor-tree
+// hierarchy: a frontend fetches this once and owns its own fold/selection state.
+// Internally tagged (`{"kind":"group",…}`) to match the `FsNode` style.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TreeNode {
     Group {
         name: String,

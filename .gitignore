@@ -1,5 +1,9 @@
 /target
 
+# Web UI: node deps are installed per-checkout; the built SPA (web/dist) IS
+# committed so `cargo install --git` embeds it without needing Node.
+/web/node_modules
+
 # Editor swap files
 *.swp
 

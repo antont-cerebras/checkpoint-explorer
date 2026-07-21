@@ -68,6 +68,15 @@ similar = "2.7"
 # `diff --map` rename rules (regex → replacement) applied to tensor names before
 # the structural comparison. Also used by tests to normalize the scan duration.
 regex = "1"
+# `--web`: a minimal synchronous HTTP server (no async runtime / tokio, matching
+# the project's blocking-IO stance) that serves the checkpoint model + reports as
+# JSON and the embedded Svelte UI.
+tiny_http = "0.12"
+# Decode URL-encoded query values (tensor names carry `/` and `.`).
+percent-encoding = "2"
+# Embed the built Svelte SPA (`web/dist`) into the binary so `--web` is
+# self-contained. Reads from disk in debug, embeds in release.
+rust-embed = "8"
 
 # Unix only: flush the tty input buffer on exit (discard mouse-wheel reports
 # still queued when quitting mid-scroll) so the shell doesn't echo them as

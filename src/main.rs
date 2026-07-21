@@ -11,6 +11,7 @@ pub use checkpoint_explorer_core::{convert, hdf5, hdf5_lz4, hdf5_zstd};
 mod explorer;
 mod tui;
 mod ui;
+mod web;
 
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
@@ -399,6 +400,30 @@ struct ExploreArgs {
         help = "Print the tensor-tree screen's ViewModel (visible rows, selection, search) as JSON and exit — the kernel's frontend-agnostic output contract a web/MCP frontend would serve"
     )]
     print_view: bool,
+
+    #[arg(
+        long = "web",
+        conflicts_with = "print_tree",
+        conflicts_with = "print_tensors",
+        conflicts_with = "print_model",
+        conflicts_with = "print_view",
+        help = "Serve a web UI (Svelte) that shows the same info as the TUI, and block until Ctrl-C. The server supplies the data over a JSON API; the browser owns the view state. Local checkpoints only for now"
+    )]
+    web: bool,
+
+    #[arg(
+        long = "port",
+        value_name = "PORT",
+        default_value_t = 8080,
+        help = "Port for --web (0 = let the OS pick a free port, printed at startup)"
+    )]
+    port: u16,
+
+    #[arg(
+        long = "open",
+        help = "With --web, open the served URL in the default browser (xdg-open / open / start)"
+    )]
+    open: bool,
 
     #[arg(
         long,
@@ -1927,6 +1952,17 @@ fn run_explore(mut args: ExploreArgs) -> Result<()> {
         let model = readers::read_local(&files)?;
         println!("{}", serde_json::to_string_pretty(&model)?);
         return Ok(());
+    }
+
+    // `--web`: serve the checkpoint over an HTTP JSON API + the embedded Svelte UI
+    // (the browser owns the view state). Local only for now; blocks until Ctrl-C.
+    if args.web {
+        if args.ssh_read.is_some() {
+            anyhow::bail!("--web is local-only for now (remote --ssh-read web serving is pending)");
+        }
+        let model = readers::read_local(&files)?;
+        let state = std::sync::Arc::new(web::WebState::build(model, &files, &index_specs));
+        return web::serve(state, args.port, args.open);
     }
 
     let mut explorer = Explorer::new(files, index_specs, open, !args.no_preload);
