@@ -7587,7 +7587,10 @@ mod tests {
                     key: "model-00000.safetensors".into(),
                     size: 100,
                     etag: "abcdef0123456789".into(),
-                    checksum: Some(("SHA256".into(), "9f8e7d6c5b4a3210".into())),
+                    checksum: Some(crate::remote::S3Checksum {
+                        algorithm: "SHA256".into(),
+                        value: "9f8e7d6c5b4a3210".into(),
+                    }),
                     last_modified: "2026-07-19T00:00:00+00:00".into(),
                     tags: Some(1),
                     user_meta: 1,
@@ -7596,7 +7599,10 @@ mod tests {
                     key: "model-00001.safetensors".into(),
                     size: 200,
                     etag: "112233445566".into(),
-                    checksum: Some(("SHA256".into(), "aabbccddeeff".into())),
+                    checksum: Some(crate::remote::S3Checksum {
+                        algorithm: "SHA256".into(),
+                        value: "aabbccddeeff".into(),
+                    }),
                     last_modified: "2026-07-18T00:00:00+00:00".into(),
                     tags: Some(0),
                     user_meta: 0,

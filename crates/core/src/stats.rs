@@ -409,8 +409,8 @@ pub struct S3ObjectStat {
     pub key: String,
     pub size: u64,
     pub etag: String,
-    /// `(algorithm, value)` when the object stored an additional checksum.
-    pub checksum: Option<(String, String)>,
+    /// The object's additional stored checksum, when present.
+    pub checksum: Option<crate::remote::S3Checksum>,
     pub last_modified: String,
     /// Number of object tags, or `None` when they couldn't be read (permission).
     pub tags: Option<usize>,
@@ -447,8 +447,8 @@ impl S3Stats {
     pub fn checksums(&self) -> Vec<(String, usize)> {
         let mut by_algo: BTreeMap<String, usize> = BTreeMap::new();
         for o in &self.objects {
-            if let Some((algo, _)) = &o.checksum {
-                *by_algo.entry(algo.to_uppercase()).or_default() += 1;
+            if let Some(c) = &o.checksum {
+                *by_algo.entry(c.algorithm.to_uppercase()).or_default() += 1;
             }
         }
         let mut v: Vec<(String, usize)> = by_algo.into_iter().collect();
@@ -1007,8 +1007,8 @@ pub fn s3_object_detail(o: &S3ObjectStat) -> String {
     if !o.etag.is_empty() {
         parts.push(format!("etag {}", o.etag));
     }
-    if let Some((algo, val)) = &o.checksum {
-        parts.push(format!("{} {}", algo.to_lowercase(), val));
+    if let Some(c) = &o.checksum {
+        parts.push(format!("{} {}", c.algorithm.to_lowercase(), c.value));
     }
     parts.join("  ")
 }
@@ -1556,7 +1556,10 @@ mod tests {
                 key: key.into(),
                 size,
                 etag: "abcdef0123456789abcdef0123456789".into(),
-                checksum: checksum.map(|(a, v)| (a.into(), v.into())),
+                checksum: checksum.map(|(a, v)| crate::remote::S3Checksum {
+                    algorithm: a.into(),
+                    value: v.into(),
+                }),
                 last_modified: "2026-07-19T00:00:00+00:00".into(),
                 tags,
                 user_meta: 0,

@@ -49,6 +49,15 @@ pub struct RemoteCheckpoint {
     pub s3: Option<S3Meta>,
 }
 
+/// An object's additional stored checksum — a named `{algorithm, value}` pair
+/// instead of a positional `(String, String)` tuple that could be stored swapped.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct S3Checksum {
+    /// e.g. `"sha256"`, `"crc32c"`.
+    pub algorithm: String,
+    pub value: String,
+}
+
 /// One S3 object under a checkpoint's prefix, with the metadata `diff` compares.
 /// Fetched best-effort by the remote dump script via boto3 (the remote's own AWS
 /// credentials — nothing S3 happens locally).
@@ -58,8 +67,8 @@ pub struct S3Object {
     pub key: String,
     pub size: u64,
     pub etag: String,
-    /// `(algorithm, value)` when the object stored an additional checksum.
-    pub checksum: Option<(String, String)>,
+    /// The object's additional stored checksum, when present.
+    pub checksum: Option<S3Checksum>,
     pub last_modified: String,
     /// User-defined `x-amz-meta-*` metadata.
     pub user_meta: BTreeMap<String, String>,
@@ -698,11 +707,16 @@ fn parse_s3_meta(v: &serde_json::Value) -> S3Meta {
             arr.iter()
                 .filter_map(|o| {
                     let key = o.get("key").and_then(|x| x.as_str())?.to_string();
+                    // The remote dump script emits `["algo", "value"]`; store it as
+                    // a named pair.
                     let checksum = o
                         .get("checksum")
                         .and_then(|c| c.as_array())
                         .and_then(|c| Some((c.first()?.as_str()?, c.get(1)?.as_str()?)))
-                        .map(|(a, b)| (a.to_string(), b.to_string()));
+                        .map(|(algo, value)| S3Checksum {
+                            algorithm: algo.to_string(),
+                            value: value.to_string(),
+                        });
                     Some(S3Object {
                         key,
                         size: o.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
@@ -897,7 +911,13 @@ mod tests {
         let o0 = &s3.objects[0];
         assert_eq!(o0.key, "shard0.dat");
         assert_eq!(o0.size, 1024);
-        assert_eq!(o0.checksum, Some(("sha256".into(), "deadbeef".into())));
+        assert_eq!(
+            o0.checksum,
+            Some(S3Checksum {
+                algorithm: "sha256".into(),
+                value: "deadbeef".into()
+            })
+        );
         assert_eq!(o0.user_meta.get("run").map(String::as_str), Some("42"));
         assert_eq!(
             o0.tags
