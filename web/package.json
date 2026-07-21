@@ -1,0 +1,25 @@
+{
+  "name": "checkpoint-explorer-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Svelte web UI for checkpoint-explorer (served by the Rust --web server)",
+  "type": "module",
+  "engines": {
+    "node": ">=16 <21"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^2.5.3",
+    "@tsconfig/svelte": "^5.0.2",
+    "svelte": "^4.2.19",
+    "svelte-check": "^3.8.6",
+    "tslib": "^2.6.3",
+    "typescript": "^5.4.5",
+    "vite": "^4.5.5"
+  }
+}

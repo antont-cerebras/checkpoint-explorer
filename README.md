@@ -157,6 +157,29 @@ checkpoint-explorer *.safetensors *.gguf
 checkpoint-explorer model.safetensors checkpoint-*.safetensors
 ```
 
+### Web UI (`--web`)
+Prefer a browser? `--web` serves the same information as the TUI over a local HTTP
+server and opens it in your browser:
+
+```bash
+checkpoint-explorer --web /path/to/checkpoint          # serve at http://127.0.0.1:8080
+checkpoint-explorer --web --port 9000 --open /path/…   # pick a port + open the browser
+```
+
+The server (a dependency-light, blocking `tiny_http` server — no async runtime)
+**supplies the data** as JSON; the **browser owns the view state** (which screen,
+tree folding, selection, search). It reads the checkpoint once and serves the
+tensor tree, tensor detail, file browser, byte-layout map, stats, and the health /
+structural check — plus on-demand heatmaps, value histograms, sample/slice grids,
+and whole-tensor statistics that scan tensor bytes only when you open them. Local
+checkpoints only for now. The UI is a Svelte single-page app **embedded in the
+binary**, so a released `checkpoint-explorer` needs nothing extra to serve it.
+
+Rebuilding the UI (only needed when changing `web/`): `cd web && npm ci && npm run
+build` regenerates `web/dist`, which is committed and embedded at compile time. In
+development, `npm run dev` runs Vite with hot-reload and proxies `/api` to a
+running `--web` instance.
+
 ### Remote checkpoints over SSH (`--ssh-read`)
 Browse a checkpoint that lives only on a remote host — either behind credentials
 you (rightly) don't want to copy to your laptop (a Cerebras **cstorch** checkpoint

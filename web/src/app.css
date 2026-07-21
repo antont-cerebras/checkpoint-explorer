@@ -1,0 +1,91 @@
+:root {
+  --bg: #12141a;
+  --bg-panel: #181b22;
+  --bg-elev: #1f2027;
+  --bg-hover: #232733;
+  --bg-sel: #2d4b6e;
+  --border: #2a2e39;
+  --fg: #d6dae3;
+  --fg-dim: #7f8796;
+  --accent: #6db3f2;
+  --group: #e2b877;
+  --tensor: #b6c2d4;
+  --meta: #9aa7b8;
+  --danger: #e06c75;
+  --warn: #e5c07b;
+  --ok: #98c379;
+  --row-h: 22px;
+
+  color-scheme: dark;
+  font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+}
+
+button {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 9px;
+  cursor: pointer;
+}
+button:hover {
+  background: var(--bg-hover);
+}
+button.active {
+  background: var(--bg-sel);
+  border-color: var(--accent);
+}
+
+input,
+select {
+  font: inherit;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+
+a {
+  color: var(--accent);
+}
+
+.dim {
+  color: var(--fg-dim);
+}
+.mono {
+  font-variant-numeric: tabular-nums;
+}
+
+/* thin scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 6px;
+}

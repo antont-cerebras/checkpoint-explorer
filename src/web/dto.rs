@@ -188,3 +188,68 @@ fn mode_label(m: &SampleMode) -> String {
     }
     .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    #[test]
+    fn file_node_relativizes_paths() {
+        let root = PathBuf::from("/abs/root");
+        let node = FileNode::Dir {
+            name: "root".into(),
+            path: root.clone(),
+            expanded: true,
+            size: 10,
+            files: 1,
+            children: vec![FileNode::File {
+                name: "a.safetensors".into(),
+                path: root.join("sub/a.safetensors"),
+                size: 10,
+                kind: FileKind::Checkpoint,
+            }],
+        };
+        let web = WebFileNode::from_node(&node, &root);
+        let json = serde_json::to_value(&web).unwrap();
+        // Root path is empty (relative to itself); child path is root-relative,
+        // never the absolute server path.
+        assert_eq!(json["path"], "");
+        assert_eq!(json["children"][0]["path"], "sub/a.safetensors");
+        assert_eq!(json["children"][0]["kind"], "file");
+        assert!(!json.to_string().contains("/abs/root"));
+    }
+
+    #[test]
+    fn stats_dto_converts_duration_and_zero_fraction() {
+        let stats = Stats {
+            count: 100,
+            min: -1.0,
+            max: 2.0,
+            mean: 0.5,
+            std: 1.0,
+            zeros: 25,
+            nonfinite: 0,
+            elapsed: Duration::from_millis(12),
+        };
+        let dto = StatsDto::from(&stats);
+        assert_eq!(dto.zero_fraction, 0.25);
+        assert!((dto.elapsed_ms - 12.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn histogram_dto_tags_bin_kind() {
+        let hist = crate::sample::Histogram {
+            bins: HistBins::Range { lo: 0.0, hi: 1.0 },
+            counts: vec![3, 5],
+            total: 8,
+            nonfinite: 1,
+            elapsed: Duration::from_millis(4),
+        };
+        let json = serde_json::to_value(HistogramDto::from(&hist)).unwrap();
+        assert_eq!(json["bins"]["type"], "range");
+        assert_eq!(json["counts"][1], 5);
+        assert_eq!(json["nonfinite"], 1);
+    }
+}

@@ -252,3 +252,25 @@ fn open_browser(url: &str) {
         .stderr(std::process::Stdio::null())
         .spawn();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_query;
+
+    #[test]
+    fn decodes_encoded_tensor_name() {
+        // The client sends encodeURIComponent("model.layers.0/mlp.weight").
+        let q = parse_query("name=model.layers.0%2Fmlp.weight&dtype=f16&rows=8");
+        assert_eq!(
+            q.get("name").map(String::as_str),
+            Some("model.layers.0/mlp.weight")
+        );
+        assert_eq!(q.get("dtype").map(String::as_str), Some("f16"));
+        assert_eq!(q.get("rows").map(String::as_str), Some("8"));
+    }
+
+    #[test]
+    fn empty_query_is_empty_map() {
+        assert!(parse_query("").is_empty());
+    }
+}
