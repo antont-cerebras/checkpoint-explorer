@@ -45,20 +45,55 @@ pub struct ShardListing {
     pub actual: BTreeSet<String>,
 }
 
-/// One directory's entries as `(name, size, is_dir)` — the file browser's view of
-/// a remote directory (see [`RemoteSession::walk_dir`]).
-pub type DirListing = Vec<(String, u64, bool)>;
+/// One entry in a remote directory listing: a file (with its size) or a
+/// subdirectory — a 2-case sum instead of a `(name, size, is_dir)` tuple whose
+/// bool gated the size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteDirEntry {
+    File { name: String, size: u64 },
+    Directory { name: String },
+}
+
+/// One directory's entries — the file browser's view of a remote directory
+/// (see [`RemoteSession::walk_dir`]).
+pub type DirListing = Vec<RemoteDirEntry>;
 
 /// A remote path's canonical filesystem metadata, with symlinks **followed** —
 /// the value type of [`RemoteSession::stat_paths`], the single source of truth for
 /// remote "file-like" sizes.
-#[derive(Debug, Clone, Copy)]
-pub struct RemoteStat {
-    /// Apparent size (`st_size`) of the target, in bytes.
-    pub apparent: u64,
-    /// On-disk allocation (`st_blocks × block-size`) of the target, in bytes.
-    pub allocated: u64,
-    pub is_dir: bool,
+/// A followed (`stat -L`) remote path is either a file (with sizes) or a
+/// directory (no size) — a 2-case sum instead of a size-carrying `is_dir` flag,
+/// so "directory with a nonzero size" is unrepresentable. Symlinks are already
+/// followed by `stat -L`, so there's no link case here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteStat {
+    File {
+        /// Apparent size (`st_size`) of the target, in bytes.
+        apparent: u64,
+        /// On-disk allocation (`st_blocks × block-size`) of the target, in bytes.
+        allocated: u64,
+    },
+    Directory,
+}
+
+impl RemoteStat {
+    pub fn is_dir(&self) -> bool {
+        matches!(self, RemoteStat::Directory)
+    }
+    /// Apparent size in bytes (0 for a directory).
+    pub fn apparent(&self) -> u64 {
+        match self {
+            RemoteStat::File { apparent, .. } => *apparent,
+            RemoteStat::Directory => 0,
+        }
+    }
+    /// On-disk allocation in bytes (0 for a directory).
+    pub fn allocated(&self) -> u64 {
+        match self {
+            RemoteStat::File { allocated, .. } => *allocated,
+            RemoteStat::Directory => 0,
+        }
+    }
 }
 
 /// An authenticated SSH session. Constructed once per host, then reused for every
@@ -223,7 +258,7 @@ impl RemoteSession {
                     continue;
                 }
             };
-            let mut rows: Vec<(String, u64, bool)> = Vec::new();
+            let mut rows: Vec<RemoteDirEntry> = Vec::new();
             for (p, st) in entries {
                 let name = match p.file_name().and_then(|n| n.to_str()) {
                     Some(n) if !n.starts_with('.') => n.to_string(),
@@ -236,14 +271,25 @@ impl RemoteSession {
                 let is_symlink = st.perm.is_some_and(|m| m & 0o170000 == 0o120000);
                 if is_symlink {
                     links.push((dir.clone(), rows.len(), full));
-                    rows.push((name, st.size.unwrap_or(0), false));
+                    // Pushed as a File leaf with a fallback size; the follow-up
+                    // `stat -L` below replaces the size with the target's.
+                    rows.push(RemoteDirEntry::File {
+                        name,
+                        size: st.size.unwrap_or(0),
+                    });
                 } else {
                     let is_dir = st.is_dir();
-                    let size = if is_dir { 0 } else { st.size.unwrap_or(0) };
                     if is_dir && depth + 1 < max_depth {
                         stack.push((full, depth + 1));
                     }
-                    rows.push((name, size, is_dir));
+                    rows.push(if is_dir {
+                        RemoteDirEntry::Directory { name }
+                    } else {
+                        RemoteDirEntry::File {
+                            name,
+                            size: st.size.unwrap_or(0),
+                        }
+                    });
                 }
             }
             map.insert(dir, rows);
@@ -256,8 +302,10 @@ impl RemoteSession {
             for (dir, idx, full) in &links {
                 if let Some(st) = resolved.get(full)
                     && let Some(rows) = map.get_mut(dir)
+                    && let Some(RemoteDirEntry::File { size, .. }) = rows.get_mut(*idx)
                 {
-                    rows[*idx].1 = if st.is_dir { 0 } else { st.apparent };
+                    // A symlinked dir stays a size-0 leaf (never descended).
+                    *size = if st.is_dir() { 0 } else { st.apparent() };
                 }
             }
         }
@@ -315,7 +363,7 @@ impl RemoteSession {
             .filter_map(|p| {
                 stats
                     .get(p)
-                    .map(|st| (p.clone(), st.apparent, st.allocated))
+                    .map(|st| (p.clone(), st.apparent(), st.allocated()))
             })
             .collect())
     }
@@ -680,10 +728,13 @@ fn parse_stat_line(line: &str) -> Option<(String, RemoteStat)> {
     let block_size = bs.trim().parse::<u64>().ok()?;
     Some((
         name.to_string(),
-        RemoteStat {
-            apparent,
-            allocated: blocks * block_size,
-            is_dir: kind == "directory",
+        if kind == "directory" {
+            RemoteStat::Directory
+        } else {
+            RemoteStat::File {
+                apparent,
+                allocated: blocks * block_size,
+            }
         },
     ))
 }
@@ -728,16 +779,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(name, "/ckpt/model-00000.safetensors");
-        assert_eq!(st.apparent, 6_127_900_160);
-        assert_eq!(st.allocated, 11_968_752 * 512); // st_blocks × block-size
-        assert!(!st.is_dir);
+        assert_eq!(st.apparent(), 6_127_900_160);
+        assert_eq!(st.allocated(), 11_968_752 * 512); // st_blocks × block-size
+        assert!(!st.is_dir());
 
         // A directory target (a followed symlink-to-dir).
         assert!(
             parse_stat_line("4096\t8\t512\tdirectory\t/d")
                 .unwrap()
                 .1
-                .is_dir
+                .is_dir()
         );
         // The path (last field) keeps embedded spaces intact.
         assert_eq!(

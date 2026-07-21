@@ -6985,10 +6985,21 @@ impl Explorer {
                         .cloned()
                         .unwrap_or_default()
                         .into_iter()
-                        .map(|(name, size, is_dir)| crate::filetree::DirEntry {
-                            name,
-                            size,
-                            is_dir,
+                        .map(|e| match e {
+                            crate::sftp::RemoteDirEntry::File { name, size } => {
+                                crate::filetree::DirEntry {
+                                    name,
+                                    size,
+                                    is_dir: false,
+                                }
+                            }
+                            crate::sftp::RemoteDirEntry::Directory { name } => {
+                                crate::filetree::DirEntry {
+                                    name,
+                                    size: 0,
+                                    is_dir: true,
+                                }
+                            }
                         })
                         .collect()
                 };
