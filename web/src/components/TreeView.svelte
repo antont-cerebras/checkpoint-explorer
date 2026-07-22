@@ -1,13 +1,56 @@
 <script lang="ts">
-  import { visibleRows, selectedId, expanded, searching, toggle, openDetail } from '../stores/view';
+  import { visibleRows, selectedId, expanded, searching, toggle, openDetail, navigate } from '../stores/view';
   import type { Row } from '../lib/flatten';
   import { humanCount, humanSize } from '../lib/format';
   import Dtype from './Dtype.svelte';
+  import Shape from './Shape.svelte';
 
   const ROW_H = 22;
   let scrollEl: HTMLDivElement;
   let scrollTop = 0;
   let viewportH = 600;
+
+  // Themed, interactive hover popover (fixed-position so the scroll container can't
+  // clip it; stays open while hovered so its buttons are clickable).
+  let tipRow: Row | null = null;
+  let tipX = 0;
+  let tipY = 0;
+  let copied = '';
+  let hideTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function openTip(e: MouseEvent, row: Row) {
+    if (row.node.kind !== 'tensor') {
+      tipRow = null;
+      return;
+    }
+    clearTimeout(hideTimer);
+    tipRow = row;
+    tipX = e.clientX;
+    tipY = e.clientY;
+    copied = '';
+  }
+  function keepTip() {
+    clearTimeout(hideTimer);
+  }
+  function scheduleHide() {
+    hideTimer = setTimeout(() => (tipRow = null), 160);
+  }
+  async function copyVal(key: string, text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = key;
+      setTimeout(() => copied === key && (copied = ''), 1000);
+    } catch {
+      /* clipboard unavailable */
+    }
+  }
+  function baseName(p: string): string {
+    return p.split('/').pop() || p;
+  }
+  $: tipInfo = tipRow && tipRow.node.kind === 'tensor' ? tipRow.node.info : null;
+  $: tipStyle = tipRow
+    ? `left:${Math.min(tipX + 12, window.innerWidth - 320)}px; top:${Math.min(tipY + 12, window.innerHeight - 210)}px`
+    : '';
 
   $: rows = $visibleRows;
   $: total = rows.length;
@@ -48,26 +91,6 @@
     return n.info.name;
   }
 
-  // Hover tooltip: the detail fields that need no computation (native title, so it
-  // isn't clipped by the scroll container).
-  function rowTitle(row: Row): string | undefined {
-    const n = row.node;
-    if (n.kind === 'tensor') {
-      const t = n.info;
-      const lines = [
-        t.name,
-        `${t.dtype}  ${t.shape.join(' × ') || 'scalar'}`,
-        `${humanCount(t.num_elements)} params · ${humanSize(t.size_bytes)}`,
-        t.source_path,
-      ];
-      return lines.join('\n');
-    }
-    if (n.kind === 'group') {
-      return `${n.name}\n${humanCount(n.tensor_count)} tensors · ${humanSize(n.total_size)}`;
-    }
-    return `${n.info.name} [${n.info.value_type}]: ${n.info.value}`;
-  }
-
   function rowMeta(row: Row): string {
     const n = row.node;
     if (n.kind === 'group') {
@@ -88,17 +111,18 @@
         class="row {row.node.kind}"
         class:sel={$selectedId === row.id}
         style="top:{(first + i) * ROW_H}px; padding-left:{6 + row.depth * 14}px"
-        title={rowTitle(row)}
         role="button"
         tabindex="-1"
         on:click={() => click(row)}
+        on:mouseenter={(e) => openTip(e, row)}
+        on:mouseleave={scheduleHide}
       >
         <span class="caret">{row.hasChildren ? ($expanded.has(row.id) ? '▾' : '▸') : ''}</span>
         <span class="lbl">{label(row, $searching)}</span>
         {#if row.node.kind === 'tensor'}
           <span class="tmeta">
             <Dtype dtype={row.node.info.dtype} bubble={false} />
-            <span class="dim">{row.node.info.shape.join('×')}</span>
+            <Shape shape={row.node.info.shape} />
             <span class="dim">{humanSize(row.node.info.size_bytes)}</span>
           </span>
         {:else}
@@ -108,6 +132,33 @@
     {/each}
   </div>
 </div>
+
+{#if tipInfo}
+  <div class="rowpop" style={tipStyle} role="tooltip" on:mouseenter={keepTip} on:mouseleave={scheduleHide}>
+    <div class="pname">{tipInfo.name}</div>
+    <div class="prow">
+      <span class="pk">dtype</span>
+      <Dtype dtype={tipInfo.dtype} />
+      <button class="cp" title="Copy dtype" on:click={() => copyVal('d', tipInfo.dtype)}>{copied === 'd' ? '✓' : '⧉'}</button>
+    </div>
+    <div class="prow">
+      <span class="pk">shape</span>
+      <Shape shape={tipInfo.shape} />
+      <button class="cp" title="Copy shape" on:click={() => copyVal('s', tipInfo.shape.join('×'))}>{copied === 's' ? '✓' : '⧉'}</button>
+    </div>
+    <div class="prow"><span class="pk">params</span><span class="mono">{humanCount(tipInfo.num_elements)}</span></div>
+    <div class="prow"><span class="pk">size</span><span class="mono">{humanSize(tipInfo.size_bytes)}</span></div>
+    <div class="prow">
+      <span class="pk">shard</span>
+      <button class="link" title="Open this shard's layout" on:click={() => navigate({ kind: 'layout', file: baseName(tipInfo.source_path) })}>{baseName(tipInfo.source_path)}</button>
+      <button class="cp" title="Copy file path" on:click={() => copyVal('f', tipInfo.source_path)}>{copied === 'f' ? '✓' : '⧉'}</button>
+    </div>
+    <div class="prow">
+      <span class="pk">name</span>
+      <button class="cp wide" on:click={() => copyVal('n', tipInfo.name)}>{copied === 'n' ? '✓ copied' : '⧉ copy name'}</button>
+    </div>
+  </div>
+{/if}
 
 <style>
   .rows {
@@ -169,5 +220,68 @@
     gap: 8px;
     overflow: hidden;
     font-size: 12px;
+  }
+
+  .rowpop {
+    position: fixed;
+    z-index: 30;
+    min-width: 240px;
+    max-width: 320px;
+    padding: 8px 10px;
+    background: var(--bg-elev);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.45);
+    font-size: 12px;
+  }
+  .pname {
+    color: var(--accent);
+    word-break: break-all;
+    margin-bottom: 6px;
+  }
+  .prow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 0;
+  }
+  .pk {
+    flex: 0 0 46px;
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.04em;
+  }
+  .cp {
+    margin-left: auto;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--fg-dim);
+    cursor: pointer;
+    font: inherit;
+    padding: 0 5px;
+    line-height: 16px;
+  }
+  .cp:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .cp.wide {
+    margin-left: 0;
+  }
+  .rowpop .link {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--accent);
+    text-decoration: underline;
+    text-decoration-style: dotted;
+    cursor: pointer;
+    font: inherit;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>

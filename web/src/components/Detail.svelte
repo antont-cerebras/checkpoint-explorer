@@ -2,10 +2,11 @@
   import { tree, cachedStats } from '../stores/server';
   import { setTab, navigate, type DataTab } from '../stores/view';
   import type { StatsDto, TensorInfo, TreeNode } from '../lib/types';
-  import { humanCount, humanSize, num, shape } from '../lib/format';
+  import { humanCount, humanSize, num } from '../lib/format';
   import DataView from './DataView.svelte';
   import HistogramView from './HistogramView.svelte';
   import Dtype from './Dtype.svelte';
+  import Shape from './Shape.svelte';
   import Spinner from './Spinner.svelte';
 
   export let tensor: string;
@@ -64,7 +65,7 @@
       <table>
         <tbody>
           <tr><th>Data Type</th><td><Dtype dtype={info.dtype} /></td></tr>
-          <tr><th>Shape</th><td class="mono">{shape(info.shape)}</td></tr>
+          <tr><th>Shape</th><td><Shape shape={info.shape} /></td></tr>
           <tr><th>Parameters</th><td class="mono">{humanCount(info.num_elements)} ({info.num_elements.toLocaleString()})</td></tr>
           <tr><th>Size</th><td class="mono">{humanSize(info.size_bytes)}</td></tr>
           {#if offsets(info.layout)}<tr><th>Data offsets</th><td class="mono">{offsets(info.layout)}</td></tr>{/if}

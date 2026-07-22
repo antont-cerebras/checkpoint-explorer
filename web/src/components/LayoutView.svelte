@@ -8,6 +8,7 @@
   import { theme } from '../stores/theme';
   import Spinner from './Spinner.svelte';
   import Dtype from './Dtype.svelte';
+  import Shape from './Shape.svelte';
 
   let shards: string[] = [];
   let selected = '';
@@ -146,7 +147,7 @@
               <span class="sname">{s.name}</span>
               {#if s.kind.kind === 'tensor'}
                 <Dtype dtype={s.kind.dtype} bubble={false} />
-                <span class="sshape dim mono">[{s.kind.shape.join('×')}]</span>
+                <Shape shape={s.kind.shape} />
               {/if}
               <span class="ssize dim mono">{humanSize(s.end - s.start)}</span>
             </div>
@@ -259,10 +260,6 @@
     flex: 0 1 auto;
     overflow: hidden;
     text-overflow: ellipsis;
-  }
-  .sshape {
-    flex: 0 0 auto;
-    font-size: 11px;
   }
   .ssize {
     flex: 1 1 auto;

@@ -82,8 +82,25 @@ export const selectedId = writable<string | null>(null);
 export const searching = writable<boolean>(false);
 export const search = writable<string>('');
 
-/** Active dtype filter (set by clicking a dtype badge); flat-lists tensors of that dtype. */
-export const dtypeFilter = writable<string | null>(null);
+/** Active tensor facet filter (set by clicking a dtype / shape / dimension badge);
+ * flat-lists the tensors that match. */
+export type Filter =
+  | { kind: 'dtype'; value: string }
+  | { kind: 'shape'; dims: number[] }
+  | { kind: 'dim'; value: number };
+export const filter = writable<Filter | null>(null);
+
+function matchesFilter(shape: number[], dtype: string, f: Filter): boolean {
+  if (f.kind === 'dtype') return dtype === f.value;
+  if (f.kind === 'dim') return shape.includes(f.value);
+  return shape.length === f.dims.length && shape.every((d, i) => d === f.dims[i]);
+}
+
+export function filterLabel(f: Filter): string {
+  if (f.kind === 'dtype') return `dtype: ${f.value}`;
+  if (f.kind === 'dim') return `dim: ${f.value}`;
+  return `shape: ${f.dims.join('×') || 'scalar'}`;
+}
 
 /** Command palette (Space / `:`) open state. */
 export const paletteOpen = writable<boolean>(false);
@@ -91,23 +108,23 @@ export const paletteOpen = writable<boolean>(false);
 /** The flattened rows — fold-aware, or a flat list while searching / dtype-filtering.
  * Shared by TreeView (render) and the key handler (cursor movement). */
 export const visibleRows = derived(
-  [treeData, expanded, search, searching, dtypeFilter],
-  ([$t, $exp, $q, $searching, $dt]) => {
+  [treeData, expanded, search, searching, filter],
+  ([$t, $exp, $q, $searching, $f]) => {
     if (!$t) return [] as Row[];
     if ($searching && $q.trim()) return searchRows($t.tree, $q.trim());
-    if ($dt) return dtypeRows($t.tree, $dt);
+    if ($f) return filterRows($t.tree, $f);
     return flatten($t.tree, $exp);
   },
 );
 
-/** Flat list of tensor rows whose dtype matches (for the dtype-badge filter). */
-function dtypeRows(nodes: TreeNode[], dt: string): Row[] {
+/** Flat list of tensor rows matching the active facet filter. */
+function filterRows(nodes: TreeNode[], f: Filter): Row[] {
   const out: Row[] = [];
   const walk = (ns: TreeNode[], parentId: string) => {
     for (const n of ns) {
       const id = nodeId(n, parentId);
       if (n.kind === 'group') walk(n.children, id);
-      else if (n.kind === 'tensor' && n.info.dtype === dt)
+      else if (n.kind === 'tensor' && matchesFilter(n.info.shape, n.info.dtype, f))
         out.push({ id, node: n, depth: 0, hasChildren: false });
     }
   };
@@ -115,14 +132,23 @@ function dtypeRows(nodes: TreeNode[], dt: string): Row[] {
   return out;
 }
 
-export function filterByDtype(dt: string): void {
-  dtypeFilter.set(dt);
+function applyFilter(f: Filter): void {
+  filter.set(f);
   searching.set(false);
   search.set('');
   navigate({ kind: 'tree' });
 }
-export function clearDtypeFilter(): void {
-  dtypeFilter.set(null);
+export function filterByDtype(value: string): void {
+  applyFilter({ kind: 'dtype', value });
+}
+export function filterByShape(dims: number[]): void {
+  applyFilter({ kind: 'shape', dims });
+}
+export function filterByDim(value: number): void {
+  applyFilter({ kind: 'dim', value });
+}
+export function clearFilter(): void {
+  filter.set(null);
 }
 
 // Expand the synthetic root node once the tree first loads, so its children show.

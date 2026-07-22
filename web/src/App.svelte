@@ -20,8 +20,9 @@
     startSearch,
     exitSearch,
     setTab,
-    dtypeFilter,
-    clearDtypeFilter,
+    filter,
+    filterLabel,
+    clearFilter,
     paletteOpen,
   } from './stores/view';
   import TreeView from './components/TreeView.svelte';
@@ -236,12 +237,6 @@
     {#if $screen.kind !== 'tree'}
       <span class="crumb dim">{crumb($screen)}</span>
     {/if}
-    {#if $dtypeFilter}
-      <span class="filterchip">
-        dtype: {$dtypeFilter}
-        <button on:click={clearDtypeFilter} title="Clear filter" aria-label="Clear dtype filter">×</button>
-      </span>
-    {/if}
     <span class="root" title={$tree?.root ?? ''}>{$tree?.root ?? '…'}</span>
     {#if $searching}
       <span class="search">
@@ -263,6 +258,15 @@
       <option value="fallout">Fallout</option>
     </select>
   </header>
+
+  {#if $filter}
+    <div class="filterbar">
+      <span class="flabel">Filtering</span>
+      <span class="fval">{filterLabel($filter)}</span>
+      <span class="dim">· {$visibleRows.length} tensors</span>
+      <button class="clear" on:click={clearFilter}>clear ✕</button>
+    </div>
+  {/if}
 
   <main>
     {#if $treeError}
@@ -347,26 +351,39 @@
   .search input {
     flex: 0 1 360px;
   }
-  .filterchip {
+  .filterbar {
     flex: 0 0 auto;
-    display: inline-flex;
+    display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 10px;
+    padding: 5px 14px;
+    background: color-mix(in srgb, var(--accent) 12%, var(--bg-panel));
+    border-bottom: 1px solid var(--border);
     font-size: 12px;
-    color: var(--dtype);
-    background: color-mix(in srgb, var(--dtype) 14%, transparent);
-    border: 1px solid color-mix(in srgb, var(--dtype) 30%, transparent);
-    border-radius: 4px;
-    padding: 1px 4px 1px 8px;
   }
-  .filterchip button {
+  .flabel {
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: 11px;
+  }
+  .fval {
+    color: var(--accent);
+    font-family: ui-monospace, monospace;
+  }
+  .clear {
+    margin-left: auto;
     background: none;
-    border: none;
-    color: inherit;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--fg-dim);
     cursor: pointer;
-    font-size: 14px;
-    padding: 0 2px;
-    line-height: 1;
+    font: inherit;
+    padding: 1px 8px;
+  }
+  .clear:hover {
+    color: var(--fg);
+    border-color: var(--accent);
   }
   .theme {
     margin-left: auto;
