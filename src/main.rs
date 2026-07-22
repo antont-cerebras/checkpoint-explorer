@@ -680,9 +680,6 @@ enum Command {
         /// reachable at your machine's hostname; use 127.0.0.1 for loopback only.
         #[arg(long, value_name = "ADDR", default_value = "0.0.0.0")]
         host: std::net::IpAddr,
-        /// Open the served URL in the default browser (xdg-open / open / start).
-        #[arg(long)]
-        open: bool,
         /// Skip parsing model.safetensors.index.json for the health check.
         #[arg(long = "no-health-check")]
         no_health_check: bool,
@@ -873,9 +870,8 @@ fn main() -> Result<()> {
             recursive,
             port,
             host,
-            open,
             no_health_check,
-        }) => run_web(&paths, recursive, no_health_check, host, port, open),
+        }) => run_web(&paths, recursive, no_health_check, host, port),
         None => run_explore(cli.explore),
     }
 }
@@ -1766,7 +1762,6 @@ fn run_web(
     no_health_check: bool,
     host: std::net::IpAddr,
     port: u16,
-    open: bool,
 ) -> Result<()> {
     let (files, index_specs) = collect_safetensors_files(paths, recursive, no_health_check)?;
     if files.is_empty() {
@@ -1774,7 +1769,7 @@ fn run_web(
     }
     let model = readers::read_local(&files)?;
     let state = std::sync::Arc::new(web::WebState::build(model, &files, &index_specs));
-    web::serve(state, host, port, open)
+    web::serve(state, host, port)
 }
 
 fn run_explore(mut args: ExploreArgs) -> Result<()> {

@@ -163,7 +163,7 @@ an HTTP server:
 
 ```bash
 checkpoint-explorer web /path/to/checkpoint          # serve on all interfaces, port 8080
-checkpoint-explorer web --port 9000 --open /path/…   # pick a port + open the browser
+checkpoint-explorer web --port 9000 /path/to/ckpt    # pick a port
 ```
 
 It binds all interfaces by default (`--host 0.0.0.0`) and prints the reachable URL

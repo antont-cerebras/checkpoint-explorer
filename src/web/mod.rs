@@ -124,7 +124,7 @@ impl WebState {
 /// Start the server and block until the process is stopped (Ctrl-C). `host` is the
 /// bind address (default `0.0.0.0` — all interfaces, so it's reachable at this
 /// machine's hostname on the network, matching how VMs serve web apps here).
-pub fn serve(state: Arc<WebState>, host: IpAddr, port: u16, open: bool) -> Result<()> {
+pub fn serve(state: Arc<WebState>, host: IpAddr, port: u16) -> Result<()> {
     let server = tiny_http::Server::http(SocketAddr::new(host, port))
         .map_err(|e| anyhow::anyhow!("failed to start web server on {host}:{port}: {e}"))?;
     let bound = server
@@ -141,9 +141,6 @@ pub fn serve(state: Arc<WebState>, host: IpAddr, port: u16, open: bool) -> Resul
     };
     let url = format!("http://{display}:{bound}/");
     println!("checkpoint-explorer web UI: {url}  (Ctrl-C to stop)");
-    if open {
-        open_browser(&url);
-    }
 
     // A small worker pool so a static-asset / metadata request stays responsive
     // while another worker is inside a multi-second tensor scan.
@@ -287,21 +284,6 @@ fn fqdn() -> Option<String> {
     }
     let name = String::from_utf8(out.stdout).ok()?.trim().to_string();
     if name.is_empty() { None } else { Some(name) }
-}
-
-fn open_browser(url: &str) {
-    let cmd = if cfg!(target_os = "macos") {
-        "open"
-    } else if cfg!(target_os = "windows") {
-        "explorer"
-    } else {
-        "xdg-open"
-    };
-    let _ = std::process::Command::new(cmd)
-        .arg(url)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
 }
 
 #[cfg(test)]

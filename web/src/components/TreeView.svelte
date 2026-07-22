@@ -13,26 +13,29 @@
   // Themed, interactive hover popover (fixed-position so the scroll container can't
   // clip it; stays open while hovered so its buttons are clickable).
   let tipRow: Row | null = null;
-  let tipX = 0;
-  let tipY = 0;
+  let tipTop = 0;
   let copied = '';
   let hideTimer: ReturnType<typeof setTimeout> | undefined;
 
   function openTip(e: MouseEvent, row: Row) {
+    // Non-tensor rows have no popover, but don't hard-close: let any open popover
+    // linger (via the grace timer) so passing over one on the way to it is fine.
     if (row.node.kind !== 'tensor') {
-      tipRow = null;
+      scheduleHide();
       return;
     }
     clearTimeout(hideTimer);
-    tipRow = row;
-    tipX = e.clientX;
-    tipY = e.clientY;
+    // Pin the popover to the right at the hovered row's height, so reaching it is a
+    // move along the same full-width row (never crossing other rows).
+    tipTop = (e.currentTarget as HTMLElement).getBoundingClientRect().top;
     copied = '';
+    tipRow = row;
   }
   function keepTip() {
     clearTimeout(hideTimer);
   }
   function scheduleHide() {
+    clearTimeout(hideTimer);
     hideTimer = setTimeout(() => (tipRow = null), 450);
   }
   async function copyVal(key: string, text: string) {
@@ -49,7 +52,7 @@
   }
   $: tipInfo = tipRow && tipRow.node.kind === 'tensor' ? tipRow.node.info : null;
   $: tipStyle = tipRow
-    ? `left:${Math.min(tipX + 6, window.innerWidth - 320)}px; top:${Math.min(tipY + 6, window.innerHeight - 210)}px`
+    ? `right:14px; top:${Math.max(8, Math.min(tipTop, window.innerHeight - 230))}px`
     : '';
 
   $: rows = $visibleRows;
