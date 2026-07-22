@@ -38,6 +38,7 @@
   import VaultBoy from './components/VaultBoy.svelte';
   import Palette from './components/Palette.svelte';
   import { theme } from './stores/theme';
+  import { copyText } from './lib/clipboard';
   import type { Screen } from './stores/view';
 
   onMount(ensureTree);
@@ -68,12 +69,8 @@
     return get(visibleRows).find((r) => r.id === id) ?? null;
   }
 
-  async function copy(text: string) {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      /* clipboard may be unavailable over plain http; ignore */
-    }
+  function copy(text: string) {
+    copyText(text);
   }
 
   function onKeydown(e: KeyboardEvent) {

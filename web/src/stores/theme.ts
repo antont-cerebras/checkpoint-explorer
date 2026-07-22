@@ -13,19 +13,27 @@ function load(): Theme {
   return v === 'dark' || v === 'light' || v === 'system' || v === 'fallout' ? v : 'system';
 }
 
-// Vault-Boy head favicon for the Fallout theme (inline so it swaps live).
+// Weathered radiation-trefoil favicon for the Fallout theme (the trefoil is a
+// public-domain safety symbol; this is a stylized, paint-chipped rendering). Inline
+// so it swaps live.
+const BLADE = 'M2 -3.46 L6.5 -11.26 A13 13 0 0 0 -6.5 -11.26 L-2 -3.46 A4 4 0 0 1 2 -3.46 Z';
 const FALLOUT_FAVICON =
   'data:image/svg+xml,' +
   encodeURIComponent(
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">` +
       `<rect width="32" height="32" rx="6" fill="#04140a"/>` +
-      `<g fill="none" stroke="#35e46a" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">` +
-      `<path d="M8 12 Q14 4 24 9"/>` + // hair
-      `<path d="M8 12 Q8 22 15 25 Q22 27 24 13"/>` + // head/jaw
-      `<path d="M10.5 15 q2.5 2 5 0.5"/>` + // wink
-      `<path d="M10 19 q6 5 12 -1"/>` + // grin
-      `<path d="M11 20 H21"/></g>` + // teeth
-      `<circle cx="20" cy="14" r="1.2" fill="#35e46a"/></svg>`,
+      `<g transform="translate(16,16)" fill="#35e46a">` +
+      `<path d="${BLADE}"/>` +
+      `<path transform="rotate(120)" d="${BLADE}"/>` +
+      `<path transform="rotate(240)" d="${BLADE}"/>` +
+      `<circle r="2.6"/></g>` +
+      // chipped/worn paint: dark specks eating into the green
+      `<g fill="#04140a">` +
+      `<circle cx="15" cy="5.5" r="1.1"/>` +
+      `<circle cx="23.5" cy="21.5" r="1.3"/>` +
+      `<circle cx="9" cy="22.5" r="1"/>` +
+      `<path d="M19.5 8 l2.2 0.6 -1 2 z"/>` +
+      `<path d="M11 18 l-1.6 1.2 0.4 1.6 z"/></g></svg>`,
   );
 
 /** Resolve the preference to a concrete theme and apply it to the document. */

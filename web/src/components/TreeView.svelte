@@ -2,6 +2,7 @@
   import { visibleRows, selectedId, expanded, searching, toggle, openDetail, navigate } from '../stores/view';
   import type { Row } from '../lib/flatten';
   import { humanCount, humanSize } from '../lib/format';
+  import { copyText } from '../lib/clipboard';
   import Dtype from './Dtype.svelte';
   import Shape from './Shape.svelte';
 
@@ -42,13 +43,10 @@
     clearTimeout(hideTimer);
     hideTimer = setTimeout(() => (tipRow = null), 450);
   }
-  async function copyVal(key: string, text: string) {
-    try {
-      await navigator.clipboard.writeText(text);
+  function copyVal(key: string, text: string) {
+    if (copyText(text)) {
       copied = key;
       setTimeout(() => copied === key && (copied = ''), 1000);
-    } catch {
-      /* clipboard unavailable */
     }
   }
   function baseName(p: string): string {
