@@ -14,6 +14,7 @@
   // clip it; stays open while hovered so its buttons are clickable).
   let tipRow: Row | null = null;
   let tipTop = 0;
+  let tipLeft = 0;
   let copied = '';
   let hideTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -25,9 +26,12 @@
       return;
     }
     clearTimeout(hideTimer);
-    // Pin the popover to the right at the hovered row's height, so reaching it is a
-    // move along the same full-width row (never crossing other rows).
-    tipTop = (e.currentTarget as HTMLElement).getBoundingClientRect().top;
+    // Place it beside the cursor horizontally but aligned to the row's top: reaching
+    // it is a straight move right along the same full-width row (never crossing other
+    // rows), while staying close to the pointer.
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    tipTop = r.top;
+    tipLeft = e.clientX;
     copied = '';
     tipRow = row;
   }
@@ -52,7 +56,7 @@
   }
   $: tipInfo = tipRow && tipRow.node.kind === 'tensor' ? tipRow.node.info : null;
   $: tipStyle = tipRow
-    ? `right:14px; top:${Math.max(8, Math.min(tipTop, window.innerHeight - 230))}px`
+    ? `left:${Math.min(tipLeft + 8, window.innerWidth - 330)}px; top:${Math.max(8, Math.min(tipTop, window.innerHeight - 230))}px`
     : '';
 
   $: rows = $visibleRows;
