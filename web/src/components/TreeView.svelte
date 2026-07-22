@@ -48,6 +48,26 @@
     return n.info.name;
   }
 
+  // Hover tooltip: the detail fields that need no computation (native title, so it
+  // isn't clipped by the scroll container).
+  function rowTitle(row: Row): string | undefined {
+    const n = row.node;
+    if (n.kind === 'tensor') {
+      const t = n.info;
+      const lines = [
+        t.name,
+        `${t.dtype}  ${t.shape.join(' × ') || 'scalar'}`,
+        `${humanCount(t.num_elements)} params · ${humanSize(t.size_bytes)}`,
+        t.source_path,
+      ];
+      return lines.join('\n');
+    }
+    if (n.kind === 'group') {
+      return `${n.name}\n${humanCount(n.tensor_count)} tensors · ${humanSize(n.total_size)}`;
+    }
+    return `${n.info.name} [${n.info.value_type}]: ${n.info.value}`;
+  }
+
   function rowMeta(row: Row): string {
     const n = row.node;
     if (n.kind === 'group') {
@@ -68,6 +88,7 @@
         class="row {row.node.kind}"
         class:sel={$selectedId === row.id}
         style="top:{(first + i) * ROW_H}px; padding-left:{6 + row.depth * 14}px"
+        title={rowTitle(row)}
         role="button"
         tabindex="-1"
         on:click={() => click(row)}
@@ -75,7 +96,11 @@
         <span class="caret">{row.hasChildren ? ($expanded.has(row.id) ? '▾' : '▸') : ''}</span>
         <span class="lbl">{label(row, $searching)}</span>
         {#if row.node.kind === 'tensor'}
-          <span class="rmeta dim">[<Dtype dtype={row.node.info.dtype} bubble={false} />, {row.node.info.shape.join('×')}, {humanSize(row.node.info.size_bytes)}]</span>
+          <span class="tmeta">
+            <Dtype dtype={row.node.info.dtype} bubble={false} />
+            <span class="dim">{row.node.info.shape.join('×')}</span>
+            <span class="dim">{humanSize(row.node.info.size_bytes)}</span>
+          </span>
         {:else}
           <span class="rmeta dim">{rowMeta(row)}</span>
         {/if}
@@ -135,6 +160,14 @@
     flex: 0 1 auto;
     overflow: hidden;
     text-overflow: ellipsis;
+    font-size: 12px;
+  }
+  .tmeta {
+    flex: 0 1 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    overflow: hidden;
     font-size: 12px;
   }
 </style>

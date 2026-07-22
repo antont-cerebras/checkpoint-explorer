@@ -27,8 +27,8 @@
     background: color-mix(in srgb, var(--dtype) 16%, transparent);
     border: 1px solid color-mix(in srgb, var(--dtype) 30%, transparent);
     border-radius: 4px;
-    padding: 0 6px;
-    line-height: 16px;
+    padding: 0 4px;
+    line-height: 15px;
     cursor: pointer;
     font-family: inherit;
   }
