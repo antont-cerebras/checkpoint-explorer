@@ -33,7 +33,7 @@
     clearTimeout(hideTimer);
   }
   function scheduleHide() {
-    hideTimer = setTimeout(() => (tipRow = null), 160);
+    hideTimer = setTimeout(() => (tipRow = null), 450);
   }
   async function copyVal(key: string, text: string) {
     try {
@@ -49,7 +49,7 @@
   }
   $: tipInfo = tipRow && tipRow.node.kind === 'tensor' ? tipRow.node.info : null;
   $: tipStyle = tipRow
-    ? `left:${Math.min(tipX + 12, window.innerWidth - 320)}px; top:${Math.min(tipY + 12, window.innerHeight - 210)}px`
+    ? `left:${Math.min(tipX + 6, window.innerWidth - 320)}px; top:${Math.min(tipY + 6, window.innerHeight - 210)}px`
     : '';
 
   $: rows = $visibleRows;
