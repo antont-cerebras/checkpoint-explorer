@@ -7,15 +7,15 @@
   <button
     class="brk"
     title="Filter tensors with this shape"
-    on:click|stopPropagation={() => filterByShape(shape)}>scalar</button
+    on:click|stopPropagation={() => filterByShape(shape)}>()</button
   >
 {:else}
   <span class="shape">
-    <button class="brk" title="Filter by this exact shape" on:click|stopPropagation={() => filterByShape(shape)}>[</button>
+    <button class="brk" title="Filter by this exact shape" on:click|stopPropagation={() => filterByShape(shape)}>(</button>
     {#each shape as d, i}
-      <button class="dim" title="Filter tensors with a dimension of {d}" on:click|stopPropagation={() => filterByDim(d)}>{d}</button>{#if i < shape.length - 1}<span class="x">×</span>{/if}
+      <button class="dim" title="Filter tensors with a dimension of {d}" on:click|stopPropagation={() => filterByDim(d)}>{d}</button>{#if i < shape.length - 1}<span class="x">,&nbsp;</span>{:else if shape.length === 1}<span class="x">,</span>{/if}
     {/each}
-    <button class="brk" title="Filter by this exact shape" on:click|stopPropagation={() => filterByShape(shape)}>]</button>
+    <button class="brk" title="Filter by this exact shape" on:click|stopPropagation={() => filterByShape(shape)}>)</button>
   </span>
 {/if}
 

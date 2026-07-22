@@ -1,7 +1,7 @@
 <script lang="ts">
   import { visibleRows, selectedId, expanded, searching, toggle, openDetail, navigate } from '../stores/view';
   import type { Row } from '../lib/flatten';
-  import { humanCount, humanSize } from '../lib/format';
+  import { humanCount, humanSize, pyShape } from '../lib/format';
   import { copyText } from '../lib/clipboard';
   import Dtype from './Dtype.svelte';
   import Shape from './Shape.svelte';
@@ -18,23 +18,32 @@
   let tipLeft = 0;
   let copied = '';
   let hideTimer: ReturnType<typeof setTimeout> | undefined;
+  let openTimer: ReturnType<typeof setTimeout> | undefined;
 
   function openTip(e: MouseEvent, row: Row) {
-    // Non-tensor rows have no popover, but don't hard-close: let any open popover
-    // linger (via the grace timer) so passing over one on the way to it is fine.
+    clearTimeout(openTimer); // restart the rest-delay for the newly hovered row
     if (row.node.kind !== 'tensor') {
       scheduleHide();
       return;
     }
-    clearTimeout(hideTimer);
     // Place it beside the cursor horizontally but aligned to the row's top: reaching
     // it is a straight move right along the same full-width row (never crossing other
     // rows), while staying close to the pointer.
-    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    tipTop = r.top;
-    tipLeft = e.clientX;
-    copied = '';
-    tipRow = row;
+    const top = (e.currentTarget as HTMLElement).getBoundingClientRect().top;
+    const left = e.clientX;
+    // Only pop up once the pointer has rested on the row, so sweeping the tree
+    // doesn't leave a trail of tooltips.
+    openTimer = setTimeout(() => {
+      clearTimeout(hideTimer);
+      tipTop = top;
+      tipLeft = left;
+      copied = '';
+      tipRow = row;
+    }, 400);
+  }
+  function leaveRow() {
+    clearTimeout(openTimer); // cancel a pending open
+    scheduleHide();
   }
   function keepTip() {
     clearTimeout(hideTimer);
@@ -120,7 +129,7 @@
         tabindex="-1"
         on:click={() => click(row)}
         on:mouseenter={(e) => openTip(e, row)}
-        on:mouseleave={scheduleHide}
+        on:mouseleave={leaveRow}
       >
         <span class="caret">{row.hasChildren ? ($expanded.has(row.id) ? '▾' : '▸') : ''}</span>
         <span class="lbl">{label(row, $searching)}</span>
@@ -149,7 +158,7 @@
     <div class="prow">
       <span class="pk">shape</span>
       <Shape shape={tipInfo.shape} />
-      <button class="cp" title="Copy shape" on:click={() => copyVal('s', tipInfo.shape.join('×'))}>{copied === 's' ? '✓' : '⧉'}</button>
+      <button class="cp" title="Copy shape (Python tuple)" on:click={() => copyVal('s', pyShape(tipInfo.shape))}>{copied === 's' ? '✓' : '⧉'}</button>
     </div>
     <div class="prow"><span class="pk">params</span><span class="mono">{humanCount(tipInfo.num_elements)}</span></div>
     <div class="prow"><span class="pk">size</span><span class="mono">{humanSize(tipInfo.size_bytes)}</span></div>

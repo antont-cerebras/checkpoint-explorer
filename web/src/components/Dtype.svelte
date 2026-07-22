@@ -11,7 +11,7 @@
 <button
   class="dtype"
   class:has-bubble={bubble}
-  title={dtypeInfo(dtype)}
+  title={bubble ? undefined : dtypeInfo(dtype)}
   on:click|stopPropagation={() => filterByDtype(dtype)}
 >
   {dtype}
@@ -38,7 +38,7 @@
   .tip {
     display: none;
     position: absolute;
-    bottom: calc(100% + 6px);
+    top: calc(100% + 6px);
     left: 0;
     width: 250px;
     padding: 8px 10px;

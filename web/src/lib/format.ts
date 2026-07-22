@@ -28,6 +28,13 @@ export function shape(dims: number[]): string {
   return dims.length ? dims.join(' × ') : 'scalar';
 }
 
+/** Python-reusable tuple form: `(768, 2048)`, `(768,)` for 1D, `()` for scalar. */
+export function pyShape(dims: number[]): string {
+  if (dims.length === 0) return '()';
+  if (dims.length === 1) return `(${dims[0]},)`;
+  return `(${dims.join(', ')})`;
+}
+
 /** A compact number for grid cells / stats (trims noise, keeps precision). */
 export function num(v: number): string {
   if (!Number.isFinite(v)) return v > 0 ? '+∞' : v < 0 ? '-∞' : 'NaN';
