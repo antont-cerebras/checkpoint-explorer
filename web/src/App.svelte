@@ -20,9 +20,10 @@
     startSearch,
     exitSearch,
     setTab,
-    filter,
+    filters,
     filterLabel,
     clearFilter,
+    removeFilter,
     paletteOpen,
   } from './stores/view';
   import TreeView from './components/TreeView.svelte';
@@ -256,12 +257,17 @@
     </select>
   </header>
 
-  {#if $filter}
+  {#if $filters.length}
     <div class="filterbar">
-      <span class="flabel">Filtering</span>
-      <span class="fval">{filterLabel($filter)}</span>
+      <span class="flabel">Filters</span>
+      {#each $filters as f, i}
+        <span class="fchip">
+          {filterLabel(f)}
+          <button class="x" title="Remove" aria-label="Remove filter" on:click={() => removeFilter(i)}>×</button>
+        </span>
+      {/each}
       <span class="dim">· {$visibleRows.length} tensors</span>
-      <button class="clear" on:click={clearFilter}>clear ✕</button>
+      <button class="clear" on:click={clearFilter}>clear all</button>
     </div>
   {/if}
 
@@ -364,9 +370,25 @@
     letter-spacing: 0.05em;
     font-size: 11px;
   }
-  .fval {
+  .fchip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     color: var(--accent);
     font-family: ui-monospace, monospace;
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
+    border-radius: 4px;
+    padding: 0 4px 0 8px;
+  }
+  .fchip .x {
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    padding: 0 2px;
   }
   .clear {
     margin-left: auto;

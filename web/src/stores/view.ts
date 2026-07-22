@@ -82,13 +82,13 @@ export const selectedId = writable<string | null>(null);
 export const searching = writable<boolean>(false);
 export const search = writable<string>('');
 
-/** Active tensor facet filter (set by clicking a dtype / shape / dimension badge);
- * flat-lists the tensors that match. */
+/** Active tensor facet filters (from clicking dtype / shape / dimension badges).
+ * They stack — a tensor must match ALL of them (AND). */
 export type Filter =
   | { kind: 'dtype'; value: string }
   | { kind: 'shape'; dims: number[] }
   | { kind: 'dim'; value: number };
-export const filter = writable<Filter | null>(null);
+export const filters = writable<Filter[]>([]);
 
 function matchesFilter(shape: number[], dtype: string, f: Filter): boolean {
   if (f.kind === 'dtype') return dtype === f.value;
@@ -96,10 +96,18 @@ function matchesFilter(shape: number[], dtype: string, f: Filter): boolean {
   return shape.length === f.dims.length && shape.every((d, i) => d === f.dims[i]);
 }
 
+function sameFilter(a: Filter, b: Filter): boolean {
+  if (a.kind === 'dtype' && b.kind === 'dtype') return a.value === b.value;
+  if (a.kind === 'dim' && b.kind === 'dim') return a.value === b.value;
+  if (a.kind === 'shape' && b.kind === 'shape')
+    return a.dims.length === b.dims.length && a.dims.every((d, i) => d === b.dims[i]);
+  return false;
+}
+
 export function filterLabel(f: Filter): string {
-  if (f.kind === 'dtype') return `dtype: ${f.value}`;
-  if (f.kind === 'dim') return `dim: ${f.value}`;
-  return `shape: ${f.dims.join('×') || 'scalar'}`;
+  if (f.kind === 'dtype') return `dtype ${f.value}`;
+  if (f.kind === 'dim') return `dim ${f.value}`;
+  return `shape ${f.dims.join('×') || 'scalar'}`;
 }
 
 /** Command palette (Space / `:`) open state. */
@@ -108,23 +116,23 @@ export const paletteOpen = writable<boolean>(false);
 /** The flattened rows — fold-aware, or a flat list while searching / dtype-filtering.
  * Shared by TreeView (render) and the key handler (cursor movement). */
 export const visibleRows = derived(
-  [treeData, expanded, search, searching, filter],
+  [treeData, expanded, search, searching, filters],
   ([$t, $exp, $q, $searching, $f]) => {
     if (!$t) return [] as Row[];
     if ($searching && $q.trim()) return searchRows($t.tree, $q.trim());
-    if ($f) return filterRows($t.tree, $f);
+    if ($f.length) return filterRows($t.tree, $f);
     return flatten($t.tree, $exp);
   },
 );
 
-/** Flat list of tensor rows matching the active facet filter. */
-function filterRows(nodes: TreeNode[], f: Filter): Row[] {
+/** Flat list of tensor rows matching ALL active facet filters. */
+function filterRows(nodes: TreeNode[], fs: Filter[]): Row[] {
   const out: Row[] = [];
   const walk = (ns: TreeNode[], parentId: string) => {
     for (const n of ns) {
       const id = nodeId(n, parentId);
       if (n.kind === 'group') walk(n.children, id);
-      else if (n.kind === 'tensor' && matchesFilter(n.info.shape, n.info.dtype, f))
+      else if (n.kind === 'tensor' && fs.every((f) => matchesFilter(n.info.shape, n.info.dtype, f)))
         out.push({ id, node: n, depth: 0, hasChildren: false });
     }
   };
@@ -132,23 +140,27 @@ function filterRows(nodes: TreeNode[], f: Filter): Row[] {
   return out;
 }
 
-function applyFilter(f: Filter): void {
-  filter.set(f);
+/** Add a filter to the active set (deduped, AND-ed with the rest). */
+function addFilter(f: Filter): void {
+  filters.update((cur) => (cur.some((x) => sameFilter(x, f)) ? cur : [...cur, f]));
   searching.set(false);
   search.set('');
   navigate({ kind: 'tree' });
 }
 export function filterByDtype(value: string): void {
-  applyFilter({ kind: 'dtype', value });
+  addFilter({ kind: 'dtype', value });
 }
 export function filterByShape(dims: number[]): void {
-  applyFilter({ kind: 'shape', dims });
+  addFilter({ kind: 'shape', dims });
 }
 export function filterByDim(value: number): void {
-  applyFilter({ kind: 'dim', value });
+  addFilter({ kind: 'dim', value });
+}
+export function removeFilter(index: number): void {
+  filters.update((cur) => cur.filter((_, i) => i !== index));
 }
 export function clearFilter(): void {
-  filter.set(null);
+  filters.set([]);
 }
 
 // Expand the synthetic root node once the tree first loads, so its children show.
